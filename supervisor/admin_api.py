@@ -19,10 +19,6 @@ class NodeCreate(BaseModel):
     id: str
     content: str
 
-class WorkflowCreate(BaseModel):
-    id: str
-    content: str
-
 class FragmentCreate(BaseModel):
     content: str
 
@@ -74,22 +70,6 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
             return data if isinstance(data, dict) else {}
         except Exception:
             return {}
-
-    def _normalize_workflow_nodes(raw_nodes: Any) -> dict[str, Any]:
-        """YAML 1.1 parses bare `on` as boolean True. Normalize it back to string 'on'."""
-        if not isinstance(raw_nodes, dict):
-            return {}
-        out: dict[str, Any] = {}
-        for nid, val in raw_nodes.items():
-            if not isinstance(val, dict):
-                out[str(nid)] = val
-                continue
-            fixed: dict[str, Any] = {}
-            for k, v in val.items():
-                key = "on" if k is True else str(k)
-                fixed[key] = v
-            out[str(nid)] = fixed
-        return out
 
     def _read_text(p: Path) -> dict[str, str]:
         if not p.exists():
@@ -155,10 +135,11 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
                 "id": data.get("id", f.stem),
                 "name": data.get("name", ""),
                 "type": data.get("type", ""),
-                "model_route": data.get("model_route", ""),
-                "output_mode": data.get("output_mode", ""),
+                "model": data.get("model", ""),
                 "tool_access": ta_raw,
+                "skills": data.get("skills", {}),
                 "description": data.get("description", ""),
+                "delegate_targets": list(data.get("delegate_targets") or []),
             })
         return res
 
@@ -185,165 +166,6 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         if p.exists():
             p.unlink()
         return {"ok": True}
-
-    # ----- Workflows -----
-    @router.get("/workflows")
-    def list_workflows() -> list[dict[str, Any]]:
-        w_dir = workspace_root / "config" / "workflows"
-        if not w_dir.exists():
-            return []
-        res = []
-        for f in w_dir.glob("*.yaml"):
-            data = _read_yaml(f)
-            raw_nodes = data.get("nodes") or data.get(True) or {}
-            res.append({
-                "id": data.get("id", f.stem),
-                "name": data.get("name", ""),
-                "description": data.get("description", ""),
-                "entry_node": data.get("entry_node", ""),
-                "nodes": _normalize_workflow_nodes(raw_nodes),
-                "ui_pos": data.get("ui_pos", {})
-            })
-        return res
-
-    @router.get("/workflows/{workflow_id}/raw")
-    def get_workflow_raw(workflow_id: str) -> dict[str, str]:
-        p = _safe_path(workspace_root / "config" / "workflows", workflow_id, ".yaml")
-        return _read_text(p)
-
-    @router.put("/workflows/{workflow_id}/raw")
-    def update_workflow_raw(workflow_id: str, payload: RawContent) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "config" / "workflows", workflow_id, ".yaml")
-        return _write_text(p, payload.content)
-
-    @router.put("/workflows/{workflow_id}")
-    def update_workflow_parsed(workflow_id: str, payload: dict = Body(...)) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "config" / "workflows", workflow_id, ".yaml")
-        content = yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
-        return _write_text(p, content)
-
-    @router.post("/workflows")
-    def create_workflow(payload: WorkflowCreate) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "config" / "workflows", payload.id, ".yaml")
-        if p.exists():
-            raise HTTPException(status_code=409, detail="Workflow already exists")
-        return _write_text(p, payload.content)
-
-    @router.delete("/workflows/{workflow_id}")
-    def delete_workflow(workflow_id: str) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "config" / "workflows", workflow_id, ".yaml")
-        if p.exists():
-            p.unlink()
-        return {"ok": True}
-
-    # ----- Prompt Packs -----
-    @router.get("/prompt-packs")
-    def list_prompt_packs() -> list[dict[str, Any]]:
-        packs_dir = workspace_root / "config" / "prompt_packs"
-        if not packs_dir.exists():
-            return []
-        res = []
-        for p in packs_dir.iterdir():
-            if p.is_dir():
-                mf = p / "manifest.yaml"
-                if mf.exists():
-                    data = _read_yaml(mf)
-                    res.append({
-                        "id": data.get("id", p.name),
-                        "name": data.get("name", ""),
-                        "description": data.get("description", "")
-                    })
-        return res
-
-    @router.get("/prompt-packs/{pack_id}/manifest/raw")
-    def get_prompt_pack_manifest(pack_id: str) -> dict[str, str]:
-        p = _safe_path(workspace_root / "config" / "prompt_packs", pack_id)
-        mf = p / "manifest.yaml"
-        return _read_text(mf)
-
-    @router.put("/prompt-packs/{pack_id}/manifest/raw")
-    def update_prompt_pack_manifest(pack_id: str, payload: RawContent) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "config" / "prompt_packs", pack_id)
-        mf = p / "manifest.yaml"
-        return _write_text(mf, payload.content)
-
-    @router.get("/prompt-packs/{pack_id}/fragments")
-    def list_fragments(pack_id: str) -> list[str]:
-        p = _safe_path(workspace_root / "config" / "prompt_packs", pack_id)
-        mf = p / "manifest.yaml"
-        manifest = _read_yaml(mf)
-        fragments_root = str(manifest.get("fragments_root", "fragments"))
-        frag_dir = _safe_path(p, fragments_root)
-        
-        if not frag_dir.exists():
-            return []
-        res = []
-        for f in frag_dir.rglob("*.md"):
-            try:
-                rel = f.relative_to(frag_dir).as_posix()
-                res.append(rel)
-            except Exception:
-                pass
-        return res
-
-    @router.get("/prompt-packs/{pack_id}/fragments/{fragment_path:path}/raw")
-    def get_fragment(pack_id: str, fragment_path: str) -> dict[str, str]:
-        p = _safe_path(workspace_root / "config" / "prompt_packs", pack_id)
-        mf = p / "manifest.yaml"
-        manifest = _read_yaml(mf)
-        fragments_root = str(manifest.get("fragments_root", "fragments"))
-        frag_dir = _safe_path(p, fragments_root)
-        
-        fp = _safe_path(frag_dir, fragment_path)
-        return _read_text(fp)
-
-    @router.put("/prompt-packs/{pack_id}/fragments/{fragment_path:path}/raw")
-    def update_fragment(pack_id: str, fragment_path: str, payload: RawContent) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "config" / "prompt_packs", pack_id)
-        mf = p / "manifest.yaml"
-        manifest = _read_yaml(mf)
-        fragments_root = str(manifest.get("fragments_root", "fragments"))
-        frag_dir = _safe_path(p, fragments_root)
-        
-        fp = _safe_path(frag_dir, fragment_path)
-        return _write_text(fp, payload.content)
-
-    @router.post("/prompt-packs/{pack_id}/fragments/{fragment_path:path}/raw")
-    def create_fragment(pack_id: str, fragment_path: str, payload: FragmentCreate) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "config" / "prompt_packs", pack_id)
-        mf = p / "manifest.yaml"
-        manifest = _read_yaml(mf)
-        fragments_root = str(manifest.get("fragments_root", "fragments"))
-        frag_dir = _safe_path(p, fragments_root)
-        
-        fp = _safe_path(frag_dir, fragment_path)
-        if fp.exists():
-            raise HTTPException(status_code=409, detail="Fragment already exists")
-        return _write_text(fp, payload.content)
-
-    @router.delete("/prompt-packs/{pack_id}/fragments/{fragment_path:path}")
-    def delete_fragment(pack_id: str, fragment_path: str) -> dict[str, Any]:
-        p = _safe_path(workspace_root / "config" / "prompt_packs", pack_id)
-        mf = p / "manifest.yaml"
-        manifest = _read_yaml(mf)
-        fragments_root = str(manifest.get("fragments_root", "fragments"))
-        frag_dir = _safe_path(p, fragments_root)
-        
-        fp = _safe_path(frag_dir, fragment_path)
-        if fp.exists():
-            fp.unlink()
-        return {"ok": True}
-
-    # ----- Model Routing -----
-    @router.get("/model-routing/raw")
-    def get_model_routing() -> dict[str, str]:
-        p = workspace_root / "config" / "model_routing.yaml"
-        return _read_text(p)
-        
-    @router.put("/model-routing/raw")
-    def update_model_routing(payload: RawContent) -> dict[str, Any]:
-        p = workspace_root / "config" / "model_routing.yaml"
-        return _write_text(p, payload.content)
 
     # ----- Runtime config -----
     @router.get("/runtime/raw")

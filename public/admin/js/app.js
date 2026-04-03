@@ -32,7 +32,7 @@ async function api(u,o={}){
 }
 
 // ════════════ Navigation ════════════
-const navTabs=[{id:'canvas',label:'工作流画布',icon:'⬡'},{id:'tools',label:'工具',icon:'🔧'},{id:'skills',label:'技能',icon:'📚'},{id:'prompts',label:'提示词',icon:'✎'},{id:'config',label:'配置',icon:'⚙'},{id:'dash',label:'概览',icon:'◎'}];
+const navTabs=[{id:'canvas',label:'节点画布',icon:'⬡'},{id:'tools',label:'工具',icon:'🔧'},{id:'skills',label:'技能',icon:'📚'},{id:'config',label:'配置',icon:'⚙'},{id:'dash',label:'概览',icon:'◎'}];
 const view=ref('canvas');
 function goView(v){
  _panStart=null;
@@ -41,20 +41,12 @@ function goView(v){
  dragUid.value=null;
  ed.value=null;
  view.value=v;
- if(v==='dash')loadDash();if(v==='prompts')loadPacks();if(v==='config')cfgLd('model-routing','routing');if(v==='tools')loadTools();if(v==='skills')loadSkills()}
+ if(v==='dash')loadDash();if(v==='config')cfgLd('runtime','runtime');if(v==='tools')loadTools();if(v==='skills')loadSkills()}
 
 // ════════════ Data ════════════
-const workflows=ref([]),allNodeDefs=ref({}),curWfId=ref(''),curWf=ref(null);
-async function loadWorkflows(){
- try{
-  const list=await api('/v1/admin/config/workflows');
-  workflows.value=list;
-  if(curWfId.value){
-   const hit=list.find(w=>w.id===curWfId.value);
-   curWf.value=hit||null;
-  }
- }catch(e){}
-}
+const allNodeDefs=ref({});
+const entryNodeId=ref('');
+
 async function loadNodeDefs(){
  try{
   const nl=await api('/v1/admin/config/nodes');
@@ -63,6 +55,13 @@ async function loadNodeDefs(){
   allNodeDefs.value=m;
  }catch(e){}
 }
+async function loadEntryNode(){
+ try{
+  const raw=await api('/v1/admin/config/runtime/raw');
+  const obj=jsyaml.load(raw.content)||{};
+  entryNodeId.value=(obj.shell&&obj.shell.entry_node_id)||'bootstrap.shell_orchestrator';
+ }catch(e){entryNodeId.value='bootstrap.shell_orchestrator'}
+}
 
 // ════════════ Canvas State ════════════
 const treeItems=ref([]),treeEdges=ref([]);
@@ -70,14 +69,13 @@ const panX=ref(0),panY=ref(0),zoom=ref(1);
 const selUid=ref(null),dragUid=ref(null),isPanning=ref(false);
 const vpRef=ref(null),editing=ref(null),rawEd=ref(null);
 const wireFrom=ref(null),wireEndX=ref(0),wireEndY=ref(0),wireSnap=ref(null),dragSnap=ref(null);
-const connModal=ref(null);
 
-// 端口中心坐标（补偿 border 偏移：左边框 3px，右边框 1.5px）
 function portInXY(n){return{x:n.x+3,y:n.y+n.h/2}}
 function portOutXY(n){return{x:n.x+n.w-1.5,y:n.y+n.h/2}}
 const zoomPct=computed(()=>Math.round(zoom.value*100));
 const aiItems=computed(()=>treeItems.value.filter(i=>i.kind==='ai'));
 const toolItems=computed(()=>treeItems.value.filter(i=>i.kind==='tool'));
+const nodeList=computed(()=>Object.values(allNodeDefs.value).sort((a,b)=>(a.id<b.id?-1:1)));
 
 function shortRoute(r){return r&&r.length>22?r.slice(0,20)+'…':r}
 function shortTool(s){return s&&s.length>18?s.slice(0,16)+'…':s}
@@ -85,7 +83,7 @@ function nodeGlyph(n){return n.isEntry?'▶':'⬡'}
 function sanitizeKey(v){return String(v||'').replace(/[^a-zA-Z0-9._-]+/g,'_')}
 function cloneObj(v){return JSON.parse(JSON.stringify(v||{}))}
 
-// ════════════ Tree Building (radial, with duplicates) ════════════
+// ════════════ Tree Building ════════════
 const ALL_TOOLS=ref([]);
 const AI_W=200,AI_H=120,TOOL_W=110,TOOL_H=22;
 const CHILD_R=380,TOOL_R=160,CHILD_WT=5,DECAY=0.85;
@@ -99,37 +97,21 @@ function resolveTools(nd){
  return[];
 }
 
-function buildCallTree(wf,nid,nodeDefs,visited,pathKey=''){
- if(!wf.nodes||!wf.nodes[nid])return null;
+function buildCallTree(nid,nodeDefs,visited,pathKey=''){
+ const nd=nodeDefs[nid];
+ if(!nd)return null;
  const uid=pathKey||`node_${sanitizeKey(nid)}`;
- const nref=wf.nodes[nid]||{};
- const nd=nodeDefs[nid]||{};
  const tools=resolveTools(nd);
  const children=[];
- const terms=[];
  const vis2=new Set(visited);
  vis2.add(nid);
 
- const ho=nref.handoffs||{};
- for(const[k,v]of Object.entries(ho)){
-  const t=String(v);
-  if(t.startsWith('$'))terms.push({name:String(k),target:t,kind:'ho'});
-  else if(!vis2.has(t)){
-   const childPath=`${uid}__ho_${sanitizeKey(k)}__${sanitizeKey(t)}`;
-   const sub=buildCallTree(wf,t,nodeDefs,vis2,childPath);
-   if(sub)children.push({label:String(k),kind:'ho',sub});
-  }
- }
-
- const onRaw=nref.on||nref[true]||{};
- for(const[k,v]of Object.entries(onRaw)){
-  const kk=k===true?'on':String(k);
-  const t=String(v);
-  if(t.startsWith('$'))terms.push({name:kk,target:t,kind:'on'});
-  else if(!vis2.has(t)){
-   const childPath=`${uid}__on_${sanitizeKey(kk)}__${sanitizeKey(t)}`;
-   const sub=buildCallTree(wf,t,nodeDefs,vis2,childPath);
-   if(sub)children.push({label:kk,kind:'on',sub});
+ const targets=nd.delegate_targets||[];
+ for(const targetId of targets){
+  if(!vis2.has(targetId)&&nodeDefs[targetId]){
+   const childPath=`${uid}__dt_${sanitizeKey(targetId)}`;
+   const sub=buildCallTree(targetId,nodeDefs,vis2,childPath);
+   if(sub)children.push({label:'',kind:'delegate',sub});
   }
  }
 
@@ -138,17 +120,15 @@ function buildCallTree(wf,nid,nodeDefs,visited,pathKey=''){
   id:nid,
   name:nd.name||nid.split('.').pop(),
   type:nd.type||'ai',
-  model_route:nd.model_route||'',
-  output_mode:nd.output_mode||'draft',
-  isEntry:nid===wf.entry_node,
+  model:nd.model||'',
+  isEntry:nid===entryNodeId.value,
   tools,
   children,
-  terms,
  };
 }
 
 function layoutTree(tree,cx,cy,parentAngle,depth,items,edges){
- const aiItem={uid:tree.uid,id:tree.id,kind:'ai',name:tree.name,type:tree.type,model_route:tree.model_route,output_mode:tree.output_mode,isEntry:tree.isEntry,toolNames:tree.tools,terms:tree.terms,x:cx-AI_W/2,y:cy-AI_H/2,w:AI_W,h:AI_H};
+ const aiItem={uid:tree.uid,id:tree.id,kind:'ai',name:tree.name,type:tree.type,model:tree.model,isEntry:tree.isEntry,toolNames:tree.tools,x:cx-AI_W/2,y:cy-AI_H/2,w:AI_W,h:AI_H};
  items.push(aiItem);
 
  const outs=[];
@@ -179,7 +159,7 @@ function layoutTree(tree,cx,cy,parentAngle,depth,items,edges){
    const before=items.length;
    layoutTree(o.ref.sub,ox,oy,angle,depth+1,items,edges);
    const ch=items.slice(before).find(it=>it.kind==='ai');
-   if(ch)edges.push({fromUid:aiItem.uid,toUid:ch.uid,type:o.ref.kind==='ho'?'handoff':'on',label:o.ref.label});
+   if(ch)edges.push({fromUid:aiItem.uid,toUid:ch.uid,type:'delegate',label:''});
   }else{
    const r=TOOL_R*Math.pow(DECAY,depth);
    const ti={uid:o.uid,kind:'tool',name:o.name,parentUid:aiItem.uid,parentNodeId:tree.id,x:cx+r*Math.cos(angle)-TOOL_W/2,y:cy+r*Math.sin(angle)-TOOL_H/2,w:TOOL_W,h:TOOL_H};
@@ -190,10 +170,18 @@ function layoutTree(tree,cx,cy,parentAngle,depth,items,edges){
  });
 }
 
-function applySavedPositions(items,uiPos){
- if(!uiPos||typeof uiPos!=='object')return;
+function _loadPositions(){
+ try{return JSON.parse(localStorage.getItem('clonoth_ui_pos')||'{}')}catch(e){return{}}
+}
+function _savePositions(){
+ const pos={};
+ treeItems.value.forEach(it=>{pos[it.uid]={x:Math.round(it.x),y:Math.round(it.y)}});
+ localStorage.setItem('clonoth_ui_pos',JSON.stringify(pos));
+}
+function applySavedPositions(items){
+ const pos=_loadPositions();
  items.forEach(it=>{
-  const p=uiPos[it.uid];
+  const p=pos[it.uid];
   if(p&&Number.isFinite(Number(p.x))&&Number.isFinite(Number(p.y))){
    it.x=Number(p.x);
    it.y=Number(p.y);
@@ -202,25 +190,26 @@ function applySavedPositions(items,uiPos){
 }
 
 function rebuildTree(){
- const wf=curWf.value;
- if(!wf){treeItems.value=[];treeEdges.value=[];return}
+ const nodeDefs=allNodeDefs.value;
+ const nodeIds=Object.keys(nodeDefs);
+ if(!nodeIds.length){treeItems.value=[];treeEdges.value=[];return}
  const items=[],edgesList=[];
- const rootId=(wf.entry_node&&wf.nodes&&wf.nodes[wf.entry_node])?wf.entry_node:Object.keys(wf.nodes||{})[0];
+ const rootId=entryNodeId.value&&nodeDefs[entryNodeId.value]?entryNodeId.value:nodeIds[0];
  if(rootId){
-  const tree=buildCallTree(wf,rootId,allNodeDefs.value,new Set(),`node_${sanitizeKey(rootId)}`);
+  const tree=buildCallTree(rootId,nodeDefs,new Set(),`node_${sanitizeKey(rootId)}`);
   if(tree)layoutTree(tree,600,500,0,0,items,edgesList);
  }
  const treeIds=new Set(items.filter(i=>i.kind==='ai').map(i=>i.id));
- const orphans=Object.keys(wf.nodes||{}).filter(id=>!treeIds.has(id));
+ const orphans=nodeIds.filter(id=>!treeIds.has(id));
  if(orphans.length){
   let ox=600-(orphans.length*(AI_W+20))/2;
   orphans.forEach(id=>{
-   const nd=allNodeDefs.value[id]||{};
-   items.push({uid:`orphan_${sanitizeKey(id)}`,id,kind:'ai',name:nd.name||id.split('.').pop(),type:'ai',model_route:nd.model_route||'',output_mode:nd.output_mode||'draft',isEntry:false,toolNames:resolveTools(nd),terms:[],x:ox,y:920,w:AI_W,h:AI_H});
+   const nd=nodeDefs[id]||{};
+   items.push({uid:`orphan_${sanitizeKey(id)}`,id,kind:'ai',name:nd.name||id.split('.').pop(),type:'ai',model:nd.model||'',isEntry:id===entryNodeId.value,toolNames:resolveTools(nd),x:ox,y:920,w:AI_W,h:AI_H});
    ox+=AI_W+20;
   });
  }
- applySavedPositions(items,wf.ui_pos||{});
+ applySavedPositions(items);
  treeItems.value=items;
  treeEdges.value=edgesList;
 }
@@ -245,23 +234,9 @@ const conns=computed(()=>{
   const off=e.type==='tool'?0:len*0.08;
   const cpx=mx-dy/len*off,cpy=my+dx/len*off;
   const path=`M ${sp.x} ${sp.y} Q ${cpx} ${cpy} ${ep.x} ${ep.y}`;
-  const lw=(e.label||'').length*6.5+12;
-  return{path,type:e.type,label:e.label||'',lx:(sp.x+ep.x)/2,ly:(sp.y+ep.y)/2-8,lw};
+  return{path,type:e.type,lx:(sp.x+ep.x)/2,ly:(sp.y+ep.y)/2-8};
  }).filter(Boolean);
 });
-
-// ════════════ Select Workflow ════════════
-function selectWf(id){
- curWfId.value=id;
- const wf=workflows.value.find(w=>w.id===id);
- curWf.value=wf||null;
- selUid.value=null;
- editing.value=null;
- rawEd.value=null;
- if(!wf){treeItems.value=[];treeEdges.value=[];return}
- rebuildTree();
- nextTick(()=>fitView());
-}
 
 // ════════════ Canvas Mouse ════════════
 let _panStart=null,_dragItem=null;
@@ -325,26 +300,23 @@ function cvUp(){
    _doConnect(ds.fromId,ds.toId);
    dragSnap.value=null;
   }
+  if(_dragItem)_savePositions();
   _panStart=null;_dragItem=null;isPanning.value=false;dragUid.value=null;
 }
-function _doConnect(fromId,toId){
-  if(!curWf.value||!curWf.value.nodes||!curWf.value.nodes[fromId])return;
-  connModal.value={fromId,toId,type:'on',outcome:''};
-}
-function confirmConn(){
-  const m=connModal.value;
-  if(!m||!m.outcome.trim())return;
-  const nref=curWf.value.nodes[m.fromId];
-  if(!nref)return;
-  if(m.type==='on'){if(!nref.on)nref.on={};nref.on[m.outcome.trim()]=m.toId}
-  else{if(!nref.handoffs)nref.handoffs={};nref.handoffs[m.outcome.trim()]=m.toId}
-  connModal.value=null;
-  saveWorkflowData().then(()=>{
-   loadWorkflows().then(()=>{
-    if(curWfId.value){const hit=workflows.value.find(w=>w.id===curWfId.value);if(hit)curWf.value=hit}
-    rebuildTree();toast('连接已创建');
-   });
-  });
+async function _doConnect(fromId,toId){
+  if(fromId===toId)return;
+  try{
+   const raw=await api(`/v1/admin/config/nodes/${fromId}/raw`);
+   let obj=jsyaml.load(raw.content)||{};
+   if(!Array.isArray(obj.delegate_targets))obj.delegate_targets=[];
+   if(obj.delegate_targets.includes(toId)){toast('已存在该委派关系');return}
+   obj.delegate_targets.push(toId);
+   const ys=jsyaml.dump(obj,{sortKeys:false,lineWidth:120});
+   await api(`/v1/admin/config/nodes/${fromId}/raw`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:ys})});
+   await loadNodeDefs();
+   rebuildTree();
+   toast('委派关系已创建');
+  }catch(e){}
 }
 function cvWheel(e){
  const d=e.deltaY>0?0.92:1.08;
@@ -392,66 +364,58 @@ function fitView(){
 }
 
 // ════════════ Node Editor ════════════
-const newTool=ref(''),newDeny=ref(''),newOnK=ref(''),newOnV=ref(''),newHoK=ref(''),newHoV=ref('');
+const newTool=ref(''),newDeny=ref(''),newDelegate=ref('');
 const otherNodes=computed(()=>{
- if(!curWf.value||!curWf.value.nodes)return[];
- return Object.keys(curWf.value.nodes)
+ return Object.keys(allNodeDefs.value)
   .filter(id=>!editing.value||id!==editing.value.id)
   .map(id=>({id,name:(allNodeDefs.value[id]||{}).name||id}));
 });
-function currentWorkflowNode(nodeId){
- if(!curWf.value||!curWf.value.nodes)return{};
- return curWf.value.nodes[nodeId]||{};
-}
 async function openEd(nodeId,focus=''){
- let pp='',pa='',ta=[],td=[],tm='none',desc='';
+ let model='',promptText='',ta=[],td=[],tm='none',desc='',name=nodeId,type='ai',skillMode='all',skillAllow=[],delegateTargets=[];
  try{
   const raw=await api(`/v1/admin/config/nodes/${nodeId}/raw`);
   const obj=jsyaml.load(raw.content)||{};
-  const pr=obj.prompt||{};
-  pp=pr.pack||'';
-  pa=pr.assembly||'';
   const t=obj.tool_access||{};
   if(typeof t==='string')tm=t;
   else{tm=t.mode||'none';ta=[...(t.allow||[])];td=[...(t.deny||[])]}
+  const s=obj.skills||{};
+  if(typeof s==='string')skillMode=s;
+  else{skillMode=s.mode||'all';skillAllow=[...(s.allow||[])]}
   desc=obj.description||'';
+  name=obj.name||nodeId;
+  type=obj.type||'ai';
+  model=obj.model||'';
+  promptText=typeof obj.prompt==='string'?obj.prompt:'';
+  delegateTargets=[...(obj.delegate_targets||[])];
  }catch(e){}
- const wfNode=currentWorkflowNode(nodeId);
- const onRaw=wfNode.on||wfNode[true]||{};
- const on={};
- for(const[k,v]of Object.entries(onRaw))on[k===true?'on':String(k)]=String(v);
- const nd=allNodeDefs.value[nodeId]||{};
  editing.value=reactive({
   id:nodeId,
-  name:nd.name||nodeId,
-  type:nd.type||'ai',
-  model_route:nd.model_route||'',
-  output_mode:nd.output_mode||'draft',
+  name,
+  type,
+  model,
   description:desc,
-  prompt_pack:pp,
-  prompt_assembly:pa,
+  prompt_text:promptText,
   tool_mode:tm,
   tool_allow:ta,
   tool_deny:td,
-  skill_mode:nd.skill_access?.mode||'all',
-  skill_allow:[...(nd.skill_access?.allow||[])],
-  isEntry:nodeId===curWf.value?.entry_node,
-  on,
-  handoffs:{...(wfNode.handoffs||{})},
+  skill_mode:skillMode,
+  skill_allow:skillAllow,
+  delegate_targets:delegateTargets,
+  isEntry:nodeId===entryNodeId.value,
  });
  await nextTick();
  if(focus)jumpEd(focus);
 }
 function closeEd(){editing.value=null}
 function jumpEd(section){nextTick(()=>{const el=document.getElementById('pn-sec-'+section);if(el)el.scrollIntoView({behavior:'smooth',block:'start'})})}
-function jumpToRoute(){goView('config');cfgLd('model-routing','routing')}
-function jumpToPack(pid){goView('prompts');loadPacks().then(()=>{if(pid)pMani(pid)})}
 
 function addTool(){const t=newTool.value.trim();if(t&&!editing.value.tool_allow.includes(t))editing.value.tool_allow.push(t);newTool.value=''}
 function addDeny(){const t=newDeny.value.trim();if(t&&!editing.value.tool_deny.includes(t))editing.value.tool_deny.push(t);newDeny.value=''}
-function addOn(){const k=newOnK.value.trim(),v=newOnV.value;if(k&&v){editing.value.on[k]=v;newOnK.value='';newOnV.value=''}}
-function addHo(){const k=newHoK.value.trim(),v=newHoV.value;if(k&&v){editing.value.handoffs[k]=v;newHoK.value='';newHoV.value=''}}
-function setEntry(checked){if(!editing.value)return;editing.value.isEntry=checked}
+function addDelegate(){const t=newDelegate.value;if(t&&!editing.value.delegate_targets.includes(t))editing.value.delegate_targets.push(t);newDelegate.value=''}
+function setEntry(checked){
+ if(!editing.value)return;
+ editing.value.isEntry=checked;
+}
 
 // ════════════ Raw Editor ════════════
 async function openRawEd(nodeId){
@@ -461,108 +425,79 @@ async function openRawEd(nodeId){
   const d=await api(`/v1/admin/config/nodes/${nodeId}/raw`);
   nodeContent=d.content;
  }catch(e){return}
- const flowContent=jsyaml.dump(cloneObj(currentWorkflowNode(nodeId)),{sortKeys:false,lineWidth:120});
- rawEd.value=reactive({nodeId,nodeContent,flowContent:flowContent||'{}\n',isEntry:nodeId===curWf.value?.entry_node});
+ rawEd.value=reactive({nodeId,nodeContent});
 }
 function closeRawEd(){rawEd.value=null}
 async function saveRawEd(){
  const r=rawEd.value;
  if(!r)return;
- let flowObj={};
- try{
-  const parsed=jsyaml.load(r.flowContent||'{}');
-  if(parsed==null)flowObj={};
-  else if(typeof parsed!=='object'||Array.isArray(parsed)){toast('工作流片段必须是对象',false);return}
-  else flowObj=parsed;
- }catch(e){toast('工作流片段 YAML 格式错误',false);return}
-
  try{
   await api(`/v1/admin/config/nodes/${r.nodeId}/raw`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:r.nodeContent})});
  }catch(e){return}
-
- if(curWf.value){
-  if(!curWf.value.nodes)curWf.value.nodes={};
-  curWf.value.nodes[r.nodeId]=flowObj;
-  if(r.isEntry)curWf.value.entry_node=r.nodeId;
-  else if(curWf.value.entry_node===r.nodeId)curWf.value.entry_node='';
-  await saveWorkflowData();
- }
-
- await Promise.all([loadNodeDefs(),loadWorkflows()]);
- if(curWfId.value){
-  const hit=workflows.value.find(w=>w.id===curWfId.value);
-  if(hit)curWf.value=hit;
- }
+ await loadNodeDefs();
  rebuildTree();
  if(editing.value&&editing.value.id===r.nodeId)await openEd(r.nodeId);
  rawEd.value=null;
- toast('原始内容已保存');
+ toast('已保存');
 }
 
-// ════════════ Save Node / Workflow ════════════
+// ════════════ Save Node ════════════
 async function saveNode(){
  const e=editing.value;
  if(!e)return;
  const ta={mode:e.tool_mode};
  if(e.tool_mode==='allowlist'&&e.tool_allow.length)ta.allow=[...e.tool_allow];
  if(e.tool_mode==='all'&&e.tool_deny.length)ta.deny=[...e.tool_deny];
- const sa={mode:e.skill_mode||'all',allow:[...e.skill_allow||[]]};
- const nodeObj={version:1,kind:'node',id:e.id,type:e.type,name:e.name,description:e.description||'',model_route:e.model_route||'',prompt:{pack:e.prompt_pack||'',assembly:e.prompt_assembly||''},tool_access:ta,skill_access:sa,output_mode:e.output_mode||'draft'};
+ const sa={mode:e.skill_mode||'all'};
+ if(e.skill_mode==='allowlist'&&e.skill_allow.length)sa.allow=[...e.skill_allow];
+ let nodeObj={};
+ try{
+  const raw=await api(`/v1/admin/config/nodes/${e.id}/raw`);
+  const parsed=jsyaml.load(raw.content||'')||{};
+  if(parsed&&typeof parsed==='object'&&!Array.isArray(parsed))nodeObj=parsed;
+ }catch(err){}
+ nodeObj.id=e.id;
+ nodeObj.type=e.type||'ai';
+ nodeObj.name=e.name;
+ nodeObj.description=e.description||'';
+ if(e.delegate_targets&&e.delegate_targets.length)nodeObj.delegate_targets=[...e.delegate_targets];
+ else delete nodeObj.delegate_targets;
+ nodeObj.model=e.model||'';
+ nodeObj.prompt=e.prompt_text||'';
+ nodeObj.tool_access=ta;
+ nodeObj.skills=sa;
+ delete nodeObj.model_route;
+ delete nodeObj.skill_access;
+ delete nodeObj.output_mode;
+ delete nodeObj.version;
+ delete nodeObj.kind;
  const yamlStr=jsyaml.dump(nodeObj,{sortKeys:false,lineWidth:120,quotingType:'"',forceQuotes:false});
  try{
   await api(`/v1/admin/config/nodes/${e.id}/raw`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:yamlStr})});
  }catch(err){return}
 
- if(curWf.value){
-  if(!curWf.value.nodes)curWf.value.nodes={};
-  const newRef={};
-  if(Object.keys(e.on).length)newRef.on={...e.on};
-  if(Object.keys(e.handoffs).length)newRef.handoffs={...e.handoffs};
-  curWf.value.nodes[e.id]=newRef;
-  if(e.isEntry)curWf.value.entry_node=e.id;
-  else if(curWf.value.entry_node===e.id)curWf.value.entry_node='';
-  await saveWorkflowData();
+ // 如果设为入口，更新 runtime config
+ if(e.isEntry&&entryNodeId.value!==e.id){
+  await _setEntryNode(e.id);
+ }else if(!e.isEntry&&entryNodeId.value===e.id){
+  await _setEntryNode('');
  }
 
- await Promise.all([loadNodeDefs(),loadWorkflows(),loadAllToolNames()]);
- if(curWfId.value){
-  const hit=workflows.value.find(w=>w.id===curWfId.value);
-  if(hit)curWf.value=hit;
- }
+ await Promise.all([loadNodeDefs(),loadAllToolNames()]);
  rebuildTree();
  await openEd(e.id);
  toast('节点已保存');
 }
 
-async function saveWorkflowData(){
- const wf=curWf.value;
- if(!wf||!curWfId.value)return;
+async function _setEntryNode(nodeId){
  try{
-  const raw=await api(`/v1/admin/config/workflows/${curWfId.value}/raw`);
-  let wfObj={};
-  try{wfObj=jsyaml.load(raw.content)||{}}catch(e){wfObj={}}
-  if(typeof wfObj!=='object'||Array.isArray(wfObj)||!wfObj)wfObj={};
-  wfObj.version=wfObj.version||1;
-  wfObj.kind='workflow';
-  wfObj.id=wf.id||curWfId.value;
-  if(typeof wf.name==='string')wfObj.name=wf.name;
-  if(typeof wf.description==='string')wfObj.description=wf.description;
-  wfObj.entry_node=wf.entry_node||'';
-  wfObj.nodes={};
-  for(const[nid,nref]of Object.entries(wf.nodes||{})){
-   const entry={};
-   const onRaw=nref.on||nref[true]||{};
-   const on={};
-   for(const[k,v]of Object.entries(onRaw))on[k===true?'on':String(k)]=String(v);
-   if(Object.keys(on).length)entry.on=on;
-   if(nref.handoffs&&Object.keys(nref.handoffs).length)entry.handoffs={...nref.handoffs};
-   wfObj.nodes[nid]=entry;
-  }
-  wfObj.ui_pos={};
-  treeItems.value.forEach(it=>{wfObj.ui_pos[it.uid]={x:Math.round(it.x),y:Math.round(it.y)}});
-  const ys=jsyaml.dump(wfObj,{sortKeys:false,lineWidth:120});
-  await api(`/v1/admin/config/workflows/${curWfId.value}/raw`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:ys})});
-  wf.ui_pos=wfObj.ui_pos;
+  const raw=await api('/v1/admin/config/runtime/raw');
+  let obj=jsyaml.load(raw.content)||{};
+  if(!obj.shell)obj.shell={};
+  obj.shell.entry_node_id=nodeId||'bootstrap.shell_orchestrator';
+  const ys=jsyaml.dump(obj,{sortKeys:false,lineWidth:120});
+  await api('/v1/admin/config/runtime/raw',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:ys})});
+  entryNodeId.value=nodeId||'bootstrap.shell_orchestrator';
  }catch(e){}
 }
 
@@ -622,47 +557,28 @@ async function saveToolPicker(){
  toolPicker.value=null;
  toast('工具配置已保存');
 }
-async function saveAll(){
- await saveWorkflowData();
- await loadWorkflows();
- if(curWfId.value){
-  const hit=workflows.value.find(w=>w.id===curWfId.value);
-  if(hit)curWf.value=hit;
- }
- toast('工作流已保存');
-}
 
 // ════════════ Add / Delete Node ════════════
 async function addNode(){
- if(!curWf.value){toast('请先选择一个工作流',false);return}
- const existing=new Set([...Object.keys(allNodeDefs.value||{}),...Object.keys(curWf.value.nodes||{})]);
+ const existing=new Set(Object.keys(allNodeDefs.value||{}));
  let idx=1;
  let nid=`custom.node_${idx}`;
  while(existing.has(nid)){idx+=1;nid=`custom.node_${idx}`}
   const nodeObj={
-   version:1,
-   kind:'node',
    id:nid,
    type:'ai',
    name:`新节点 ${idx}`,
    description:'',
-   model_route:'executor_default',
-   prompt:{pack:'bootstrap_cn',assembly:''},
+   model:'',
+   prompt:'你是一个 AI 节点。请根据指令完成处理。',
    tool_access:{mode:'none'},
-   output_mode:'draft'
+   skills:{mode:'all'}
   };
  const ys=jsyaml.dump(nodeObj,{sortKeys:false,lineWidth:120});
  try{
   await api('/v1/admin/config/nodes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:nid,content:ys})});
  }catch(e){return}
- if(!curWf.value.nodes)curWf.value.nodes={};
- curWf.value.nodes[nid]={};
- await saveWorkflowData();
- await Promise.all([loadNodeDefs(),loadWorkflows()]);
- if(curWfId.value){
-  const hit=workflows.value.find(w=>w.id===curWfId.value);
-  if(hit)curWf.value=hit;
- }
+ await loadNodeDefs();
  rebuildTree();
  nextTick(async()=>{
   fitView();
@@ -676,39 +592,32 @@ async function delNode(){
  const nid=editing.value.id;
  if(!confirm(`确定删除节点 ${nid}？`))return;
  try{await api(`/v1/admin/config/nodes/${nid}`,{method:'DELETE'})}catch(e){}
- if(curWf.value&&curWf.value.nodes){
-  delete curWf.value.nodes[nid];
-  for(const ref2 of Object.values(curWf.value.nodes)){
-   if(ref2.on){for(const k in ref2.on)if(String(ref2.on[k])===nid)delete ref2.on[k]}
-   if(ref2[true]){for(const k in ref2[true])if(String(ref2[true][k])===nid)delete ref2[true][k]}
-   if(ref2.handoffs){for(const k in ref2.handoffs)if(String(ref2.handoffs[k])===nid)delete ref2.handoffs[k]}
+ // 从其他节点的 delegate_targets 中移除
+ for(const [id,nd] of Object.entries(allNodeDefs.value)){
+  if(nd.delegate_targets&&nd.delegate_targets.includes(nid)){
+   try{
+    const raw=await api(`/v1/admin/config/nodes/${id}/raw`);
+    let obj=jsyaml.load(raw.content)||{};
+    if(Array.isArray(obj.delegate_targets)){
+     obj.delegate_targets=obj.delegate_targets.filter(t=>t!==nid);
+     if(!obj.delegate_targets.length)delete obj.delegate_targets;
+     const ys=jsyaml.dump(obj,{sortKeys:false,lineWidth:120});
+     await api(`/v1/admin/config/nodes/${id}/raw`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:ys})});
+    }
+   }catch(e){}
   }
-  if(curWf.value.entry_node===nid)curWf.value.entry_node='';
  }
- await saveWorkflowData();
- await Promise.all([loadNodeDefs(),loadWorkflows()]);
- if(curWfId.value){
-  const hit=workflows.value.find(w=>w.id===curWfId.value);
-  if(hit)curWf.value=hit;
- }
+ if(entryNodeId.value===nid)await _setEntryNode('');
+ await loadNodeDefs();
  editing.value=null;selUid.value=null;rawEd.value=null;rebuildTree();toast('节点已删除');
 }
 
-// ════════════ Workflow CRUD ════════════
-async function newWf(){
- const name=prompt('工作流名称：');if(!name)return;
- const id=prompt('工作流 ID（如 custom.my_flow）：');if(!id)return;
- const wfObj={version:1,kind:'workflow',id,name,description:'',entry_node:'',nodes:{},ui_pos:{}};
- const ys=jsyaml.dump(wfObj,{sortKeys:false,lineWidth:120});
- try{await api('/v1/admin/config/workflows',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id,content:ys})})}catch(e){return}
- await loadWorkflows();selectWf(id);toast('工作流已创建');
-}
-async function delWf(){
- if(!curWfId.value)return;
- if(!confirm(`确定删除工作流 ${curWfId.value}？`))return;
- try{await api(`/v1/admin/config/workflows/${curWfId.value}`,{method:'DELETE'})}catch(e){return}
- curWfId.value='';curWf.value=null;treeItems.value=[];treeEdges.value=[];editing.value=null;rawEd.value=null;selUid.value=null;
- await loadWorkflows();toast('工作流已删除');
+function selectNode(id){
+ const item=treeItems.value.find(it=>it.kind==='ai'&&it.id===id);
+ if(item){
+  selUid.value=item.uid;
+  openEd(id);
+ }
 }
 
 // ════════════ Dashboard ════════════
@@ -717,20 +626,9 @@ async function loadDash(){try{health.value=await api('/v1/health');adm.value=awa
 function fmtUp(s){if(!s)return'';const h=Math.floor(s/3600),m=Math.floor(s%3600/60);return h?`${h}h${m}m`:`${m}m`}
 async function restart(){if(!confirm('确定重启引擎？'))return;await api('/v1/admin/restart',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({target:'engine',reason:'Admin UI'})});toast('重启已下发');setTimeout(loadDash,2000)}
 
-// ════════════ Prompts ════════════
-const packs=ref([]),ed=ref(null);
-async function loadPacks(){try{packs.value=await api('/v1/admin/config/prompt-packs')}catch(e){}}
-async function pMani(id){const d=await api(`/v1/admin/config/prompt-packs/${id}/manifest/raw`);ed.value={type:'mani',pid:id,content:d.content}}
-async function pFList(id){const f=await api(`/v1/admin/config/prompt-packs/${id}/fragments`);ed.value={type:'flist',pid:id,fs:f}}
-async function pFEd(pid,fp){const d=await api(`/v1/admin/config/prompt-packs/${pid}/fragments/${fp}/raw`);ed.value={type:'frag',pid,fp,content:d.content,isNew:false}}
-function pFNew(pid){ed.value={type:'frag',pid,fp:'',content:'',isNew:true}}
-function pBack(){if(ed.value?.type==='frag')pFList(ed.value.pid);else ed.value=null}
-function pTitle(){const e=ed.value;if(e.type==='mani')return e.pid+' / manifest.yaml';if(e.type==='frag')return e.isNew?'新建片段':e.fp;return''}
-async function pSave(){const e=ed.value;if(e.type==='mani'){await api(`/v1/admin/config/prompt-packs/${e.pid}/manifest/raw`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:e.content})});toast('已保存');ed.value=null;loadPacks()}else if(e.type==='frag'){if(!e.fp)return toast('路径不能为空',false);await api(`/v1/admin/config/prompt-packs/${e.pid}/fragments/${e.fp}/raw`,{method:e.isNew?'POST':'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:e.content})});toast('已保存');pFList(e.pid)}}
-async function pFDel(pid,fp){if(!confirm('确定删除 '+fp+'？'))return;await api(`/v1/admin/config/prompt-packs/${pid}/fragments/${fp}`,{method:'DELETE'});toast('已删除');pFList(pid)}
-
 // ════════════ Config ════════════
-const cfgTabs=[{k:'routing',a:'model-routing',l:'模型路由'},{k:'runtime',a:'runtime',l:'运行时'},{k:'policy',a:'policy',l:'安全策略'},{k:'schedules',a:'schedules',l:'定时调度'}];
+const ed=ref(null);
+const cfgTabs=[{k:'runtime',a:'runtime',l:'运行时'},{k:'policy',a:'policy',l:'安全策略'},{k:'schedules',a:'schedules',l:'定时调度'}];
 const csub=ref('');
 const cfgLbl=computed(()=>(cfgTabs.find(c=>c.k===csub.value)||{}).l||'');
 async function cfgLd(a,k){csub.value=k;const d=await api(`/v1/admin/config/${a}/raw`);ed.value={type:'cfg',a,content:d.content}}
@@ -776,7 +674,7 @@ async function openMcpEd(){
 
 async function reloadTools(){
  reloading.value=true;
- try{await api('/v1/tools/reload',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});toast('重载信号已发送，引擎将在下次轮询时生效')}catch(e){toast('发送失败',false)}
+ try{await api('/v1/tools/reload',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});toast('重载信号已发送')}catch(e){toast('发送失败',false)}
  setTimeout(async()=>{await loadTools();reloading.value=false},2000);
 }
 
@@ -828,8 +726,9 @@ function onKey(e){
 
 // ════════════ Init ════════════
 async function initLoad(){
- await Promise.all([loadWorkflows(),loadNodeDefs(),loadAllToolNames()]);
- if(workflows.value.length)selectWf(workflows.value[0].id);
+ await Promise.all([loadNodeDefs(),loadEntryNode(),loadAllToolNames()]);
+ rebuildTree();
+ nextTick(()=>fitView());
 }
 async function loadAllToolNames(){
  try{
@@ -837,14 +736,13 @@ async function loadAllToolNames(){
   try{
    names=await api('/v1/admin/config/all-tool-names');
   }catch(e1){
-   // fallback: derive from /v1/admin/config/tools
    try{
     const ext=await api('/v1/admin/config/tools');
     names=ext.filter(t=>t.name).map(t=>t.name);
-   }catch(e2){console.warn('loadAllToolNames: both endpoints failed',e2)}
+   }catch(e2){}
   }
   if(Array.isArray(names)&&names.length)ALL_TOOLS.value=[...new Set(names)];
- }catch(e){console.warn('loadAllToolNames error',e)}
+ }catch(e){}
 }
 
 onMounted(()=>{
@@ -857,10 +755,10 @@ watch(vpRef,(el,old)=>{
  if(el)el.addEventListener('wheel',nativeWheel,{passive:false});
 });
 function nativeWheel(e){
- if(e.target.closest('.rpanel')||e.target.closest('.rpbg')||e.target.closest('.raw-mask')||e.target.closest('.raw-box')||e.target.closest('.conn-modal-mask')||e.target.closest('.tool-picker'))return;
+ if(e.target.closest('.rpanel')||e.target.closest('.rpbg')||e.target.closest('.raw-mask')||e.target.closest('.raw-box')||e.target.closest('.tool-picker'))return;
  e.preventDefault();
  cvWheel(e);
 }
 
-return{authed,ltk,lerr,login,logout,tshow,tmsg,ttyp,navTabs,view,goView,workflows,curWfId,curWf,treeItems,treeEdges,aiItems,toolItems,panX,panY,zoom,zoomPct,selUid,dragUid,isPanning,vpRef,editing,rawEd,conns,shortRoute,shortTool,nodeGlyph,selectWf,cvDown,cvMove,cvUp,cvWheel,ndDown,toolDown,wireStart,zoomIn,zoomOut,fitView,otherNodes,openEd,closeEd,jumpEd,openRawEd,closeRawEd,saveRawEd,saveNode,delNode,newTool,newDeny,newOnK,newOnV,newHoK,newHoV,addTool,addDeny,addOn,addHo,setEntry,saveAll,addNode,newWf,delWf,health,adm,appCfg,loadDash,fmtUp,restart,packs,ed,loadPacks,pMani,pFList,pFEd,pFNew,pBack,pTitle,pSave,pFDel,cfgTabs,csub,cfgLbl,cfgLd,cfgSv,wireFrom,wireEndX,wireEndY,wireSnap,dragSnap,connModal,confirmConn,toolsList,mcpList,toolEd,mcpEd,reloading,loadTools,openToolEd,newToolEd,saveToolEd,delTool,openMcpEd,saveMcpEd,reloadTools,skillsList,skillEd,loadSkills,openSkillEd,newSkillEd,saveSkillEd,delSkill,jumpToRoute,jumpToPack,toolPicker,allToolNames,openToolPicker,tpModeChange,tpChecked,tpToggle,saveToolPicker}
+return{authed,ltk,lerr,login,logout,tshow,tmsg,ttyp,navTabs,view,goView,nodeList,entryNodeId,allNodeDefs,treeItems,treeEdges,aiItems,toolItems,panX,panY,zoom,zoomPct,selUid,dragUid,isPanning,vpRef,editing,rawEd,conns,shortRoute,shortTool,nodeGlyph,cvDown,cvMove,cvUp,cvWheel,ndDown,toolDown,wireStart,zoomIn,zoomOut,fitView,otherNodes,openEd,closeEd,jumpEd,openRawEd,closeRawEd,saveRawEd,saveNode,delNode,newTool,newDeny,newDelegate,addTool,addDeny,addDelegate,setEntry,addNode,selectNode,health,adm,appCfg,loadDash,fmtUp,restart,ed,cfgTabs,csub,cfgLbl,cfgLd,cfgSv,wireFrom,wireEndX,wireEndY,wireSnap,dragSnap,toolsList,mcpList,toolEd,mcpEd,reloading,loadTools,openToolEd,newToolEd,saveToolEd,delTool,openMcpEd,saveMcpEd,reloadTools,skillsList,skillEd,loadSkills,openSkillEd,newSkillEd,saveSkillEd,delSkill,toolPicker,allToolNames,openToolPicker,tpModeChange,tpChecked,tpToggle,saveToolPicker}
 }}).mount('#app');

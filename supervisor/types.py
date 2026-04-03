@@ -24,6 +24,7 @@ class TaskStatus(str, Enum):
     running = "running"
     completed = "completed"
     failed = "failed"
+    suspended = "suspended"
     cancelled = "cancelled"
 
 
@@ -51,7 +52,7 @@ class InboundMessageIn(BaseModel):
     text: str
     attachments: list[dict[str, Any]] | None = None
     use_context: bool = True
-    workflow_id: str | None = None
+    entry_node_id: str | None = None
 
 
 class InboundMessageOut(BaseModel):
@@ -78,7 +79,7 @@ class InboundWorkItem(BaseModel):
     text: str
     attachments: list[dict[str, Any]] | None = None
     use_context: bool = True
-    workflow_id: str | None = None
+    entry_node_id: str | None = None
 
 
 class InboundAckIn(BaseModel):
@@ -93,14 +94,14 @@ class Task(BaseModel):
     task_id: str
     session_id: str
     session_generation: int = 1
-    workflow_id: str
     kind: TaskKind
     node_id: str | None = None
     tool_name: str | None = None
     input: dict[str, Any] = Field(default_factory=dict)
     continuation: dict[str, Any] = Field(default_factory=dict)
     source_inbound_seq: int | None = None
-    parent_task_id: str | None = None
+    caller_task_id: str | None = None
+    waiting_for_task_id: str | None = None
     status: TaskStatus = TaskStatus.pending
     cancel_requested: bool = False
     worker_id: str | None = None

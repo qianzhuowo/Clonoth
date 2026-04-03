@@ -22,7 +22,6 @@ from toolbox.registry import ToolRegistry
 
 from .ai_step import run_ai_node
 from .context import RunContext
-from .graph import Workflow, load_workflow
 from .model import resolve_provider
 from .node import Node, load_node
 from .tool_step import result_to_raw, summarize_result, write_artifact
@@ -53,38 +52,35 @@ def _collect_own_tool_capabilities(node: "Node", registry: ToolRegistry) -> str:
     )
 
 
-def _collect_downstream_capabilities(workspace_root: Path, workflow: Workflow, registry: ToolRegistry, node_id: str) -> str:
-    edges = workflow.edges.get(node_id, {})
-    handoffs = workflow.handoffs.get(node_id, {})
-    merged = {**edges, **handoffs}
+def _collect_downstream_capabilities(workspace_root: Path, node: Node, registry: ToolRegistry) -> str:
+    """收集当前节点可委派的下游节点能力描述（从节点自身的 delegate_targets 读取）。"""
+    if not node.delegate_targets:
+        return ""
+
     all_specs = registry.list_specs()
     all_tool_names = [s["name"] for s in all_specs]
-    lines: list[str] = []
-    seen_nodes: set[str] = set()
     all_names = {s["name"] for s in all_specs}
-    for _outcome_name, target_id in merged.items():
-        if not target_id or target_id.startswith("$"):
+    lines: list[str] = []
+
+    for target_id in node.delegate_targets:
+        target = load_node(workspace_root, target_id)
+        if target is None:
             continue
-        if target_id in seen_nodes:
-            continue
-        seen_nodes.add(target_id)
-        node = load_node(workspace_root, target_id)
-        if node is None:
-            continue
-        mode = (node.tool_access.mode or "none").lower()
+        mode = (target.tool_access.mode or "none").lower()
         if mode == "all":
-            denied = set(node.tool_access.deny)
+            denied = set(target.tool_access.deny)
             tool_names = [n for n in all_tool_names if n not in denied] if denied else all_tool_names
         elif mode == "allowlist":
-            tool_names = [n for n in node.tool_access.allow if n in all_names]
+            tool_names = [n for n in target.tool_access.allow if n in all_names]
         else:
             tool_names = []
-        desc = node.description or node.name
+        desc = target.description or target.name
         tool_list = ", ".join(tool_names) if tool_names else "（无工具）"
-        lines.append(f"- {node.name}（{node.id}）：{desc}\n  可用工具：{tool_list}")
+        lines.append(f"- {target.name}（{target.id}）：{desc}\n  可用工具：{tool_list}")
+
     if not lines:
         return ""
-    return "## 下游节点能力\n\n通过 outcome 你可以把处理交给以下下游节点：\n\n" + "\n".join(lines)
+    return "## 下游节点能力\n\n通过 dispatch_node 你可以把任务委派给以下下游节点：\n\n" + "\n".join(lines)
 
 
 async def _fetch_history(rctx: RunContext, limit: int = 40) -> list[dict[str, Any]]:
@@ -151,7 +147,6 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
 
         while True:
             try:
-                # 检查工具热重载信号
                 try:
                     rr = await http.get(f"{supervisor_url}/v1/tools/reload-seq")
                     if rr.status_code == 200:
@@ -187,42 +182,27 @@ async def _handle_task(
     kind = str(item.get("kind") or "").strip()
     session_id = str(item.get("session_id") or "").strip()
     session_generation = int(item.get("session_generation") or 0)
-    workflow_id = str(item.get("workflow_id") or "bootstrap.default_chat").strip() or "bootstrap.default_chat"
-    source_inbound_seq = item.get("source_inbound_seq")
 
     cfg_raw = await fetch_openai_secret(http, sup_url)
     api_key, base_url, default_model = normalize_openai_secret(cfg_raw)
 
     if kind == "node":
         result = await _run_node_task(
-            http=http,
-            llm_http=llm_http,
-            sup_url=sup_url,
-            ws_root=ws_root,
-            registry=registry,
-            task=item,
-            worker_id=worker_id,
-            session_id=session_id,
-            session_generation=session_generation,
-            workflow_id=workflow_id,
-            api_key=api_key,
-            base_url=base_url,
+            http=http, llm_http=llm_http, sup_url=sup_url, ws_root=ws_root,
+            registry=registry, task=item, worker_id=worker_id,
+            session_id=session_id, session_generation=session_generation,
+            api_key=api_key, base_url=base_url,
             default_model=default_model,
         )
     elif kind == "tool":
         result = await _run_tool_task(
-            http=http,
-            sup_url=sup_url,
-            ws_root=ws_root,
-            registry=registry,
-            task=item,
-            worker_id=worker_id,
-            session_id=session_id,
-            session_generation=session_generation,
+            http=http, sup_url=sup_url, ws_root=ws_root,
+            registry=registry, task=item, worker_id=worker_id,
+            session_id=session_id, session_generation=session_generation,
             task_id=task_id,
         )
     else:
-        result = {"status": "failed", "outcome": "failed", "text": f"未知 task kind: {kind}"}
+        result = {"action": "fail", "node_id": "", "error": f"未知 task kind: {kind}"}
 
     await http.post(
         f"{sup_url}/v1/tasks/{task_id}/complete",
@@ -241,7 +221,6 @@ async def _run_node_task(
     worker_id: str,
     session_id: str,
     session_generation: int,
-    workflow_id: str,
     api_key: str,
     base_url: str,
     default_model: str,
@@ -251,40 +230,34 @@ async def _run_node_task(
     source_inbound_seq = task.get("source_inbound_seq")
     input_data = task.get("input") if isinstance(task.get("input"), dict) else {}
 
-    wf = load_workflow(ws_root, workflow_id)
-    if wf is None:
-        return {"status": "failed", "outcome": "failed", "text": f"Workflow 未找到：{workflow_id}"}
     node = load_node(ws_root, node_id)
     if node is None:
-        return {"status": "failed", "outcome": "failed", "text": f"节点未找到：{node_id}"}
+        return {"action": "fail", "node_id": node_id, "error": f"节点未找到：{node_id}"}
     if not api_key:
-        return {"status": "failed", "outcome": "failed", "text": "OpenAI api_key 未配置。"}
+        return {"action": "fail", "node_id": node_id, "error": "OpenAI api_key 未配置。"}
 
     rctx = RunContext(
-        workspace_root=ws_root,
-        supervisor_url=sup_url,
-        session_id=session_id,
-        worker_id=worker_id,
-        http=http,
-        llm_http=llm_http,
-        api_key=api_key,
-        base_url=base_url,
-        default_model=default_model,
+        workspace_root=ws_root, supervisor_url=sup_url,
+        session_id=session_id, worker_id=worker_id,
+        http=http, llm_http=llm_http,
+        api_key=api_key, base_url=base_url, default_model=default_model,
         user_text=str(input_data.get("instruction") or "").strip(),
-        task_id=task_id,
-        session_generation=session_generation,
+        task_id=task_id, session_generation=session_generation,
     )
 
     history = []
     context_ref = str(input_data.get("context_ref") or "").strip()
-    if not context_ref:
+    use_context = bool(input_data.get("use_context", True))
+    if not context_ref and use_context:
         history = await _fetch_history(rctx)
 
     own_caps = _collect_own_tool_capabilities(node, registry)
-    downstream_caps = _collect_downstream_capabilities(ws_root, wf, registry, node.id)
+    downstream_caps = _collect_downstream_capabilities(ws_root, node, registry)
 
     runtime_cfg = load_runtime_config(ws_root)
-    rp = resolve_provider(ws_root, runtime_cfg, node, default_model)
+    entry_node_id = get_str(runtime_cfg, "shell.entry_node_id", "bootstrap.shell_orchestrator").strip()
+
+    rp = resolve_provider(ws_root, node, default_model)
     provider = OpenAIProvider(
         http=llm_http,
         api_key=rp.api_key or api_key,
@@ -293,41 +266,29 @@ async def _run_node_task(
     )
 
     await rctx.emit_event("node_started", {
-        "task_id": task_id,
-        "node_id": node.id,
+        "task_id": task_id, "node_id": node.id,
         "node_name": node.name,
-        "workflow_id": wf.id,
     })
 
     input_attachments = input_data.get("attachments") if isinstance(input_data.get("attachments"), list) else None
 
-    outcome = await run_ai_node(
-        rctx=rctx,
-        provider=provider,
-        registry=registry,
-        workflow=wf,
-        node=node,
+    action = await run_ai_node(
+        rctx=rctx, provider=provider, registry=registry, node=node,
         instruction=str(input_data.get("instruction") or "").strip(),
-        history=history,
-        run_id=task_id,
-        context_ref=context_ref,
+        history=history, run_id=task_id, context_ref=context_ref,
         resume_data=input_data.get("resume_data") if isinstance(input_data.get("resume_data"), dict) else None,
-        own_tools_text=own_caps,
-        downstream_capabilities=downstream_caps,
-        streaming=bool(node.id == wf.entry_node and get_bool(runtime_cfg, "engine.streaming", False)),
+        own_tools_text=own_caps, downstream_capabilities=downstream_caps,
+        streaming=bool(node.id == entry_node_id and get_bool(runtime_cfg, "engine.streaming", False)),
         attachments=input_attachments,
     )
 
     await rctx.emit_event("node_completed", {
-        "task_id": task_id,
-        "node_id": node.id,
-        "node_name": node.name,
-        "outcome": outcome.outcome,
-        "summary": outcome.summary,
-        "workflow_id": wf.id,
+        "task_id": task_id, "node_id": node.id, "node_name": node.name,
+        "action": action.action, "summary": action.summary,
         "source_inbound_seq": source_inbound_seq,
     })
-    return outcome.to_dict()
+
+    return action.to_dict()
 
 
 async def _run_tool_task(
@@ -347,39 +308,26 @@ async def _run_tool_task(
     arguments = dict(input_data.get("arguments") or {})
 
     kctx = ToolContext(
-        supervisor_url=sup_url,
-        session_id=session_id,
-        run_id=task_id,
-        worker_id=worker_id,
-        workspace_root=ws_root,
-        http=http,
-        registry=registry,
-        task_id=task_id,
-        session_generation=session_generation,
-        approval_poll_interval_sec=0.5,
+        supervisor_url=sup_url, session_id=session_id, run_id=task_id,
+        worker_id=worker_id, workspace_root=ws_root, http=http,
+        registry=registry, task_id=task_id,
+        session_generation=session_generation, approval_poll_interval_sec=0.5,
     )
 
     await kctx.emit_event("handoff_progress", {
         "message": f"[tool] 开始执行 {tool_name}",
-        "task_id": task_id,
-        "tool_name": tool_name,
+        "task_id": task_id, "tool_name": tool_name,
     })
 
     result = await registry.execute(name=tool_name, arguments=arguments, ctx=kctx)
     if isinstance(result, dict) and result.get("cancelled"):
         await kctx.emit_event("cancel_acknowledged", {"task_id": task_id, "tool_name": tool_name})
         return {
-            "status": "cancelled",
-            "tool_name": tool_name,
-            "arguments": arguments,
+            "action": "cancelled",
+            "node_id": tool_name,
             "summary": "任务已取消",
-            "format": "json",
-            "raw_inline": json.dumps(result, ensure_ascii=False),
-            "truncated": False,
-            "ref": "",
         }
 
-    # 提取工具结果中的附件（如图片路径）
     tool_attachments = result.get("attachments") if isinstance(result, dict) and isinstance(result.get("attachments"), list) else []
 
     summary = summarize_result(tool_name, result)
@@ -393,18 +341,24 @@ async def _run_tool_task(
 
     await kctx.emit_event("handoff_progress", {
         "message": f"[tool] {tool_name}: {summary}",
-        "task_id": task_id,
-        "tool_name": tool_name,
+        "task_id": task_id, "tool_name": tool_name,
     })
 
     return {
-        "status": "completed",
-        "tool_name": tool_name,
-        "arguments": arguments,
+        "action": "finish",
+        "node_id": tool_name,
         "summary": summary,
-        "format": fmt,
-        "raw_inline": raw_inline,
-        "truncated": truncated,
-        "ref": ref,
-        "attachments": tool_attachments,
+        "result": {
+            "summary": summary,
+            "text": raw_inline,
+            "attachments": tool_attachments,
+            "format": fmt,
+            "truncated": truncated,
+            "ref": ref,
+            # 旧字段保留供 tool_trace 格式化用
+            "raw_format": fmt,
+            "raw_inline": raw_inline,
+            "tool_name": tool_name,
+            "arguments": arguments,
+        },
     }

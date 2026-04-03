@@ -11,8 +11,9 @@ import yaml
 
 DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "version": 1,
-    "kernel": {
+    "engine": {
         "max_steps": 32,
+        "streaming": True,
         "history_limit": 80,
         "poll_interval_sec": 1.0,
         "approval_poll_interval_sec": 0.5,
@@ -24,6 +25,10 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
         "tool_trace": {
             "max_inline_chars": 8000,
             "max_progress_arg_chars": 320,
+        },
+        "compact": {
+            "threshold_chars": 800000,
+            "keep_recent": 6,
         },
         "model": "",
     },
@@ -45,17 +50,12 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
             "default_timeout_sec": 60.0,
         }
     },
+    "skills": {
+        "max_budget_chars": 0,
+    },
     "shell": {
         "default_conversation_key": "cli:default",
-        "workflow_id": "bootstrap.default_chat",
-        "entry_node": {
-            "history_limit": 40,
-            "model": "",
-        },
-        "reply_node": {
-            "tool_trace_history_limit": 200,
-            "model": "",
-        },
+        "entry_node_id": "bootstrap.shell_orchestrator",
         "http": {"client_timeout_sec": 10.0},
         "supervisor": {
             "health_timeout_sec": 2.0,

@@ -47,10 +47,7 @@ def _default_policy_dict() -> dict[str, Any]:
             "rules": [
                 {"pattern": "tools/**", "decision": "approval_required", "reason": "creating/updating tools requires approval"},
                 {"pattern": "config/runtime.yaml", "decision": "auto", "reason": "runtime tuning config"},
-                {"pattern": "config/model_routing.yaml", "decision": "approval_required", "reason": "model routing changes affect node behavior"},
-                {"pattern": "config/nodes/**", "decision": "approval_required", "reason": "node definition changes affect execution"},
-                {"pattern": "config/workflows/**", "decision": "approval_required", "reason": "workflow changes affect node graph"},
-                {"pattern": "config/prompt_packs/**", "decision": "approval_required", "reason": "prompt pack changes require approval"},
+                {"pattern": "config/nodes/**", "decision": "approval_required", "reason": "node definition changes affect execution, prompts, and model selection"},
                 {"pattern": "data/config.yaml", "decision": "approval_required", "reason": "config changes require approval"},
                 {"pattern": "data/policy.yaml", "decision": "deny", "reason": "policy is high-risk (human-only)"},
                 {"pattern": "data/events.jsonl", "decision": "deny", "reason": "event log is append-only; never modify"},

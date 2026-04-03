@@ -47,6 +47,21 @@ def _extract_openai_error_message(payload: Any) -> str | None:
 
     return None
 
+def _extract_usage(data: Any) -> dict[str, int] | None:
+    """Extract token usage dict from an OpenAI response/chunk."""
+    if not isinstance(data, dict):
+        return None
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        return None
+    result: dict[str, int] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        val = usage.get(key)
+        if isinstance(val, int):
+            result[key] = val
+    return result if result else None
+
+
 
 class OpenAIProvider(BaseProvider):
     """OpenAI-compatible provider implemented with raw HTTP (no SDK).
@@ -91,6 +106,7 @@ class OpenAIProvider(BaseProvider):
             "model": self.model,
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if tools:
             payload["tools"] = tools
@@ -121,6 +137,7 @@ class OpenAIProvider(BaseProvider):
                 # index -> {id, name, arguments_parts}
                 tc_map: dict[int, dict[str, Any]] = {}
 
+                stream_usage: dict[str, int] | None = None
                 async for line in resp.aiter_lines():
                     line = line.strip()
                     if not line or not line.startswith("data: "):
@@ -133,6 +150,11 @@ class OpenAIProvider(BaseProvider):
                         chunk = json.loads(data_str)
                     except Exception:
                         continue
+
+                    # 捕获 usage（流式最后一个 chunk 携带）
+                    raw_usage = chunk.get("usage")
+                    if isinstance(raw_usage, dict):
+                        stream_usage = _extract_usage(chunk)
 
                     choices = chunk.get("choices")
                     if not isinstance(choices, list) or not choices:
@@ -197,7 +219,7 @@ class OpenAIProvider(BaseProvider):
 
                 return ProviderResponse(
                     ok=True, text=text, tool_calls=tool_calls,
-                    thinking=thinking_text, status_code=status,
+                    thinking=thinking_text, status_code=status, usage=stream_usage,
                 )
 
         except Exception as e:
@@ -309,7 +331,10 @@ class OpenAIProvider(BaseProvider):
 
                     tool_calls.append(ToolCall(id=tc_id_str, name=name.strip(), arguments=args))
 
-            return ProviderResponse(ok=True, text=text, tool_calls=tool_calls, status_code=status)
+            # 解析 usage
+            usage = _extract_usage(data)
+
+            return ProviderResponse(ok=True, text=text, tool_calls=tool_calls, status_code=status, usage=usage)
 
         except Exception as e:
             return ProviderResponse(ok=False, error=f"failed to parse response: {e}", status_code=status, raw=data)

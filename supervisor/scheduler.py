@@ -168,7 +168,7 @@ class SchedulerThread:
             text = str(s.get("text") or f"[scheduled:{sid}]").strip()
             conv_key = str(s.get("conversation_key") or f"scheduler:{sid}").strip()
             msg_id = f"scheduler:{sid}:{uuid.uuid4()}"
-            workflow_id = str(s.get("workflow_id") or "").strip()
+            entry_node_id = str(s.get("entry_node_id") or "").strip()
 
             try:
                 session_id = self._state.get_or_create_session(
@@ -184,7 +184,7 @@ class SchedulerThread:
                         "message_id": msg_id,
                         "text": text,
                         "schedule_id": sid,
-                        "workflow_id": workflow_id,
+                        "entry_node_id": entry_node_id,
                     },
                 )
                 self._state.record_inbound_message_event(evt)

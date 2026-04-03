@@ -215,14 +215,13 @@ MCP 工具注册后的名称格式为 `mcp_{client_id}_{tool_name}`。
 
 ### 2.1 task 化执行
 
-所有工具调用都以独立的 tool task 形式执行。流程如下：
+所有工具调用都以独立的 tool task 形式执行。流程如下（v2 协议）：
 
-1. AI 节点发出工具调用请求
-2. AI 节点返回 `yield_tool` 结果，保存当前上下文快照到 `data/node_contexts/{session_id}/`
-3. Supervisor 为每个工具调用创建独立的 tool task
-4. Engine worker 领取 tool task 并执行
-5. 同一批次的所有 tool task 完成后，Supervisor 创建恢复 task
-6. 恢复 task 加载之前保存的上下文快照，把工具结果注入 AI 对话历史，继续执行
+1. AI 节点发出工具调用请求，返回 `dispatch` 动作，保存当前上下文快照到 `data/node_contexts/{session_id}/`
+2. Supervisor 为每个工具调用创建独立的 tool task，并将当前 AI 节点的 task 标记为 `suspended`（挂起）
+3. Engine worker 领取 tool task 并执行
+4. 同一批次的所有 tool task 完成后，Supervisor 通过 `caller_task_id` 找到挂起中的 AI task，将其状态改回 `pending`，并注入工具结果
+5. Engine worker 重新领取该 task，加载之前保存的上下文快照，把工具结果注入 AI 对话历史，继续执行
 
 ### 2.2 可中断性
 
@@ -307,14 +306,18 @@ AI 审核不能替代人类审批。
 |---|---|---|
 | `engine/**`、`supervisor/**`、`toolbox/**`、`providers/**`、`shell/**` | 需要审批 | 核心源码 |
 | `clonoth_runtime.py`、`main.py` | 需要审批 | 入口和运行时库 |
-| `config/nodes/**`、`config/workflows/**`、`config/prompt_packs/**` | 需要审批 | 节点图配置 |
-| `config/model_routing.yaml` | 需要审批 | 模型路由 |
+| `config/nodes/**`、`config/workflows/**` | 需要审批 | 节点与工作流定义（含提示词与模型） |
 | `tools/**` | 需要审批 | 脚本工具 |
 | `data/config.yaml` | 需要审批 | 运行时配置 |
 | `data/policy.yaml` | 硬拒绝 | 安全策略 |
 | `data/events.jsonl` | 硬拒绝 | 事件日志 |
 | `.env`、`**/.env` | 硬拒绝 | 密钥文件 |
 | `config/runtime.yaml` | 自动允许 | 调优参数 |
+
+补充约定：
+
+- `config/nodes/*.yaml` 可以直接写完整 prompt，也可以用 `{{include:文件名}}` 引入 `config/nodes/` 同目录的共享片段。
+- `kind`、`version`、`output_mode` 等默认字段可以省略。所有节点统一使用 `finish`（完成）、`ask`（提问）、`dispatch_node`（委派）三个伪工具。
 
 ### 4.3 extra_roots
 
@@ -344,7 +347,7 @@ extra_roots:
 
 ---
 
-## 5. 自进化
+## 5. 自修改
 
 AI 可以在人类审批下修改系统自身。
 
@@ -353,10 +356,8 @@ AI 可以在人类审批下修改系统自身。
 | 操作 | 途径 | 审批 |
 |---|---|---|
 | 创建新工具 | `create_or_update_tool` | 需要 |
-| 修改节点定义 | `write_file` → `config/nodes/*.yaml` | 需要 |
+| 修改节点定义（含提示词与模型） | `write_file` → `config/nodes/*.yaml` | 需要 |
 | 修改工作流 | `write_file` → `config/workflows/*.yaml` | 需要 |
-| 修改提示词 | `write_file` → `config/prompt_packs/**` | 需要 |
-| 修改模型路由 | `write_file` → `config/model_routing.yaml` | 需要 |
 | 修改引擎源码 | `write_file` → `engine/**` 等 | 需要 |
 | 接入 MCP 服务 | `create_or_update_mcp_client` | 不需要 |
 | 调整运行参数 | `write_file` → `config/runtime.yaml` | 不需要 |
@@ -417,3 +418,75 @@ artifact 文件保存在 `data/artifacts/{run_id}/` 下，可供人工复盘。
 | `engine.tool_trace.max_inline_chars` | 8000 | 工具输出内联显示的最大字符数 |
 | `tools.command.default_timeout_sec` | 60 | 脚本工具默认超时 |
 | `supervisor.process_manager.engine_workers` | 2 | Engine worker 进程数 |
+
+---
+
+## 8. 图片与多模态
+
+### 8.1 设计原则
+
+- 图片数据以文件形式存储在 `data/attachments/` 下，不嵌入日志或状态。
+- 系统内部使用 `file://` 协议引用图片（如 `file://data/attachments/session123/abc.png`）。
+- Base64 编码仅在发送给 LLM 前的最后一步进行（`prepare_messages_for_llm`），单图上限 10 MB。
+- 同一次 LLM 调用中，相同路径的图片只编码一次（per-call 缓存）。
+
+### 8.2 数据流
+
+```
+用户发送图片
+  → Adapter 保存到 data/attachments/{conversation_key}/
+  → POST /v1/inbound (attachments: [{type, path, mime_type, name}])
+  → Supervisor 创建入口 task，attachments 写入 task input
+  → Engine 构建多模态消息（file:// 引用）
+  → 发送给 LLM 前转换为 base64 data URL
+
+工具生成图片
+  → 工具保存到 data/attachments/{tool_name}/
+  → 工具返回 attachments 字段
+  → Engine 将附件注入 AI 对话历史
+  → AI 节点返回结果时携带 attachments
+  → Supervisor 的 outbound_message 事件包含 attachments
+  → Adapter 读取文件发送给用户
+```
+
+### 8.3 附件数据结构
+
+```json
+{
+  "type": "image",
+  "path": "data/attachments/gemini_image/abc123.png",
+  "mime_type": "image/png",
+  "name": "abc123.png"
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `type` | 附件类型。当前支持 `image`。 |
+| `path` | 相对于工作区根目录的文件路径。必须在 `data/attachments/` 下。 |
+| `mime_type` | MIME 类型。 |
+| `name` | 文件名。 |
+
+### 8.4 gemini_image 工具
+
+使用 Gemini REST API（`v1beta/models/{model}:generateContent`）生成图片。
+
+| 参数 | 类型 | 必填 | 说明 |
+|---|---|---|---|
+| `prompt` | string | 是 | 图片描述 |
+| `aspect_ratio` | string | 否 | 宽高比：`1:1`、`3:4`、`4:3`、`9:16`、`16:9`。默认 `1:1`。 |
+| `model` | string | 否 | Gemini 模型名。默认 `gemini-2.5-flash-image`。 |
+
+生成的图片保存在 `data/attachments/gemini_image/` 下。返回值包含 `attachments` 数组，可被 Engine 自动处理。
+
+需要 `GEMINI_API_KEY` 环境变量。该变量需要在 `toolbox/meta_tools.py` 的 `_safe_subprocess_env()` 中加入白名单，否则会被子进程环境过滤掉。
+
+### 8.5 工具热重载
+
+Admin UI 保存或删除工具后，会自动触发 Supervisor 的 reload 序号递增。Engine worker 在每次轮询 task 队列时检查序号变化，发现递增后调用 `registry.reload()` 重新扫描 `tools/` 目录。
+
+也可以通过 AI 调用 `reload_tools` 工具手动触发。
+
+### 8.6 存储清理
+
+`data/attachments/` 下的文件当前不会自动清理。长期运行可能占用较多存储。需要时可自行实现定期清理逻辑。

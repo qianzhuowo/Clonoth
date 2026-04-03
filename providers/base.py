@@ -30,6 +30,7 @@ class ProviderResponse:
     error: str | None = None
     status_code: int | None = None
     raw: dict[str, Any] | None = None
+    usage: dict[str, int] | None = None  # {"prompt_tokens": N, "completion_tokens": N, "total_tokens": N}
 
 
 class BaseProvider(ABC):

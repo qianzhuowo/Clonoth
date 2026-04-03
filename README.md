@@ -1,19 +1,19 @@
 <div align="center">
   <img src="public/logo.jpg" alt="Clonoth Logo" width="200" />
   <h1>Clonoth</h1>
-  <p>一个自进化的 Agent 基座</p>
+  <p>声明式、可审计的多 Agent 引擎</p>
 </div>
 
 ## 0. 架构
 
-Clonoth 采用节点图架构，由以下部分组成：
+Clonoth 采用自包含节点架构，由以下部分组成：
 
 - **Supervisor**：控制面。负责 HTTP API、事件日志、审批流程、安全策略、进程管理。
-- **Engine**：执行引擎。加载节点图（workflow），按连接关系调度 AI 节点和工具节点，支持子链调用（handoff）。
+- **Engine**：执行引擎。加载自包含节点定义，调度 AI 节点和工具节点，支持节点间委派（dispatch/return）。
 - **Toolbox**：工具层。包含 14 个内置工具和 `tools/` 下的脚本工具。
 - **Shell CLI**：终端适配层。负责用户交互、流式输出、审批确认。
 
-节点图中的所有角色——入口节点、执行节点、审核节点、规划节点——都是 AI 节点的不同配置。它们的区别在于提示词、模型路由和工具权限，而不是代码层级。
+所有角色——入口节点、执行节点、审核节点、规划节点——都是 AI 节点的不同配置。每个节点自身包含提示词、模型、工具权限和委派目标（delegate_targets），不依赖外部 workflow 文件。
 
 ## 1. 快速开始
 
@@ -79,25 +79,13 @@ python -m shell.cli --supervisor http://127.0.0.1:8765
 | `bootstrap.shell_orchestrator` | 入口节点。判断直接回复还是移交下游 |
 | `bootstrap.executor` | 执行节点。多步推理、调用工具 |
 | `bootstrap.cmd_reviewer` | 命令审核节点。对 shell 命令做语义审核 |
-| `bootstrap.planner` | 规划节点 |
-| `bootstrap.reviewer` | 复核节点 |
 
-### 2.2 工作流
+每个节点的 `delegate_targets` 字段定义了它可以委派任务的下游节点。入口节点在 `config/runtime.yaml` 的 `shell.entry_node_id` 中指定。
 
-`config/workflows/*.yaml` 定义节点之间的连接关系。
+### 2.2 节点内联提示词与模型
 
-当前默认工作流：
-
-- `bootstrap.default_chat`：入口 → 执行 → 命令审核（handoff）→ 回复
-- `bootstrap.plan_execute_review`：规划 → 执行 → 复核
-
-### 2.3 提示词
-
-`config/prompt_packs/` 存放提示词片段和组装规则。按 `manifest.yaml` 中的 assembly 定义拼装最终 system prompt。
-
-### 2.4 模型路由
-
-`config/model_routing.yaml` 为不同节点指定模型。支持按节点、按角色分配不同的 provider 和 model。
+`config/nodes/*.yaml` 直接保存节点的 `prompt` 和 `model`。共享提示词片段可以通过 `{{include:文件名}}` 从 `config/nodes/` 同目录引入。
+`kind`、`version`、`output_mode` 等默认字段可以省略。所有节点统一使用 `finish`（完成）、`ask`（提问）、`dispatch_node`（委派）三个伪工具。
 
 ## 3. 工具系统
 
@@ -131,7 +119,7 @@ AI 审核不能替代人类审批。
 | 路径 | 策略 |
 |---|---|
 | `engine/**`、`supervisor/**`、`toolbox/**`、`providers/**`、`shell/**` | 需要审批 |
-| `config/nodes/**`、`config/workflows/**`、`config/prompt_packs/**` | 需要审批 |
+| `config/nodes/**` | 需要审批 |
 | `tools/**` | 需要审批 |
 | `clonoth_runtime.py`、`main.py` | 需要审批 |
 | `data/policy.yaml` | 硬拒绝 |
@@ -143,9 +131,9 @@ AI 审核不能替代人类审批。
 
 以下命令无论如何不会通过：`rm -rf /`、`rm -rf ~`、`rm -rf *`、`format`、`mkfs`、`fdisk`、`dd if=/dev/zero`、`shutdown`、`reboot`。
 
-## 5. 自进化
+## 5. 自修改
 
-AI 可以在人类审批下修改自身的节点定义、工作流、提示词、模型路由和工具。修改后通过 `request_restart` 重启 Engine 使改动生效。
+AI 可以在人类审批下修改节点定义、工具和运行参数。修改后通过 `request_restart` 重启 Engine 使改动生效。
 
 唯一不可修改的是安全策略（`data/policy.yaml`）和事件日志（`data/events.jsonl`）。
 
@@ -158,7 +146,7 @@ Clonoth/
 ├── shell/          # CLI 适配层
 ├── toolbox/        # 工具层（内置工具 + 脚本工具运行器 + MCP）
 ├── providers/      # 模型适配层
-├── config/         # nodes / workflows / prompt_packs / model_routing / runtime
+├── config/         # nodes / runtime
 ├── tools/          # 脚本工具
 ├── skills/         # Skill 文件
 ├── data/           # 事件日志、配置、运行时数据

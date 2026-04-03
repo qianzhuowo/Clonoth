@@ -12,16 +12,119 @@ from providers.openai import OpenAIProvider
 
 from .context_store import load_context_snapshot, save_context_snapshot, write_context_snapshot
 from .attachments import build_multimodal_content, prepare_messages_for_llm
-from .graph import Workflow, allowed_outcomes
 from .node import Node
 from .prompt import assemble_prompt
-from .protocol import TaskResult
+from .protocol import (
+    TaskAction,
+    ACTION_DISPATCH,
+    ACTION_FINISH,
+    ACTION_ASK,
+    ACTION_FAIL,
+    ACTION_CANCELLED,
+)
 from .tool_step import format_tool_trace
+from .compact import should_compact, compact_messages
 from clonoth_runtime import get_int, load_runtime_config
 
 if TYPE_CHECKING:
     from .context import RunContext
 
+
+# ---------------------------------------------------------------------------
+#  v3 伪工具名称
+# ---------------------------------------------------------------------------
+
+_PSEUDO_TOOL_NAMES = frozenset({"dispatch_node", "finish", "ask"})
+
+
+# ---------------------------------------------------------------------------
+#  v3 伪工具 spec 构建
+# ---------------------------------------------------------------------------
+
+def _dispatch_node_spec(targets: list[str]) -> dict:
+    """构建 dispatch_node 伪工具定义。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": "dispatch_node",
+            "description": (
+                "将任务委派给另一个节点。目标节点执行完成后，结果会返回给你。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "enum": targets,
+                        "description": "委派目标节点。",
+                    },
+                    "instruction": {
+                        "type": "string",
+                        "description": "给目标节点的清晰、具体、可执行的指令。",
+                    },
+                },
+                "required": ["target", "instruction"],
+            },
+        },
+    }
+
+
+def _finish_spec() -> dict:
+    """构建 finish 伪工具定义。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": "finish",
+            "description": "完成当前任务，提交结果。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "结果文本。",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "简要摘要（可选）。",
+                    },
+                    "attachment_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "附带的文件路径列表（可选）。",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    }
+
+
+def _ask_spec() -> dict:
+    """构建 ask 伪工具定义。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": "ask",
+            "description": "信息不足，向调用方提问以获取更多信息。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "需要补充的问题。",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    }
+
+
+
+
+# ---------------------------------------------------------------------------
+#  工具 spec 相关
+# ---------------------------------------------------------------------------
 
 def _to_openai_tools(specs: list[dict]) -> list[dict]:
     return [{
@@ -32,25 +135,6 @@ def _to_openai_tools(specs: list[dict]) -> list[dict]:
             "parameters": s.get("input_schema", {"type": "object", "properties": {}, "required": []}),
         },
     } for s in specs]
-
-
-def _select_outcome_spec(outcomes: list[str]) -> dict:
-    return {
-        "type": "function",
-        "function": {
-            "name": "select_outcome",
-            "description": "选择当前节点的处理结果。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "outcome": {"type": "string", "description": "结果类型", "enum": outcomes},
-                    "instruction": {"type": "string", "description": "给下游节点或后续处理的说明"},
-                    "text": {"type": "string", "description": "回复文本（如果 outcome 是 reply）"},
-                },
-                "required": ["outcome"],
-            },
-        },
-    }
 
 
 def _filter_tool_specs(node: Node, all_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -69,6 +153,10 @@ def _filter_tool_specs(node: Node, all_specs: list[dict[str, Any]]) -> list[dict
 def _short(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n] + "...<truncated>"
 
+
+# ---------------------------------------------------------------------------
+#  流式输出缓冲
+# ---------------------------------------------------------------------------
 
 class _StreamBuffer:
     def __init__(self, rctx: "RunContext", node_id: str, kind: str) -> None:
@@ -100,6 +188,10 @@ class _StreamBuffer:
         })
 
 
+# ---------------------------------------------------------------------------
+#  上下文持久化
+# ---------------------------------------------------------------------------
+
 def _sanitize_context_id(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", (text or "ctx").strip() or "ctx")[:80]
 
@@ -126,16 +218,59 @@ def _persist_node_context(
     return save_context_snapshot(workspace_root, session_id, snapshot, context_id=context_id)
 
 
+# ---------------------------------------------------------------------------
+#  恢复消息构建（同时兼容 v1 和 v2 格式）
+# ---------------------------------------------------------------------------
+
 def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
-    """Build resume messages from resume_data. Returns a list (possibly empty)."""
+    """从 resume_data / resume_event 构建恢复消息。
+
+    v2 格式:
+      - child_result:    下级节点完成
+      - child_failed:    下级节点失败
+      - child_cancelled: 下级节点被取消
+    v1 兼容:
+      - tool_results:    工具调用结果
+      - handoff_result:  子链返回结果
+    """
     rtype = str(resume_data.get("type") or "").strip()
+
+    # v2: child_result
+    if rtype == "child_result":
+        from_node = str(resume_data.get("from_node") or "")
+        result = resume_data.get("result") or {}
+        summary = str(result.get("summary") or "")
+        text = str(result.get("text") or "")
+        child_atts = result.get("attachments")
+        lines = [f"下游节点 {from_node} 已完成。"]
+        if summary:
+            lines.append(f"摘要：{summary}")
+        if text:
+            lines.append("结果：")
+            lines.append(text)
+        content_text = "\n".join(lines).strip()
+        if isinstance(child_atts, list) and child_atts:
+            return [{"role": "user", "content": build_multimodal_content(content_text, child_atts)}]
+        return [{"role": "user", "content": content_text}]
+
+    # v2: child_failed
+    if rtype == "child_failed":
+        from_node = str(resume_data.get("from_node") or "")
+        error = str(resume_data.get("error") or "未知错误")
+        return [{"role": "user", "content": f"下游节点 {from_node} 执行失败：{error}"}]
+
+    # v2: child_cancelled
+    if rtype == "child_cancelled":
+        from_node = str(resume_data.get("from_node") or "")
+        return [{"role": "user", "content": f"下游节点 {from_node} 已被取消。"}]
+
+    # v1: tool_results
     if rtype == "tool_results":
         entries = resume_data.get("tool_results")
         if not isinstance(entries, list):
             entries = resume_data.get("entries")
         if isinstance(entries, list) and entries:
             msgs: list[dict[str, Any]] = [{"role": "assistant", "content": format_tool_trace(entries)}]
-            # 收集工具结果中的图片附件，追加为 user 消息让 LLM 看到
             all_atts: list[dict[str, Any]] = []
             for e in entries:
                 atts = e.get("attachments")
@@ -146,37 +281,34 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             return msgs
         return []
 
-    if rtype == "handoff_result":
-        child_node_id = str(resume_data.get("child_node_id") or "")
-        child_outcome = str(resume_data.get("child_outcome") or "")
-        summary = str(resume_data.get("summary") or "")
-        text = str(resume_data.get("text") or resume_data.get("result") or "")
-        child_attachments = resume_data.get("attachments")
-        lines = [
-            "下游节点已经完成。",
-            f"节点：{child_node_id}",
-            f"outcome：{child_outcome}",
-        ]
-        if summary:
-            lines.append(f"摘要：{summary}")
-        if text:
-            lines.append("结果：")
-            lines.append(text)
-        content_text = "\n".join(lines).strip()
-        if isinstance(child_attachments, list) and child_attachments:
-            return [{"role": "user", "content": build_multimodal_content(content_text, child_attachments)}]
-        return [{"role": "user", "content": content_text}]
-
     return []
 
 
+# ---------------------------------------------------------------------------
+#  附件筛选
+# ---------------------------------------------------------------------------
+
+def _select_attachments(
+    collected: list[dict[str, Any]],
+    selected_paths: Any,
+) -> list[dict[str, Any]]:
+    if isinstance(selected_paths, list) and selected_paths:
+        path_set = {str(p).strip() for p in selected_paths if isinstance(p, str)}
+        selected = [a for a in collected if a.get("path") in path_set]
+        return selected if selected else collected
+    return collected
+
+
+# ---------------------------------------------------------------------------
+#  AI 节点主执行函数
+# ---------------------------------------------------------------------------
+
 async def run_ai_node(
     *,
-    rctx: RunContext,
+    rctx: "RunContext",
     streaming: bool = False,
     provider: OpenAIProvider,
     registry: ToolRegistry,
-    workflow: Workflow,
     node: Node,
     instruction: str,
     history: list[dict[str, Any]],
@@ -186,10 +318,26 @@ async def run_ai_node(
     downstream_capabilities: str = "",
     own_tools_text: str = "",
     attachments: list[dict[str, Any]] | None = None,
-) -> TaskResult:
+) -> TaskAction:
     runtime_cfg = load_runtime_config(rctx.workspace_root)
     max_steps = get_int(runtime_cfg, "engine.max_steps", 32, min_value=1, max_value=200)
 
+    # ---- 收集附件 ----
+    collected_attachments: list[dict[str, Any]] = []
+    if attachments:
+        collected_attachments.extend(attachments)
+    if resume_data and isinstance(resume_data, dict):
+        for e in (resume_data.get("tool_results") or resume_data.get("entries") or []):
+            if isinstance(e, dict) and isinstance(e.get("attachments"), list):
+                collected_attachments.extend(e["attachments"])
+        if isinstance(resume_data.get("attachments"), list):
+            collected_attachments.extend(resume_data["attachments"])
+        # v2: child_result 中的附件
+        rd = resume_data.get("result")
+        if isinstance(rd, dict) and isinstance(rd.get("attachments"), list):
+            collected_attachments.extend(rd["attachments"])
+
+    # ---- 恢复或新建消息历史 ----
     step_count = 0
     snapshot = load_context_snapshot(rctx.workspace_root, context_ref) if context_ref else None
     if snapshot and isinstance(snapshot.get("messages"), list):
@@ -227,28 +375,55 @@ async def run_ai_node(
         else:
             messages.append({"role": "user", "content": ctx_text})
 
+    # ---- 追加恢复消息 ----
     if resume_data:
         messages.extend(_build_resume_messages(resume_data))
 
+    # ---- 构建工具列表 ----
     tool_specs = _filter_tool_specs(node, registry.list_specs())
     openai_tools = _to_openai_tools(tool_specs) if tool_specs else []
-    # ── diagnostic log ──
-    _all_names = [s["name"] for s in registry.list_specs()]
-    _filtered_names = [s["name"] for s in tool_specs]
-    print(f"[ai_step] node={node.id} tool_access.mode={node.tool_access.mode}"
-          f" allow={node.tool_access.allow} deny={node.tool_access.deny}"
-          f" registry={len(_all_names)} filtered={len(_filtered_names)}"
-          f" filtered_names={_filtered_names}", flush=True)
-    outcomes = allowed_outcomes(workflow, node.id)
-    if outcomes:
-        openai_tools.append(_select_outcome_spec(outcomes))
+
+    # 伪工具：委派
+    delegate_targets = list(node.delegate_targets)
+    if delegate_targets:
+        openai_tools.append(_dispatch_node_spec(delegate_targets))
+
+    # 伪工具：完成 + 提问（所有节点均可用）
+    openai_tools.append(_finish_spec())
+    openai_tools.append(_ask_spec())
 
     use_stream = streaming
 
+    # ---- 上下文压缩配置 ----
+    _compact_threshold = get_int(runtime_cfg, "engine.compact.threshold_tokens", 100_000, min_value=0)
+    _compact_keep_recent = get_int(runtime_cfg, "engine.compact.keep_recent", 6, min_value=2, max_value=50)
+    _compacted = False  # 防止同一轮推理循环中重复压缩
+    _last_prompt_tokens: int | None = None  # 上一次 LLM 返回的 prompt_tokens
+
+    # ---- 推理循环 ----
     for step in range(step_count, max_steps):
         if await rctx.check_cancelled():
             await rctx.emit_event("cancel_acknowledged", {"node_id": node.id, "task_id": rctx.task_id, "step": step})
-            return TaskResult(node_id=node.id, status="cancelled", outcome="cancelled", text="任务已被用户取消。")
+            return TaskAction(action=ACTION_CANCELLED, node_id=node.id, summary="任务已被用户取消。")
+
+        # ---- 上下文压缩检查 ----
+        if not _compacted and _compact_threshold > 0 and should_compact(messages, _compact_threshold, _last_prompt_tokens):
+            _compacted = True
+            try:
+                await rctx.emit_event("compact_start", {"node_id": node.id, "step": step})
+                compacted_messages = await compact_messages(provider, messages, keep_recent=_compact_keep_recent)
+                if len(compacted_messages) < len(messages):
+                    next_context_ref = _persist_node_context(
+                        rctx.workspace_root, rctx.session_id,
+                        rctx.task_id or run_id or node.id, node.id, compacted_messages,
+                        step_count=step, context_ref=context_ref,
+                    )
+                    messages = compacted_messages
+                    context_ref = next_context_ref
+                await rctx.emit_event("compact_done", {"node_id": node.id, "step": step})
+            except Exception as compact_err:
+                await rctx.emit_event("compact_failed", {"node_id": node.id, "step": step, "error": str(compact_err)})
+
 
         text_buf: _StreamBuffer | None = None
         think_buf: _StreamBuffer | None = None
@@ -257,6 +432,7 @@ async def run_ai_node(
 
         resp = None
 
+        # ---- 流式调用 ----
         if use_stream:
             text_buf = _StreamBuffer(rctx, node.id, "text")
             think_buf = _StreamBuffer(rctx, node.id, "thinking")
@@ -284,7 +460,7 @@ async def run_ai_node(
                     if text_buf.flushed_any or think_buf.flushed_any:
                         await rctx.emit_event("stream_end", {"node_id": node.id, "has_text": text_buf.flushed_any, "has_thinking": think_buf.flushed_any})
                     await rctx.emit_event("cancel_acknowledged", {"node_id": node.id, "task_id": rctx.task_id, "step": step})
-                    return TaskResult(node_id=node.id, status="cancelled", outcome="cancelled", text="任务已被用户取消。")
+                    return TaskAction(action=ACTION_CANCELLED, node_id=node.id, summary="任务已被用户取消。")
             await text_buf.flush()
             await think_buf.flush()
             if text_buf.flushed_any or think_buf.flushed_any:
@@ -296,7 +472,7 @@ async def run_ai_node(
             if resp.ok and resp.tool_calls:
                 use_stream = False
         else:
-            # 把 LLM 调用包装成可取消的：每 0.3 秒检查一次取消状态
+            # ---- 非流式调用（可取消） ----
             llm_task = asyncio.create_task(
                 provider.chat(messages=llm_messages, tools=tools_arg)
             )
@@ -312,36 +488,36 @@ async def run_ai_node(
                     except (asyncio.CancelledError, Exception):
                         pass
                     await rctx.emit_event("cancel_acknowledged", {"node_id": node.id, "task_id": rctx.task_id, "step": step})
-                    return TaskResult(node_id=node.id, status="cancelled", outcome="cancelled", text="任务已被用户取消。")
+                    return TaskAction(action=ACTION_CANCELLED, node_id=node.id, summary="任务已被用户取消。")
 
         assert resp is not None
 
+        # ---- 提取 token usage ----
+        if resp.usage and isinstance(resp.usage.get("prompt_tokens"), int):
+            _last_prompt_tokens = resp.usage["prompt_tokens"]
+            _compacted = False  # 有了新的 token 数据，允许重新判定是否需要压缩
+
+        # ---- LLM 调用失败 ----
         if not resp.ok:
             ctx_ref = _persist_node_context(
-                rctx.workspace_root,
-                rctx.session_id,
-                rctx.task_id or run_id or node.id,
-                node.id,
-                messages,
-                step_count=step + 1,
-                context_ref=context_ref,
+                rctx.workspace_root, rctx.session_id,
+                rctx.task_id or run_id or node.id, node.id, messages,
+                step_count=step + 1, context_ref=context_ref,
             )
-            return TaskResult(
-                node_id=node.id,
-                kind="final",
-                status="failed",
-                outcome="failed",
-                text=resp.error or "LLM 调用失败",
-                summary=_short(resp.error or "LLM 调用失败", 240),
+            return TaskAction(
+                action=ACTION_FAIL, node_id=node.id,
+                error=resp.error or "LLM 调用失败",
                 context_ref=ctx_ref,
+                summary=_short(resp.error or "LLM 调用失败", 240),
             )
 
+        # ---- 处理 tool_calls ----
         if resp.tool_calls:
-            select_call = None
+            pseudo_call = None
             real_tool_calls: list[dict[str, Any]] = []
             for tc in resp.tool_calls:
-                if tc.name == "select_outcome":
-                    select_call = tc
+                if tc.name in _PSEUDO_TOOL_NAMES:
+                    pseudo_call = tc
                 else:
                     real_tool_calls.append({
                         "id": tc.id,
@@ -349,41 +525,51 @@ async def run_ai_node(
                         "arguments": dict(tc.arguments or {}),
                     })
 
-            if select_call is not None:
-                args = select_call.arguments or {}
-                outcome_name = str(args.get("outcome") or "completed").strip() or "completed"
-                text = str(args.get("text") or args.get("instruction") or "").strip()
-                instr = str(args.get("instruction") or "").strip()
+            # 处理伪工具
+            if pseudo_call is not None:
+                args = pseudo_call.arguments or {}
                 ctx_ref = _persist_node_context(
-                    rctx.workspace_root,
-                    rctx.session_id,
-                    rctx.task_id or run_id or node.id,
-                    node.id,
-                    messages,
-                    step_count=step + 1,
-                    context_ref=context_ref,
-                )
-                if outcome_name == "reply":
-                    return TaskResult(
-                        node_id=node.id,
-                        kind="final",
-                        status="completed",
-                        outcome="reply",
-                        text=text,
-                        summary=_short(text, 240),
-                        context_ref=ctx_ref,
-                    )
-                return TaskResult(
-                    node_id=node.id,
-                    kind="final",
-                    status="completed",
-                    outcome=outcome_name,
-                    text=text,
-                    instruction=instr,
-                    summary=_short(text or instr or outcome_name, 240),
-                    context_ref=ctx_ref,
+                    rctx.workspace_root, rctx.session_id,
+                    rctx.task_id or run_id or node.id, node.id, messages,
+                    step_count=step + 1, context_ref=context_ref,
                 )
 
+                if pseudo_call.name == "dispatch_node":
+                    target = str(args.get("target") or "").strip()
+                    instr = str(args.get("instruction") or "").strip()
+                    return TaskAction(
+                        action=ACTION_DISPATCH, node_id=node.id,
+                        target_node=target,
+                        dispatch_input={"instruction": instr},
+                        context_ref=ctx_ref,
+                        summary=f"dispatch → {target}",
+                    )
+
+                if pseudo_call.name == "finish":
+                    summary_text = str(args.get("summary") or "").strip()
+                    result_text = str(args.get("text") or "").strip()
+                    final_atts = _select_attachments(collected_attachments, args.get("attachment_paths"))
+                    return TaskAction(
+                        action=ACTION_FINISH, node_id=node.id,
+                        result={
+                            "summary": summary_text,
+                            "text": result_text,
+                            "attachments": final_atts,
+                        },
+                        context_ref=ctx_ref,
+                        summary=_short(summary_text or result_text, 240),
+                    )
+
+                if pseudo_call.name == "ask":
+                    ask_text = str(args.get("text") or "").strip()
+                    return TaskAction(
+                        action=ACTION_ASK, node_id=node.id,
+                        result={"text": ask_text},
+                        context_ref=ctx_ref,
+                        summary=_short(ask_text, 240),
+                    )
+
+            # 处理真实工具调用 → 委派给 Tool 节点
             if real_tool_calls:
                 await rctx.emit_event("handoff_progress", {
                     "message": f"[{node.id}] 请求执行 {len(real_tool_calls)} 个工具",
@@ -391,61 +577,56 @@ async def run_ai_node(
                     "task_id": rctx.task_id,
                 })
                 ctx_ref = _persist_node_context(
-                    rctx.workspace_root,
-                    rctx.session_id,
-                    rctx.task_id or run_id or node.id,
-                    node.id,
-                    messages,
-                    step_count=step + 1,
-                    context_ref=context_ref,
+                    rctx.workspace_root, rctx.session_id,
+                    rctx.task_id or run_id or node.id, node.id, messages,
+                    step_count=step + 1, context_ref=context_ref,
                 )
-                return TaskResult(
-                    node_id=node.id,
-                    kind="yield_tool",
-                    status="completed",
-                    result_type="yield_tool",
-                    outcome="yield_tool",
-                    summary=f"yield {len(real_tool_calls)} tool calls",
-                    context_ref=ctx_ref,
-                    tool_calls=real_tool_calls,
-                )
+                if len(real_tool_calls) == 1:
+                    tc = real_tool_calls[0]
+                    return TaskAction(
+                        action=ACTION_DISPATCH, node_id=node.id,
+                        target_node=tc["name"],
+                        dispatch_input={
+                            "tool_call_id": tc["id"],
+                            "arguments": tc["arguments"],
+                        },
+                        context_ref=ctx_ref,
+                        summary=f"dispatch tool → {tc['name']}",
+                    )
+                else:
+                    # 多个工具调用：批量委派
+                    return TaskAction(
+                        action=ACTION_DISPATCH, node_id=node.id,
+                        target_node="__tool_batch__",
+                        dispatch_input={"tool_calls": real_tool_calls},
+                        context_ref=ctx_ref,
+                        summary=f"dispatch {len(real_tool_calls)} tools",
+                    )
 
+        # ---- 纯文本输出 → 返回结果 ----
         text = (resp.text or "").strip()
         if text:
             ctx_ref = _persist_node_context(
-                rctx.workspace_root,
-                rctx.session_id,
-                rctx.task_id or run_id or node.id,
-                node.id,
-                messages,
-                step_count=step + 1,
-                context_ref=context_ref,
+                rctx.workspace_root, rctx.session_id,
+                rctx.task_id or run_id or node.id, node.id, messages,
+                step_count=step + 1, context_ref=context_ref,
             )
-            return TaskResult(
-                node_id=node.id,
-                kind="final",
-                status="completed",
-                outcome="completed",
-                text=text,
-                summary=_short(text, 240),
+            return TaskAction(
+                action=ACTION_FINISH, node_id=node.id,
+                result={"text": text, "attachments": collected_attachments},
                 context_ref=ctx_ref,
+                summary=_short(text, 240),
             )
 
+    # ---- 达到最大步数 ----
     ctx_ref = _persist_node_context(
-        rctx.workspace_root,
-        rctx.session_id,
-        rctx.task_id or run_id or node.id,
-        node.id,
-        messages,
-        step_count=max_steps,
-        context_ref=context_ref,
+        rctx.workspace_root, rctx.session_id,
+        rctx.task_id or run_id or node.id, node.id, messages,
+        step_count=max_steps, context_ref=context_ref,
     )
-    return TaskResult(
-        node_id=node.id,
-        kind="final",
-        status="failed",
-        outcome="failed",
-        text="达到最大步数限制。",
-        summary="max_steps reached",
+    return TaskAction(
+        action=ACTION_FAIL, node_id=node.id,
+        error="达到最大步数限制。",
         context_ref=ctx_ref,
+        summary="max_steps reached",
     )

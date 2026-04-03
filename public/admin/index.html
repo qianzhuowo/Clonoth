@@ -111,13 +111,12 @@
      <span class="nd-name">{{n.name||n.id}}</span>
     </div>
     <div class="nd-id">{{n.id}}</div>
-    <div class="nd-info" v-if="n.model_route">📡 {{shortRoute(n.model_route)}}</div>
+    <div class="nd-info" v-if="n.model">📡 {{shortRoute(n.model)}}</div>
     <div class="nd-terms" v-if="n.terms&&n.terms.length">
      <div class="nd-term" v-for="tm in n.terms.slice(0,3)" :key="tm.name+'-'+tm.target" :style="{color:tm.target==='$reply'?'rgba(158,206,106,.6)':'rgba(247,118,142,.5)'}">{{tm.name}} → {{tm.target}}</div>
     </div>
     <div class="nd-foot">
      <span class="nd-tools" @click.stop="openToolPicker(n)" style="cursor:pointer">🔧 {{(n.toolNames&&n.toolNames.length)||0}}</span>
-     <span :class="'nd-mode nd-mode-'+n.output_mode">{{n.output_mode}}</span>
     </div>
     <div class="nd-port nd-port-out" @mousedown.stop.prevent="wireStart($event,n,'out')"></div>
    </div>
@@ -149,12 +148,10 @@
      </div>
      <div class="pn-sec" id="pn-sec-model">
       <div class="pn-sec-t">模型与提示词</div>
-      <div class="pn-lbl">模型路由</div>
-      <div class="pn-add"><input class="pn-inp" v-model="editing.model_route"><button class="btn-add" @click="jumpToRoute" title="编辑模型路由">↗</button></div>
-      <div class="pn-lbl">提示词包</div>
-      <div class="pn-add"><input class="pn-inp" v-model="editing.prompt_pack"><button class="btn-add" @click="jumpToPack(editing.prompt_pack)" title="编辑提示词包">↗</button></div>
-      <div class="pn-lbl">Assembly</div>
-      <input class="pn-inp" v-model="editing.prompt_assembly">
+      <div class="pn-lbl">模型</div>
+      <input class="pn-inp" v-model="editing.model" placeholder="留空表示使用全局默认模型">
+      <div class="pn-lbl">提示词</div>
+      <textarea class="pn-text pn-prompt" v-model="editing.prompt_text" spellcheck="false" placeholder="直接写入节点 YAML 的完整 prompt。支持 {{include:文件名}} 引入共享片段。可用变量：{{node_name}} {{node_id}} {{instruction}} {{now}} {{own_tools}} {{downstream}}"></textarea>
      </div>
      <div class="pn-sec" id="pn-sec-tools">
       <div class="pn-sec-t">工具访问</div>
@@ -180,11 +177,6 @@
        <div class="pn-tags"><span class="pn-tag" v-for="(s,i) in editing.skill_allow" :key="i">{{s}} <span class="pn-tag-x" @click="editing.skill_allow.splice(i,1)">✕</span></span></div>
        <div class="pn-add"><input class="pn-inp-s" placeholder="技能名" @keyup.enter="if($event.target.value.trim()){editing.skill_allow.push($event.target.value.trim());$event.target.value=''}"><button class="btn-add" @click="">+</button></div>
       </template>
-     </div>
-     <div class="pn-sec" id="pn-sec-output" v-if="editing.type!=='tool'">
-      <div class="pn-sec-t">输出</div>
-      <div class="pn-lbl">输出模式</div>
-      <select class="pn-inp" v-model="editing.output_mode"><option value="draft">draft</option><option value="reply">reply</option></select>
      </div>
      <div class="pn-sec" id="pn-sec-links">
       <div class="pn-sec-t">连接 (工作流级)</div>
@@ -315,29 +307,6 @@
    <tr><td style="color:var(--sub)">Base URL</td><td>{{appCfg.openai?.base_url}}</td></tr>
    <tr><td style="color:var(--sub)">Model</td><td>{{appCfg.openai?.model}}</td></tr>
   </tbody></table>
- </div>
-</div>
-
-<!-- ══ Prompts ══ -->
-<div v-if="view==='prompts'" class="view-pane">
- <div v-if="!ed">
-  <div class="vp-head"><h2>提示词包</h2></div>
-  <div class="cg"><div class="card" v-for="p in packs" :key="p.id">
-   <div class="ch"><h3>{{p.name}}</h3><span class="b b-ai">{{p.id}}</span></div>
-   <p style="font-size:.75rem;color:var(--sub);margin-bottom:10px">{{p.description}}</p>
-   <div class="bg"><button class="btn btn-s" @click="pMani(p.id)">Manifest</button><button class="btn btn-s" @click="pFList(p.id)">Fragments</button></div>
-  </div></div>
- </div>
- <div v-else-if="ed.type==='flist'">
-  <div class="et mb12"><div class="fx"><button class="btn btn-s" @click="ed=null">← 返回</button><h2>{{ed.pid}} / fragments</h2></div><button class="btn btn-p btn-s" @click="pFNew(ed.pid)">+ 新建</button></div>
-  <div class="card" style="padding:0;overflow:hidden"><div class="fi" v-for="f in ed.fs" :key="f" @click="pFEd(ed.pid,f)">{{f}}</div>
-   <div v-if="!ed.fs.length" style="padding:16px;text-align:center;color:var(--sub)">暂无</div></div>
- </div>
- <div v-else class="ew">
-  <div class="et"><div class="fx"><button class="btn btn-s" @click="pBack">← 返回</button><h2>{{pTitle()}}</h2></div>
-   <div class="bg"><button v-if="ed.type==='frag'&&!ed.isNew" class="btn btn-d btn-s" @click="pFDel(ed.pid,ed.fp)">删除</button><button class="btn btn-p btn-s" @click="pSave">保存</button></div></div>
-  <div class="field" v-if="ed.type==='frag'&&ed.isNew"><label>片段路径</label><input v-model="ed.fp"></div>
-  <textarea class="ce" v-model="ed.content" spellcheck="false"></textarea>
  </div>
 </div>
 

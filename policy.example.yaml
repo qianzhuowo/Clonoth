@@ -30,18 +30,12 @@ write_file:
     - pattern: "config/runtime.yaml"
       decision: auto
       reason: "runtime tuning config"
-    - pattern: "config/model_routing.yaml"
-      decision: approval_required
-      reason: "model routing changes affect node behavior"
     - pattern: "config/nodes/**"
       decision: approval_required
-      reason: "node definition changes affect execution"
+      reason: "node definition changes affect execution, prompts, and model selection"
     - pattern: "config/workflows/**"
       decision: approval_required
       reason: "workflow changes affect node graph"
-    - pattern: "config/prompt_packs/**"
-      decision: approval_required
-      reason: "prompt pack changes require approval"
     - pattern: "data/config.yaml"
       decision: approval_required
       reason: "config changes require approval"

@@ -30,6 +30,12 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
             "threshold_chars": 800000,
             "keep_recent": 6,
         },
+        "retry": {
+            "max_retries": 3,
+            "initial_delay_sec": 1.0,
+            "max_delay_sec": 30.0,
+            "backoff_multiplier": 2.0,
+        },
         "model": "",
     },
     "providers": {

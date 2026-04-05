@@ -375,7 +375,8 @@ class SessionMixin:
                         msgs.append({"role": "user", "content": text})
             elif et == "handoff_progress":
                 prog_msg = str(payload.get("message") or "")
-                if prog_msg and "[tool]" in prog_msg:
+                # 捕获所有工具相关进度（[tool] 前缀或含冒号的结果摘要）
+                if prog_msg:
                     tool_records.append(prog_msg)
             elif et == "outbound_message":
                 text = payload.get("text")

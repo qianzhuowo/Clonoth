@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import atexit
+import signal
+import threading
 import os
 from pathlib import Path
 
@@ -68,6 +71,41 @@ def main() -> None:
 
     env_access_log = (os.getenv("CLONOTH_ACCESS_LOG") or "").strip().lower() in {"1", "true", "yes", "y"}
     access_log = bool(args.access_log or env_access_log)
+
+    # TUI 子进程退出时自动关停 supervisor
+    if process_manager and process_manager.shell_cli:
+        _shell_proc = process_manager.shell_cli
+        _pm = process_manager
+
+        def _watch_shell() -> None:
+            """后台线程：等待 TUI 进程退出，根据 restart 标记决定重启或退出。"""
+            try:
+                _shell_proc.popen.wait()
+            except Exception:
+                pass
+
+            restart = _pm._restart_pending
+
+            if restart:
+                print("[supervisor] TUI 已退出，正在重启...", flush=True)
+            else:
+                print("[supervisor] TUI 已退出，正在关闭...", flush=True)
+
+            try:
+                _pm.stop_engine()
+            except Exception:
+                pass
+
+            if restart:
+                import subprocess as _sp
+                import sys as _sys
+                _sp.Popen([_sys.executable, *_sys.argv], cwd=str(workspace_root))
+                print("[supervisor] 新进程已启动", flush=True)
+
+            print("[supervisor] 退出", flush=True)
+            os._exit(0)
+
+        threading.Thread(target=_watch_shell, daemon=True, name="shell-watcher").start()
 
     uvicorn.run(
         app,

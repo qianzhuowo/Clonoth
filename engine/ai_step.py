@@ -23,8 +23,10 @@ from .protocol import (
     ACTION_CANCELLED,
 )
 from .tool_step import format_tool_trace
+from .tool_step import result_to_raw, summarize_result, write_artifact
 from .compact import should_compact, compact_messages
-from clonoth_runtime import get_int, load_runtime_config
+from clonoth_runtime import get_int, get_float, load_runtime_config
+from toolbox.context import ToolContext
 
 if TYPE_CHECKING:
     from .context import RunContext
@@ -35,6 +37,23 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _PSEUDO_TOOL_NAMES = frozenset({"dispatch_node", "finish", "ask"})
+
+# ---------------------------------------------------------------------------
+#  LLM 调用重试：可重试状态码
+# ---------------------------------------------------------------------------
+
+_RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def _is_retryable_error(resp) -> bool:
+    """判定 ProviderResponse 是否属于可重试的临时性错误。"""
+    if resp.ok:
+        return False
+    # 有明确的 HTTP 状态码 → 检查是否在可重试集合内
+    if resp.status_code is not None:
+        return resp.status_code in _RETRYABLE_STATUS_CODES
+    # 无状态码 → 网络异常（连接超时等），视为可重试
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -400,6 +419,12 @@ async def run_ai_node(
     _compacted = False  # 防止同一轮推理循环中重复压缩
     _last_prompt_tokens: int | None = None  # 上一次 LLM 返回的 prompt_tokens
 
+    # ---- LLM 重试配置 ----
+    _retry_max = get_int(runtime_cfg, "engine.retry.max_retries", 3, min_value=0, max_value=10)
+    _retry_initial_delay = get_float(runtime_cfg, "engine.retry.initial_delay_sec", 1.0, min_value=0.1, max_value=60.0)
+    _retry_max_delay = get_float(runtime_cfg, "engine.retry.max_delay_sec", 30.0, min_value=1.0, max_value=300.0)
+    _retry_backoff = get_float(runtime_cfg, "engine.retry.backoff_multiplier", 2.0, min_value=1.0, max_value=10.0)
+
     # ---- 推理循环 ----
     for step in range(step_count, max_steps):
         if await rctx.check_cancelled():
@@ -425,80 +450,119 @@ async def run_ai_node(
                 await rctx.emit_event("compact_failed", {"node_id": node.id, "step": step, "error": str(compact_err)})
 
 
-        text_buf: _StreamBuffer | None = None
-        think_buf: _StreamBuffer | None = None
         tools_arg = openai_tools if openai_tools else None
         llm_messages = prepare_messages_for_llm(messages, rctx.workspace_root)
 
         resp = None
+        _retry_attempt = 0
 
-        # ---- 流式调用 ----
-        if use_stream:
-            text_buf = _StreamBuffer(rctx, node.id, "text")
-            think_buf = _StreamBuffer(rctx, node.id, "thinking")
-            stream_task = asyncio.create_task(
-                provider.chat_stream(
-                    messages=llm_messages,
-                    tools=tools_arg,
-                    on_text=text_buf.push,
-                    on_thinking=think_buf.push,
+        # ---- LLM 调用（含重试） ----
+        while True:
+            text_buf: _StreamBuffer | None = None
+            think_buf: _StreamBuffer | None = None
+
+            # ---- 流式调用 ----
+            if use_stream:
+                text_buf = _StreamBuffer(rctx, node.id, "text")
+                think_buf = _StreamBuffer(rctx, node.id, "thinking")
+                stream_task = asyncio.create_task(
+                    provider.chat_stream(
+                        messages=llm_messages,
+                        tools=tools_arg,
+                        on_text=text_buf.push,
+                        on_thinking=think_buf.push,
+                    )
                 )
-            )
-            while True:
-                done, _ = await asyncio.wait({stream_task}, timeout=0.3)
-                if stream_task in done:
-                    resp = stream_task.result()
-                    break
-                if await rctx.check_cancelled():
-                    stream_task.cancel()
-                    try:
-                        await stream_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    await text_buf.flush()
-                    await think_buf.flush()
-                    if text_buf.flushed_any or think_buf.flushed_any:
-                        await rctx.emit_event("stream_end", {"node_id": node.id, "has_text": text_buf.flushed_any, "has_thinking": think_buf.flushed_any})
-                    await rctx.emit_event("cancel_acknowledged", {"node_id": node.id, "task_id": rctx.task_id, "step": step})
-                    return TaskAction(action=ACTION_CANCELLED, node_id=node.id, summary="任务已被用户取消。")
-            await text_buf.flush()
-            await think_buf.flush()
-            if text_buf.flushed_any or think_buf.flushed_any:
-                await rctx.emit_event("stream_end", {
+                while True:
+                    done, _ = await asyncio.wait({stream_task}, timeout=0.3)
+                    if stream_task in done:
+                        resp = stream_task.result()
+                        break
+                    if await rctx.check_cancelled():
+                        stream_task.cancel()
+                        try:
+                            await stream_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        await text_buf.flush()
+                        await think_buf.flush()
+                        if text_buf.flushed_any or think_buf.flushed_any:
+                            await rctx.emit_event("stream_end", {"node_id": node.id, "has_text": text_buf.flushed_any, "has_thinking": think_buf.flushed_any})
+                        await rctx.emit_event("cancel_acknowledged", {"node_id": node.id, "task_id": rctx.task_id, "step": step})
+                        return TaskAction(action=ACTION_CANCELLED, node_id=node.id, summary="任务已被用户取消。")
+                await text_buf.flush()
+                await think_buf.flush()
+                if text_buf.flushed_any or think_buf.flushed_any:
+                    await rctx.emit_event("stream_end", {
+                        "node_id": node.id,
+                        "has_text": text_buf.flushed_any,
+                        "has_thinking": think_buf.flushed_any,
+                    })
+                if resp.ok and resp.tool_calls:
+                    use_stream = False
+            else:
+                # ---- 非流式调用（可取消） ----
+                llm_task = asyncio.create_task(
+                    provider.chat(messages=llm_messages, tools=tools_arg)
+                )
+                while True:
+                    done, _ = await asyncio.wait({llm_task}, timeout=0.3)
+                    if llm_task in done:
+                        resp = llm_task.result()
+                        break
+                    if await rctx.check_cancelled():
+                        llm_task.cancel()
+                        try:
+                            await llm_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                        await rctx.emit_event("cancel_acknowledged", {"node_id": node.id, "task_id": rctx.task_id, "step": step})
+                        return TaskAction(action=ACTION_CANCELLED, node_id=node.id, summary="任务已被用户取消。")
+
+            assert resp is not None
+
+            # ---- 提取 token usage ----
+            if resp.usage and isinstance(resp.usage.get("prompt_tokens"), int):
+                _last_prompt_tokens = resp.usage["prompt_tokens"]
+                _compacted = False  # 有了新的 token 数据，允许重新判定是否需要压缩
+
+            # ---- 重试判定 ----
+            if not resp.ok and _is_retryable_error(resp) and _retry_attempt < _retry_max:
+                _retry_attempt += 1
+                _delay = min(
+                    _retry_initial_delay * (_retry_backoff ** (_retry_attempt - 1)),
+                    _retry_max_delay,
+                )
+                await rctx.emit_event("llm_retry", {
                     "node_id": node.id,
-                    "has_text": text_buf.flushed_any,
-                    "has_thinking": think_buf.flushed_any,
+                    "step": step,
+                    "attempt": _retry_attempt,
+                    "max_retries": _retry_max,
+                    "delay_sec": round(_delay, 2),
+                    "error": resp.error or "unknown",
+                    "status_code": resp.status_code,
                 })
-            if resp.ok and resp.tool_calls:
-                use_stream = False
-        else:
-            # ---- 非流式调用（可取消） ----
-            llm_task = asyncio.create_task(
-                provider.chat(messages=llm_messages, tools=tools_arg)
-            )
-            while True:
-                done, _ = await asyncio.wait({llm_task}, timeout=0.3)
-                if llm_task in done:
-                    resp = llm_task.result()
-                    break
-                if await rctx.check_cancelled():
-                    llm_task.cancel()
-                    try:
-                        await llm_task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    await rctx.emit_event("cancel_acknowledged", {"node_id": node.id, "task_id": rctx.task_id, "step": step})
-                    return TaskAction(action=ACTION_CANCELLED, node_id=node.id, summary="任务已被用户取消。")
+                # 退避等待，期间检查取消
+                _waited = 0.0
+                while _waited < _delay:
+                    _sleep_step = min(0.5, _delay - _waited)
+                    await asyncio.sleep(_sleep_step)
+                    _waited += _sleep_step
+                    if await rctx.check_cancelled():
+                        await rctx.emit_event("cancel_acknowledged", {
+                            "node_id": node.id, "task_id": rctx.task_id, "step": step,
+                        })
+                        return TaskAction(action=ACTION_CANCELLED, node_id=node.id, summary="任务已被用户取消。")
+                resp = None
+                continue  # 重试
 
-        assert resp is not None
+            break  # 成功或不可重试的错误，退出重试循环
 
-        # ---- 提取 token usage ----
-        if resp.usage and isinstance(resp.usage.get("prompt_tokens"), int):
-            _last_prompt_tokens = resp.usage["prompt_tokens"]
-            _compacted = False  # 有了新的 token 数据，允许重新判定是否需要压缩
-
-        # ---- LLM 调用失败 ----
+        # ---- LLM 调用失败（重试耗尽） ----
         if not resp.ok:
+            _fail_msg = resp.error or "LLM 调用失败"
+            if _retry_attempt > 0:
+                _fail_msg = f"{_fail_msg} (已重试 {_retry_attempt} 次)"
             ctx_ref = _persist_node_context(
                 rctx.workspace_root, rctx.session_id,
                 rctx.task_id or run_id or node.id, node.id, messages,
@@ -506,9 +570,9 @@ async def run_ai_node(
             )
             return TaskAction(
                 action=ACTION_FAIL, node_id=node.id,
-                error=resp.error or "LLM 调用失败",
+                error=_fail_msg,
                 context_ref=ctx_ref,
-                summary=_short(resp.error or "LLM 调用失败", 240),
+                summary=_short(_fail_msg, 240),
             )
 
         # ---- 处理 tool_calls ----
@@ -524,6 +588,15 @@ async def run_ai_node(
                         "name": tc.name,
                         "arguments": dict(tc.arguments or {}),
                     })
+
+            # 将 LLM 的工具调用决策追加到对话历史，
+            # 确保 dispatch 后恢复时上下文完整
+            _tc_desc_parts: list[str] = []
+            if resp.text:
+                _tc_desc_parts.append(resp.text)
+            for _tc in resp.tool_calls:
+                _tc_desc_parts.append(f"[Calling tool: {_tc.name}]")
+            messages.append({"role": "assistant", "content": "\n".join(_tc_desc_parts) or "[tool_call]"})
 
             # 处理伪工具
             if pseudo_call is not None:
@@ -569,39 +642,80 @@ async def run_ai_node(
                         summary=_short(ask_text, 240),
                     )
 
-            # 处理真实工具调用 → 委派给 Tool 节点
+            # 处理真实工具调用 → 循环内直接执行
             if real_tool_calls:
+                _rt_cfg = load_runtime_config(rctx.workspace_root)
+                _max_inline = get_int(_rt_cfg, "engine.tool_trace.max_inline_chars", 8000, min_value=1000, max_value=200_000)
+
                 await rctx.emit_event("handoff_progress", {
-                    "message": f"[{node.id}] 请求执行 {len(real_tool_calls)} 个工具",
+                    "message": f"[{node.id}] 执行 {len(real_tool_calls)} 个工具",
                     "node_id": node.id,
                     "task_id": rctx.task_id,
                 })
-                ctx_ref = _persist_node_context(
-                    rctx.workspace_root, rctx.session_id,
-                    rctx.task_id or run_id or node.id, node.id, messages,
-                    step_count=step + 1, context_ref=context_ref,
+
+                _tool_ctx = ToolContext(
+                    supervisor_url=rctx.supervisor_url,
+                    session_id=rctx.session_id,
+                    run_id=rctx.task_id or run_id or node.id,
+                    worker_id=rctx.worker_id,
+                    workspace_root=rctx.workspace_root,
+                    http=rctx.http,
+                    registry=registry,
+                    task_id=rctx.task_id,
+                    session_generation=rctx.session_generation,
                 )
-                if len(real_tool_calls) == 1:
-                    tc = real_tool_calls[0]
-                    return TaskAction(
-                        action=ACTION_DISPATCH, node_id=node.id,
-                        target_node=tc["name"],
-                        dispatch_input={
-                            "tool_call_id": tc["id"],
-                            "arguments": tc["arguments"],
-                        },
-                        context_ref=ctx_ref,
-                        summary=f"dispatch tool → {tc['name']}",
-                    )
-                else:
-                    # 多个工具调用：批量委派
-                    return TaskAction(
-                        action=ACTION_DISPATCH, node_id=node.id,
-                        target_node="__tool_batch__",
-                        dispatch_input={"tool_calls": real_tool_calls},
-                        context_ref=ctx_ref,
-                        summary=f"dispatch {len(real_tool_calls)} tools",
-                    )
+
+                _tool_entries: list[dict[str, Any]] = []
+                _tool_atts: list[dict[str, Any]] = []
+
+                for _rtc in real_tool_calls:
+                    if await rctx.check_cancelled():
+                        break
+                    _t_name = _rtc["name"]
+                    _t_args = _rtc["arguments"]
+                    _t_result = await registry.execute(name=_t_name, arguments=_t_args, ctx=_tool_ctx)
+                    if isinstance(_t_result, dict) and _t_result.get("cancelled"):
+                        break
+
+                    _t_summary = summarize_result(_t_name, _t_result)
+                    _t_fmt, _t_raw = result_to_raw(_t_name, _t_result)
+                    _t_truncated = len(_t_raw) > _max_inline
+                    _t_ref = ""
+                    if _t_truncated:
+                        _t_ref = await write_artifact(
+                            rctx.workspace_root, rctx.task_id or run_id,
+                            _rtc["id"], _t_name, _t_fmt, _t_raw,
+                        )
+                    _t_raw_inline = _t_raw if not _t_truncated else _t_raw[:_max_inline] + "\n...<truncated>"
+
+                    _tool_entries.append({
+                        "name": _t_name,
+                        "args": _t_args,
+                        "format": _t_fmt,
+                        "raw_inline": _t_raw_inline,
+                        "truncated": _t_truncated,
+                        "ref": _t_ref,
+                        "summary": _t_summary,
+                    })
+
+                    if isinstance(_t_result, dict) and isinstance(_t_result.get("attachments"), list):
+                        _tool_atts.extend(_t_result["attachments"])
+                        collected_attachments.extend(_t_result["attachments"])
+
+                    await rctx.emit_event("handoff_progress", {
+                        "message": f"[{node.id}] {_t_name}: {_t_summary}",
+                        "node_id": node.id,
+                        "task_id": rctx.task_id,
+                    })
+
+                # 将工具结果追加到对话历史，继续推理循环
+                if _tool_entries:
+                    messages.append({"role": "assistant", "content": format_tool_trace(_tool_entries)})
+                    if _tool_atts:
+                        messages.append({"role": "user", "content": build_multimodal_content("以上工具执行产生了以下图片结果：", _tool_atts)})
+                use_stream = streaming  # 工具执行完毕，恢复流式输出
+                continue  # 工具结果已追加，回到循环顶部进行下一轮 LLM 调用
+
 
         # ---- 纯文本输出 → 返回结果 ----
         text = (resp.text or "").strip()

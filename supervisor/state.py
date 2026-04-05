@@ -142,7 +142,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             status=ApprovalStatus.pending,
             decision=None,
             comment=None,
-            created_at=now,
+            requested_at=now,
             decided_at=None,
         )
 
@@ -184,7 +184,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             return a
 
     def request_operation(self, *, session_id: str, op: str, parameters: dict[str, Any]) -> OpRequestOut:
-        decision = self.policy.evaluate(op, parameters)
+        decision = self.policy.evaluate(op=op, parameters=parameters)
         if decision.safety_level == SafetyLevel.auto:
             return OpRequestOut(safety_level=SafetyLevel.auto, reason=decision.reason, approval_id=None)
         approval = self.create_approval(session_id=session_id, operation=op, details=parameters)

@@ -369,16 +369,9 @@ def create_app(
             )
             return RestartOut(scheduled=True, target=inp.target)
 
-        def _do_execv() -> None:
-            try:
-                if pm is not None:
-                    pm.stop_all()
-            finally:
-                time.sleep(0.2)
-                os.execv(sys.executable, [sys.executable, *sys.argv])
-
-        th = threading.Thread(target=_do_execv, daemon=True)
-        th.start()
+        # 标记重启，等 TUI 干净退出后由 _watch_shell 执行实际重启
+        if pm is not None:
+            pm._restart_pending = True
         return RestartOut(scheduled=True, target="all")
 
     admin_router = create_admin_router(workspace_root=state.workspace_root)

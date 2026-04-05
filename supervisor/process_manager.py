@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -51,6 +52,7 @@ class ProcessManager:
         self.engines: list[ManagedProcess] = []
         self.shell_cli: ManagedProcess | None = None
         self._stopped = False
+        self._restart_pending = False
 
         runtime_cfg = load_runtime_config(workspace_root)
 
@@ -176,12 +178,41 @@ class ProcessManager:
     def start_shell_cli(self) -> None:
         if self.shell_cli and self.shell_cli.popen.poll() is None:
             return
-        self.shell_cli = self._spawn(
-            name="shell-cli",
-            module="shell.cli",
-            capture_output=False,
-            new_console=self.shell_new_console,
-        )
+        runtime_cfg = load_runtime_config(self.workspace_root)
+        shell_mode = (runtime_cfg.get("shell", {}).get("mode", "") or "tui").strip().lower()
+        module = "shell.tui" if shell_mode == "tui" else "shell.cli"
+        name = "shell-tui" if shell_mode == "tui" else "shell-cli"
+
+        # Windows TUI 需要在支持 VT100 的终端中运行
+        if shell_mode == "tui" and sys.platform == "win32" and self.shell_new_console:
+            py = sys.executable
+            tui_cmd = [py, "-m", module, "--supervisor", self.supervisor_url]
+            env = {**os.environ, "CLONOTH_SUPERVISOR_URL": self.supervisor_url}
+
+            wt = shutil.which("wt")
+            if wt:
+                # wt --wait：阻塞到标签页关闭，popen.wait() 可正确追踪
+                cmd = [wt, "--wait", "--"] + tui_cmd
+            else:
+                # cmd /c：命令结束后 cmd 自动退出（不要用 /k）
+                cmd_str = subprocess.list2cmdline(tui_cmd)
+                cmd = ["cmd", "/c", cmd_str]
+
+            p = subprocess.Popen(
+                cmd,
+                cwd=str(self.workspace_root),
+                env=env,
+                creationflags=0,
+            )
+            print(f"[process_manager] spawned {name} pid={p.pid}", flush=True)
+            self.shell_cli = ManagedProcess(name=name, popen=p, log_path=None)
+        else:
+            self.shell_cli = self._spawn(
+                name=name,
+                module=module,
+                capture_output=False,
+                new_console=self.shell_new_console,
+            )
 
     def stop_engine(self) -> None:
         for proc in list(self.engines):

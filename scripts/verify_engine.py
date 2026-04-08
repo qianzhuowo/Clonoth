@@ -145,6 +145,30 @@ def test_prompt_assembly() -> None:
     assert "dispatch_node" in prompt_text
     print(f"  executor prompt: {len(prompt_text)} chars ({len(prompt_msgs)} system msgs)")
 
+def test_resume_message_building() -> None:
+    print("[test] resume message building...")
+    from engine.ai_step import _build_resume_messages
+
+    msgs = _build_resume_messages({
+        "type": "child_result",
+        "child_node_id": "bootstrap.executor",
+        "result": {"summary": "ok", "text": "执行完成"},
+    })
+    assert msgs and isinstance(msgs[0], dict)
+    assert "bootstrap.executor" in str(msgs[0].get("content", ""))
+    assert "执行完成" in str(msgs[0].get("content", ""))
+
+    ask_msgs = _build_resume_messages({
+        "type": "child_ask",
+        "child_node_id": "bootstrap.executor",
+        "result": {"text": "请提供要读取的目录路径"},
+    })
+    assert ask_msgs and isinstance(ask_msgs[0], dict)
+    assert "请提供要读取的目录路径" in str(ask_msgs[0].get("content", ""))
+    print("  child_result / child_ask resume messages. OK")
+
+
+
 
 async def test_ai_node_execution() -> None:
     print("[test] AI node execution (mock)...")
@@ -226,6 +250,8 @@ def main() -> None:
     test_node_loading()
     test_delegate_targets()
     test_prompt_assembly()
+    test_resume_message_building()
+
     asyncio.run(test_ai_node_execution())
     print()
     print("=" * 60)

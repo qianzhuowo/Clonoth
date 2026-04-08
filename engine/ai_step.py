@@ -281,12 +281,12 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
 
     # v2: child_result
     if rtype == "child_result":
-        from_node = str(resume_data.get("from_node") or "")
+        from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
         result = resume_data.get("result") or {}
         summary = str(result.get("summary") or "")
         text = str(result.get("text") or "")
         child_atts = result.get("attachments")
-        lines = [f"下游节点 {from_node} 已完成。"]
+        lines = [f"下游节点 {from_node} 已完成。" if from_node else "下游节点已完成。"]
         if summary:
             lines.append(f"摘要：{summary}")
         if text:
@@ -297,16 +297,34 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             return [{"role": "user", "content": build_multimodal_content(content_text, child_atts)}]
         return [{"role": "user", "content": content_text}]
 
+    # v2: child_ask
+    if rtype == "child_ask":
+        from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
+        result = resume_data.get("result") or {}
+        text = str(result.get("text") or "").strip()
+        if from_node and text:
+            content = f"下游节点 {from_node} 需要补充信息：{text}"
+        elif text:
+            content = f"下游节点需要补充信息：{text}"
+        elif from_node:
+            content = f"下游节点 {from_node} 需要补充信息。"
+        else:
+            content = "下游节点需要补充信息。"
+        return [{"role": "user", "content": content}]
+
     # v2: child_failed
     if rtype == "child_failed":
-        from_node = str(resume_data.get("from_node") or "")
+        from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
         error = str(resume_data.get("error") or "未知错误")
-        return [{"role": "user", "content": f"下游节点 {from_node} 执行失败：{error}"}]
+        prefix = f"下游节点 {from_node} 执行失败：" if from_node else "下游节点执行失败："
+        return [{"role": "user", "content": f"{prefix}{error}"}]
 
     # v2: child_cancelled
     if rtype == "child_cancelled":
-        from_node = str(resume_data.get("from_node") or "")
-        return [{"role": "user", "content": f"下游节点 {from_node} 已被取消。"}]
+        from_node = str(resume_data.get("from_node") or resume_data.get("child_node_id") or "")
+        text = f"下游节点 {from_node} 已被取消。" if from_node else "下游节点已被取消。"
+        return [{"role": "user", "content": text}]
+
 
     # v1: tool_results
     if rtype == "tool_results":

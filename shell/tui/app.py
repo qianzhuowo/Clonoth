@@ -11,7 +11,7 @@ from typing import Any
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, Center
+from textual.containers import Vertical, VerticalScroll, Center
 from textual.widgets import Static, Button, Label
 
 from .styles import DEFAULT_CSS
@@ -81,10 +81,12 @@ class ClonothApp(App):
     }
     #approval-overlay.visible { display: block; }
     #approval-box {
-        width: 60; height: auto; max-height: 20;
+        width: 70; height: auto; max-height: 30;
         border: thick $warning; background: $surface; padding: 1 2;
     }
     #approval-title { text-style: bold; color: $warning; margin-bottom: 1; }
+    #approval-scroll { max-height: 20; margin-bottom: 1; }
+    #approval-info { height: auto; }
     """
 
     # Ctrl+Q 和 Ctrl+C 在 VS Code 终端中被拦截，用 Ctrl+D 退出
@@ -148,7 +150,8 @@ class ClonothApp(App):
         with Center(id="approval-overlay"):
             with Vertical(id="approval-box"):
                 yield Label("⚠ 审批请求", id="approval-title")
-                yield Static("", id="approval-info")
+                with VerticalScroll(id="approval-scroll"):
+                    yield Static("", id="approval-info")
                 yield Button("允许 (Y)", variant="warning", id="btn-allow")
                 yield Button("拒绝 (N)", variant="error", id="btn-deny")
 

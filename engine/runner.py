@@ -66,43 +66,42 @@ def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str,
     if not isinstance(content, str):
         return history
 
-    # 逐行查找伪工具调用
-    lines = content.split("\n")
-    pseudo_idx = -1
+    # 查找伪工具调用标记
     pseudo_name = ""
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("Calling tool: "):
-            after = stripped[len("Calling tool: "):]
-            paren = after.find("(")
-            if paren > 0 and after[:paren] in _PSEUDO_TOOL_NAMES:
-                pseudo_idx = i
-                pseudo_name = after[:paren]
-                break
+    marker_pos = -1
+    for name in _PSEUDO_TOOL_NAMES:
+        tag = f"Calling tool: {name}("
+        pos = content.find(tag)
+        if pos >= 0:
+            pseudo_name = name
+            marker_pos = pos
+            break
 
-    if pseudo_idx < 0:
+    if marker_pos < 0:
         return history
 
-    pre_text = "\n".join(lines[:pseudo_idx]).strip()
+    pre_text = content[:marker_pos].strip()
     result = list(history)
 
     if pseudo_name == "finish":
-        # 提取 finish({"text": "..."}) 中的 text
-        pseudo_line = lines[pseudo_idx].strip()
-        arg_start = pseudo_line.find("(")
-        if arg_start > 0:
-            arg_str = pseudo_line[arg_start + 1:]
-            if arg_str.endswith(")"):
-                arg_str = arg_str[:-1]
-            try:
-                args = json.loads(arg_str)
-                finish_text = str(args.get("text", "")).strip()
-                if finish_text:
-                    combined = f"{pre_text}\n\n{finish_text}".strip() if pre_text else finish_text
-                    result[-1] = {"role": "assistant", "content": combined}
-                    return result
-            except Exception:
-                pass
+        # 提取 finish({"text": "..."}) 中的 text（可能跨多行）
+        call_str = content[marker_pos:]
+        paren_start = call_str.find("(")
+        if paren_start > 0:
+            # 从第一个 '(' 到最后一个 ')' 之间就是 JSON 参数
+            inner = call_str[paren_start + 1:]
+            last_paren = inner.rfind(")")
+            if last_paren >= 0:
+                inner = inner[:last_paren]
+                try:
+                    args = json.loads(inner)
+                    finish_text = str(args.get("text", "")).strip()
+                    if finish_text:
+                        combined = f"{pre_text}\n\n{finish_text}".strip() if pre_text else finish_text
+                        result[-1] = {"role": "assistant", "content": combined}
+                        return result
+                except Exception:
+                    pass
 
     # ask/dispatch_node 或解析失败：保留 pre_text 或删除整条
     if pre_text:

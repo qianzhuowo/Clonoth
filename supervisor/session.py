@@ -383,14 +383,10 @@ class SessionMixin:
                 outbound_atts = payload.get("attachments")
                 if isinstance(text, str) or (isinstance(outbound_atts, list) and outbound_atts):
                     text_str = str(text or "")
-                    if tool_records:
-                        prefix = "[实际执行的工具: " + "; ".join(tool_records) + "]\n"
-                    else:
-                        prefix = "[未调用任何工具，直接生成文本]\n"
                     if isinstance(outbound_atts, list) and outbound_atts:
-                        msgs.append({"role": "assistant", "content": _build_multimodal_content(prefix + text_str, outbound_atts)})
+                        msgs.append({"role": "assistant", "content": _build_multimodal_content(text_str, outbound_atts)})
                     else:
-                        msgs.append({"role": "assistant", "content": prefix + text_str})
+                        msgs.append({"role": "assistant", "content": text_str})
                     tool_records.clear()
         if limit > 0:
             msgs = msgs[-limit:]

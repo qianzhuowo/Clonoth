@@ -107,3 +107,10 @@ class SlashCommand(Message):
         super().__init__()
         self.command = command
         self.args = args
+
+
+class ConfigUpdated(Message):
+    """配置已变更（如模型切换、引擎重启）。"""
+    def __init__(self, event_type: str = "") -> None:
+        super().__init__()
+        self.event_type = event_type

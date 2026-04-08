@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import time
 from pathlib import Path
@@ -22,7 +23,6 @@ from .protocol import (
     ACTION_FAIL,
     ACTION_CANCELLED,
 )
-from .tool_step import format_tool_trace
 from .tool_step import result_to_raw, summarize_result, write_artifact
 from .compact import should_compact, compact_messages
 from clonoth_runtime import get_int, get_float, load_runtime_config
@@ -60,26 +60,41 @@ def _is_retryable_error(resp) -> bool:
 #  v3 伪工具 spec 构建
 # ---------------------------------------------------------------------------
 
-def _dispatch_node_spec(targets: list[str]) -> dict:
-    """构建 dispatch_node 伪工具定义。"""
+def _dispatch_node_spec(targets: list[str], downstream_info: list[dict[str, str]] | None = None) -> dict:
+    """构建 dispatch_node 伪工具定义。downstream_info 包含各下游节点的 id/name/description。"""
+    desc_parts = [
+        "将任务委派给另一个节点。目标节点会独立执行，完成后结果返回给你。",
+        "",
+        "使用方式：",
+        "- target：选择委派目标（见 enum）",
+        "- instruction：给出清晰、具体、可执行的指令",
+    ]
+    if downstream_info:
+        desc_parts.append("")
+        desc_parts.append("各目标节点：")
+        for info in downstream_info:
+            desc_parts.append(f"- {info.get('name', info['id'])}（{info['id']}）：{info.get('description', '')}")
+    desc_parts.extend([
+        "",
+        "何时使用：需要工具操作但你没有对应权限、需要多步执行、需要 shell 命令。",
+        "何时不用：能直接回答的问题、你自己有工具可以直接调用。",
+    ])
     return {
         "type": "function",
         "function": {
             "name": "dispatch_node",
-            "description": (
-                "将任务委派给另一个节点。目标节点执行完成后，结果会返回给你。"
-            ),
+            "description": "\n".join(desc_parts),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target": {
                         "type": "string",
                         "enum": targets,
-                        "description": "委派目标节点。",
+                        "description": "委派目标节点 ID。",
                     },
                     "instruction": {
                         "type": "string",
-                        "description": "给目标节点的清晰、具体、可执行的指令。",
+                        "description": "给目标节点的清晰、具体、可执行的指令。像给一个刚进入房间的同事做简报——说明要做什么、为什么、你已经知道什么。",
                     },
                 },
                 "required": ["target", "instruction"],
@@ -94,22 +109,27 @@ def _finish_spec() -> dict:
         "type": "function",
         "function": {
             "name": "finish",
-            "description": "完成当前任务，提交结果。",
+            "description": (
+                "完成当前任务，向调用方提交结果。\n\n"
+                "- text：最终结果文本，面向调用方或用户的回答。\n"
+                "- summary：简要摘要（可选），用于上游节点快速了解结果。\n"
+                "- 不要在 text 中包含内部协议标记或调试信息。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "结果文本。",
+                        "description": "最终结果文本。",
                     },
                     "summary": {
                         "type": "string",
-                        "description": "简要摘要（可选）。",
+                        "description": "简要摘要（可选），帮助上游快速了解结果。",
                     },
                     "attachment_paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "附带的文件路径列表（可选）。",
+                        "description": "附带的文件路径列表（可选，仅在有图片等附件时使用）。",
                     },
                 },
                 "required": ["text"],
@@ -124,13 +144,18 @@ def _ask_spec() -> dict:
         "type": "function",
         "function": {
             "name": "ask",
-            "description": "信息不足，向调用方提问以获取更多信息。",
+            "description": (
+                "信息不足时，向调用方提问以获取更多信息。\n\n"
+                "- 只在确实缺少完成任务所必需的信息时使用。\n"
+                "- 不要用来确认你已经知道答案的问题。\n"
+                "- 不要用来征求许可——如果你有权限做，直接做。"
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {
                         "type": "string",
-                        "description": "需要补充的问题。",
+                        "description": "向调用方提出的具体问题。",
                     },
                 },
                 "required": ["text"],
@@ -289,9 +314,12 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         if not isinstance(entries, list):
             entries = resume_data.get("entries")
         if isinstance(entries, list) and entries:
-            msgs: list[dict[str, Any]] = [{"role": "assistant", "content": format_tool_trace(entries)}]
-            all_atts: list[dict[str, Any]] = []
+            msgs: list[dict[str, Any]] = []
+            all_atts: list[dict[str, Any]] = [] 
             for e in entries:
+                _name = e.get("name", "unknown")
+                _raw = e.get("raw_inline", "")
+                msgs.append({"role": "user", "content": f'Tool result for "{_name}":\n{_raw}'})
                 atts = e.get("attachments")
                 if isinstance(atts, list):
                     all_atts.extend(atts)
@@ -334,8 +362,7 @@ async def run_ai_node(
     run_id: str = "",
     context_ref: str = "",
     resume_data: dict[str, Any] | None = None,
-    downstream_capabilities: str = "",
-    own_tools_text: str = "",
+    downstream_info: list[dict[str, str]] | None = None,
     attachments: list[dict[str, Any]] | None = None,
 ) -> TaskAction:
     runtime_cfg = load_runtime_config(rctx.workspace_root)
@@ -371,10 +398,6 @@ async def run_ai_node(
             "node_name": node.name,
             "instruction": instruction,
         }
-        if own_tools_text:
-            prompt_vars["own_tools"] = own_tools_text
-        if downstream_capabilities:
-            prompt_vars["downstream"] = downstream_capabilities
         system_prompt = assemble_prompt(rctx.workspace_root, node, variables=prompt_vars)
         skill_budget = get_int(runtime_cfg, "skills.max_budget_chars", 0, min_value=0)
         skill_msgs = build_skill_messages(
@@ -385,14 +408,25 @@ async def run_ai_node(
             skill_allow=node.skill_access.allow,
             max_budget_chars=skill_budget,
         )
-        messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+        # system_prompt 现在是 list[dict]（多条 system 消息）
+        messages: list[dict[str, Any]] = list(system_prompt)
         messages.extend(skill_msgs)
         messages.extend(history)
-        ctx_text = "\n".join([f"当前节点={node.id}", f"请完成指令：{instruction}"])
-        if attachments:
-            messages.append({"role": "user", "content": build_multimodal_content(ctx_text, attachments)})
-        else:
-            messages.append({"role": "user", "content": ctx_text})
+        # 检查 history 末尾是否已包含当前 instruction（避免重复）
+        _last = history[-1] if history else None
+        _last_content = _last.get("content", "") if isinstance(_last, dict) else ""
+        _already_in_history = (
+            _last is not None
+            and _last.get("role") == "user"
+            and isinstance(_last_content, str)
+            and _last_content.strip() == instruction.strip()
+        )
+        if not _already_in_history:
+            ctx_text = instruction
+            if attachments:
+                messages.append({"role": "user", "content": build_multimodal_content(ctx_text, attachments)})
+            else:
+                messages.append({"role": "user", "content": ctx_text})
 
     # ---- 追加恢复消息 ----
     if resume_data:
@@ -405,7 +439,7 @@ async def run_ai_node(
     # 伪工具：委派
     delegate_targets = list(node.delegate_targets)
     if delegate_targets:
-        openai_tools.append(_dispatch_node_spec(delegate_targets))
+        openai_tools.append(_dispatch_node_spec(delegate_targets, downstream_info))
 
     # 伪工具：完成 + 提问（所有节点均可用）
     openai_tools.append(_finish_spec())
@@ -595,7 +629,8 @@ async def run_ai_node(
             if resp.text:
                 _tc_desc_parts.append(resp.text)
             for _tc in resp.tool_calls:
-                _tc_desc_parts.append(f"[Calling tool: {_tc.name}]")
+                _tc_args = json.dumps(dict(_tc.arguments or {}), ensure_ascii=False)
+                _tc_desc_parts.append(f"Calling tool: {_tc.name}({_tc_args})")
             messages.append({"role": "assistant", "content": "\n".join(_tc_desc_parts) or "[tool_call]"})
 
             # 处理伪工具
@@ -710,7 +745,14 @@ async def run_ai_node(
 
                 # 将工具结果追加到对话历史，继续推理循环
                 if _tool_entries:
-                    messages.append({"role": "assistant", "content": format_tool_trace(_tool_entries)})
+                    for _entry in _tool_entries:
+                        _result_body = _entry["raw_inline"]
+                        if _entry.get("truncated") and _entry.get("ref"):
+                            _result_body += f"\n(Truncated. Full output: {_entry['ref']})"
+                        messages.append({
+                            "role": "user",
+                            "content": f'Tool result for "{_entry["name"]}":\n{_result_body}',
+                        })
                     if _tool_atts:
                         messages.append({"role": "user", "content": build_multimodal_content("以上工具执行产生了以下图片结果：", _tool_atts)})
                 use_stream = streaming  # 工具执行完毕，恢复流式输出

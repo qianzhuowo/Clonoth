@@ -27,61 +27,19 @@ from .node import Node, load_node
 from .tool_step import result_to_raw, summarize_result, write_artifact
 
 
-def _collect_own_tool_capabilities(node: "Node", registry: ToolRegistry) -> str:
-    all_specs = registry.list_specs()
-    mode = (node.tool_access.mode or "none").lower()
-    if mode == "all":
-        denied = set(node.tool_access.deny)
-        tool_specs = [s for s in all_specs if s["name"] not in denied] if denied else list(all_specs)
-    elif mode == "allowlist":
-        allowed = set(node.tool_access.allow)
-        tool_specs = [s for s in all_specs if s["name"] in allowed]
-    else:
-        tool_specs = []
-    if not tool_specs:
-        return ""
-    lines = []
-    for s in tool_specs:
-        name = s["name"]
-        desc = s.get("description", "")
-        lines.append(f"- {name}：{desc}" if desc else f"- {name}")
-    return (
-        "## 你的直接工具\n\n"
-        "以下工具已通过 function calling 提供给你，你可以直接发起调用。调用后系统会把它们调度为 task 执行，再把结果返回给你。\n\n"
-        + "\n".join(lines)
-    )
-
-
-def _collect_downstream_capabilities(workspace_root: Path, node: Node, registry: ToolRegistry) -> str:
-    """收集当前节点可委派的下游节点能力描述（从节点自身的 delegate_targets 读取）。"""
-    if not node.delegate_targets:
-        return ""
-
-    all_specs = registry.list_specs()
-    all_tool_names = [s["name"] for s in all_specs]
-    all_names = {s["name"] for s in all_specs}
-    lines: list[str] = []
-
-    for target_id in node.delegate_targets:
+def _collect_downstream_info(workspace_root: Path, node: Node) -> list[dict[str, str]]:
+    """收集下游节点基本信息（id/name/description），用于 dispatch_node 工具描述。"""
+    result: list[dict[str, str]] = []
+    for target_id in (node.delegate_targets or []):
         target = load_node(workspace_root, target_id)
         if target is None:
             continue
-        mode = (target.tool_access.mode or "none").lower()
-        if mode == "all":
-            denied = set(target.tool_access.deny)
-            tool_names = [n for n in all_tool_names if n not in denied] if denied else all_tool_names
-        elif mode == "allowlist":
-            tool_names = [n for n in target.tool_access.allow if n in all_names]
-        else:
-            tool_names = []
-        desc = target.description or target.name
-        tool_list = ", ".join(tool_names) if tool_names else "（无工具）"
-        lines.append(f"- {target.name}（{target.id}）：{desc}\n  可用工具：{tool_list}")
-
-    if not lines:
-        return ""
-    return "## 下游节点能力\n\n通过 dispatch_node 你可以把任务委派给以下下游节点：\n\n" + "\n".join(lines)
-
+        result.append({
+            "id": target.id,
+            "name": target.name,
+            "description": target.description or target.name,
+        })
+    return result
 
 async def _fetch_history(rctx: RunContext, limit: int = 40) -> list[dict[str, Any]]:
     try:
@@ -251,8 +209,7 @@ async def _run_node_task(
     if not context_ref and use_context:
         history = await _fetch_history(rctx)
 
-    own_caps = _collect_own_tool_capabilities(node, registry)
-    downstream_caps = _collect_downstream_capabilities(ws_root, node, registry)
+    ds_info = _collect_downstream_info(ws_root, node)
 
     runtime_cfg = load_runtime_config(ws_root)
     entry_node_id = get_str(runtime_cfg, "shell.entry_node_id", "bootstrap.shell_orchestrator").strip()
@@ -277,7 +234,7 @@ async def _run_node_task(
         instruction=str(input_data.get("instruction") or "").strip(),
         history=history, run_id=task_id, context_ref=context_ref,
         resume_data=input_data.get("resume_data") if isinstance(input_data.get("resume_data"), dict) else None,
-        own_tools_text=own_caps, downstream_capabilities=downstream_caps,
+        downstream_info=ds_info,
         streaming=bool(node.id == entry_node_id and get_bool(runtime_cfg, "engine.streaming", False)),
         attachments=input_attachments,
     )

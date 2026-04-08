@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from textual.containers import ScrollableContainer
-from textual.widgets import Static
+from textual.widgets import Static, Markdown
 
 
 class MessageList(ScrollableContainer):
@@ -27,6 +27,10 @@ class MessageList(ScrollableContainer):
     }
     .assistant-msg {
         color: $text;
+        margin: 0 2 0 2;
+        padding: 0 1;
+    }
+    .assistant-md {
         margin: 0 2 0 2;
         padding: 0 1;
     }
@@ -75,6 +79,24 @@ class MessageList(ScrollableContainer):
         self._stream_text: str = ""
         self._auto_scroll: bool = True
 
+    # ---- 判断内容是否含 Markdown 格式 ----
+
+    @staticmethod
+    def _has_markdown(text: str) -> bool:
+        """简单检测文本中是否含有 Markdown 格式标记。"""
+        indicators = (
+            "```",     # 代码块
+            "**",      # 粗体
+            "# ",      # 标题
+            "## ",
+            "- ",      # 列表
+            "* ",
+            "1. ",     # 有序列表
+            "| ",      # 表格
+            "> ",      # 引用
+        )
+        return any(ind in text for ind in indicators)
+
     # ---- 追加消息 ----
 
     async def add_user_message(self, text: str) -> None:
@@ -84,7 +106,10 @@ class MessageList(ScrollableContainer):
 
     async def add_assistant_message(self, text: str) -> None:
         await self.mount(Static("Assistant", classes="assistant-prefix"))
-        await self.mount(Static(text, classes="assistant-msg"))
+        if self._has_markdown(text):
+            await self.mount(Markdown(text, classes="assistant-md"))
+        else:
+            await self.mount(Static(text, classes="assistant-msg"))
         await self.mount(Static("─" * 40, classes="divider"))
         self._scroll_to_end()
 
@@ -118,6 +143,7 @@ class MessageList(ScrollableContainer):
     async def start_streaming(self) -> None:
         self._stream_text = ""
         await self.mount(Static("Assistant", classes="assistant-prefix"))
+        # 流式期间用 Static（Markdown 高频 update 会闪烁）
         self._streaming_widget = Static("", classes="assistant-msg")
         await self.mount(self._streaming_widget)
         self._scroll_to_end()
@@ -130,10 +156,17 @@ class MessageList(ScrollableContainer):
         self._scroll_to_end()
 
     async def end_streaming(self) -> None:
-        """流结束，追加分隔线。"""
+        """流结束：如果内容含 Markdown，替换为 Markdown 组件渲染。"""
         if self._streaming_widget is not None:
+            final_text = self._stream_text.strip()
+            if final_text and self._has_markdown(final_text):
+                # 替换 Static 为 Markdown
+                md_widget = Markdown(final_text, classes="assistant-md")
+                await self.mount(md_widget, after=self._streaming_widget)
+                self._streaming_widget.remove()
             await self.mount(Static("─" * 40, classes="divider"))
         self._streaming_widget = None
+        self._stream_text = ""
         self._scroll_to_end()
 
     @property
@@ -142,11 +175,15 @@ class MessageList(ScrollableContainer):
 
     # ---- 搜索 ----
 
-    def get_all_text(self) -> list[tuple[Static, str]]:
+    def get_all_text(self) -> list[tuple, str]:
         results = []
         for child in self.children:
             if isinstance(child, Static):
                 results.append((child, str(child.renderable or "")))
+            elif isinstance(child, Markdown):
+                # Markdown 组件内部存储原始文本
+                raw = getattr(child, '_markdown', '') or ''
+                results.append((child, raw))
         return results
 
     # ---- 滚动 ----

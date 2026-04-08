@@ -43,7 +43,7 @@ class ManagedProcess:
 class ProcessManager:
     """管理引擎 worker 和 CLI 适配器进程。"""
 
-    def __init__(self, *, supervisor_url: str, workspace_root: Path, log_dir: Path) -> None:
+    def __init__(self, *, supervisor_url: str, workspace_root: Path, log_dir: Path, log_func=None) -> None:
         self.supervisor_url = supervisor_url
         self.workspace_root = workspace_root
         self.log_dir = log_dir
@@ -53,6 +53,9 @@ class ProcessManager:
         self.shell_cli: ManagedProcess | None = None
         self._stopped = False
         self._restart_pending = False
+
+        # 日志函数：写日志文件而不是终端（终端留给 TUI）
+        self._log = log_func or (lambda msg: print(msg))
 
         runtime_cfg = load_runtime_config(workspace_root)
 
@@ -71,7 +74,8 @@ class ProcessManager:
             max_value=8,
         )
 
-        platform_default_new_console = sys.platform == "win32"
+        # 默认 False：TUI 在原终端前台运行（supervisor 输出已重定向到日志文件）
+        platform_default_new_console = False
         cfg_new_console = runtime_cfg.get("supervisor", {}).get("process_manager", {}).get("shell_new_console", None)
         shell_new_console = get_bool(runtime_cfg, "supervisor.process_manager.shell_new_console", platform_default_new_console)
         if cfg_new_console is None:
@@ -114,7 +118,7 @@ class ProcessManager:
         if self._stopped:
             return
         self._stopped = True
-        print("[process_manager] cleaning up child processes...", flush=True)
+        self._log("[process_manager] cleaning up child processes...")
         self.stop_all()
 
     def _spawn(
@@ -157,7 +161,7 @@ class ProcessManager:
             creationflags=creationflags,
             preexec_fn=preexec_fn,
         )
-        print(f"[process_manager] spawned {name} pid={p.pid}", flush=True)
+        self._log(f"[process_manager] spawned {name} pid={p.pid}")
         return ManagedProcess(name=name, popen=p, log_path=log_path)
 
     def start_engine(self) -> None:
@@ -193,18 +197,25 @@ class ProcessManager:
             if wt:
                 # wt --wait：阻塞到标签页关闭，popen.wait() 可正确追踪
                 cmd = [wt, "--wait", "--"] + tui_cmd
+                creationflags = 0
             else:
-                # cmd /c：命令结束后 cmd 自动退出（不要用 /k）
-                cmd_str = subprocess.list2cmdline(tui_cmd)
-                cmd = ["cmd", "/c", cmd_str]
+                # 优先用 powershell，Unicode/emoji 支持远好于 cmd.exe
+                pwsh = shutil.which("pwsh") or shutil.which("powershell")
+                if pwsh:
+                    cmd_str = subprocess.list2cmdline(tui_cmd)
+                    cmd = [pwsh, "-NoProfile", "-Command", cmd_str]
+                else:
+                    cmd_str = subprocess.list2cmdline(tui_cmd)
+                    cmd = ["cmd", "/c", cmd_str]
+                creationflags = subprocess.CREATE_NEW_CONSOLE
 
             p = subprocess.Popen(
                 cmd,
                 cwd=str(self.workspace_root),
                 env=env,
-                creationflags=0,
+                creationflags=creationflags,
             )
-            print(f"[process_manager] spawned {name} pid={p.pid}", flush=True)
+            self._log(f"[process_manager] spawned {name} pid={p.pid}")
             self.shell_cli = ManagedProcess(name=name, popen=p, log_path=None)
         else:
             self.shell_cli = self._spawn(
@@ -244,4 +255,4 @@ class ProcessManager:
                 p.kill()
             except Exception:
                 pass
-        print(f"[process_manager] stopped {proc.name} pid={p.pid}", flush=True)
+        self._log(f"[process_manager] stopped {proc.name} pid={p.pid}")

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import logging
+import socket
 import atexit
+import io
 import signal
 import threading
 import os
@@ -38,6 +41,22 @@ def main() -> None:
 
     workspace_root = Path(__file__).resolve().parents[1]
     data_dir = workspace_root / "data"
+    log_dir = data_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    # ---- 把 supervisor 自身的所有输出重定向到日志文件 ----
+    # 这样 TUI 可以在同一终端前台运行，不会被 uvicorn 日志覆盖。
+    _supervisor_log_path = log_dir / "supervisor.log"
+    _supervisor_log_f = open(_supervisor_log_path, "a", encoding="utf-8", buffering=1)
+
+    def _log(msg: str) -> None:
+        """写 supervisor 日志（不写终端）。"""
+        try:
+            _supervisor_log_f.write(msg + "\n")
+            _supervisor_log_f.flush()
+        except Exception:
+            pass
+
     events_path = data_dir / "events.jsonl"
     config_path = data_dir / "config.yaml"
 
@@ -50,6 +69,14 @@ def main() -> None:
     config_store = ConfigStore(path=config_path)
     state.write_boot_event()
 
+    # 在拉起子进程之前，先检查端口是否可用
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+            _s.bind((args.host, args.port))
+    except OSError as e:
+        _log(f"[supervisor] 端口 {args.host}:{args.port} 已被占用: {e}")
+        return
+
     base_url = f"http://{args.host}:{args.port}"
 
     process_manager: ProcessManager | None = None
@@ -58,6 +85,7 @@ def main() -> None:
             supervisor_url=base_url,
             workspace_root=workspace_root,
             log_dir=data_dir / "logs",
+            log_func=_log,
         )
         if not args.no_kernel:
             process_manager.start_engine()
@@ -87,32 +115,49 @@ def main() -> None:
             restart = _pm._restart_pending
 
             if restart:
-                print("[supervisor] TUI 已退出，正在重启...", flush=True)
+                _log("[supervisor] TUI 已退出，正在重启...")
             else:
-                print("[supervisor] TUI 已退出，正在关闭...", flush=True)
+                _log("[supervisor] TUI 已退出，正在关闭...")
 
             try:
                 _pm.stop_engine()
             except Exception:
                 pass
 
-            if restart:
-                import subprocess as _sp
-                import sys as _sys
-                _sp.Popen([_sys.executable, *_sys.argv], cwd=str(workspace_root))
-                print("[supervisor] 新进程已启动", flush=True)
-
-            print("[supervisor] 退出", flush=True)
-            os._exit(0)
+            # 退出码 75 = 请求重启（由 main.py 外层循环检测）
+            _code = 75 if restart else 0
+            _log(f"[supervisor] exit code={_code}")
+            os._exit(_code)
 
         threading.Thread(target=_watch_shell, daemon=True, name="shell-watcher").start()
 
+    # uvicorn 日志全部写到文件，不输出到终端（终端留给 TUI）
+    _uvi_log_cfg = {
+        "version": 1,
+        "disable_existing_loggers": False,
+        "handlers": {
+            "file": {
+                "class": "logging.FileHandler",
+                "filename": str(_supervisor_log_path),
+                "mode": "a",
+                "encoding": "utf-8",
+            },
+        },
+        "loggers": {
+            "uvicorn": {"handlers": ["file"], "level": "INFO", "propagate": False},
+            "uvicorn.error": {"handlers": ["file"], "level": "INFO", "propagate": False},
+            "uvicorn.access": {"handlers": ["file"], "level": "INFO", "propagate": False},
+        },
+    }
+
+    _log(f"[supervisor] starting uvicorn on {args.host}:{args.port}")
     uvicorn.run(
         app,
         host=args.host,
         port=args.port,
         log_level=args.log_level,
         access_log=access_log,
+        log_config=_uvi_log_cfg,
     )
 
 

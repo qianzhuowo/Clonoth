@@ -224,7 +224,7 @@ def parse_extra_roots(workspace_root: Path, raw: Any) -> list[Path]:
 
 def strip_tool_trace_blocks(text: str) -> str:
     s = str(text or "")
-    start = "[CLONOTH_TOOL_TRACE v1]"
+    start = "[CLONOTH_TOOL_TRACE v2]"
     end = "[/CLONOTH_TOOL_TRACE]"
     while True:
         i = s.find(start)

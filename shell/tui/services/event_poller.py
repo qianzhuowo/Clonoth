@@ -10,6 +10,7 @@ from clonoth_runtime import strip_tool_trace_blocks
 from ..models import (
     ApprovalRequested,
     AssistantReply,
+    ConfigUpdated,
     ToolActivity,
     NodeCompleted,
     NodeStarted,
@@ -126,12 +127,15 @@ class EventPoller:
     async def _poll_global_tick(self) -> None:
         events = await self._client.get_global_events(
             after_seq=self._global_seq,
-            types="outbound_message,approval_requested",
+            types="outbound_message,approval_requested,config_updated,config_reloaded,restart_completed",
         )
         for e in events:
             seq = int(e.get("seq", 0))
             if seq > self._global_seq:
                 self._global_seq = seq
+            et = e.get("type", "")
+            if et in ("config_updated", "config_reloaded", "restart_completed"):
+                self._app.post_message(ConfigUpdated(et))
 
     # ---- 事件解析 ----
 

@@ -135,13 +135,15 @@ def test_prompt_assembly() -> None:
     print("[test] prompt assembly...")
     node = load_node(WORKSPACE, "bootstrap.executor")
     assert node is not None
-    prompt = assemble_prompt(WORKSPACE, node)
-    assert len(prompt) > 50
-    assert "{{include:" not in prompt
+    prompt_msgs = assemble_prompt(WORKSPACE, node)
+    assert isinstance(prompt_msgs, list) and len(prompt_msgs) > 0
+    prompt_text = "\n".join(m["content"] for m in prompt_msgs)
+    assert len(prompt_text) > 50
+    assert "{{include:" not in prompt_text
     # 确认包含新伪工具名
-    assert "finish" in prompt
-    assert "dispatch_node" in prompt
-    print(f"  executor prompt: {len(prompt)} chars")
+    assert "finish" in prompt_text
+    assert "dispatch_node" in prompt_text
+    print(f"  executor prompt: {len(prompt_text)} chars ({len(prompt_msgs)} system msgs)")
 
 
 async def test_ai_node_execution() -> None:

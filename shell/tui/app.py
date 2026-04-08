@@ -26,6 +26,7 @@ from .widgets.search_bar import SearchBar
 from .models import (
     ApprovalRequested,
     AssistantReply,
+    ConfigUpdated,
     ToolActivity,
     NodeCompleted,
     NodeStarted,
@@ -431,6 +432,18 @@ class ClonothApp(App):
             return
         await self.query_one(MessageList).add_system_message("任务已取消")
         self.query_one(StatusBar).update_status(waiting=False)
+
+    # ---- 配置变更 ----
+
+    async def on_config_updated(self, event: ConfigUpdated) -> None:
+        """配置变更时刷新状态栏显示。"""
+        try:
+            model = await self.supervisor.fetch_model_name()
+            if model:
+                self._model_name = model
+                self.query_one(StatusBar).update_status(model=model)
+        except Exception:
+            pass
 
     # ---- 搜索 ----
 

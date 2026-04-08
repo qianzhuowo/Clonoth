@@ -10,7 +10,8 @@ from typing import Any, Awaitable, Callable
 
 from clonoth_runtime import get_float, load_runtime_config
 
-from . import meta_tools
+from . import builtins as _builtins
+from ._common import safe_subprocess_env as _safe_subprocess_env
 from . import mcp_runtime
 
 
@@ -107,7 +108,7 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(root) if isinstance(root, Path) else None,
-                env=meta_tools._safe_subprocess_env(),
+                env=_safe_subprocess_env(),
             )
             waiter = asyncio.create_task(proc.communicate(input=input_json.encode("utf-8")))
             started = asyncio.get_running_loop().time()
@@ -179,27 +180,51 @@ class ToolRegistry:
         builtins: list[tuple[str, str, dict[str, Any], ToolFunc]] = [
             (
                 "list_dir",
-                "List a directory under workspace root.",
-                {
-                    "type": "object",
-                    "properties": {"path": {"type": "string", "description": "relative path"}},
-                    "required": [],
-                },
-                meta_tools.list_dir,
-            ),
-            (
-                "read_file",
-                "Read a text file under workspace root with optional line range (policy+approval guarded).",
+                "List one or more directories under workspace root. Supports batch listing and recursive mode. Ignores .git by default.",
                 {
                     "type": "object",
                     "properties": {
-                        "path": {"type": "string"},
-                        "start_line": {"type": "integer"},
-                        "end_line": {"type": "integer"},
+                        "paths": {
+                            "type": "array",
+                            "description": "Array of directory paths to list (relative to workspace root). MUST be an array even for single directory.",
+                            "items": {"type": "string"},
+                        },
+                        "recursive": {
+                            "type": "boolean",
+                            "description": "Whether to list subdirectories recursively. Default false.",
+                        },
+                        "path": {"type": "string", "description": "(Legacy) Single directory path."},
                     },
-                    "required": ["path"],
+                    "required": [],
                 },
-                meta_tools.read_file,
+                _builtins.list_dir,
+            ),
+            (
+                "read_file",
+                "Read one or more files under workspace root. Supports text files (with optional line range), images (returned as multimodal), and binary files. Policy+approval guarded.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "files": {
+                            "type": "array",
+                            "description": "Array of file objects. Each has: path (required), startLine (optional, 1-based), endLine (optional, 1-based inclusive). MUST be an array even for single file.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "path": {"type": "string", "description": "File path relative to workspace root."},
+                                    "startLine": {"type": "integer", "description": "Start line (1-based, inclusive). Only for text files."},
+                                    "endLine": {"type": "integer", "description": "End line (1-based, inclusive). Only for text files."},
+                                },
+                                "required": ["path"],
+                            },
+                        },
+                        "path": {"type": "string", "description": "(Legacy single-file mode) File path relative to workspace root."},
+                        "start_line": {"type": "integer", "description": "(Legacy) Start line number."},
+                        "end_line": {"type": "integer", "description": "(Legacy) End line number."},
+                    },
+                    "required": [],
+                },
+                _builtins.read_file,
             ),
             (
                 "write_file",
@@ -209,7 +234,7 @@ class ToolRegistry:
                     "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
                     "required": ["path", "content"],
                 },
-                meta_tools.write_file,
+                _builtins.write_file,
             ),
             (
                 "execute_command",
@@ -222,7 +247,7 @@ class ToolRegistry:
                     },
                     "required": ["command"],
                 },
-                meta_tools.execute_command,
+                _builtins.execute_command,
             ),
             (
                 "search_in_files",
@@ -235,7 +260,7 @@ class ToolRegistry:
                     },
                     "required": ["query"],
                 },
-                meta_tools.search_in_files,
+                _builtins.search_in_files,
             ),
             (
                 "create_or_update_skill",
@@ -255,13 +280,13 @@ class ToolRegistry:
                     },
                     "required": ["name"],
                 },
-                meta_tools.create_or_update_skill,
+                _builtins.create_or_update_skill,
             ),
             (
                 "list_skills",
                 "List local skills under skills/*/SKILL.md.",
                 {"type": "object", "properties": {}, "required": []},
-                meta_tools.list_skills,
+                _builtins.list_skills,
             ),
             (
                 "delete_skill",
@@ -273,7 +298,7 @@ class ToolRegistry:
                     },
                     "required": ["name"],
                 },
-                meta_tools.delete_skill,
+                _builtins.delete_skill,
             ),
             (
                 "create_or_update_mcp_client",
@@ -293,13 +318,13 @@ class ToolRegistry:
                     },
                     "required": ["id", "transport"],
                 },
-                meta_tools.create_or_update_mcp_client,
+                _builtins.create_or_update_mcp_client,
             ),
             (
                 "list_mcp_clients",
                 "List configured MCP clients.",
                 {"type": "object", "properties": {}, "required": []},
-                meta_tools.list_mcp_clients,
+                _builtins.list_mcp_clients,
             ),
             (
                 "delete_mcp_client",
@@ -311,7 +336,7 @@ class ToolRegistry:
                     },
                     "required": ["id"],
                 },
-                meta_tools.delete_mcp_client,
+                _builtins.delete_mcp_client,
             ),
             (
                 "create_or_update_tool",
@@ -329,13 +354,13 @@ class ToolRegistry:
                     },
                     "required": ["name", "script"],
                 },
-                meta_tools.create_or_update_tool,
+                _builtins.create_or_update_tool,
             ),
             (
                 "reload_tools",
                 "Reload tools/ directory.",
                 {"type": "object", "properties": {}, "required": []},
-                meta_tools.reload_tools,
+                _builtins.reload_tools,
             ),
             (
                 "request_restart",
@@ -348,7 +373,7 @@ class ToolRegistry:
                     },
                     "required": ["target"],
                 },
-                meta_tools.request_restart,
+                _builtins.request_restart,
             ),
             (
                 "create_schedule",
@@ -368,13 +393,13 @@ class ToolRegistry:
                     },
                     "required": ["id", "cron", "text"],
                 },
-                meta_tools.create_schedule,
+                _builtins.create_schedule,
             ),
             (
                 "list_schedules",
                 "List all scheduled tasks from data/schedules.yaml.",
                 {"type": "object", "properties": {}, "required": []},
-                meta_tools.list_schedules,
+                _builtins.list_schedules,
             ),
             (
                 "delete_schedule",
@@ -386,14 +411,14 @@ class ToolRegistry:
                     },
                     "required": ["id"],
                 },
-                meta_tools.delete_schedule,
+                _builtins.delete_schedule,
             ),
             (
                 "cancel_active_tasks",
                 "Cancel all active downstream tasks in the current session. "
                 "Use when the user's new message makes the previous task unnecessary.",
                 {"type": "object", "properties": {}, "required": []},
-                meta_tools.cancel_active_tasks,
+                _builtins.cancel_active_tasks,
             ),
         ]
 

@@ -360,6 +360,12 @@ def create_app(
         if inp.target == "engine":
             if pm is None:
                 raise HTTPException(status_code=409, detail="process manager not enabled")
+            # 重新加载 .env，确保修改后的环境变量在 supervisor 进程中生效
+            try:
+                from dotenv import load_dotenv
+                load_dotenv(override=True)
+            except Exception:
+                pass
             pm.restart_engine()
             st.eventlog.append(
                 session_id="__system__",

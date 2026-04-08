@@ -119,6 +119,21 @@ class TaskStoreMixin:
                 task.updated_at = now
                 self._event_task_snapshot("task_cancel_requested", task)
 
+    def _find_last_context_ref_locked(self, session_id: str, node_id: str) -> str:
+        """查找同一 session 中指定 node_id 最近一次完成的 task 的 context_ref。
+
+        用于在新任务中传递上下文快照引用，使 AI 能看到上一轮的完整对话（包括工具调用）。
+        """
+        for tid in reversed(self._task_order):
+            t = self.tasks.get(tid)
+            if (t is not None
+                and t.session_id == session_id
+                and t.node_id == node_id
+                and t.status == TaskStatus.completed
+                and t.result.get("context_ref")):
+                return str(t.result["context_ref"])
+        return ""
+
     def _create_entry_task_for_inbound_locked(self, *, inbound_seq: int, session_id: str, payload: dict[str, Any]) -> Task | None:
         text = str(payload.get("text") or "").strip()
         has_attachments = isinstance(payload.get("attachments"), list) and bool(payload.get("attachments"))
@@ -133,6 +148,8 @@ class TaskStoreMixin:
         active_tasks_summary = self._active_tasks_summary_locked(session_id)
         attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else None
         use_context = bool(payload.get("use_context", True))
+        # 查找入口节点上一轮的 context_ref，使对话上下文（含工具调用）跨轮次连续
+        last_ctx_ref = self._find_last_context_ref_locked(session_id, entry_node)
         return self._create_task_locked(
             session_id=session_id,
             session_generation=generation,
@@ -140,7 +157,7 @@ class TaskStoreMixin:
             node_id=entry_node,
             input_data={
                 "instruction": text,
-                "context_ref": "",
+                "context_ref": last_ctx_ref,
                 "resume_data": {},
                 "use_context": use_context,
                 "active_tasks_summary": active_tasks_summary,

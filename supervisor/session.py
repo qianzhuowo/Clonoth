@@ -375,7 +375,10 @@ class SessionMixin:
                         msgs.append({"role": "user", "content": text})
             elif et == "handoff_progress":
                 prog_msg = str(payload.get("message") or "")
-                # 捕获所有工具相关进度（[tool] 前缀或含冒号的结果摘要）
+                # 跳过流式文本/思考块，只保留工具调用进度
+                kind = payload.get("kind")
+                if kind in ("text", "thinking"):
+                    continue
                 if prog_msg:
                     tool_records.append(prog_msg)
             elif et == "outbound_message":
@@ -383,6 +386,10 @@ class SessionMixin:
                 outbound_atts = payload.get("attachments")
                 if isinstance(text, str) or (isinstance(outbound_atts, list) and outbound_atts):
                     text_str = str(text or "")
+                    # 将本轮工具调用记录注入助手消息，供后续轮次上下文使用
+                    if tool_records:
+                        tool_section = "\n".join(tool_records)
+                        text_str = f"[本轮工具调用]\n{tool_section}\n\n{text_str}"
                     if isinstance(outbound_atts, list) and outbound_atts:
                         msgs.append({"role": "assistant", "content": _build_multimodal_content(text_str, outbound_atts)})
                     else:

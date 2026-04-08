@@ -23,6 +23,8 @@ from toolbox.registry import ToolRegistry
 from .ai_step import run_ai_node
 from .context import RunContext
 from .model import resolve_provider
+from .context_store import load_context_snapshot
+
 from .node import Node, load_node
 from .tool_step import result_to_raw, summarize_result, write_artifact
 
@@ -40,6 +42,74 @@ def _collect_downstream_info(workspace_root: Path, node: Node) -> list[dict[str,
             "description": target.description or target.name,
         })
     return result
+
+
+_PSEUDO_TOOL_NAMES = {"finish", "ask", "dispatch_node"}
+
+
+def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """剥离 history 末尾的伪工具调用消息。
+
+    从上下文快照恢复历史时，最后一条 assistant 消息可能是 finish/ask/dispatch_node
+    的伪工具调用（如 'Calling tool: finish({"text": "..."})'）。
+    对 finish：提取 text 参数，替换为正常的 assistant 回复。
+    对 ask/dispatch_node：直接删除。
+    """
+    if not history:
+        return history
+
+    last = history[-1]
+    if last.get("role") != "assistant":
+        return history
+
+    content = last.get("content", "")
+    if not isinstance(content, str):
+        return history
+
+    # 逐行查找伪工具调用
+    lines = content.split("\n")
+    pseudo_idx = -1
+    pseudo_name = ""
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("Calling tool: "):
+            after = stripped[len("Calling tool: "):]
+            paren = after.find("(")
+            if paren > 0 and after[:paren] in _PSEUDO_TOOL_NAMES:
+                pseudo_idx = i
+                pseudo_name = after[:paren]
+                break
+
+    if pseudo_idx < 0:
+        return history
+
+    pre_text = "\n".join(lines[:pseudo_idx]).strip()
+    result = list(history)
+
+    if pseudo_name == "finish":
+        # 提取 finish({"text": "..."}) 中的 text
+        pseudo_line = lines[pseudo_idx].strip()
+        arg_start = pseudo_line.find("(")
+        if arg_start > 0:
+            arg_str = pseudo_line[arg_start + 1:]
+            if arg_str.endswith(")"):
+                arg_str = arg_str[:-1]
+            try:
+                args = json.loads(arg_str)
+                finish_text = str(args.get("text", "")).strip()
+                if finish_text:
+                    combined = f"{pre_text}\n\n{finish_text}".strip() if pre_text else finish_text
+                    result[-1] = {"role": "assistant", "content": combined}
+                    return result
+            except Exception:
+                pass
+
+    # ask/dispatch_node 或解析失败：保留 pre_text 或删除整条
+    if pre_text:
+        result[-1] = {"role": "assistant", "content": pre_text}
+        return result
+    return result[:-1]
+
 
 async def _fetch_history(rctx: RunContext, limit: int = 40) -> list[dict[str, Any]]:
     try:
@@ -206,7 +276,23 @@ async def _run_node_task(
     history = []
     context_ref = str(input_data.get("context_ref") or "").strip()
     use_context = bool(input_data.get("use_context", True))
-    if not context_ref and use_context:
+    resume_data_raw = input_data.get("resume_data") if isinstance(input_data.get("resume_data"), dict) else None
+    is_resume = bool(resume_data_raw)
+
+    if context_ref and not is_resume:
+        # 有上一轮 context_ref 但不是 resume：从快照提取非系统消息作为 enriched history，
+        # 清空 context_ref 让 ai_step 重建新的系统提示词。
+        snapshot = load_context_snapshot(ws_root, context_ref)
+        if snapshot and isinstance(snapshot.get("messages"), list):
+            history = [m for m in snapshot["messages"] if m.get("role") != "system"]
+            # 剥离尾部的伪工具调用（finish/ask/dispatch_node），
+            # 改为提取 finish/ask 的 text 作为正常 assistant 回复。
+            history = _strip_trailing_pseudo_call(history)
+        elif use_context:
+            # 快照加载失败，降级为 session_messages
+            history = await _fetch_history(rctx)
+        context_ref = ""  # 让 ai_step 走 else 分支重建系统提示词
+    elif not context_ref and use_context:
         history = await _fetch_history(rctx)
 
     ds_info = _collect_downstream_info(ws_root, node)
@@ -233,7 +319,7 @@ async def _run_node_task(
         rctx=rctx, provider=provider, registry=registry, node=node,
         instruction=str(input_data.get("instruction") or "").strip(),
         history=history, run_id=task_id, context_ref=context_ref,
-        resume_data=input_data.get("resume_data") if isinstance(input_data.get("resume_data"), dict) else None,
+        resume_data=resume_data_raw,
         downstream_info=ds_info,
         streaming=bool(node.id == entry_node_id and get_bool(runtime_cfg, "engine.streaming", False)),
         attachments=input_attachments,

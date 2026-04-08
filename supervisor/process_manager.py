@@ -3,7 +3,6 @@ from __future__ import annotations
 import atexit
 import os
 import signal
-import shutil
 import subprocess
 import sys
 import time
@@ -187,43 +186,12 @@ class ProcessManager:
         module = "shell.tui" if shell_mode == "tui" else "shell.cli"
         name = "shell-tui" if shell_mode == "tui" else "shell-cli"
 
-        # Windows TUI 需要在支持 VT100 的终端中运行
-        if shell_mode == "tui" and sys.platform == "win32" and self.shell_new_console:
-            py = sys.executable
-            tui_cmd = [py, "-m", module, "--supervisor", self.supervisor_url]
-            env = {**os.environ, "CLONOTH_SUPERVISOR_URL": self.supervisor_url}
-
-            wt = shutil.which("wt")
-            if wt:
-                # wt --wait：阻塞到标签页关闭，popen.wait() 可正确追踪
-                cmd = [wt, "--wait", "--"] + tui_cmd
-                creationflags = 0
-            else:
-                # 优先用 powershell，Unicode/emoji 支持远好于 cmd.exe
-                pwsh = shutil.which("pwsh") or shutil.which("powershell")
-                if pwsh:
-                    cmd_str = subprocess.list2cmdline(tui_cmd)
-                    cmd = [pwsh, "-NoProfile", "-Command", cmd_str]
-                else:
-                    cmd_str = subprocess.list2cmdline(tui_cmd)
-                    cmd = ["cmd", "/c", cmd_str]
-                creationflags = subprocess.CREATE_NEW_CONSOLE
-
-            p = subprocess.Popen(
-                cmd,
-                cwd=str(self.workspace_root),
-                env=env,
-                creationflags=creationflags,
-            )
-            self._log(f"[process_manager] spawned {name} pid={p.pid}")
-            self.shell_cli = ManagedProcess(name=name, popen=p, log_path=None)
-        else:
-            self.shell_cli = self._spawn(
-                name=name,
-                module=module,
-                capture_output=False,
-                new_console=self.shell_new_console,
-            )
+        self.shell_cli = self._spawn(
+            name=name,
+            module=module,
+            capture_output=False,
+            new_console=self.shell_new_console,
+        )
 
     def stop_engine(self) -> None:
         for proc in list(self.engines):

@@ -92,6 +92,8 @@ class TaskRouterMixin:
 
         # ---- AI 节点委派 ----
         if not created_child_ids:
+            # 查找目标节点上一轮的 context_ref，使对话上下文（含工具调用）跨轮次连续
+            child_ctx_ref = self._find_last_context_ref_locked(task.session_id, target)
             child = self._create_task_locked(
                 session_id=task.session_id,
                 session_generation=task.session_generation,
@@ -99,6 +101,7 @@ class TaskRouterMixin:
                 node_id=target,
                 input_data={
                     "instruction": str(dispatch_input.get("instruction") or "").strip(),
+                    "context_ref": child_ctx_ref,
                 },
                 continuation={},
                 source_inbound_seq=task.source_inbound_seq,

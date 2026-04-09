@@ -420,6 +420,57 @@ class ToolRegistry:
                 {"type": "object", "properties": {}, "required": []},
                 _builtins.cancel_active_tasks,
             ),
+            (
+                "save_memory",
+                "Save or update a memory entry in a book. "
+                "Use this when you learn something worth remembering across conversations: "
+                "user preferences, corrections, project context, external resource pointers, "
+                "or character profiles in group chat.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Unique entry id (e.g. user_zhangsan, rule_no_mock)."},
+                        "book": {"type": "string", "description": "Book name (file grouping). Default 'default'. Use e.g. 'people' for character profiles, 'rules' for behavioral rules."},
+                        "content": {"type": "string", "description": "Memory content text."},
+                        "keywords": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Activation keywords. Supports /regex/flags. When any keyword matches user input, this memory is injected into context.",
+                        },
+                        "constant": {"type": "boolean", "description": "If true, always injected regardless of keywords. Default false."},
+                        "enabled": {"type": "boolean", "description": "Whether this entry is active. Default true."},
+                        "priority": {"type": "integer", "description": "Budget priority; higher = kept first when budget exceeded."},
+                        "scan_depth": {"type": "integer", "description": "Number of recent conversation rounds to scan for keywords. 0 = current message only."},
+                    },
+                    "required": ["id", "content"],
+                },
+                _builtins.save_memory,
+            ),
+            (
+                "list_memories",
+                "List memory entries, optionally filtered by book name.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "book": {"type": "string", "description": "Filter by book name. Omit to list all."},
+                    },
+                    "required": [],
+                },
+                _builtins.list_memories,
+            ),
+            (
+                "delete_memory",
+                "Delete a memory entry from a book.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string", "description": "Memory entry id to delete."},
+                        "book": {"type": "string", "description": "Book name. Default 'default'."},
+                    },
+                    "required": ["id"],
+                },
+                _builtins.delete_memory,
+            ),
         ]
 
         for name, desc, schema, func in builtins:

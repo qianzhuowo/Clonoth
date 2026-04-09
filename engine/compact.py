@@ -151,26 +151,40 @@ async def compact_messages(
     *,
     keep_recent: int = 6,
 ) -> list[dict[str, Any]]:
-    """Compress *messages*.  Keep system prompt + last *keep_recent*;
-    summarize everything in between.
+    """Compress *messages*.  Keep system prompts + last *keep_recent*
+    user/assistant messages; summarize everything in between.
+
+    New layout aware: dynamic system messages may appear after history
+    (between the old conversation and the recent messages).  They are
+    extracted from the body and preserved — only user/assistant messages
+    are subject to compression.
 
     On summary failure the original list is returned unchanged.
     """
     if len(messages) <= keep_recent + 2:
         return messages
 
-    # --- split three segments ---
-    # 收集开头所有 system 消息（可能有多条：静态段 + 动态段）
-    system_msgs: list[dict[str, Any]] = []
+    # --- split segments ---
+    # 1. 收集开头的 system 消息（静态前缀：静态 prompt + 常驻 skills/memory）
+    prefix_systems: list[dict[str, Any]] = []
     body = list(messages)
     while body and body[0].get("role") == "system":
-        system_msgs.append(body.pop(0))
+        prefix_systems.append(body.pop(0))
 
-    if len(body) <= keep_recent:
+    # 2. 分离 body 中嵌入的 system 消息（动态 prompt/skills/memory）与对话消息
+    conversation: list[dict[str, Any]] = []
+    inner_systems: list[dict[str, Any]] = []
+    for msg in body:
+        if msg.get("role") == "system":
+            inner_systems.append(msg)
+        else:
+            conversation.append(msg)
+
+    if len(conversation) <= keep_recent:
         return messages
 
-    to_compress = body[:-keep_recent]
-    to_keep = body[-keep_recent:]
+    to_compress = conversation[:-keep_recent]
+    to_keep = conversation[-keep_recent:]
 
     conversation_text = _format_messages_for_summary(to_compress)
     if not conversation_text.strip():
@@ -193,9 +207,9 @@ async def compact_messages(
     }
 
     result: list[dict[str, Any]] = []
-    if system_msgs:
-        result.extend(system_msgs)
+    result.extend(prefix_systems)
     result.append(summary_msg)
+    result.extend(inner_systems)
     result.extend(to_keep)
 
     logger.info(

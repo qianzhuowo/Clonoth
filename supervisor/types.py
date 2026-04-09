@@ -101,6 +101,8 @@ class Task(BaseModel):
     continuation: dict[str, Any] = Field(default_factory=dict)
     source_inbound_seq: int | None = None
     caller_task_id: str | None = None
+    batch_id: str | None = None
+    batch_index: int = 0
     waiting_for_task_id: str | None = None
     status: TaskStatus = TaskStatus.pending
     cancel_requested: bool = False
@@ -174,6 +176,7 @@ class RestartOut(BaseModel):
 class HealthOut(BaseModel):
     status: Literal["ok"] = "ok"
     run_id: str
+    workspace_root: str = ""
     started_at: datetime
     uptime_seconds: float
 

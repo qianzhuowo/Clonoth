@@ -66,6 +66,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._inbound_leases: dict[int, _InboundLease] = {}
 
         self._cancelled_sessions: set[str] = set()
+        self._memory_extract_msg_counts: dict[str, int] = {}
         self._tools_reload_seq: int = 0
 
         self.rebuild_from_events(eventlog.events)

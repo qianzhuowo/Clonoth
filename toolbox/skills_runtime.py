@@ -167,6 +167,13 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
             if isinstance(meta.get("scan_depth"), (int, float)):
                 scan_depth = max(0, int(meta["scan_depth"]))
 
+            raw_node_ids = meta.get("node_ids")
+            node_ids: list[str] = []
+            if isinstance(raw_node_ids, list):
+                node_ids = [str(n).strip() for n in raw_node_ids if isinstance(n, str) and str(n).strip()]
+            elif isinstance(raw_node_ids, str) and raw_node_ids.strip():
+                node_ids = [raw_node_ids.strip()]
+
             items.append({
                 "name": name,
                 "description": description,
@@ -179,6 +186,7 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
                 "priority": priority,
                 "scan_depth": scan_depth,
                 "body": body.strip(),
+                "node_ids": node_ids,
             })
         except Exception:
             continue
@@ -241,33 +249,38 @@ def _build_scan_text(
 def build_skill_messages(
     workspace_root: Path,
     *,
+    node_id: str = "",
     instruction_text: str = "",
     history: list[dict[str, Any]] | None = None,
     skill_mode: str = "all",
     skill_allow: list[str] | None = None,
     max_budget_chars: int = 0,
-) -> list[dict[str, str]]:
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Build system messages for skill injection.
 
-    Returns a list of ``{"role": "system", "content": "..."}`` dicts
-    arranged for prompt-cache friendliness:
+    Returns ``(static_msgs, dynamic_msgs)`` tuple for prompt-cache
+    optimisation.  The caller should place *static_msgs* in the stable
+    prefix (before history) and *dynamic_msgs* after history so that
+    the prefix remains identical across turns.
 
-    * ``[0]`` — constant skills block (stable across turns)
-    * ``[1]`` — dynamic skills + discovery index (may vary per turn)
-
-    Either or both may be absent when there is nothing to inject.
+    * *static_msgs*  — constant skills block (stable across turns)
+    * *dynamic_msgs* — active (keyword-matched) skills + discovery index
     """
     catalog = load_skill_catalog(workspace_root)
 
     # --- filter by enabled + node-level access --------------------------
     skills = [s for s in catalog if s.get("enabled", True)]
+    # --- filter by skill-level node_ids (skill declares which nodes can see it)
+    if node_id:
+        skills = [s for s in skills if not s.get("node_ids") or node_id in s["node_ids"]]
+
     if skill_mode == "none":
-        return []
+        return [], []
     if skill_mode == "allowlist" and skill_allow is not None:
         allow_set = set(skill_allow)
         skills = [s for s in skills if s.get("name") in allow_set]
     if not skills:
-        return []
+        return [], []
 
     # --- classify -------------------------------------------------------
     constant_skills: list[dict[str, Any]] = []
@@ -327,7 +340,8 @@ def build_skill_messages(
         dynamic_skills = kept_dynamic
 
     # --- build messages -------------------------------------------------
-    messages: list[dict[str, str]] = []
+    static_msgs: list[dict[str, str]] = []
+    dynamic_msgs: list[dict[str, str]] = []
 
     # constant block
     if constant_skills:
@@ -336,7 +350,7 @@ def build_skill_messages(
             parts.append(f"\n## Skill: {s['name']}\n")
             parts.append(s.get("body") or "")
         parts.append("\n[/SKILLS:CONSTANT]")
-        messages.append({"role": "system", "content": "\n".join(parts)})
+        static_msgs.append({"role": "system", "content": "\n".join(parts)})
 
     # dynamic + index block
     dynamic_parts: list[str] = []
@@ -361,6 +375,6 @@ def build_skill_messages(
         dynamic_parts.append("[/SKILLS:INDEX]")
 
     if dynamic_parts:
-        messages.append({"role": "system", "content": "\n".join(dynamic_parts)})
+        dynamic_msgs.append({"role": "system", "content": "\n".join(dynamic_parts)})
 
-    return messages
+    return static_msgs, dynamic_msgs

@@ -104,13 +104,14 @@ def test_turn1_fresh_build() -> dict[str, Any]:
     print(f"  system prompt: {len(prompt_text)} chars, {len(system_msgs)} msg(s)")
 
     # 2. Skill 注入（orchestrator 的 skills.mode=none，应该为空）
-    skill_msgs = build_skill_messages(
+    skill_static, skill_dynamic = build_skill_messages(
         WORKSPACE,
         instruction_text=instruction,
         history=[],
         skill_mode=node.skill_access.mode,
         skill_allow=node.skill_access.allow,
     )
+    skill_msgs = skill_static + skill_dynamic
     assert skill_msgs == [], f"orchestrator skills.mode=none，应返回空，实际 {len(skill_msgs)} 条"
     print("  skill injection: 0 (mode=none, correct)")
 
@@ -457,13 +458,14 @@ def test_executor_skills() -> None:
     assert node is not None
 
     # 根据实际 skills/ 目录是否有文件来判断
-    skill_msgs = build_skill_messages(
+    skill_static, skill_dynamic = build_skill_messages(
         WORKSPACE,
         instruction_text="读取文件",
         history=[],
         skill_mode=node.skill_access.mode,
         skill_allow=node.skill_access.allow,
     )
+    skill_msgs = skill_static + skill_dynamic
     # 如果 skills/ 下没有文件，返回空也是正确的
     skills_dir = WORKSPACE / "skills"
     has_skills = skills_dir.exists() and any(skills_dir.glob("*/SKILL.md"))

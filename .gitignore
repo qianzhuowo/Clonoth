@@ -20,5 +20,7 @@ pip-wheel-metadata/
 /data/artifacts/
 /data/upgrade_pending.json
 /data/node_contexts/
+/data/memory/
 
 .limcode/
+secret_skills/

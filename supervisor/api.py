@@ -65,7 +65,11 @@ def create_app(
     async def health() -> HealthOut:
         st: SupervisorState = app.state.state
         uptime = (_now() - st.started_at).total_seconds()
-        return HealthOut(run_id=st.eventlog.run_id, started_at=st.started_at, uptime_seconds=uptime)
+        return HealthOut(
+            run_id=st.eventlog.run_id, started_at=st.started_at,
+            uptime_seconds=uptime,
+            workspace_root=str(st.workspace_root),
+        )
 
     @app.get("/v1/config", response_model=AppConfigPublic)
     async def get_config() -> AppConfigPublic:

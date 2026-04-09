@@ -7,6 +7,7 @@ import sys
 import json
 import urllib.request
 import urllib.error
+import os
 
 SPEC = {
     "name": "discord_manage",
@@ -20,20 +21,8 @@ SPEC = {
         "代码以 async 函数体的方式执行，可以直接使用 await。\n"
         "用 return 返回结果（dict/list/str/int 均可）。\n"
         "最大执行时间 60 秒。\n\n"
-        "示例 1 - 禁言用户 60 秒：\n"
-        "  guild = client.get_guild(123456)\n"
-        "  member = guild.get_member(789012)\n"
-        "  until = discord.utils.utcnow() + datetime.timedelta(seconds=60)\n"
-        "  await member.timeout(until, reason='违规发言')\n"
-        "  return {'done': True}\n\n"
-        "示例 2 - 封禁用户并在指定频道公示：\n"
-        "  guild = client.get_guild(123456)\n"
-        "  member = guild.get_member(789012)\n"
-        "  await guild.ban(member, reason='严重违规')\n"
-        "  ch = client.get_channel(111222)\n"
-        "  await ch.send(f'{member.display_name} 已被封禁，原因：严重违规')\n"
-        "  return {'banned': True, 'announced': True}\n\n"
-        "示例 3 - 查询服务器信息：\n"
+        "port 参数指定目标 Bot 的 Bridge Server 端口号。\n\n"
+        "示例 - 查询服务器信息：\n"
         "  guilds = [{'id': g.id, 'name': g.name} for g in client.guilds]\n"
         "  return guilds"
     ),
@@ -43,15 +32,19 @@ SPEC = {
             "code": {
                 "type": "string",
                 "description": "要执行的 Python 代码（async 函数体，可直接 await，用 return 返回结果）"
+            },
+            "port": {
+                "type": "integer",
+                "description": "目标 Bot 的 Bridge Server 端口号"
             }
         },
-        "required": ["code"]
+        "required": ["code", "port"]
     }
 }
 
 TIMEOUT_SEC = 65
 
-BRIDGE_URL = "http://127.0.0.1:8766/discord"
+BRIDGE_HOST = os.environ.get("DISCORD_BRIDGE_HOST", "127.0.0.1")
 
 
 def output(result):
@@ -74,10 +67,15 @@ if __name__ == "__main__":
     if not code:
         fail("缺少 code 参数")
 
+    port = args.get("port")
+    if not port:
+        fail("缺少 port 参数")
+
+    url = f"http://{BRIDGE_HOST}:{port}/discord"
     payload = json.dumps({"code": code}, ensure_ascii=False).encode("utf-8")
 
     req = urllib.request.Request(
-        BRIDGE_URL,
+        url,
         data=payload,
         headers={"Content-Type": "application/json"},
         method="POST"

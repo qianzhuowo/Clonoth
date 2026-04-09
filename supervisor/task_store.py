@@ -90,6 +90,8 @@ class TaskStoreMixin:
             continuation=dict(continuation or {}),
             source_inbound_seq=source_inbound_seq,
             caller_task_id=caller_task_id,
+            batch_id=batch_id,
+            batch_index=batch_index,
             status=TaskStatus.pending,
             cancel_requested=False,
             worker_id=None,

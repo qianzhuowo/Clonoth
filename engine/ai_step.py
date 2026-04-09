@@ -10,6 +10,7 @@ from typing import Any, TYPE_CHECKING
 from toolbox.registry import ToolRegistry
 from toolbox.skills_runtime import build_skill_messages
 from providers.openai import OpenAIProvider
+from .memory import build_memory_messages
 
 from .context_store import load_context_snapshot, save_context_snapshot, write_context_snapshot
 from .attachments import build_multimodal_content, prepare_messages_for_llm
@@ -36,7 +37,7 @@ if TYPE_CHECKING:
 #  v3 伪工具名称
 # ---------------------------------------------------------------------------
 
-_PSEUDO_TOOL_NAMES = frozenset({"dispatch_node", "finish", "ask"})
+_PSEUDO_TOOL_NAMES = frozenset({"dispatch_node", "dispatch_nodes", "finish", "ask"})
 
 # ---------------------------------------------------------------------------
 #  LLM 调用重试：可重试状态码
@@ -102,18 +103,72 @@ def _dispatch_node_spec(targets: list[str], downstream_info: list[dict[str, str]
         },
     }
 
+def _dispatch_nodes_spec(targets: list[str], downstream_info: list[dict[str, str]] | None = None) -> dict:
+    """构建 dispatch_nodes 伪工具定义——并行委派多个节点实例。"""
+    desc_parts = [
+        "将任务并行委派给多个节点实例。所有子任务同时执行，全部完成后结果一起返回给你。",
+        "",
+        "使用场景：",
+        "- 需要对大量数据分段处理（每段交给一个独立实例）",
+        "- 需要多个独立子任务并行执行以提高效率",
+        "- 同一个 target 可以出现多次，每次创建该角色的一个新实例",
+    ]
+    if downstream_info:
+        desc_parts.append("")
+        desc_parts.append("可用目标节点：")
+        for info in downstream_info:
+            desc_parts.append(f"- {info.get('name', info['id'])}（{info['id']}）：{info.get('description', '')}")
+    return {
+        "type": "function",
+        "function": {
+            "name": "dispatch_nodes",
+            "description": "\n".join(desc_parts),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "target": {
+                                    "type": "string",
+                                    "enum": targets,
+                                    "description": "目标节点 ID。",
+                                },
+                                "instruction": {
+                                    "type": "string",
+                                    "description": "给该实例的清晰、具体、可执行的指令。",
+                                },
+                            },
+                            "required": ["target", "instruction"],
+                        },
+                        "description": "并行子任务列表。同一 target 可多次出现，每次创建独立实例。",
+                    },
+                },
+                "required": ["tasks"],
+            },
+        },
+    }
 
 def _finish_spec() -> dict:
-    """构建 finish 伪工具定义。"""
+    """Build the finish pseudo-tool spec."""
     return {
         "type": "function",
         "function": {
             "name": "finish",
             "description": (
-                "完成当前任务，向调用方提交结果。\n\n"
-                "- text：最终结果文本，面向调用方或用户的回答。\n"
-                "- summary：简要摘要（可选），用于上游节点快速了解结果。\n"
-                "- 不要在 text 中包含内部协议标记或调试信息。"
+                "Submit the final result and terminate this node immediately.\n\n"
+                "CRITICAL: Once you call finish, the node exits. No further tool calls "
+                "will be executed — not in this turn, not after. If you still have tools "
+                "to call, call them FIRST, then finish in a later turn.\n\n"
+                "Parameters:\n"
+                "- text: The final result text. Must describe what HAS BEEN done, "
+                "not what is being done or will be done. Never use phrases like "
+                "'working on it', 'please wait', 'in progress'.\n"
+                "- summary: Brief summary (optional) for the upstream node.\n"
+                "- attachment_paths: File paths to attach (optional).\n\n"
+                "Do not include internal protocol markers or debug info in text."
             ),
             "parameters": {
                 "type": "object",
@@ -346,6 +401,46 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
             return msgs
         return []
 
+    # v3: batch_results（统一批量返回，node 和 tool 共用）
+    if rtype == "batch_results":
+        entries = resume_data.get("entries")
+        if isinstance(entries, list) and entries:
+            msgs: list[dict[str, Any]] = []
+            all_atts: list[dict[str, Any]] = []
+            for e in entries:
+                _kind = str(e.get("kind") or "node")
+                _status = str(e.get("status") or "")
+
+                if _kind == "tool":
+                    _name = e.get("name", "unknown")
+                    _raw = e.get("raw_inline", "")
+                    if _status == "fail":
+                        msgs.append({"role": "user", "content": f'Tool "{_name}" 执行失败：{e.get("error", "")}'})    
+                    else:
+                        msgs.append({"role": "user", "content": f'Tool result for "{_name}":\n{_raw}'})
+                else:
+                    _node = str(e.get("node_id") or "unknown")
+                    _instr = str(e.get("instruction") or "")
+                    _text = str(e.get("text") or "")
+                    _summary = str(e.get("summary") or "")
+                    if _status == "fail":
+                        msgs.append({"role": "user", "content": f"子节点 {_node} 执行失败：{e.get('error', '')}"})    
+                    else:
+                        lines = [f"子节点 {_node}（指令：{_instr[:100]}）已完成。"]
+                        if _summary:
+                            lines.append(f"摘要：{_summary}")
+                        if _text:
+                            lines.append(f"结果：\n{_text}")
+                        msgs.append({"role": "user", "content": "\n".join(lines)})
+
+                atts = e.get("attachments")
+                if isinstance(atts, list):
+                    all_atts.extend(atts)
+            if all_atts:
+                msgs.append({"role": "user", "content": build_multimodal_content("批量执行产生了以下图片结果：", all_atts)})
+            return msgs
+        return []
+
     return []
 
 
@@ -388,6 +483,7 @@ async def run_ai_node(
 
     # ---- 收集附件 ----
     collected_attachments: list[dict[str, Any]] = []
+    _tool_produced_attachments: list[dict[str, Any]] = []  # 仅工具产出的，不含用户输入的
     if attachments:
         collected_attachments.extend(attachments)
     if resume_data and isinstance(resume_data, dict):
@@ -418,18 +514,48 @@ async def run_ai_node(
         }
         system_prompt = assemble_prompt(rctx.workspace_root, node, variables=prompt_vars)
         skill_budget = get_int(runtime_cfg, "skills.max_budget_chars", 0, min_value=0)
-        skill_msgs = build_skill_messages(
+        skill_static, skill_dynamic = build_skill_messages(
             rctx.workspace_root,
+            node_id=node.id,
             instruction_text=instruction,
             history=history,
             skill_mode=node.skill_access.mode,
             skill_allow=node.skill_access.allow,
             max_budget_chars=skill_budget,
         )
-        # system_prompt 现在是 list[dict]（多条 system 消息）
-        messages: list[dict[str, Any]] = list(system_prompt)
-        messages.extend(skill_msgs)
+        memory_static, memory_dynamic = build_memory_messages(
+            rctx.workspace_root,
+            instruction_text=instruction,
+            history=history,
+            max_budget_chars=get_int(
+                runtime_cfg, "memory.max_budget_chars", 0, min_value=0,
+            ),
+        )
+
+        # ---- 按 prompt cache 友好顺序拼接 ----
+        # 前缀（跨 turn 稳定，利于前缀缓存命中）:
+        #   static system prompt → constant skills → constant memory
+        # 中段（追加式增长，已有前缀跨 turn 不变）:
+        #   history
+        # 后缀（每 turn 可能变化）:
+        #   dynamic system prompt → dynamic skills/memory → instruction
+        messages: list[dict[str, Any]] = []
+
+        # --- 稳定前缀 ---
+        if system_prompt:
+            messages.append(system_prompt[0])  # static part
+        messages.extend(skill_static)
+        messages.extend(memory_static)
+
+        # --- 历史记录 ---
         messages.extend(history)
+
+        # --- 动态后缀 ---
+        if len(system_prompt) >= 2:
+            messages.append(system_prompt[1])  # dynamic part
+        messages.extend(skill_dynamic)
+        messages.extend(memory_dynamic)
+
         # 检查 history 末尾是否已包含当前 instruction（避免重复）
         _last = history[-1] if history else None
         _last_content = _last.get("content", "") if isinstance(_last, dict) else ""
@@ -458,6 +584,7 @@ async def run_ai_node(
     delegate_targets = list(node.delegate_targets)
     if delegate_targets:
         openai_tools.append(_dispatch_node_spec(delegate_targets, downstream_info))
+        openai_tools.append(_dispatch_nodes_spec(delegate_targets, downstream_info))
 
     # 伪工具：完成 + 提问（所有节点均可用）
     openai_tools.append(_finish_spec())
@@ -476,6 +603,9 @@ async def run_ai_node(
     _retry_initial_delay = get_float(runtime_cfg, "engine.retry.initial_delay_sec", 1.0, min_value=0.1, max_value=60.0)
     _retry_max_delay = get_float(runtime_cfg, "engine.retry.max_delay_sec", 30.0, min_value=1.0, max_value=300.0)
     _retry_backoff = get_float(runtime_cfg, "engine.retry.backoff_multiplier", 2.0, min_value=1.0, max_value=10.0)
+    _plaintext_retry_count = 0
+    _plaintext_retry_max = get_int(runtime_cfg, "engine.plaintext_retry_max", 2, min_value=0, max_value=10)
+
 
     # ---- 推理循环 ----
     for step in range(step_count, max_steps):
@@ -578,8 +708,14 @@ async def run_ai_node(
                 _last_prompt_tokens = resp.usage["prompt_tokens"]
                 _compacted = False  # 有了新的 token 数据，允许重新判定是否需要压缩
 
-            # ---- 重试判定 ----
-            if not resp.ok and _is_retryable_error(resp) and _retry_attempt < _retry_max:
+            # ---- 重试判定（错误重试 / 空回复重试，统一路径） ----
+            _retry_reason = ""
+            if not resp.ok and _is_retryable_error(resp):
+                _retry_reason = resp.error or "unknown"
+            elif resp.ok and not resp.tool_calls and not (resp.text or "").strip():
+                _retry_reason = "empty_response"
+
+            if _retry_reason and _retry_attempt < _retry_max:
                 _retry_attempt += 1
                 _delay = min(
                     _retry_initial_delay * (_retry_backoff ** (_retry_attempt - 1)),
@@ -591,10 +727,9 @@ async def run_ai_node(
                     "attempt": _retry_attempt,
                     "max_retries": _retry_max,
                     "delay_sec": round(_delay, 2),
-                    "error": resp.error or "unknown",
+                    "error": _retry_reason,
                     "status_code": resp.status_code,
                 })
-                # 退避等待，期间检查取消
                 _waited = 0.0
                 while _waited < _delay:
                     _sleep_step = min(0.5, _delay - _waited)
@@ -608,7 +743,8 @@ async def run_ai_node(
                 resp = None
                 continue  # 重试
 
-            break  # 成功或不可重试的错误，退出重试循环
+            break  # 成功或不可重试，退出重试循环
+
 
         # ---- LLM 调用失败（重试耗尽） ----
         if not resp.ok:
@@ -671,10 +807,32 @@ async def run_ai_node(
                         summary=f"dispatch → {target}",
                     )
 
+                if pseudo_call.name == "dispatch_nodes":
+                    tasks_list = args.get("tasks")
+                    if isinstance(tasks_list, list) and tasks_list:
+                        batch_items = []
+                        for t in tasks_list:
+                            batch_items.append({
+                                "kind": "node",
+                                "target": str(t.get("target") or "").strip(),
+                                "instruction": str(t.get("instruction") or "").strip(),
+                            })
+                        targets_str = ", ".join(c["target"] for c in batch_items)
+                        return TaskAction(
+                            action=ACTION_DISPATCH, node_id=node.id,
+                            dispatch_batch=batch_items,
+                            context_ref=ctx_ref,
+                            summary=f"dispatch_nodes → [{targets_str}]",
+                        )
+
                 if pseudo_call.name == "finish":
                     summary_text = str(args.get("summary") or "").strip()
                     result_text = str(args.get("text") or "").strip()
-                    final_atts = _select_attachments(collected_attachments, args.get("attachment_paths"))
+                    _selected_paths = args.get("attachment_paths")
+                    if isinstance(_selected_paths, list) and _selected_paths:
+                        final_atts = _select_attachments(collected_attachments, _selected_paths)
+                    else:
+                        final_atts = list(_tool_produced_attachments)  # 不含用户输入的附件
                     return TaskAction(
                         action=ACTION_FINISH, node_id=node.id,
                         result={
@@ -754,6 +912,7 @@ async def run_ai_node(
                     if isinstance(_t_result, dict) and isinstance(_t_result.get("attachments"), list):
                         _tool_atts.extend(_t_result["attachments"])
                         collected_attachments.extend(_t_result["attachments"])
+                        _tool_produced_attachments.extend(_t_result["attachments"])
 
                     await rctx.emit_event("handoff_progress", {
                         "message": f"[{node.id}] {_t_name}: {_t_summary}",
@@ -777,20 +936,36 @@ async def run_ai_node(
                 continue  # 工具结果已追加，回到循环顶部进行下一轮 LLM 调用
 
 
-        # ---- 纯文本输出 → 返回结果 ----
+        # ---- 纯文本输出 → 要求使用 finish 提交 ----
         text = (resp.text or "").strip()
         if text:
-            ctx_ref = _persist_node_context(
-                rctx.workspace_root, rctx.session_id,
-                rctx.task_id or run_id or node.id, node.id, messages,
-                step_count=step + 1, context_ref=context_ref,
-            )
-            return TaskAction(
-                action=ACTION_FINISH, node_id=node.id,
-                result={"text": text, "attachments": collected_attachments},
-                context_ref=ctx_ref,
-                summary=_short(text, 240),
-            )
+            _plaintext_retry_count += 1
+            if _plaintext_retry_count <= _plaintext_retry_max:
+                # LLM 返回纯文本而非调用 finish，追加提示要求它用 finish 提交。
+                # 同时解决 LLM 在文本中幻觉工具调用（如 "Calling tool: xxx"）的问题。
+                messages.append({"role": "assistant", "content": text})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "请使用 finish 工具提交你的最终回复，不要直接输出纯文本。"
+                        "将你要回复的内容放在 finish 的 text 参数中。"
+                    ),
+                })
+                use_stream = streaming
+                continue  # 回到推理循环顶部
+            else:
+                # 纯文本重试次数耗尽，回退为直接以纯文本作为结果返回
+                ctx_ref = _persist_node_context(
+                    rctx.workspace_root, rctx.session_id,
+                    rctx.task_id or run_id or node.id, node.id, messages,
+                    step_count=step + 1, context_ref=context_ref,
+                )
+                return TaskAction(
+                    action=ACTION_FINISH, node_id=node.id,
+                    result={"text": text, "attachments": collected_attachments},
+                    context_ref=ctx_ref,
+                    summary=_short(text, 240),
+                )
 
     # ---- 达到最大步数 ----
     ctx_ref = _persist_node_context(

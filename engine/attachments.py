@@ -4,16 +4,17 @@ All image data in the system is stored as files under data/attachments/.
 Messages reference images via file:// URLs (e.g. file://data/attachments/xxx/yyy.png).
 Before sending to the LLM provider, file:// refs are resolved to base64 data URLs.
 """
-
 from __future__ import annotations
 
 import base64
-import functools
+import logging
 import mimetypes
 import uuid
 from pathlib import Path
 from typing import Any
 
+
+_logger = logging.getLogger(__name__)
 
 _FILE_SCHEME = "file://"
 _ALLOWED_PREFIX = "data/attachments/"
@@ -33,7 +34,10 @@ _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
 
 def _guess_mime(ext: str) -> str:
-    return _MIME_MAP.get(ext.lower(), "application/octet-stream")
+    """根据扩展名猜测 MIME。未知扩展名兜底为 image/png 而非 octet-stream，
+    因为 LLM API 不接受 application/octet-stream。
+    """
+    return _MIME_MAP.get(ext.lower(), "image/png")
 
 
 def _guess_mime_from_path(path: str) -> str:
@@ -167,8 +171,12 @@ def prepare_messages_for_llm(
                             "type": "image_url",
                             "image_url": {"url": resolved},
                         })
-                        continue
-            new_content.append(part)
+                    else:
+                        # 解析失败（文件不存在等），跳过这个图片，不传给 API。
+                        # 原样传递 file:// URL 会导致 API 报 octet-stream 错误。
+                        _logger.warning("attachment resolve failed, skipping: %s", rel_path)
+                    continue  # 无论成功失败都 continue，不 fallback 到 append(part)
+            new_content.append(part)  # 非 file:// 的 part 原样保留
         new_msg["content"] = new_content
         result.append(new_msg)
 

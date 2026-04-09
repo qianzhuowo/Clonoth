@@ -33,6 +33,7 @@ class TaskAction:
     # dispatch 时填写
     target_node: str = ""  # 委派目标节点 id
     dispatch_input: dict[str, Any] = field(default_factory=dict)
+    dispatch_batch: list[dict[str, Any]] = field(default_factory=list)  # 批量委派 [{kind, target, instruction/arguments, ...}]
 
     # finish / ask 时填写
     result: dict[str, Any] = field(default_factory=dict)
@@ -54,6 +55,8 @@ class TaskAction:
         if self.action == ACTION_DISPATCH:
             d["target_node"] = self.target_node
             d["dispatch_input"] = dict(self.dispatch_input)
+            if self.dispatch_batch:
+                d["dispatch_batch"] = list(self.dispatch_batch)
         elif self.action in (ACTION_FINISH, ACTION_ASK):
             d["result"] = dict(self.result)
         elif self.action == ACTION_FAIL:

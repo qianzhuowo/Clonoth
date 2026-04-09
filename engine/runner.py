@@ -44,7 +44,7 @@ def _collect_downstream_info(workspace_root: Path, node: Node) -> list[dict[str,
     return result
 
 
-_PSEUDO_TOOL_NAMES = {"finish", "ask", "dispatch_node"}
+_PSEUDO_TOOL_NAMES = {"finish", "ask", "dispatch_node", "dispatch_nodes"}
 
 
 def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -295,8 +295,13 @@ async def open_session(workspace_root: Path, client_id: str):
             url = str(spec.get("url") or "").strip()
             if not url:
                 raise RuntimeError("streamable_http client missing url")
+            _hdrs = {str(k): resolve_env_ref(v) for k, v in (spec.get("headers") or {}).items()}
+            _sh_kw: dict[str, Any] = {}
+            if _hdrs:
+                import httpx as _httpx
+                _sh_kw["http_client"] = _httpx.AsyncClient(headers=_hdrs)
             transport_obj = await stack.enter_async_context(
-                streamable_http_client(url, headers={str(k): resolve_env_ref(v) for k, v in (spec.get("headers") or {}).items()})
+                streamable_http_client(url, **_sh_kw)
             )
             if not isinstance(transport_obj, tuple) or len(transport_obj) < 2:
                 raise RuntimeError("invalid streamable HTTP transport object")

@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from ..context import ToolContext
-from .._common import resolve_under_root
+from .._common import resolve_and_classify, guard_external_read
 
 
 # Default directories to ignore
@@ -101,6 +101,24 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     recursive = bool(args.get("recursive", False))
     ignore_dirs = _DEFAULT_IGNORE_DIRS
 
+    # ---- External path approval (batch: check first external hit) ----
+    _external_paths: list[str] = []
+    for _dp in dir_paths:
+        try:
+            _resolved, _is_ext = resolve_and_classify(ctx.workspace_root, _dp)
+            if _is_ext:
+                _external_paths.append(_dp)
+        except ValueError:
+            continue
+
+    if _external_paths:
+        _reason = f"list_dir on external path(s): {', '.join(_external_paths[:5])}"
+        if len(_external_paths) > 5:
+            _reason += f" (+{len(_external_paths) - 5} more)"
+        err = await guard_external_read(ctx, True, _external_paths[0], "list_dir", reason=_reason)
+        if err is not None:
+            return {"ok": False, "success": False, **err, "data": {"results": [], "totalFiles": 0, "totalDirs": 0, "totalPaths": 0}}
+
     # ---- Iterate directories ----
     results: list[dict[str, Any]] = []
     total_files = 0
@@ -108,7 +126,7 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
 
     for dir_path in dir_paths:
         try:
-            p = resolve_under_root(ctx.workspace_root, dir_path)
+            p, _ext = resolve_and_classify(ctx.workspace_root, dir_path)
         except ValueError as exc:
             results.append({
                 "path": dir_path, "success": False, "error": str(exc),

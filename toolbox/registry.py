@@ -237,6 +237,48 @@ class ToolRegistry:
                 _builtins.write_file,
             ),
             (
+                "apply_diff",
+                "Apply sequential search/replace diffs to a file. "
+                "Each diff specifies an exact 'search' string and a 'replace' string. "
+                "The search must match 100% exactly (including whitespace and indentation). "
+                "Multiple diffs are applied in order; each operates on the result of the previous. "
+                "If 'start_line' is omitted and search matches multiple locations, the diff is rejected. "
+                "Policy+approval guarded.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "File path relative to workspace root.",
+                        },
+                        "diffs": {
+                            "type": "array",
+                            "description": "Array of diff objects to apply sequentially.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "search": {
+                                        "type": "string",
+                                        "description": "Exact text to find. Must match 100% including whitespace and indentation.",
+                                    },
+                                    "replace": {
+                                        "type": "string",
+                                        "description": "Replacement text.",
+                                    },
+                                    "start_line": {
+                                        "type": "integer",
+                                        "description": "(Recommended) 1-based line number to start searching from. Required when search matches multiple locations. Note: line numbers refer to content AFTER previous diffs in the array have been applied.",
+                                    },
+                                },
+                                "required": ["search", "replace"],
+                            },
+                        },
+                    },
+                    "required": ["path", "diffs"],
+                },
+                _builtins.apply_diff,
+            ),
+            (
                 "execute_command",
                 "Execute a shell command in workspace root (policy+approval guarded; secrets are stripped from env).",
                 {
@@ -257,6 +299,12 @@ class ToolRegistry:
                     "properties": {
                         "query": {"type": "string"},
                         "path": {"type": "string"},
+                        "mode": {"type": "string", "description": "search (default) or replace", "enum": ["search", "replace"]},
+                        "pattern": {"type": "string", "description": "file glob pattern, e.g. '*.py', '**/*.js'. Default '**/*'"},
+                        "isRegex": {"type": "boolean", "description": "treat query as regex. Default false"},
+                        "maxResults": {"type": "integer", "description": "max matches for search mode. Default 100"},
+                        "replace": {"type": "string", "description": "replacement string for replace mode. Supports $1 $2 capture groups"},
+                        "maxFiles": {"type": "integer", "description": "max files to modify in replace mode. Default 50"},
                     },
                     "required": ["query"],
                 },

@@ -483,12 +483,43 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
 def _select_attachments(
     collected: list[dict[str, Any]],
     selected_paths: Any,
+    workspace_root: "Path | None" = None,
+    session_id: str = "",
 ) -> list[dict[str, Any]]:
-    if isinstance(selected_paths, list) and selected_paths:
-        path_set = {str(p).strip() for p in selected_paths if isinstance(p, str)}
-        selected = [a for a in collected if a.get("path") in path_set]
-        return selected if selected else collected
-    return collected
+    """Select attachments by path from collected, or read from disk as fallback.
+
+    Disk fallback is restricted to paths under workspace_root for security.
+    """
+    if not isinstance(selected_paths, list) or not selected_paths:
+        return collected
+
+    path_set = {str(p).strip() for p in selected_paths if isinstance(p, str) and str(p).strip()}
+    selected = [a for a in collected if a.get("path") in path_set]
+    found_paths = {a.get("path") for a in selected}
+
+    if workspace_root:
+        from .attachments import save_attachment
+        for raw in sorted(path_set - found_paths):
+            if not raw:
+                continue
+            p = Path(raw)
+            if not p.is_absolute():
+                p = workspace_root / p
+            # Security: only allow paths within workspace
+            try:
+                p.resolve().relative_to(workspace_root.resolve())
+            except ValueError:
+                continue
+            if not p.is_file():
+                continue
+            try:
+                data_bytes = p.read_bytes()
+            except Exception:
+                continue
+            att = save_attachment(workspace_root, session_id, data_bytes, filename=p.name)
+            selected.append(att)
+
+    return selected if selected else collected
 
 
 # ---------------------------------------------------------------------------
@@ -898,7 +929,11 @@ async def run_ai_node(
                         result_text = str(args.get("text") or "").strip()
                         _selected_paths = args.get("attachment_paths")
                         if isinstance(_selected_paths, list) and _selected_paths:
-                            final_atts = _select_attachments(collected_attachments, _selected_paths)
+                            final_atts = _select_attachments(
+                                collected_attachments, _selected_paths,
+                                workspace_root=rctx.workspace_root,
+                                session_id=rctx.session_id,
+                            )
                         else:
                             final_atts = list(_tool_produced_attachments)  # 不含用户输入的附件
                         return TaskAction(

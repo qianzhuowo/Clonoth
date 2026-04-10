@@ -26,15 +26,13 @@ if __name__ == "__main__":
     def fail(error): print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False)); sys.exit(1)
     args = _input
     import httpx
-    import shutil
-    from pathlib import Path
-    
+
     channel_id = str(args.get("channel_id", "")).strip()
     if not channel_id:
         fail("channel_id is required")
-    
+
     results = {}
-    
+
     # 1. 清 Bot 端 _channel_history
     try:
         resp = httpx.post(
@@ -46,57 +44,29 @@ if __name__ == "__main__":
         results["bot_history"] = "cleared" if bot_result.get("ok") else f"failed: {bot_result}"
     except Exception as e:
         results["bot_history"] = f"error: {e}"
-    
-    # 2. 查 session_id
+
+    # 2. 调用 supervisor 的 conversation reset API
+    #    这会：移除 conversation_map 映射（下次消息创建新 session）+ 清理 node_contexts
     conversation_key = f"discord:{channel_id}"
-    session_id = None
     try:
-        resp = httpx.get("http://127.0.0.1:8765/v1/health", timeout=5.0)
-        if resp.status_code == 200:
-            workspace_root = resp.json().get("workspace_root", "")
-    except Exception:
-        workspace_root = "/www/wwwroot/Clonoth"
-    
-    # 从 events 查找 session
-    try:
-        resp = httpx.get(
-            "http://127.0.0.1:8765/v1/events",
-            params={"after_seq": 0, "types": "session_created"},
+        resp = httpx.post(
+            "http://127.0.0.1:8765/v1/conversations/reset",
+            json={"conversation_key": conversation_key},
             timeout=10.0,
         )
         if resp.status_code == 200:
-            for ev in resp.json():
-                payload = ev.get("payload") or {}
-                if payload.get("conversation_key") == conversation_key:
-                    session_id = ev.get("session_id")
-    except Exception:
-        pass
-    
-    # 3. 删 Engine context 文件
-    if session_id:
-        ctx_dir = Path(workspace_root) / "data" / "node_contexts" / session_id
-        if ctx_dir.exists() and ctx_dir.is_dir():
-            file_count = len(list(ctx_dir.glob("*.json")))
-            shutil.rmtree(ctx_dir, ignore_errors=True)
-            results["engine_context"] = f"deleted {file_count} files for session {session_id}"
+            data = resp.json()
+            results["session_reset"] = "ok"
+            results["old_session_id"] = data.get("old_session_id", "")
+            results["context_files_cleaned"] = data.get("context_files_cleaned", 0)
         else:
-            results["engine_context"] = f"no context dir for session {session_id}"
-    else:
-        # 尝试直接搜索
-        ctx_base = Path(workspace_root) / "data" / "node_contexts"
-        deleted = 0
-        if ctx_base.exists():
-            for d in ctx_base.iterdir():
-                if d.is_dir():
-                    for f in d.glob("*.json"):
-                        try:
-                            import json
-                            data = json.loads(f.read_text())
-                            # 检查是否包含这个 conversation_key 相关内容
-                        except:
-                            pass
-        results["engine_context"] = f"session_id not found for {conversation_key}, context files may need manual cleanup"
-    
-    results["session_id"] = session_id
+            # 404 = conversation not found (already clean)
+            if resp.status_code == 404:
+                results["session_reset"] = "already clean (no active session)"
+            else:
+                results["session_reset"] = f"failed: {resp.status_code}"
+    except Exception as e:
+        results["session_reset"] = f"error: {e}"
+
     results["conversation_key"] = conversation_key
     output(results)

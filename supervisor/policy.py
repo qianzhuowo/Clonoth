@@ -8,7 +8,7 @@ from typing import Any
 
 import yaml
 
-from clonoth_runtime import load_yaml_dict, parse_extra_roots
+from clonoth_runtime import classify_path, load_yaml_dict, parse_extra_roots
 
 from .types import SafetyLevel
 
@@ -205,26 +205,7 @@ class PolicyEngine:
             self._restart_default = SafetyLevel.approval_required
 
     def _resolve_relpath(self, path_str: str) -> tuple[Path | None, str, bool]:
-        try:
-            raw = Path(path_str)
-            p = raw.resolve() if raw.is_absolute() else (self._root / path_str).resolve()
-        except Exception as e:
-            return None, f"invalid path: {e}", False
-
-        try:
-            rel = p.relative_to(self._root)
-            return p, rel.as_posix(), False
-        except ValueError:
-            pass
-
-        for r in self._extra_roots:
-            try:
-                p.relative_to(r)
-                return p, p.as_posix(), True
-            except ValueError:
-                continue
-
-        return None, "path escapes workspace root", False
+        return classify_path(self._root, self._extra_roots, path_str)
 
     @staticmethod
     def _match_rules(rel: str, rules: list[tuple[str, SafetyLevel, str]], default: SafetyLevel) -> PolicyDecision:
@@ -239,7 +220,7 @@ class PolicyEngine:
         if resolved is None:
             return PolicyDecision(SafetyLevel.deny, rel)
         default = self._read_default
-        if is_external and default == SafetyLevel.auto:
+        if is_external:
             default = SafetyLevel.approval_required
         return self._match_rules(rel, self._read_rules, default)
 
@@ -249,7 +230,7 @@ class PolicyEngine:
         if resolved is None:
             return PolicyDecision(SafetyLevel.deny, rel)
         default = self._write_default
-        if is_external and default == SafetyLevel.auto:
+        if is_external:
             default = SafetyLevel.approval_required
         return self._match_rules(rel, self._write_rules, default)
 

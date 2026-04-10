@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from clonoth_runtime import load_policy_config, parse_extra_roots
+from clonoth_runtime import classify_path, load_policy_config, parse_extra_roots
 
 from .context import ToolContext
 
@@ -68,27 +68,26 @@ def _load_allowed_extra_roots(workspace_root: Path) -> list[Path]:
     )
 
 
-def resolve_under_allowed_roots(workspace_root: Path, path_str: str) -> Path:
-    """Resolve path under workspace_root or policy-configured extra_roots."""
+def resolve_and_classify(workspace_root: Path, path_str: str) -> tuple[Path, bool]:
+    """Resolve path and classify as internal (False) or external (True).
+
+    Returns (resolved_path, is_external).
+    Raises ValueError for invalid or escaping relative paths.
+    """
     extra_roots = _load_allowed_extra_roots(workspace_root)
+    resolved, display, is_external = classify_path(workspace_root, extra_roots, path_str)
+    if resolved is None:
+        raise ValueError(display)
+    return resolved, is_external
 
-    raw = Path(path_str)
-    p = raw.resolve() if raw.is_absolute() else (workspace_root / path_str).resolve()
 
-    try:
-        p.relative_to(workspace_root)
-        return p
-    except ValueError:
-        pass
+def resolve_under_allowed_roots(workspace_root: Path, path_str: str) -> Path:
+    """Resolve path under workspace_root or policy-configured extra_roots.
 
-    for r in extra_roots:
-        try:
-            p.relative_to(r)
-            return p
-        except ValueError:
-            continue
-
-    raise ValueError("path escapes workspace root")
+    Allows untrusted external absolute paths (policy layer enforces approval).
+    """
+    resolved, _is_external = resolve_and_classify(workspace_root, path_str)
+    return resolved
 
 
 # ---------------------------------------------------------------------------
@@ -126,3 +125,27 @@ async def request_guard(
         return op_res, {"ok": False, "error": "task cancelled", "cancelled": True}
 
     return op_res, None
+
+
+async def guard_external_read(
+    ctx: ToolContext,
+    is_external: bool,
+    rel_path: str,
+    tool_name: str,
+    reason: str = "",
+) -> dict[str, Any] | None:
+    """Request approval for external paths. Returns error dict or None (proceed)."""
+    if not is_external:
+        return None
+    _op, err = await request_guard(
+        ctx, "read_file",
+        {"path": rel_path, "tool_name": tool_name,
+         "reason": reason or f"{tool_name} on external path: {rel_path}"},
+    )
+    if err is not None:
+        return {
+            "success": False,
+            "cancelled": err.get("cancelled", False),
+            "error": err.get("error", "denied"),
+        }
+    return None

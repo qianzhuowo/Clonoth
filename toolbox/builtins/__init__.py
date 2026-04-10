@@ -24,6 +24,7 @@ SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 RESERVED_TOOL_NAMES = {
     "list_dir",
     "read_file",
+    "apply_diff",
     "write_file",
     "execute_command",
     "search_in_files",
@@ -63,3 +64,4 @@ from .system import request_restart  # noqa: E402,F401
 from .schedules import create_schedule, list_schedules, delete_schedule  # noqa: E402,F401
 from .tasks import cancel_active_tasks, list_active_tasks  # noqa: E402,F401
 from .memory import save_memory, list_memories, delete_memory  # noqa: E402,F401
+from .apply_diff import apply_diff  # noqa: E402,F401

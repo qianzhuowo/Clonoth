@@ -110,6 +110,29 @@ def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str,
     return result[:-1]
 
 
+def _strip_images_from_content(content: list[dict[str, Any]]) -> str:
+    """Strip image_url parts from multimodal content, return plain text with placeholder.
+
+    Historical images should not be re-sent every turn as base64 (expensive and redundant).
+    Current turn's images are passed separately via the attachments mechanism.
+    """
+    text_parts: list[str] = []
+    had_images = False
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "image_url":
+            had_images = True
+        elif part.get("type") == "text":
+            t = str(part.get("text", "")).strip()
+            if t:
+                text_parts.append(t)
+    text = "\n".join(text_parts)
+    if had_images:
+        text = f"{text}\n[图片附件已省略]" if text else "[图片附件已省略]"
+    return text
+
+
 async def _fetch_history(rctx: RunContext, limit: int = 40) -> list[dict[str, Any]]:
     try:
         r = await rctx.http.get(
@@ -125,7 +148,10 @@ async def _fetch_history(rctx: RunContext, limit: int = 40) -> list[dict[str, An
                         continue
                     content = m.get("content", "")
                     if isinstance(content, list):
-                        result.append({"role": str(m.get("role")), "content": content})
+                        # Strip image_url parts from historical messages to avoid
+                        # re-encoding large base64 images on every turn.
+                        # Current turn's images are passed separately via attachments.
+                        result.append({"role": str(m.get("role")), "content": _strip_images_from_content(content)})
                     else:
                         result.append({"role": str(m.get("role")), "content": str(content)})
                 return result
@@ -164,8 +190,8 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
     poll_sec = get_float(runtime_cfg, "engine.poll_interval_sec", 1.0, min_value=0.1, max_value=60.0)
 
     async with (
-        httpx.AsyncClient(timeout=sup_timeout, trust_env=False) as http,
-        httpx.AsyncClient(timeout=llm_timeout, trust_env=False) as llm_http,
+        httpx.AsyncClient(timeout=sup_timeout, trust_env=False, headers={"User-Agent": "Clonoth"}) as http,
+        httpx.AsyncClient(timeout=llm_timeout, trust_env=False, headers={"User-Agent": "Clonoth"}) as llm_http,
     ):
         await wait_supervisor(http, supervisor_url)
         mcp_count = await registry.load_mcp_tools()

@@ -47,13 +47,23 @@ def _sanitize_mime(mime_type: str) -> str:
 
 
 def _guess_mime(ext: str) -> str:
-    """根据扩展名猜测 MIME。未知扩展名兜底为 image/png 而非 octet-stream，
-    因为 LLM API 不接受 application/octet-stream。
+    """根据扩展名猜测 MIME。
+
+    已知图片扩展名走 _MIME_MAP；其余走 stdlib mimetypes；
+    都猜不出的兜底为 application/octet-stream。
     """
-    return _MIME_MAP.get(ext.lower(), "image/png")
+    lower = ext.lower()
+    if lower in _MIME_MAP:
+        return _MIME_MAP[lower]
+    guessed = mimetypes.guess_type(f"file{lower}")[0]
+    return guessed or "application/octet-stream"
 
 
 def _guess_mime_from_path(path: str) -> str:
+    """根据路径扩展名猜测 MIME。
+
+    仅用于 LLM 图片 base64 编码场景，未知扩展名仍兜底为 image/png。
+    """
     ext = Path(path).suffix.lower()
     return _MIME_MAP.get(ext, "image/png")
 

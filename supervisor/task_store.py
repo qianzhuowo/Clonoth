@@ -143,7 +143,14 @@ class TaskStoreMixin:
         has_attachments = isinstance(payload.get("attachments"), list) and bool(payload.get("attachments"))
         if not text and not has_attachments:
             return None
-        entry_node = str(payload.get("entry_node_id") or "").strip() or self._default_entry_node()
+        # 优先级: session 覆盖（AI switch） > 前端指定 > 全局默认
+        default_node = self._default_entry_node()
+        session_override = self.session_entry_overrides.get(session_id, "").strip()
+        entry_node = (
+            session_override
+            or str(payload.get("entry_node_id") or "").strip()
+            or default_node
+        )
         generation = self._current_session_generation_locked(session_id) or 1
         if not self.session_generations.get(session_id):
             self.session_generations[session_id] = generation
@@ -162,6 +169,7 @@ class TaskStoreMixin:
             input_data={
                 "instruction": text,
                 "context_ref": last_ctx_ref,
+                "switched_from": default_node if session_override else "",
                 "resume_data": {},
                 "use_context": use_context,
                 "active_tasks_summary": active_tasks_summary,

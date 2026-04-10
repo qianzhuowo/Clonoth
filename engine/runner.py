@@ -29,10 +29,10 @@ from .node import Node, load_node
 from .tool_step import result_to_raw, summarize_result, write_artifact
 
 
-def _collect_downstream_info(workspace_root: Path, node: Node) -> list[dict[str, str]]:
-    """收集下游节点基本信息（id/name/description），用于 dispatch_node 工具描述。"""
+def _collect_node_info(workspace_root: Path, node_ids: list[str]) -> list[dict[str, str]]:
+    """收集指定节点的基本信息（id/name/description）。"""
     result: list[dict[str, str]] = []
-    for target_id in (node.delegate_targets or []):
+    for target_id in node_ids:
         target = load_node(workspace_root, target_id)
         if target is None:
             continue
@@ -42,6 +42,29 @@ def _collect_downstream_info(workspace_root: Path, node: Node) -> list[dict[str,
             "description": target.description or target.name,
         })
     return result
+
+
+def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> list[dict[str, str]]:
+    """发现可切换的根节点（不被任何其他节点 delegate_targets 引用的节点），排除当前节点。"""
+    nodes_dir = workspace_root / "config" / "nodes"
+    if not nodes_dir.is_dir():
+        return []
+    all_nodes: list[dict[str, Any]] = []
+    all_targets: set[str] = set()
+    for f in sorted(nodes_dir.iterdir()):
+        if f.suffix not in (".yaml", ".yml") or f.name.startswith("_"):
+            continue
+        n = load_node(workspace_root, f.stem)
+        if n is None or n.type != "ai":
+            continue
+        all_nodes.append({"id": n.id, "name": n.name, "description": n.description or n.name})
+        all_targets.update(n.delegate_targets)
+    # 根节点 = 不被任何节点 delegate 引用的节点
+    roots = [n for n in all_nodes if n["id"] not in all_targets]
+    if not roots:
+        roots = list(all_nodes)
+    # 排除当前节点自己
+    return [n for n in roots if n["id"] != current_node_id]
 
 
 _PSEUDO_TOOL_NAMES = {"finish", "ask", "dispatch_node", "dispatch_nodes", "reply"}
@@ -320,9 +343,10 @@ async def _run_node_task(
     elif not context_ref and use_context:
         history = await _fetch_history(rctx)
 
-    ds_info = _collect_downstream_info(ws_root, node)
+    ds_info = _collect_node_info(ws_root, list(node.delegate_targets))
 
     runtime_cfg = load_runtime_config(ws_root)
+    sw_info = _discover_switchable_nodes(ws_root, node.id)
     entry_node_id = get_str(runtime_cfg, "shell.entry_node_id", "bootstrap.shell_orchestrator").strip()
 
     rp = resolve_provider(ws_root, node, default_model)
@@ -340,12 +364,19 @@ async def _run_node_task(
 
     input_attachments = input_data.get("attachments") if isinstance(input_data.get("attachments"), list) else None
 
+    # 如果是被 switch 过来的节点，在 instruction 前注入提示
+    instruction = str(input_data.get("instruction") or "").strip()
+    switched_from = str(input_data.get("switched_from") or "").strip()
+    if switched_from:
+        instruction = f"[系统提示：你当前是通过节点切换接管此会话的。会话的默认入口节点是 {switched_from}。用户可以要求切回默认节点，你可以使用 switch_node 工具（target 传空字符串）恢复默认。]\n\n{instruction}"
+
     action = await run_ai_node(
         rctx=rctx, provider=provider, registry=registry, node=node,
-        instruction=str(input_data.get("instruction") or "").strip(),
+        instruction=instruction,
         history=history, run_id=task_id, context_ref=context_ref,
         resume_data=resume_data_raw,
         downstream_info=ds_info,
+        switch_info=sw_info,
         streaming=bool(get_bool(runtime_cfg, "engine.streaming", False)),
         attachments=input_attachments,
     )

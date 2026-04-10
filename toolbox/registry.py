@@ -469,6 +469,15 @@ class ToolRegistry:
                 _builtins.cancel_active_tasks,
             ),
             (
+                "get_context_window",
+                "Get current context window token usage for this session. "
+                "Returns actual LLM-reported tokens (if available), character-based estimates, "
+                "compact threshold, and utilization ratio. "
+                "Use this to check how much context budget remains before automatic compaction triggers.",
+                {"type": "object", "properties": {}, "required": []},
+                _builtins.get_context_window,
+            ),
+            (
                 "save_memory",
                 "Save or update a memory entry in a book. "
                 "Use this when you learn something worth remembering across conversations: "

@@ -68,6 +68,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._cancelled_sessions: set[str] = set()
         self._memory_extract_msg_counts: dict[str, int] = {}
         self._tools_reload_seq: int = 0
+        self.session_entry_overrides: dict[str, str] = {}  # session_id -> node_id (AI switch)
+        self._session_context_usage: dict[str, dict[str, Any]] = {}  # session_id -> latest usage
 
         self.rebuild_from_events(eventlog.events)
 
@@ -105,8 +107,66 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 self._apply_task_snapshot(payload)
             elif et == "cancel_requested":
                 self._apply_cancel_requested(session_id, payload)
+            elif et == "node_switch":
+                self._apply_node_switch(session_id, payload)
 
         self._advance_inbound_cursor()
+    # ------------------------------------------------------------------ #
+    #  节点切换
+    # ------------------------------------------------------------------ #
+
+    def _apply_node_switch(self, session_id: str, payload: dict[str, Any]) -> None:
+        target = str(payload.get("target_node_id") or "").strip()
+        if session_id and target:
+            self.session_entry_overrides[session_id] = target
+        elif session_id and not target:
+            self.session_entry_overrides.pop(session_id, None)
+
+    def switch_session_node(self, session_id: str, target_node_id: str) -> dict[str, Any]:
+        """设置或清除 session 级入口节点覆盖。"""
+        sid = (session_id or "").strip()
+        target = (target_node_id or "").strip()
+        if not sid:
+            return {"ok": False, "error": "session_id required"}
+        with self._lock:
+            if sid not in self.sessions:
+                return {"ok": False, "error": "session not found"}
+            default_node = self._default_entry_node()
+            if target and target != default_node:
+                self.session_entry_overrides[sid] = target
+            else:
+                self.session_entry_overrides.pop(sid, None)
+                target = ""  # 清除覆盖
+            self.eventlog.append(
+                session_id=sid,
+                component="engine",
+                type_="node_switch",
+                payload={
+                    "target_node_id": target,
+                    "default_node_id": default_node,
+                    "ts": _now().isoformat(),
+                },
+            )
+            return {
+                "ok": True,
+                "session_id": sid,
+                "target_node_id": target or default_node,
+                "is_override": bool(target),
+            }
+
+    def get_session_active_node(self, session_id: str) -> dict[str, Any]:
+        """获取 session 当前实际使用的入口节点。"""
+        sid = (session_id or "").strip()
+        with self._lock:
+            override = self.session_entry_overrides.get(sid, "").strip()
+            default_node = self._default_entry_node()
+            return {
+                "node_id": override or default_node,
+                "is_override": bool(override),
+                "default_node_id": default_node,
+            }
+
+
 
     # ------------------------------------------------------------------ #
     #  审批

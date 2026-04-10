@@ -270,6 +270,8 @@ def create_app(
             raise HTTPException(status_code=404, detail="session not found")
 
         transient = ev.type in {"stream_delta", "stream_end"}
+        if ev.type == "context_usage":
+            transient = True
         evt = st.eventlog.append(
             session_id=session_id,
             component="shell",
@@ -279,6 +281,8 @@ def create_app(
         )
         if ev.type == "outbound_message":
             st.record_outbound_message_event(evt)
+        if ev.type == "context_usage":
+            st.update_context_usage(session_id, dict(ev.payload or {}))
         return {"ok": True}
 
     @app.get("/v1/sessions/{session_id}/messages")
@@ -335,6 +339,27 @@ def create_app(
         if session_id not in st.sessions:
             raise HTTPException(status_code=404, detail="session not found")
         return st.cancel_active_tasks(session_id, exclude_task_id=exclude_task_id)
+
+    @app.post("/v1/sessions/{session_id}/switch_node")
+    async def session_switch_node(session_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        """AI 或外部调用：设置/清除 session 级入口节点覆盖。"""
+        st: SupervisorState = app.state.state
+        target = str(body.get("target_node_id") or "").strip()
+        return st.switch_session_node(session_id, target)
+
+    @app.get("/v1/sessions/{session_id}/active_node")
+    async def session_active_node(session_id: str) -> dict[str, Any]:
+        """查询 session 当前实际使用的入口节点。"""
+        st: SupervisorState = app.state.state
+        return st.get_session_active_node(session_id)
+
+    @app.get("/v1/sessions/{session_id}/context_window")
+    async def session_context_window(session_id: str) -> dict[str, Any]:
+        """获取 session 当前上下文窗口的 token 用量信息。"""
+        st: SupervisorState = app.state.state
+        if session_id not in st.sessions:
+            raise HTTPException(status_code=404, detail="session not found")
+        return st.get_session_context_usage(session_id)
 
     @app.post("/v1/approvals/request", response_model=Approval)
     async def approval_request(inp: ApprovalRequestIn) -> Approval:

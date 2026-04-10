@@ -37,7 +37,7 @@ if TYPE_CHECKING:
 #  v3 伪工具名称
 # ---------------------------------------------------------------------------
 
-_PSEUDO_TOOL_NAMES = frozenset({"dispatch_node", "dispatch_nodes", "finish", "ask", "reply"})
+_PSEUDO_TOOL_NAMES = frozenset({"dispatch_node", "dispatch_nodes", "finish", "ask", "reply", "switch_node"})
 
 # ---------------------------------------------------------------------------
 #  LLM 调用重试：可重试状态码
@@ -250,6 +250,52 @@ def _reply_spec() -> dict:
             },
         },
     }
+
+
+def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | None = None) -> dict:
+    """构建 switch_node 伪工具定义——切换 session 的对话节点。"""
+    desc_parts = [
+        "切换当前会话的对话节点。调用后当前节点 finish，用户的下一条消息将由目标节点处理。",
+        "",
+        "使用场景：",
+        "- 用户明确要求切换到某个节点（如'切到编程节点'）",
+        "- 当前节点能力不足，判断应该由其他节点持续对话",
+        "",
+        "注意：",
+        "- 调用后当前节点立即终止，不会再执行后续工具调用",
+        "- 目标节点能看到之前的对话历史",
+        "- 传空字符串的 target 可恢复为默认入口节点",
+    ]
+    if switch_info:
+        desc_parts.append("")
+        desc_parts.append("可切换到的节点：")
+        for info in switch_info:
+            desc_parts.append(f"- {info.get('name', info['id'])}（{info['id']}）：{info.get('description', '')}")
+    # target enum 允许空字符串（恢复默认）
+    enum_vals = targets + [""] if targets else [""]
+    return {
+        "type": "function",
+        "function": {
+            "name": "switch_node",
+            "description": "\n".join(desc_parts),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "enum": enum_vals,
+                        "description": "目标节点 ID。传空字符串恢复为默认入口节点。",
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "给用户的回复文本（如'已切换到编程节点'）。",
+                    },
+                },
+                "required": ["target", "text"],
+            },
+        },
+    }
+
 
 
 
@@ -539,6 +585,7 @@ async def run_ai_node(
     context_ref: str = "",
     resume_data: dict[str, Any] | None = None,
     downstream_info: list[dict[str, str]] | None = None,
+    switch_info: list[dict[str, str]] | None = None,
     attachments: list[dict[str, Any]] | None = None,
 ) -> TaskAction:
     runtime_cfg = load_runtime_config(rctx.workspace_root)
@@ -663,6 +710,10 @@ async def run_ai_node(
         openai_tools.append(_dispatch_node_spec(delegate_targets, downstream_info))
         openai_tools.append(_dispatch_nodes_spec(delegate_targets, downstream_info))
 
+    # 伪工具：节点切换
+    _sw_targets = [info["id"] for info in (switch_info or [])]
+    openai_tools.append(_switch_node_spec(_sw_targets, switch_info))
+
     # 伪工具：完成 + 提问（所有节点均可用）
     openai_tools.append(_finish_spec())
     openai_tools.append(_ask_spec())
@@ -785,6 +836,12 @@ async def run_ai_node(
             if resp.usage and isinstance(resp.usage.get("prompt_tokens"), int):
                 _last_prompt_tokens = resp.usage["prompt_tokens"]
                 _compacted = False  # 有了新的 token 数据，允许重新判定是否需要压缩
+                # 上报上下文窗口用量到 supervisor
+                await rctx.emit_event("context_usage", {
+                    "node_id": node.id,
+                    "task_id": rctx.task_id,
+                    "usage": resp.usage,
+                })
 
             # ---- 重试判定（错误重试 / 空回复重试，统一路径） ----
             _retry_reason = ""
@@ -954,6 +1011,32 @@ async def run_ai_node(
                             result={"text": ask_text},
                             context_ref=ctx_ref,
                             summary=_short(ask_text, 240),
+                        )
+
+                    if pseudo_call.name == "switch_node":
+                        switch_target = str(args.get("target") or "").strip()
+                        switch_text = str(args.get("text") or "").strip()
+                        # 调用 supervisor API 设置 session 级节点覆盖
+                        try:
+                            await rctx.http.post(
+                                f"{rctx.supervisor_url}/v1/sessions/{rctx.session_id}/switch_node",
+                                json={"target_node_id": switch_target},
+                            )
+                        except Exception:
+                            pass  # 设置失败不影响 finish
+                        # 发出事件通知前端
+                        await rctx.emit_event("node_switch", {
+                            "target_node_id": switch_target,
+                            "node_id": node.id,
+                        })
+                        return TaskAction(
+                            action=ACTION_FINISH, node_id=node.id,
+                            result={
+                                "text": switch_text,
+                                "attachments": list(_tool_produced_attachments),
+                            },
+                            context_ref=ctx_ref,
+                            summary=f"switch → {switch_target or 'default'}",
                         )
 
             # 处理真实工具调用 → 循环内直接执行

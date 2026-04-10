@@ -110,6 +110,7 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             "path": path_str,
             "content_preview": f"apply_diff: {len(diffs)} diff(s)",
             "content_len": 0,
+            "tool_name": "apply_diff",
         },
     )
     if err is not None:

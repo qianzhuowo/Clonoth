@@ -43,6 +43,7 @@ RESERVED_TOOL_NAMES = {
     "save_memory",
     "list_memories",
     "delete_memory",
+    "get_context_window",
 }
 
 # Convenience alias used by supervisor/admin_api.py
@@ -62,6 +63,6 @@ from .mcp_clients import create_or_update_mcp_client, list_mcp_clients, delete_m
 from .tool_manage import create_or_update_tool, reload_tools  # noqa: E402,F401
 from .system import request_restart  # noqa: E402,F401
 from .schedules import create_schedule, list_schedules, delete_schedule  # noqa: E402,F401
-from .tasks import cancel_active_tasks, list_active_tasks  # noqa: E402,F401
+from .tasks import cancel_active_tasks, list_active_tasks, get_context_window  # noqa: E402,F401
 from .memory import save_memory, list_memories, delete_memory  # noqa: E402,F401
 from .apply_diff import apply_diff  # noqa: E402,F401

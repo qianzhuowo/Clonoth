@@ -170,16 +170,22 @@ class SchedulerThread:
             msg_id = f"scheduler:{sid}:{uuid.uuid4()}"
             entry_node_id = str(s.get("entry_node_id") or "").strip()
 
+            # 从 conversation_key 提取 channel（如 "discord:123" -> "discord"）
+            if ":" in conv_key:
+                channel = conv_key.split(":", 1)[0]
+            else:
+                channel = "scheduler"
+
             try:
                 session_id = self._state.get_or_create_session(
-                    channel="scheduler", conversation_key=conv_key,
+                    channel=channel, conversation_key=conv_key,
                 )
                 evt = self._state.eventlog.append(
                     session_id=session_id,
                     component="scheduler",
                     type_="inbound_message",
                     payload={
-                        "channel": "scheduler",
+                        "channel": channel,
                         "conversation_key": conv_key,
                         "message_id": msg_id,
                         "text": text,

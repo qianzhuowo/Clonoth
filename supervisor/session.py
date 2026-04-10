@@ -410,3 +410,74 @@ class SessionMixin:
         if limit > 0:
             msgs = msgs[-limit:]
         return msgs
+
+    # ---- 上下文窗口用量 ----
+
+    def update_context_usage(self, session_id: str, payload: dict[str, Any]) -> None:
+        """更新 session 的上下文窗口用量（由 engine 上报）。"""
+        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        if not session_id or not usage:
+            return
+        with self._lock:
+            self._session_context_usage[session_id] = {
+                "prompt_tokens": usage.get("prompt_tokens"),
+                "completion_tokens": usage.get("completion_tokens"),
+                "total_tokens": usage.get("total_tokens"),
+                "node_id": str(payload.get("node_id") or ""),
+                "task_id": str(payload.get("task_id") or ""),
+                "updated_at": _now().isoformat(),
+            }
+
+    def get_session_context_usage(self, session_id: str) -> dict[str, Any]:
+        """获取 session 的上下文窗口用量，包含实际值、估算值和利用率。"""
+        from clonoth_runtime import get_int, load_runtime_config
+
+        with self._lock:
+            usage = dict(self._session_context_usage.get(session_id) or {})
+
+        msgs = self.session_messages(session_id=session_id, limit=0)
+        estimated = self._estimate_tokens_from_messages(msgs)
+
+        runtime_cfg = load_runtime_config(self.workspace_root)
+        compact_threshold = get_int(
+            runtime_cfg, "engine.compact.threshold_tokens", 100_000, min_value=0,
+        )
+
+        prompt_tokens = usage.get("prompt_tokens")
+        source = "llm_usage" if prompt_tokens is not None else "estimate"
+        effective_tokens = prompt_tokens if prompt_tokens is not None else estimated
+        utilization = (
+            round(effective_tokens / compact_threshold, 4)
+            if compact_threshold > 0
+            else 0.0
+        )
+
+        return {
+            "session_id": session_id,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": usage.get("completion_tokens"),
+            "total_tokens": usage.get("total_tokens"),
+            "estimated_tokens": estimated,
+            "effective_tokens": effective_tokens,
+            "source": source,
+            "node_id": usage.get("node_id", ""),
+            "task_id": usage.get("task_id", ""),
+            "compact_threshold": compact_threshold,
+            "utilization": utilization,
+            "updated_at": usage.get("updated_at"),
+            "message_count": len(msgs),
+        }
+
+    @staticmethod
+    def _estimate_tokens_from_messages(messages: list[dict[str, Any]]) -> int:
+        """从消息列表估算 token 数（约 3 字符/token，适用于中英混合内容）。"""
+        total_chars = 0
+        for m in messages:
+            content = m.get("content", "")
+            if isinstance(content, str):
+                total_chars += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        total_chars += len(part["text"])
+        return total_chars // 3

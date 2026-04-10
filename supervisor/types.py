@@ -57,6 +57,7 @@ class InboundMessageIn(BaseModel):
 
 class InboundMessageOut(BaseModel):
     session_id: str
+    inbound_seq: int = 0
     accepted: bool = True
 
 

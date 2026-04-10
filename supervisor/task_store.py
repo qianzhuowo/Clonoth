@@ -77,6 +77,8 @@ class TaskStoreMixin:
         continuation: dict[str, Any] | None = None,
         source_inbound_seq: int | None = None,
         caller_task_id: str | None = None,
+        batch_id: str | None = None,
+        batch_index: int = 0,
     ) -> Task:
         now = _now()
         task = Task(

@@ -131,7 +131,8 @@ def create_app(
             payload=msg.model_dump(),
         )
         st.record_inbound_message_event(evt)
-        return InboundMessageOut(session_id=session_id, accepted=True)
+        inbound_seq = int(evt.get("seq", 0) or 0)
+        return InboundMessageOut(session_id=session_id, inbound_seq=inbound_seq, accepted=True)
 
     @app.get("/v1/inbound/next", response_model=InboundWorkItem)
     async def inbound_next(
@@ -303,6 +304,27 @@ def create_app(
         st: SupervisorState = app.state.state
         st.clear_cancelled(session_id)
         return {"ok": True}
+
+    @app.post("/v1/conversations/reset")
+    async def conversation_reset(body: dict[str, Any]) -> dict[str, Any]:
+        """Reset a conversation, forcing next message to create a new session."""
+        st: SupervisorState = app.state.state
+        conv_key = str(body.get("conversation_key") or "").strip()
+        if not conv_key:
+            raise HTTPException(status_code=400, detail="conversation_key required")
+        result = st.reset_conversation(conversation_key=conv_key)
+        if not result.get("ok"):
+            raise HTTPException(status_code=404, detail=result.get("error", "not found"))
+        # Also clean up node_contexts for old session
+        old_sid = result.get("old_session_id", "")
+        if old_sid:
+            from engine.context_store import cleanup_session_contexts
+            try:
+                cleaned = cleanup_session_contexts(st.workspace_root, old_sid)
+                result["context_files_cleaned"] = cleaned
+            except Exception:
+                pass
+        return result
 
     @app.post("/v1/sessions/{session_id}/cancel_active_tasks")
     async def session_cancel_active_tasks(

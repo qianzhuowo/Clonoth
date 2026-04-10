@@ -37,13 +37,14 @@ if TYPE_CHECKING:
 #  v3 伪工具名称
 # ---------------------------------------------------------------------------
 
-_PSEUDO_TOOL_NAMES = frozenset({"dispatch_node", "dispatch_nodes", "finish", "ask"})
+_PSEUDO_TOOL_NAMES = frozenset({"dispatch_node", "dispatch_nodes", "finish", "ask", "reply"})
 
 # ---------------------------------------------------------------------------
 #  LLM 调用重试：可重试状态码
 # ---------------------------------------------------------------------------
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
 
 
 def _is_retryable_error(resp) -> bool:
@@ -218,6 +219,37 @@ def _ask_spec() -> dict:
         },
     }
 
+
+def _reply_spec() -> dict:
+    """Build the reply pseudo-tool spec (non-terminating)."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "reply",
+            "description": (
+                "Send an intermediate message to the user WITHOUT terminating this node.\n\n"
+                "The node keeps running after this call — you can continue calling tools "
+                "or do more work in subsequent turns.\n\n"
+                "When to use:\n"
+                "- You have a partial result or progress update to share, but more work remains.\n"
+                "- The user asked for multiple things and you want to respond to one "
+                "while continuing to work on the rest.\n\n"
+                "When NOT to use:\n"
+                "- You are done with all work → use finish instead.\n"
+                "- You need more information from the user → use ask instead."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The intermediate message to send to the user.",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    }
 
 
 
@@ -532,29 +564,43 @@ async def run_ai_node(
             ),
         )
 
-        # ---- 按 prompt cache 友好顺序拼接 ----
-        # 前缀（跨 turn 稳定，利于前缀缓存命中）:
+        # ---- Prompt cache friendly layout ----
+        # Stable prefix (system role, identical across turns → cache hit):
         #   static system prompt → constant skills → constant memory
-        # 中段（追加式增长，已有前缀跨 turn 不变）:
-        #   history
-        # 后缀（每 turn 可能变化）:
-        #   dynamic system prompt → dynamic skills/memory → instruction
+        # History (appended, existing prefix unchanged across turns):
+        #   user/assistant messages
+        # Dynamic suffix (user role, may change per turn):
+        #   dynamic prompt + active skills/memory → instruction
+        #
+        # Dynamic content uses role=user instead of role=system so that
+        # Anthropic/Gemini (which merge all system messages into a single
+        # system field) keep a stable system cache across turns.
         messages: list[dict[str, Any]] = []
 
-        # --- 稳定前缀 ---
+        # --- stable prefix (system) ---
         if system_prompt:
             messages.append(system_prompt[0])  # static part
         messages.extend(skill_static)
         messages.extend(memory_static)
 
-        # --- 历史记录 ---
+        # --- history ---
         messages.extend(history)
 
-        # --- 动态后缀 ---
-        if len(system_prompt) >= 2:
-            messages.append(system_prompt[1])  # dynamic part
-        messages.extend(skill_dynamic)
-        messages.extend(memory_dynamic)
+        # --- dynamic suffix (user role) ---
+        _dynamic_parts: list[str] = []
+        if len(system_prompt) >= 2 and system_prompt[1].get("content"):
+            _dynamic_parts.append(system_prompt[1]["content"])
+        for _dm in skill_dynamic:
+            if _dm.get("content"):
+                _dynamic_parts.append(_dm["content"])
+        for _dm in memory_dynamic:
+            if _dm.get("content"):
+                _dynamic_parts.append(_dm["content"])
+        if _dynamic_parts:
+            messages.append({
+                "role": "user",
+                "content": "This is the current turn's dynamic context information you can use. It may change between turns. Continue with the previous task if the information is not needed and ignore it.\n\n" + "\n\n".join(_dynamic_parts),
+            })
 
         # 检查 history 末尾是否已包含当前 instruction（避免重复）
         _last = history[-1] if history else None
@@ -589,6 +635,7 @@ async def run_ai_node(
     # 伪工具：完成 + 提问（所有节点均可用）
     openai_tools.append(_finish_spec())
     openai_tools.append(_ask_spec())
+    openai_tools.append(_reply_spec())
 
     use_stream = streaming
 
@@ -784,74 +831,95 @@ async def run_ai_node(
                 _tc_desc_parts.append(resp.text)
             for _tc in resp.tool_calls:
                 _tc_args = json.dumps(dict(_tc.arguments or {}), ensure_ascii=False)
-                _tc_desc_parts.append(f"Calling tool: {_tc.name}({_tc_args})")
-            messages.append({"role": "assistant", "content": "\n".join(_tc_desc_parts) or "[tool_call]"})
+                _tc_desc_parts.append(f"[Tool call history record: {_tc.name} was executed with args: {_tc_args}]")
+            messages.append({"role": "user", "content": "\n".join(_tc_desc_parts) or "[tool_call]"})
 
             # 处理伪工具
             if pseudo_call is not None:
                 args = pseudo_call.arguments or {}
-                ctx_ref = _persist_node_context(
-                    rctx.workspace_root, rctx.session_id,
-                    rctx.task_id or run_id or node.id, node.id, messages,
-                    step_count=step + 1, context_ref=context_ref,
-                )
 
-                if pseudo_call.name == "dispatch_node":
-                    target = str(args.get("target") or "").strip()
-                    instr = str(args.get("instruction") or "").strip()
-                    return TaskAction(
-                        action=ACTION_DISPATCH, node_id=node.id,
-                        target_node=target,
-                        dispatch_input={"instruction": instr},
-                        context_ref=ctx_ref,
-                        summary=f"dispatch → {target}",
+                # reply: non-terminating, send intermediate message and continue
+                if pseudo_call.name == "reply":
+                    reply_text = str(args.get("text") or "").strip()
+                    if reply_text:
+                        await rctx.emit_event("intermediate_reply", {
+                            "node_id": node.id,
+                            "task_id": rctx.task_id,
+                            "text": reply_text,
+                        })
+                        messages.append({
+                            "role": "user",
+                            "content": f"[Intermediate reply delivered to user: {reply_text}]",
+                        })
+                    if not real_tool_calls:
+                        use_stream = streaming
+                        continue
+                    # Has real_tool_calls: fall through to execute them below
+
+                # Terminating pseudo-tools: persist context and return
+                else:
+                    ctx_ref = _persist_node_context(
+                        rctx.workspace_root, rctx.session_id,
+                        rctx.task_id or run_id or node.id, node.id, messages,
+                        step_count=step + 1, context_ref=context_ref,
                     )
 
-                if pseudo_call.name == "dispatch_nodes":
-                    tasks_list = args.get("tasks")
-                    if isinstance(tasks_list, list) and tasks_list:
-                        batch_items = []
-                        for t in tasks_list:
-                            batch_items.append({
-                                "kind": "node",
-                                "target": str(t.get("target") or "").strip(),
-                                "instruction": str(t.get("instruction") or "").strip(),
-                            })
-                        targets_str = ", ".join(c["target"] for c in batch_items)
+                    if pseudo_call.name == "dispatch_node":
+                        target = str(args.get("target") or "").strip()
+                        instr = str(args.get("instruction") or "").strip()
                         return TaskAction(
                             action=ACTION_DISPATCH, node_id=node.id,
-                            dispatch_batch=batch_items,
+                            target_node=target,
+                            dispatch_input={"instruction": instr},
                             context_ref=ctx_ref,
-                            summary=f"dispatch_nodes → [{targets_str}]",
+                            summary=f"dispatch → {target}",
                         )
 
-                if pseudo_call.name == "finish":
-                    summary_text = str(args.get("summary") or "").strip()
-                    result_text = str(args.get("text") or "").strip()
-                    _selected_paths = args.get("attachment_paths")
-                    if isinstance(_selected_paths, list) and _selected_paths:
-                        final_atts = _select_attachments(collected_attachments, _selected_paths)
-                    else:
-                        final_atts = list(_tool_produced_attachments)  # 不含用户输入的附件
-                    return TaskAction(
-                        action=ACTION_FINISH, node_id=node.id,
-                        result={
-                            "summary": summary_text,
-                            "text": result_text,
-                            "attachments": final_atts,
-                        },
-                        context_ref=ctx_ref,
-                        summary=_short(summary_text or result_text, 240),
-                    )
+                    if pseudo_call.name == "dispatch_nodes":
+                        tasks_list = args.get("tasks")
+                        if isinstance(tasks_list, list) and tasks_list:
+                            batch_items = []
+                            for t in tasks_list:
+                                batch_items.append({
+                                    "kind": "node",
+                                    "target": str(t.get("target") or "").strip(),
+                                    "instruction": str(t.get("instruction") or "").strip(),
+                                })
+                            targets_str = ", ".join(c["target"] for c in batch_items)
+                            return TaskAction(
+                                action=ACTION_DISPATCH, node_id=node.id,
+                                dispatch_batch=batch_items,
+                                context_ref=ctx_ref,
+                                summary=f"dispatch_nodes → [{targets_str}]",
+                            )
 
-                if pseudo_call.name == "ask":
-                    ask_text = str(args.get("text") or "").strip()
-                    return TaskAction(
-                        action=ACTION_ASK, node_id=node.id,
-                        result={"text": ask_text},
-                        context_ref=ctx_ref,
-                        summary=_short(ask_text, 240),
-                    )
+                    if pseudo_call.name == "finish":
+                        summary_text = str(args.get("summary") or "").strip()
+                        result_text = str(args.get("text") or "").strip()
+                        _selected_paths = args.get("attachment_paths")
+                        if isinstance(_selected_paths, list) and _selected_paths:
+                            final_atts = _select_attachments(collected_attachments, _selected_paths)
+                        else:
+                            final_atts = list(_tool_produced_attachments)  # 不含用户输入的附件
+                        return TaskAction(
+                            action=ACTION_FINISH, node_id=node.id,
+                            result={
+                                "summary": summary_text,
+                                "text": result_text,
+                                "attachments": final_atts,
+                            },
+                            context_ref=ctx_ref,
+                            summary=_short(summary_text or result_text, 240),
+                        )
+
+                    if pseudo_call.name == "ask":
+                        ask_text = str(args.get("text") or "").strip()
+                        return TaskAction(
+                            action=ACTION_ASK, node_id=node.id,
+                            result={"text": ask_text},
+                            context_ref=ctx_ref,
+                            summary=_short(ask_text, 240),
+                        )
 
             # 处理真实工具调用 → 循环内直接执行
             if real_tool_calls:
@@ -941,14 +1009,14 @@ async def run_ai_node(
         if text:
             _plaintext_retry_count += 1
             if _plaintext_retry_count <= _plaintext_retry_max:
-                # LLM 返回纯文本而非调用 finish，追加提示要求它用 finish 提交。
-                # 同时解决 LLM 在文本中幻觉工具调用（如 "Calling tool: xxx"）的问题。
-                messages.append({"role": "assistant", "content": text})
+                # LLM 返回纯文本而非调用工具 → 不将纯文本塞回上下文（避免强化错误模式），
+                # 直接提示使用正确的工具提交。
                 messages.append({
                     "role": "user",
                     "content": (
                         "请使用 finish 工具提交你的最终回复，不要直接输出纯文本。"
                         "将你要回复的内容放在 finish 的 text 参数中。"
+                        "如果你还有后续工作要做，使用 reply 工具发送中间进度。"
                     ),
                 })
                 use_stream = streaming

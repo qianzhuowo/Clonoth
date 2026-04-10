@@ -32,6 +32,19 @@ _MIME_MAP = {
 # 单图最大 10 MB
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
+# Discord CDN 等来源经常返回无意义的 MIME，需要清洗掉以便 fallback 到扩展名猜测
+_USELESS_MIMES = frozenset({
+    "application/octet-stream",
+    "binary/octet-stream",
+})
+
+
+def _sanitize_mime(mime_type: str) -> str:
+    """清洗无意义的 MIME 类型，返回空字符串以触发扩展名猜测。"""
+    if not mime_type or mime_type.strip() in _USELESS_MIMES:
+        return ""
+    return mime_type.strip()
+
 
 def _guess_mime(ext: str) -> str:
     """根据扩展名猜测 MIME。未知扩展名兜底为 image/png 而非 octet-stream，
@@ -60,6 +73,9 @@ def save_attachment(
     mime_type: str = "",
 ) -> dict[str, Any]:
     """Save attachment bytes to data/attachments/{session_id}/. Returns attachment dict."""
+    # 清洗无意义的 MIME（如 Discord CDN 返回的 application/octet-stream）
+    mime_type = _sanitize_mime(mime_type)
+
     sid = (session_id or "unknown").strip() or "unknown"
     d = workspace_root / "data" / "attachments" / sid
     d.mkdir(parents=True, exist_ok=True)
@@ -121,11 +137,29 @@ def build_multimodal_content(
     return parts
 
 
+def _strip_image_parts_for_assistant(content: list[dict[str, Any]]) -> list[dict[str, Any]] | str:
+    """从 assistant 消息的 content 中剥掉所有 image_url 部分。
+
+    Claude API 不允许 assistant turn 包含 image block，会报：
+    'image' blocks are not permitted within assistant turns.
+    """
+    text_parts = [p for p in content if isinstance(p, dict) and p.get("type") != "image_url"]
+    if not text_parts:
+        # 全是图片，返回占位文本
+        return "[image attachment]"
+    if len(text_parts) == 1 and text_parts[0].get("type") == "text":
+        # 只剩一个 text part，展平为纯字符串
+        return text_parts[0].get("text", "")
+    return text_parts
+
+
 def prepare_messages_for_llm(
     messages: list[dict[str, Any]],
     workspace_root: Path,
 ) -> list[dict[str, Any]]:
     """Return a copy of messages with file:// image refs resolved to base64 data URLs.
+
+    Also strips image blocks from assistant messages (Claude API restriction).
 
     Uses a per-call cache keyed by relative path to avoid re-encoding the same
     image file multiple times within a single invocation.
@@ -134,10 +168,29 @@ def prepare_messages_for_llm(
     result: list[dict[str, Any]] = []
     for msg in messages:
         content = msg.get("content")
+        role = msg.get("role", "")
+
         if not isinstance(content, list):
             result.append(msg)
             continue
 
+        # --- assistant 消息：剥掉所有 image_url 部分 ---
+        if role == "assistant":
+            has_image = any(
+                isinstance(p, dict) and p.get("type") == "image_url"
+                for p in content
+            )
+            if has_image:
+                new_msg = dict(msg)
+                new_msg["content"] = _strip_image_parts_for_assistant(content)
+                result.append(new_msg)
+                _logger.debug("stripped image blocks from assistant message")
+                continue
+            # assistant 消息没有 image_url，正常处理
+            result.append(msg)
+            continue
+
+        # --- user / system 等消息：正常解析 file:// 引用 ---
         needs_resolve = any(
             isinstance(part, dict)
             and part.get("type") == "image_url"
@@ -210,6 +263,6 @@ def _resolve_file_url(url: str, workspace_root: Path) -> str | None:
     except Exception:
         return None
 
-    mime = _guess_mime_from_path(str(p))
+    mime = _guess_mime_from_path(rel_path)
     b64 = base64.b64encode(data).decode("ascii")
     return f"data:{mime};base64,{b64}"

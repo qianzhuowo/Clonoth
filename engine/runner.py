@@ -44,16 +44,16 @@ def _collect_downstream_info(workspace_root: Path, node: Node) -> list[dict[str,
     return result
 
 
-_PSEUDO_TOOL_NAMES = {"finish", "ask", "dispatch_node", "dispatch_nodes"}
+_PSEUDO_TOOL_NAMES = {"finish", "ask", "dispatch_node", "dispatch_nodes", "reply"}
 
 
 def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """剥离 history 末尾的伪工具调用消息。
+    """Strip trailing pseudo-tool call from the last assistant message in history.
 
-    从上下文快照恢复历史时，最后一条 assistant 消息可能是 finish/ask/dispatch_node
-    的伪工具调用（如 'Calling tool: finish({"text": "..."})'）。
-    对 finish：提取 text 参数，替换为正常的 assistant 回复。
-    对 ask/dispatch_node：直接删除。
+    When restoring history from a context snapshot, the last assistant message
+    may contain a pseudo-tool record like '[Tool call history record: finish was executed with args: {...}]'.
+    For finish: extract the text param and replace with a normal assistant reply.
+    For ask/dispatch_node/dispatch_nodes: drop or trim.
     """
     if not history:
         return history
@@ -66,11 +66,11 @@ def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str,
     if not isinstance(content, str):
         return history
 
-    # 查找伪工具调用标记
+    # Look for pseudo-tool record marker
     pseudo_name = ""
     marker_pos = -1
     for name in _PSEUDO_TOOL_NAMES:
-        tag = f"Calling tool: {name}("
+        tag = f"[Tool call history record: {name} was executed with args: "
         pos = content.find(tag)
         if pos >= 0:
             pseudo_name = name
@@ -84,15 +84,15 @@ def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str,
     result = list(history)
 
     if pseudo_name == "finish":
-        # 提取 finish({"text": "..."}) 中的 text（可能跨多行）
+        # Extract the text param from '[Tool call history record: finish was executed with args: {"text": "..."}]'
         call_str = content[marker_pos:]
-        paren_start = call_str.find("(")
-        if paren_start > 0:
-            # 从第一个 '(' 到最后一个 ')' 之间就是 JSON 参数
-            inner = call_str[paren_start + 1:]
-            last_paren = inner.rfind(")")
-            if last_paren >= 0:
-                inner = inner[:last_paren]
+        args_start = call_str.find("args: ")
+        if args_start >= 0:
+            inner = call_str[args_start + len("args: "):]
+            # Strip trailing ']' bracket
+            last_bracket = inner.rfind("]")
+            if last_bracket >= 0:
+                inner = inner[:last_bracket]
                 try:
                     args = json.loads(inner)
                     finish_text = str(args.get("text", "")).strip()
@@ -103,7 +103,7 @@ def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str,
                 except Exception:
                     pass
 
-    # ask/dispatch_node 或解析失败：保留 pre_text 或删除整条
+    # ask/dispatch_node or parse failure: keep pre_text or drop the message
     if pre_text:
         result[-1] = {"role": "assistant", "content": pre_text}
         return result
@@ -320,7 +320,7 @@ async def _run_node_task(
         history=history, run_id=task_id, context_ref=context_ref,
         resume_data=resume_data_raw,
         downstream_info=ds_info,
-        streaming=bool(node.id == entry_node_id and get_bool(runtime_cfg, "engine.streaming", False)),
+        streaming=bool(get_bool(runtime_cfg, "engine.streaming", False)),
         attachments=input_attachments,
     )
 

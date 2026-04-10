@@ -356,6 +356,18 @@ class SessionMixin:
 
             return {"ok": True, "deduped": False, "event_seq": int(evt.get("seq", 0) or 0)}
 
+    def reset_conversation(self, *, conversation_key: str) -> dict[str, Any]:
+        """Reset a conversation by removing the conversation_map entry.
+
+        Next inbound message with this conversation_key will create a fresh session.
+        Also cleans up node_contexts for the old session.
+        """
+        with self._lock:
+            old_session_id = self.conversation_map.pop(conversation_key, None)
+            if not old_session_id:
+                return {"ok": False, "error": f"conversation not found: {conversation_key}"}
+            return {"ok": True, "old_session_id": old_session_id, "conversation_key": conversation_key}
+
     def session_messages(self, *, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
         msgs: list[dict[str, Any]] = []
         tool_records: list[str] = []

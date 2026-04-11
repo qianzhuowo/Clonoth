@@ -23,8 +23,11 @@ class RunContext:
     user_text: str = ""
     task_id: str = ""
     session_generation: int = 0
+    source_inbound_seq: int | None = None
 
     async def emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        if self.source_inbound_seq is not None:
+            payload.setdefault("source_inbound_seq", self.source_inbound_seq)
         try:
             await self.http.post(
                 f"{self.supervisor_url}/v1/sessions/{self.session_id}/events",

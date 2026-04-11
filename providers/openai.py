@@ -8,6 +8,21 @@ import httpx
 from .base import BaseProvider, ProviderResponse, ToolCall
 
 
+def _parse_first_json_object(raw: str) -> dict | None:
+    """Fallback: parse the first JSON object from concatenated '{...}{...}' strings."""
+    raw = raw.strip()
+    if not raw.startswith("{"):
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        obj, _ = decoder.raw_decode(raw)
+        if isinstance(obj, dict):
+            return obj
+    except (json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
 def _normalize_base_url(base_url: str | None) -> str:
     """Normalize base_url for OpenAI-compatible APIs.
 
@@ -214,7 +229,8 @@ class OpenAIProvider(BaseProvider):
                             parsed = json.loads(raw_args)
                             args = parsed if isinstance(parsed, dict) else {"_raw": parsed}
                         except Exception:
-                            args = {"_raw": raw_args}
+                            fallback = _parse_first_json_object(raw_args)
+                            args = fallback if fallback is not None else {"_raw": raw_args}
                     tool_calls.append(ToolCall(id=tc_data["id"], name=name.strip(), arguments=args))
 
                 return ProviderResponse(
@@ -327,7 +343,8 @@ class OpenAIProvider(BaseProvider):
                             else:
                                 args = {"_raw": parsed}
                         except Exception:
-                            args = {"_raw": raw_args}
+                            fallback = _parse_first_json_object(raw_args)
+                            args = fallback if fallback is not None else {"_raw": raw_args}
 
                     tool_calls.append(ToolCall(id=tc_id_str, name=name.strip(), arguments=args))
 

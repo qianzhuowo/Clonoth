@@ -323,6 +323,7 @@ async def _run_node_task(
         api_key=api_key, base_url=base_url, default_model=default_model,
         user_text=str(input_data.get("instruction") or "").strip(),
         task_id=task_id, session_generation=session_generation,
+        source_inbound_seq=int(source_inbound_seq) if source_inbound_seq is not None else None,
     )
 
     history = []

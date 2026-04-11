@@ -5,7 +5,8 @@ Backward-compatible with legacy single-file ``path`` parameter.
 """
 from __future__ import annotations
 
-import base64
+import shutil
+import uuid as _uuid
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,30 @@ _MIME_MAP: dict[str, str] = {
     ".bmp": "image/bmp",
     ".svg": "image/svg+xml",
 }
+
+# Map from sniffed MIME to canonical extension
+_MIME_TO_EXT: dict[str, str] = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+}
+
+
+def _sniff_image_mime(data: bytes) -> str | None:
+    """Detect actual image MIME type from magic bytes."""
+    if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if len(data) >= 2 and data[:2] == b"\xff\xd8":
+        return "image/jpeg"
+    if len(data) >= 4 and data[:4] == b"GIF8":
+        return "image/gif"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 2 and data[:2] == b"BM":
+        return "image/bmp"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -110,8 +135,11 @@ async def _read_single_file(
     # ---- multimodal (image) ----
     if ext in _IMAGE_EXTENSIONS:
         try:
-            size = p.stat().st_size
-            mime = _MIME_MAP.get(ext, "application/octet-stream")
+            raw = p.read_bytes()
+            size = len(raw)
+            # Sniff actual MIME from magic bytes; fall back to extension
+            mime = _sniff_image_mime(raw) or _MIME_MAP.get(ext, "application/octet-stream")
+            real_ext = _MIME_TO_EXT.get(mime, ext)
             entry: dict[str, Any] = {
                 "path": path_str, "success": True,
                 "type": "multimodal", "mimeType": mime, "size": size,
@@ -119,9 +147,20 @@ async def _read_single_file(
             dims = _get_image_dimensions(p)
             if dims:
                 entry["dimensions"] = dims
-            data_bytes = p.read_bytes()
-            b64 = base64.b64encode(data_bytes).decode("ascii")
-            mm: dict[str, Any] = {"mimeType": mime, "data": b64, "name": p.name}
+            # Save a copy under data/attachments/ so the multimodal pipeline
+            # can resolve it to a base64 data-URL for the LLM.
+            att_dir = ctx.workspace_root / "data" / "attachments" / "read_file"
+            att_dir.mkdir(parents=True, exist_ok=True)
+            att_name = f"{_uuid.uuid4().hex}{real_ext}"
+            att_path = att_dir / att_name
+            shutil.copy2(p, att_path)
+            att_rel = att_path.relative_to(ctx.workspace_root).as_posix()
+            mm: dict[str, Any] = {
+                "type": "image",
+                "path": att_rel,
+                "mime_type": mime,
+                "name": p.stem + real_ext,
+            }
             return entry, mm
         except Exception as exc:
             return {"path": path_str, "success": False, "error": str(exc)}, None
@@ -232,7 +271,7 @@ async def read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if fail_count > 0:
         response["error"] = f"{fail_count} file(s) failed to read"
     if multimodal_data:
-        response["multimodal"] = multimodal_data
+        response["attachments"] = multimodal_data
 
     # Backward compat: single text file → set top-level path/content
     if total_count == 1 and results:

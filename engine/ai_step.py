@@ -712,7 +712,7 @@ async def run_ai_node(
 
     # 伪工具：节点切换
     _sw_targets = [info["id"] for info in (switch_info or [])]
-    openai_tools.append(_switch_node_spec(_sw_targets, switch_info))
+    openai_tools.append(_switch_node_spec(_sw_targets, switch_info, current_node_id=node.id, current_node_name=node.name))
 
     # 伪工具：完成 + 提问（所有节点均可用）
     openai_tools.append(_finish_spec())
@@ -992,7 +992,7 @@ async def run_ai_node(
                                 session_id=rctx.session_id,
                             )
                         else:
-                            final_atts = list(_tool_produced_attachments)  # 不含用户输入的附件
+                            final_atts = []
                         return TaskAction(
                             action=ACTION_FINISH, node_id=node.id,
                             result={

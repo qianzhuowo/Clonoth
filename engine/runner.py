@@ -262,23 +262,27 @@ async def _handle_task(
     cfg_raw = await fetch_openai_secret(http, sup_url)
     api_key, base_url, default_model = normalize_openai_secret(cfg_raw)
 
-    if kind == "node":
-        result = await _run_node_task(
-            http=http, llm_http=llm_http, sup_url=sup_url, ws_root=ws_root,
-            registry=registry, task=item, worker_id=worker_id,
-            session_id=session_id, session_generation=session_generation,
-            api_key=api_key, base_url=base_url,
-            default_model=default_model,
-        )
-    elif kind == "tool":
-        result = await _run_tool_task(
-            http=http, sup_url=sup_url, ws_root=ws_root,
-            registry=registry, task=item, worker_id=worker_id,
-            session_id=session_id, session_generation=session_generation,
-            task_id=task_id,
-        )
-    else:
-        result = {"action": "fail", "node_id": "", "error": f"未知 task kind: {kind}"}
+    try:
+        if kind == "node":
+            result = await _run_node_task(
+                http=http, llm_http=llm_http, sup_url=sup_url, ws_root=ws_root,
+                registry=registry, task=item, worker_id=worker_id,
+                session_id=session_id, session_generation=session_generation,
+                api_key=api_key, base_url=base_url,
+                default_model=default_model,
+            )
+        elif kind == "tool":
+            result = await _run_tool_task(
+                http=http, sup_url=sup_url, ws_root=ws_root,
+                registry=registry, task=item, worker_id=worker_id,
+                session_id=session_id, session_generation=session_generation,
+                task_id=task_id,
+            )
+        else:
+            result = {"action": "fail", "node_id": "", "error": f"未知 task kind: {kind}"}
+    except Exception as exc:
+        print(f"[engine] task {task_id} crashed: {exc}", flush=True)
+        result = {"action": "fail", "node_id": str(item.get("node_id") or ""), "error": f"引擎内部错误: {exc}"}
 
     await http.post(
         f"{sup_url}/v1/tasks/{task_id}/complete",

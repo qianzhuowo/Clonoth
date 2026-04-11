@@ -252,7 +252,7 @@ def _reply_spec() -> dict:
     }
 
 
-def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | None = None) -> dict:
+def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | None = None, *, current_node_id: str = "", current_node_name: str = "") -> dict:
     """构建 switch_node 伪工具定义——切换 session 的对话节点。"""
     desc_parts = [
         "切换当前会话的对话节点。调用后当前节点 finish，用户的下一条消息将由目标节点处理。",

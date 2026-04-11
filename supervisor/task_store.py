@@ -172,6 +172,7 @@ class TaskStoreMixin:
                 "switched_from": default_node if session_override else "",
                 "resume_data": {},
                 "use_context": use_context,
+                "_system_task": bool(payload.get("_system_task", False)),
                 "active_tasks_summary": active_tasks_summary,
                 "attachments": attachments or [],
             },

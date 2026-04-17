@@ -16,3 +16,9 @@ pip-wheel-metadata/
 
 # backup archives
 *.tar.gz
+
+# IDE / tool configs
+.limcode/
+
+# private skills
+secret_skills/

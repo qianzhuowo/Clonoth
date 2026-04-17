@@ -225,25 +225,20 @@ class AdapterCallbacks(Protocol):
             对应 ereuna_main.py L1595-1632。
           - compact_start / compact_done / compact_failed 事件
             对应 ereuna_main.py L1889-1948。
-          - 每轮 poll 结束时的 sweep 点阵动画刷新
-            对应 ereuna_main.py L2002-2022。
-
         SDK 已完成：
           - 向 state.progress_records 追加新记录
-          - 更新 state.dot_state（点阵步进、思维链预览内容）
-          - 节流检查（state.should_edit(), 2 秒间隔）：仅满足条件时调用
           - 刷新 trigger.created_at 防止超时
 
         适配器需要：
-          - 将 progress_records + dot_state 格式化为进度日志文本
+          - 将 progress_records 格式化为进度日志文本
           - DM 场景 → edit trigger 的 status_msg
           - 群聊场景 → edit 日志频道的 log_msg（首次时 send 创建）
-          - 完成后调用 state.mark_edited() 记录编辑时间
           - 将 log_msg 引用存入 state.platform_data["log_msg"]
+          - SDK 不做节流，适配器自行决定是否 edit（如 2 秒间隔）
 
         Args:
             trigger: 关联的触发信息。
-            state: 当前主任务状态（progress_records 和 dot_state 已是最新）。
+            state: 当前主任务状态（progress_records 已是最新）。
         """
         ...
 
@@ -263,7 +258,7 @@ class AdapterCallbacks(Protocol):
         对应 ereuna_main.py L1672-1691 子节点日志首次创建。
 
         SDK 已完成：
-          - 创建 ChildTaskState（含 prefix, lines=[首条消息], dot_state）
+          - 创建 ChildTaskState（含 prefix, lines=[首条消息]）
           - 超量清理（trim_child_states）
 
         适配器需要：
@@ -298,21 +293,18 @@ class AdapterCallbacks(Protocol):
             对应 ereuna_main.py L1573-1587。
           - intermediate_reply 事件在子节点日志中追加「↳ 已发送中间回复」后
             对应 ereuna_main.py L1492-1500。
-          - 每轮 poll 结束时的 sweep 点阵动画刷新
-            对应 ereuna_main.py L2024-2034。
 
         SDK 已完成：
-          - 向 state.lines 追加新记录 / 更新 dot_state
-          - 节流检查（state.should_edit(), 2 秒间隔）：仅满足条件时调用
+          - 向 state.lines 追加新记录
 
         适配器需要：
-          - 格式化 state.prefix + state.lines + state.dot_state 为显示文本
+          - 格式化 state.prefix + state.lines 为显示文本
           - 从 state.platform_data 获取消息引用并 edit
-          - 完成后调用 state.mark_edited() 记录编辑时间
+          - SDK 不做节流，适配器自行决定是否 edit（如 2 秒间隔）
 
         Args:
             task_key: 子任务标识。
-            state: 当前子任务状态（lines 和 dot_state 已是最新）。
+            state: 当前子任务状态（lines 已是最新）。
         """
         ...
 

@@ -817,6 +817,8 @@ class EventRouter:
             cleaned_triggers: list[TriggerInfo] = []
         else:
             # 完整清理
+            # 约定：conv_key 格式为 "prefix:channel_id"（如 "discord:123456"）
+            # 若其他平台 conv_key 含多个冒号，int(parts[1]) 会失败并被 except 捕获
             parts = conv_key.split(":", 1)
             ch_id = None
             if len(parts) == 2:

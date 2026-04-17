@@ -33,10 +33,9 @@ class BotConfig:
     max_history: int = 50
     workspace_root: Path | None = None
     extra_roots: list[Path] = field(default_factory=list)
+    # Phase 3 (2026-04-17): EventRouter 审批处理需要此字段。
+    # 提取自 ereuna_main.py _process_approval_event 中 _is_external_operation 后的分支逻辑。
+    # False（默认）：所有审批请求都交给适配器展示审批 UI，由人工决定。安全默认值。
+    # True：工作区内部操作自动放行，仅外部操作需人工审批（ereuna_main.py 的现有行为）。
+    # Bot 侧根据安全需求显式开启。
     auto_approve_internal: bool = False
-    """是否自动放行工作区内部操作的审批请求。
-
-    False（默认）：所有审批请求都交给适配器展示审批 UI，由人工决定。
-    True：工作区内部操作自动放行，仅外部操作需人工审批。
-    Bot 侧根据安全需求显式开启，SDK 不做默认自动放行。
-    """

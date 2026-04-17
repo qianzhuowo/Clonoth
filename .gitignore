@@ -11,16 +11,8 @@ pip-wheel-metadata/
 .env
 **/.env
 
-# runtime data
-/data/events.jsonl
-/data/config.yaml
-/data/policy.yaml
-/data/policy.yaml.bak
-/data/logs/
-/data/artifacts/
-/data/upgrade_pending.json
-/data/node_contexts/
-/data/memory/
+# all runtime data
+/data/
 
-.limcode/
-secret_skills/
+# backup archives
+*.tar.gz

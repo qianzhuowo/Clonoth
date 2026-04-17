@@ -42,7 +42,7 @@ from ..protocol import (
     ACTION_CANCELLED,
     ACTION_PREEMPTED,
 )
-from ..tool_step import result_to_raw, summarize_result, write_artifact
+from ..tool_step import result_to_raw, summarize_result
 from ..compact import should_compact, _format_messages_for_summary
 from clonoth_runtime import get_int, get_float, load_runtime_config
 from toolbox.context import ToolContext
@@ -415,8 +415,8 @@ async def _execute_real_tools(
     ls: _LoopState, real_tool_calls: list[dict[str, Any]], step: int,
 ) -> TaskAction | None:
     """批量执行真实工具调用，将结果追加到 messages。"""
-    _rt_cfg = load_runtime_config(ls.rctx.workspace_root)
-    _max_inline = get_int(_rt_cfg, "engine.tool_trace.max_inline_chars", 8000, min_value=1000, max_value=200_000)
+    # [2026-04-17] 移除 _max_inline / _rt_cfg：截断机制已废弃，不再需要读取 runtime config 中的
+    # engine.tool_trace.max_inline_chars 配置项。
 
     await ls.rctx.emit_event("handoff_progress", {
         "message": f"[{ls.node.id}] 执行 {len(real_tool_calls)} 个工具",
@@ -450,22 +450,16 @@ async def _execute_real_tools(
 
         _t_summary = summarize_result(_t_name, _t_result)
         _t_fmt, _t_raw = result_to_raw(_t_name, _t_result)
-        _t_truncated = len(_t_raw) > _max_inline
-        _t_ref = ""
-        if _t_truncated:
-            _t_ref = await write_artifact(
-                ls.rctx.workspace_root, ls.rctx.task_id or ls.run_id,
-                _rtc["id"], _t_name, _t_fmt, _t_raw,
-            )
-        _t_raw_inline = _t_raw if not _t_truncated else _t_raw[:_max_inline] + "\n...<truncated>"
+        # [2026-04-17] 移除工具结果截断机制：不再截断、不再写 artifact，直接传完整结果。
+        _t_raw_inline = _t_raw
 
         _tool_entries.append({
             "name": _t_name,
             "args": _t_args,
             "format": _t_fmt,
             "raw_inline": _t_raw_inline,
-            "truncated": _t_truncated,
-            "ref": _t_ref,
+            "truncated": False,  # [2026-04-17] 截断机制已移除，保留字段兼容 format_tool_trace
+            "ref": "",
             "summary": _t_summary,
         })
 
@@ -483,8 +477,7 @@ async def _execute_real_tools(
     if _tool_entries:
         for _entry in _tool_entries:
             _result_body = _entry["raw_inline"]
-            if _entry.get("truncated") and _entry.get("ref"):
-                _result_body += f"\n(Truncated. Full output: {_entry['ref']})"
+            # [2026-04-17] 截断机制已移除，不再追加 truncated 提示
             _tool_msg = {
                 "role": "user",
                 "content": f'Tool result for "{_entry["name"]}":\n{_result_body}',

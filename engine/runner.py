@@ -28,7 +28,7 @@ from .model import resolve_provider
 from .context_store import load_context_snapshot
 
 from .node import Node, load_node
-from .tool_step import result_to_raw, summarize_result, write_artifact
+from .tool_step import result_to_raw, summarize_result
 # Phase 1 (Session Conversation Store): 导入 ConversationStore 用于影子写入，
 # 在每个 node task 执行时实例化并挂载到 RunContext，供 ai_step 影子写入消息。
 from .conversation_store import ConversationStore, Message, MessageType
@@ -687,12 +687,9 @@ async def _run_tool_task(
 
     summary = summarize_result(tool_name, result)
     fmt, raw = result_to_raw(tool_name, result)
-    max_inline = 8000
-    truncated = len(raw) > max_inline
-    ref = ""
-    if truncated:
-        ref = await write_artifact(ws_root, task_id, str(input_data.get("call_id") or task_id), tool_name, fmt, raw)
-    raw_inline = raw if not truncated else raw[:max_inline] + "\n...<truncated>"
+    # [2026-04-17] 移除工具结果截断机制：不再对 raw 做 max_inline 截断和 artifact 写入，
+    # 直接将完整结果传递给下游，避免信息丢失。
+    raw_inline = raw
 
     await kctx.emit_event("handoff_progress", {
         "message": f"[tool] {tool_name}: {summary}",
@@ -708,8 +705,8 @@ async def _run_tool_task(
             "text": raw_inline,
             "attachments": tool_attachments,
             "format": fmt,
-            "truncated": truncated,
-            "ref": ref,
+            "truncated": False,  # [2026-04-17] 截断机制已移除，保留字段兼容下游
+            "ref": "",
             # 旧字段保留供 tool_trace 格式化用
             "raw_format": fmt,
             "raw_inline": raw_inline,

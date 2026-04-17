@@ -6,25 +6,9 @@ from pathlib import Path
 from typing import Any
 
 
-def _sanitize(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", (s or "x").strip() or "x")[:80]
-
-
-async def write_artifact(
-    workspace_root: Path,
-    run_id: str,
-    tool_call_id: str,
-    tool_name: str,
-    raw_format: str,
-    raw_text: str,
-) -> str:
-    """把工具原始输出写入 artifact 文件，返回相对路径。"""
-    d = workspace_root / "data" / "artifacts" / str(run_id or "unknown")
-    d.mkdir(parents=True, exist_ok=True)
-    ext = ".json" if raw_format == "json" else ".txt"
-    path = d / f"{_sanitize(tool_call_id)}_{_sanitize(tool_name)}{ext}"
-    path.write_text(raw_text, encoding="utf-8")
-    return str(path.relative_to(workspace_root))
+# [2026-04-17] 已移除 _sanitize() 和 write_artifact()：
+# 工具结果截断 + artifact 写入机制已废弃，完整结果直接内联传递。
+# data/artifacts/ 目录仍保留，供 system.py 的 _write_text_artifact 使用（如 git diff）。
 
 
 def result_to_raw(tool_name: str, result: Any) -> tuple[str, str]:

@@ -33,3 +33,10 @@ class BotConfig:
     max_history: int = 50
     workspace_root: Path | None = None
     extra_roots: list[Path] = field(default_factory=list)
+    auto_approve_internal: bool = False
+    """是否自动放行工作区内部操作的审批请求。
+
+    False（默认）：所有审批请求都交给适配器展示审批 UI，由人工决定。
+    True：工作区内部操作自动放行，仅外部操作需人工审批。
+    Bot 侧根据安全需求显式开启，SDK 不做默认自动放行。
+    """

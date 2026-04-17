@@ -606,7 +606,9 @@ class SessionState:
                 trigger_seq, trigger = result
 
         # 消费 trigger 及关联状态
-        if trigger and trigger_seq:
+        # fix: 原条件 `trigger and trigger_seq` 在 trigger_seq=0 时 falsy 会跳过清理。
+        # 虽然实际 inbound_seq 永远 >0，但语义应正确：只要 trigger 存在就执行清理。
+        if trigger is not None:
             self.triggers.pop(trigger_seq, None)
             self.main_task_states.pop(trigger_seq, None)
 

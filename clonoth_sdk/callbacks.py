@@ -235,6 +235,7 @@ class AdapterCallbacks(Protocol):
           - 群聊场景 → edit 日志频道的 log_msg（首次时 send 创建）
           - 将 log_msg 引用存入 state.platform_data["log_msg"]
           - SDK 不做节流，适配器自行决定是否 edit（如 2 秒间隔）
+          - **重要：SDK 的 sweep 阶段每轮 poll 都会调用此回调，适配器必须自行实现节流（如 2 秒间隔），否则会导致高频率平台 API 调用。**
 
         Args:
             trigger: 关联的触发信息。
@@ -301,6 +302,7 @@ class AdapterCallbacks(Protocol):
           - 格式化 state.prefix + state.lines 为显示文本
           - 从 state.platform_data 获取消息引用并 edit
           - SDK 不做节流，适配器自行决定是否 edit（如 2 秒间隔）
+          - **重要：SDK 的 sweep 阶段每轮 poll 都会调用此回调，适配器必须自行实现节流（如 2 秒间隔），否则会导致高频率平台 API 调用。**
 
         Args:
             task_key: 子任务标识。

@@ -94,8 +94,9 @@ def classify_path(
     # 绝对路径且不在任何信任区域内 → 外部路径
     if raw.is_absolute():
         return p, p.as_posix(), True
-    # 相对路径解析后逃逸出工作区
-    return None, "path escapes workspace root", False
+    # 相对路径解析后逃逸出工作区 → 视为外部路径，需要人工审批
+    # fix: 原返回 False（内部）不正确，逃逸工作区的路径应归类为外部（True）
+    return None, "path escapes workspace root", True
 
 
 def is_external_operation(

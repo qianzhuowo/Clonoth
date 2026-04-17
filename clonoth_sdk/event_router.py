@@ -599,14 +599,26 @@ class EventRouter:
                 return
             main_state.handled_approvals.add(appr_id)
 
-        # 分类：外部操作需人工审批，内部操作自动放行
+        # 分类审批操作：外部 vs 内部，结合 bot 侧 auto_approve_internal 配置决定放行策略。
+        # fix: 原逻辑在 workspace_root 未配置时默认自动放行所有操作，不安全。
+        # 现改为：auto_approve 行为由 bot 侧 config.auto_approve_internal 显式控制，
+        # SDK 默认不自动放行。
         details = p.get("details") or {}
         operation = details.get("tool_name") or p.get("operation", "")
 
-        if self._config.workspace_root and is_external_operation(
-            details, self._config.workspace_root, self._config.extra_roots,
-        ):
-            # 外部操作 → 通知适配器展示审批 UI
+        # 判断是否为外部操作
+        is_external = False
+        if self._config.workspace_root:
+            is_external = is_external_operation(
+                details, self._config.workspace_root, self._config.extra_roots,
+            )
+        else:
+            logger.warning("workspace_root not configured, treating all approvals as requiring manual review")
+            is_external = True  # 没配置 workspace_root 视为全部需要人工审批
+
+        # 决定是否自动放行
+        if is_external or not self._config.auto_approve_internal:
+            # 外部操作 或 bot 未开启自动放行 → 通知适配器展示审批 UI
             conv_key = self._state.get_conversation_key(ap_session) or ""
             try:
                 await self._cb.show_approval_ui(
@@ -618,7 +630,7 @@ class EventRouter:
                 logger.error("show_approval_ui failed: %s", e)
             status = f"⏳ 等待审批: {operation}"
         else:
-            # 内部操作 → 自动放行
+            # 内部操作 且 bot 开启了自动放行 → 自动放行
             ok = await auto_approve(self._client, appr_id)
             status = (
                 f"✅ 自动放行: {operation}"

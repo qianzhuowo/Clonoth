@@ -7,6 +7,7 @@ import atexit
 import io
 import signal
 import threading
+import time
 import os
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from .policy import PolicyEngine
 from .process_manager import ProcessManager
 from .scheduler import SchedulerThread
 from .state import SupervisorState
+from .types import TaskStatus
 
 
 def main() -> None:
@@ -57,6 +59,15 @@ def main() -> None:
         except Exception:
             pass
 
+    # 在做任何状态变更之前，先检查端口是否可用
+    # 如果端口被占用就立即退出，不会误删 restart_pending.json 或取消任务
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+            _s.bind((args.host, args.port))
+    except OSError as e:
+        _log(f"[supervisor] 端口 {args.host}:{args.port} 已被占用: {e}")
+        return
+
     events_path = data_dir / "events.jsonl"
     config_path = data_dir / "config.yaml"
 
@@ -69,13 +80,42 @@ def main() -> None:
     config_store = ConfigStore(path=config_path)
     state.write_boot_event()
 
-    # 在拉起子进程之前，先检查端口是否可用
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
-            _s.bind((args.host, args.port))
-    except OSError as e:
-        _log(f"[supervisor] 端口 {args.host}:{args.port} 已被占用: {e}")
-        return
+    # ---- Cancel orphaned tasks from previous run ----
+    _orphan_count = state.cancel_orphaned_tasks()
+    if _orphan_count:
+        _log(f"[supervisor] Cancelled {_orphan_count} orphaned task(s) from previous run")
+
+    # Check for pending restart completion → inject inbound_message (v3: self-awareness)
+    _restart_pending_path = data_dir / "restart_pending.json"
+    if _restart_pending_path.exists():
+        try:
+            import json as _rjson
+            _pending = _rjson.loads(_restart_pending_path.read_text(encoding="utf-8"))
+            _conv_key = _pending.get("conversation_key", "")
+            _channel = _pending.get("channel", "")
+            if _conv_key and _channel:
+                _sid = state.get_or_create_session(channel=_channel, conversation_key=_conv_key)
+                _evt = state.eventlog.append(
+                    session_id=_sid,
+                    component="supervisor",
+                    type_="inbound_message",
+                    payload={
+                        "channel": _channel,
+                        "conversation_key": _conv_key,
+                        "text": "[系统通知] 全量重启已完成，新代码已生效。",
+                    },
+                )
+                state.record_inbound_message_event(_evt)
+                _log(f"[supervisor] Injected restart completion inbound for session {_sid}")
+            else:
+                _log(f"[supervisor] restart_pending.json missing conversation_key/channel, skipped")
+        except Exception as e:
+            _log(f"[supervisor] Failed to process restart_pending.json: {e}")
+        finally:
+            try:
+                _restart_pending_path.unlink()
+            except Exception:
+                pass
 
     base_url = f"http://{args.host}:{args.port}"
 
@@ -94,6 +134,48 @@ def main() -> None:
 
     scheduler = SchedulerThread(state=state, workspace_root=workspace_root)
     scheduler.start()
+
+    # ---- 后台僵尸 task 回收线程 ----
+    def _reap_zombie_tasks() -> None:
+        """定期回收 lease 过期超过 grace period 的僵尸 task。
+
+        跳过 session 中存在 pending approval 的 task，因为
+        等审批期间 agent 是合法阻塞状态，不应被当作僵尸回收。
+        """
+        from datetime import datetime, timedelta, timezone
+        from .types import ApprovalStatus
+        _REAP_INTERVAL = 60.0
+        _GRACE = timedelta(seconds=180)
+        while True:
+            time.sleep(_REAP_INTERVAL)
+            try:
+                now = datetime.now(timezone.utc)
+                with state._lock:
+                    # 预先收集有 pending approval 的 session 集合
+                    _sessions_with_pending_approval: set[str] = set()
+                    for a in state.approvals.values():
+                        if a.status == ApprovalStatus.pending:
+                            _sessions_with_pending_approval.add(a.session_id)
+
+                    for task in state.tasks.values():
+                        if task.status != TaskStatus.running:
+                            continue
+                        if not task.lease_expires_at:
+                            continue
+                        if task.lease_expires_at + _GRACE < now:
+                            # 如果该 task 所属 session 有待审批，跳过回收
+                            if task.session_id in _sessions_with_pending_approval:
+                                continue
+                            task.status = TaskStatus.failed
+                            task.updated_at = now
+                            task.lease_expires_at = None
+                            task.result = {"action": "fail", "error": "lease expired (zombie reaped by background)"}
+                            state._event_task_snapshot("task_completed", task)
+                            _log(f"[zombie-reaper] reaped task {task.task_id[:12]} node={task.node_id}")
+            except Exception as e:
+                _log(f"[zombie-reaper] error: {e}")
+
+    threading.Thread(target=_reap_zombie_tasks, daemon=True, name="zombie-reaper").start()
 
     app = create_app(state=state, process_manager=process_manager, config_store=config_store)
 

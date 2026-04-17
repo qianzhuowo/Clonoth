@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from clonoth_runtime import load_yaml_dict, resolve_env_ref
+from clonoth_runtime import load_yaml_dict, load_runtime_config, resolve_env_ref
 
 
 @dataclass
@@ -21,6 +21,12 @@ class SkillAccess:
 
 
 @dataclass
+class MemoryAccess:
+    mode: str = "all"  # "all" | "allowlist" | "none"
+    allow: list[str] = field(default_factory=list)
+
+
+@dataclass
 class Node:
     id: str
     type: str  # "ai" | "tool"
@@ -29,9 +35,11 @@ class Node:
     model: str = ""          # 模型名称，空 = 使用全局默认
     api_key: str = ""        # 可选独立 API key（支持 $ENV{} 语法）
     base_url: str = ""       # 可选独立 base URL（支持 $ENV{} 语法）
-    prompt: str = ""         # 完整 system prompt 模板（支持 {{var}} 和 {{include:file}} ）
+    prompt: str | list = ""  # system prompt：字符串模式或 block 列表模式
     tool_access: ToolAccess = field(default_factory=ToolAccess)
     skill_access: SkillAccess = field(default_factory=SkillAccess)
+    memory_access: MemoryAccess = field(default_factory=MemoryAccess)
+    tool_mode: str = "native"  # "native" | "json"
     delegate_targets: list[str] = field(default_factory=list)
 
 
@@ -49,9 +57,14 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
     if node_type not in {"ai", "tool"}:
         return None
 
-    # prompt：字符串直接用，dict 兼容旧格式（忽略）
+    # prompt：字符串→字符串模式，列表→block 列表模式
     raw_prompt = data.get("prompt")
-    prompt = str(raw_prompt).strip() if isinstance(raw_prompt, str) else ""
+    if isinstance(raw_prompt, list):
+        prompt = raw_prompt
+    elif isinstance(raw_prompt, str):
+        prompt = raw_prompt.strip()
+    else:
+        prompt = ""
 
     # model：直接值或 $ENV{} 引用
     raw_model = str(data.get("model") or "").strip()
@@ -94,6 +107,26 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
     else:
         sa = SkillAccess()
 
+    ma_raw = data.get("memories")
+    if isinstance(ma_raw, str):
+        mm = ma_raw.strip().lower()
+        ma = MemoryAccess(mode=mm if mm in {"all", "allowlist", "none"} else "all")
+    elif isinstance(ma_raw, dict):
+        mm = str(ma_raw.get("mode") or "all").strip().lower()
+        ma_allow = [str(x).strip() for x in (ma_raw.get("allow") or []) if isinstance(x, str) and x.strip()]
+        ma = MemoryAccess(mode=mm if mm in {"all", "allowlist", "none"} else "all", allow=ma_allow)
+    else:
+        ma = MemoryAccess()
+
+    # tool_mode — 节点 yaml 优先，否则用 runtime.yaml engine.tool_mode 全局默认
+    _node_tm = data.get("tool_mode")
+    if _node_tm is not None:
+        raw_tool_mode = str(_node_tm).strip().lower()
+    else:
+        _rt = load_runtime_config(workspace_root)
+        raw_tool_mode = str((_rt.get("engine") or {}).get("tool_mode") or "native").strip().lower()
+    tool_mode = raw_tool_mode if raw_tool_mode in {"native", "json"} else "native"
+
     # delegate_targets
     dt_raw = data.get("delegate_targets")
     delegate_targets: list[str] = [
@@ -111,5 +144,7 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         prompt=prompt,
         tool_access=ta,
         skill_access=sa,
+        memory_access=ma,
+        tool_mode=tool_mode,
         delegate_targets=delegate_targets,
     )

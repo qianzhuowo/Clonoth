@@ -167,13 +167,13 @@ async def request_restart(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         final_text += "\n（系统已创建 checkpoint；若新版本启动失败将自动回滚）"
 
         try:
-            await ctx.emit_event("outbound_message", {"text": final_text})
+            await ctx.emit_event("intermediate_reply", {"text": final_text})
         except Exception:
             pass
 
     r = await ctx.http.post(
         f"{ctx.supervisor_url}/v1/admin/restart",
-        json={"target": target, "reason": reason, "approval_id": approval_id},
+        json={"target": target, "reason": reason, "approval_id": approval_id, "session_id": ctx.session_id},
     )
     if r.status_code >= 400:
         return {"ok": False, "error": r.text, "git": git_info, "git_commit": commit_res}

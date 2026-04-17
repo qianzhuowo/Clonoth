@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,11 @@ class RunContext:
     task_id: str = ""
     session_generation: int = 0
     source_inbound_seq: int | None = None
+    task_context: dict = field(default_factory=dict)
+    # Child Session 隔离：dispatch 子节点使用独立 session ID。
+    # 非空时，_shadow_write 和 ConversationStore 操作写入此 session 而非 parent session_id。
+    # 主节点和无 child session 的场景下为空字符串。
+    child_session_id: str = ""
 
     async def emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.source_inbound_seq is not None:
@@ -49,3 +54,25 @@ class RunContext:
         except Exception:
             pass
         return False
+
+    async def check_preempted(self) -> dict:
+        try:
+            if self.task_id:
+                r = await self.http.get(
+                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/preempted"
+                )
+                if r.status_code == 200:
+                    return r.json()
+        except Exception:
+            pass
+        return {"preempted": False, "message": "", "attachments": []}
+
+    async def consume_preempt(self) -> None:
+        """通知 supervisor 已消费 preempt message，防止重复注入。"""
+        try:
+            if self.task_id:
+                await self.http.post(
+                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/preempt_consumed"
+                )
+        except Exception:
+            pass

@@ -107,6 +107,10 @@ class Task(BaseModel):
     waiting_for_task_id: str | None = None
     status: TaskStatus = TaskStatus.pending
     cancel_requested: bool = False
+    preempt_requested: bool = False
+    preempted_context_ref: str = ""
+    preempt_message: str = ""
+    preempt_attachments: list = Field(default_factory=list)
     worker_id: str | None = None
     created_at: datetime
     updated_at: datetime
@@ -167,6 +171,7 @@ class RestartIn(BaseModel):
     target: Literal["engine", "all"]
     reason: str | None = None
     approval_id: str | None = None
+    session_id: str | None = None
 
 
 class RestartOut(BaseModel):

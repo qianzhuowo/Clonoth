@@ -10,6 +10,7 @@ from typing import Any
 
 
 SYSTEM_SESSION_ID = "__system__"
+_MAX_MEMORY_EVENTS = 5000
 
 
 def _now() -> datetime:
@@ -71,6 +72,9 @@ class EventLog:
                     max_seq = seq
 
         self._seq = max_seq
+        # Cap in-memory list on startup to prevent OOM from huge files
+        if len(self._events) > _MAX_MEMORY_EVENTS:
+            self._events = self._events[-_MAX_MEMORY_EVENTS:]
 
     def append(
         self,
@@ -105,6 +109,9 @@ class EventLog:
                     f.write(line + "\n")
 
             self._events.append(evt)
+            # Trim with hysteresis to prevent unbounded memory growth
+            if len(self._events) > _MAX_MEMORY_EVENTS + 500:
+                self._events = self._events[-_MAX_MEMORY_EVENTS:]
             return evt
 
     def list_events(self, *, session_id: str, after_seq: int = 0) -> list[dict[str, Any]]:

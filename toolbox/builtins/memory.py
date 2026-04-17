@@ -89,6 +89,14 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     constant = bool(args.get("constant", False))
     enabled = bool(args.get("enabled", True))
 
+    # node_ids: 逗号分隔字符串或列表，空 = 全局
+    raw_node_ids = args.get("node_ids")
+    node_ids: list[str] = []
+    if isinstance(raw_node_ids, list):
+        node_ids = [str(n).strip() for n in raw_node_ids if isinstance(n, str) and str(n).strip()]
+    elif isinstance(raw_node_ids, str) and raw_node_ids.strip():
+        node_ids = [n.strip() for n in raw_node_ids.split(",") if n.strip()]
+
     priority = 0
     if args.get("priority") is not None:
         try:
@@ -163,6 +171,7 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
                     "enabled": bool(e.get("enabled", True)),
                     "priority": int(e.get("priority") or 0),
                     "scan_depth": int(e.get("scan_depth") or 0),
+                    "node_ids": e.get("node_ids", []),
                 })
         except Exception:
             continue

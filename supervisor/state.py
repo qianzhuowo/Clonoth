@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 import uuid
 from dataclasses import dataclass
@@ -10,10 +11,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger(__name__)
+
 from ._helpers import SessionInfo, _now
 from .eventlog import EventLog, SYSTEM_SESSION_ID
 from .policy import PolicyEngine
 from .session import SessionMixin
+from .session_store import SessionStore
 from .task_router import TaskRouterMixin
 from .task_store import TaskStoreMixin
 from .types import (
@@ -70,6 +74,26 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._tools_reload_seq: int = 0
         self.session_entry_overrides: dict[str, str] = {}  # session_id -> node_id (AI switch)
         self._session_context_usage: dict[str, dict[str, Any]] = {}  # session_id -> latest usage
+        self._engine_generations: dict[str, str] = {}  # worker_id -> generation_id (Direction 2)
+
+        # ---- Child Session 隔离（Phase A）：映射表 ----
+        # (parent_session_id, node_id, context_key) → child_session_id
+        self.child_session_map: dict[tuple[str, str, str], str] = {}
+        # 反向索引：parent_session_id → set of child_session_ids，用于 clear 时快速查找
+        self.parent_children: dict[str, set[str]] = {}
+
+        # ---- 方案 A: 独立 session 持久化 ----
+        self._session_store = SessionStore(workspace_root / "data" / "sessions.json")
+        loaded_sessions, loaded_conv_map, loaded_child_map, loaded_parent_children = self._session_store.load()
+        if loaded_sessions:
+            self.sessions.update(loaded_sessions)
+            self.conversation_map.update(loaded_conv_map)
+        # Child Session 隔离（Phase A）：从 sessions.json 恢复 child session 映射
+        if loaded_child_map:
+            self.child_session_map.update(loaded_child_map)
+        if loaded_parent_children:
+            for psid, children in loaded_parent_children.items():
+                self.parent_children.setdefault(psid, set()).update(children)
 
         self.rebuild_from_events(eventlog.events)
 
@@ -94,6 +118,15 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 conv = payload.get("conversation_key")
                 if isinstance(conv, str) and session_id:
                     self.conversation_map[conv] = session_id
+                    # 方案 B: 若 session 记录缺失，从 inbound 事件恢复最小 SessionInfo
+                    if session_id not in self.sessions:
+                        self.sessions[session_id] = SessionInfo(
+                            session_id=session_id,
+                            channel=payload.get("channel", ""),
+                            conversation_key=conv,
+                            created_at=_now(),
+                            updated_at=_now(),
+                        )
                 self._apply_inbound_message(seq=seq, session_id=session_id, payload=payload)
             elif et == "inbound_processed":
                 self._apply_inbound_processed(payload)
@@ -105,10 +138,19 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 self._apply_approval_decided(payload)
             elif et in {"task_created", "task_started", "task_completed", "task_cancelled", "task_cancel_requested", "task_requeued", "task_suspended", "task_resumed"}:
                 self._apply_task_snapshot(payload)
+            elif et == "context_reset":
+                conv = payload.get("conversation_key")
+                if isinstance(conv, str):
+                    self.conversation_map.pop(conv, None)
             elif et == "cancel_requested":
                 self._apply_cancel_requested(session_id, payload)
             elif et == "node_switch":
                 self._apply_node_switch(session_id, payload)
+            elif et == "engine_registered":
+                wid = str(payload.get("worker_id") or "").strip()
+                gid = str(payload.get("generation_id") or "").strip()
+                if wid and gid:
+                    self._engine_generations[wid] = gid
 
         self._advance_inbound_cursor()
     # ------------------------------------------------------------------ #
@@ -166,7 +208,131 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 "default_node_id": default_node,
             }
 
+    # ------------------------------------------------------------------ #
+    #  Child Session 隔离（Phase A + B）
+    # ------------------------------------------------------------------ #
 
+    def get_or_create_child_session(
+        self,
+        parent_session_id: str,
+        node_id: str,
+        context_key: str,
+        context_mode: str,
+    ) -> tuple[str, bool]:
+        """根据 context_mode 获取或创建 child session。
+
+        Child Session 隔离核心方法。三种 context_mode：
+        - accumulate：复用已有 child session（如存在且未过期），否则新建
+        - fresh：强制创建新 child session，旧的不删除（等 TTL 过期清理）
+        - fork：创建新 child session，调用方需额外做 ConversationStore.fork()
+
+        Returns:
+            (child_session_id, is_new) — is_new 表示是否新建了 session
+        """
+        map_key = (parent_session_id, node_id, context_key)
+
+        if context_mode == "accumulate":
+            existing_cid = self.child_session_map.get(map_key)
+            if existing_cid and not self._is_child_session_expired(existing_cid):
+                # 复用现有 child session，更新 last_active_at
+                self._session_store.update_last_active(existing_cid)
+                return existing_cid, False
+            # 已过期或不存在：新建（过期的旧 session 留给 TTL 清理）
+            return self._create_child_session(parent_session_id, node_id, context_key), True
+
+        elif context_mode == "fresh":
+            # 强制新建，旧映射更新为新 ID
+            return self._create_child_session(parent_session_id, node_id, context_key), True
+
+        elif context_mode == "fork":
+            # fork 与 fresh 类似：总是新建
+            return self._create_child_session(parent_session_id, node_id, context_key), True
+
+        else:
+            # 未知模式，按 accumulate 处理
+            logger.warning("unknown context_mode '%s', falling back to accumulate", context_mode)
+            return self.get_or_create_child_session(
+                parent_session_id, node_id, context_key, "accumulate",
+            )
+
+    def _create_child_session(
+        self, parent_session_id: str, node_id: str, context_key: str,
+    ) -> str:
+        """生成新 child session 并持久化映射。
+
+        Child Session 隔离（Phase A）：生成 child_{uuid4().hex[:12]} 格式的 ID，
+        写入 child_session_map、parent_children、sessions.json。
+        """
+        child_sid = f"child_{uuid.uuid4().hex[:12]}"
+        map_key = (parent_session_id, node_id, context_key)
+
+        # 更新内存映射
+        self.child_session_map[map_key] = child_sid
+        self.parent_children.setdefault(parent_session_id, set()).add(child_sid)
+
+        # 持久化到 sessions.json
+        self._session_store.on_child_session_created(
+            child_session_id=child_sid,
+            parent_session_id=parent_session_id,
+            node_id=node_id,
+            context_key=context_key,
+        )
+
+        logger.info(
+            "child session created: %s (parent=%s, node=%s, key=%s)",
+            child_sid, parent_session_id, node_id, context_key,
+        )
+        return child_sid
+
+    def _is_child_session_expired(self, child_session_id: str) -> bool:
+        """检查 child session 是否已超过 TTL。
+
+        Child Session 隔离（Phase A）：从 sessions.json 的 last_active_at 字段
+        判定是否过期。如果记录不存在或已 reset，视为过期。
+        """
+        from clonoth_runtime import get_int, load_runtime_config
+        runtime_cfg = load_runtime_config(self.workspace_root)
+        ttl_hours = get_int(runtime_cfg, "engine.child_session.ttl_hours", 24, min_value=1)
+
+        entry = self._session_store._registry.get(child_session_id)
+        if entry is None or entry.get("reset"):
+            return True
+        last_active_str = entry.get("last_active_at", "")
+        if not last_active_str:
+            return True
+        try:
+            last_active = datetime.fromisoformat(last_active_str)
+            age_hours = (_now() - last_active).total_seconds() / 3600
+            return age_hours > ttl_hours
+        except (ValueError, TypeError):
+            return True
+
+    def _expire_child_session(self, child_session_id: str) -> None:
+        """删除一个过期的 child session。
+
+        Child Session 隔离（Phase A）：删除 JSONL 文件、从映射表移除、标记 reset。
+        """
+        # 1. 删除 JSONL 文件
+        conv_path = self.workspace_root / "data" / "conversations" / f"{child_session_id}.jsonl"
+        if conv_path.exists():
+            conv_path.unlink()
+
+        # 2. 从映射表移除
+        key_to_remove = None
+        for key, cid in self.child_session_map.items():
+            if cid == child_session_id:
+                key_to_remove = key
+                break
+        if key_to_remove:
+            del self.child_session_map[key_to_remove]
+            parent_sid = key_to_remove[0]
+            if parent_sid in self.parent_children:
+                self.parent_children[parent_sid].discard(child_session_id)
+
+        # 3. 标记 session 为 reset
+        self._session_store.on_session_reset(child_session_id)
+
+        logger.info("child session expired: %s", child_session_id)
 
     # ------------------------------------------------------------------ #
     #  审批
@@ -283,6 +449,68 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 "workers": sorted({t.worker_id for t in self.tasks.values() if t.worker_id}),
             },
         )
+
+    # ------------------------------------------------------------------ #
+    #  Direction 2: Engine Generation ID
+    # ------------------------------------------------------------------ #
+
+    def register_engine(self, worker_id: str, generation_id: str) -> dict[str, Any]:
+        """Register an engine worker with its generation ID.
+
+        Cancels any running/pending tasks from the same worker_id with a
+        different generation (orphans from a previous engine instance).
+        """
+        wid = (worker_id or "").strip()
+        gid = (generation_id or "").strip()
+        if not wid or not gid:
+            return {"ok": False, "error": "worker_id and generation_id required"}
+
+        with self._lock:
+            old_gen = self._engine_generations.get(wid)
+            self._engine_generations[wid] = gid
+
+            orphan_count = 0
+            if old_gen and old_gen != gid:
+                # Same worker restarted with new generation — cancel its old tasks
+                orphan_count = self._cancel_worker_orphans_locked(wid)
+            elif not old_gen:
+                # First registration of this worker — also clean up any tasks
+                # from a previous run where this worker_id was used
+                orphan_count = self._cancel_worker_orphans_locked(wid)
+
+            self.eventlog.append(
+                session_id=SYSTEM_SESSION_ID,
+                component="engine",
+                type_="engine_registered",
+                payload={
+                    "worker_id": wid,
+                    "generation_id": gid,
+                    "previous_generation_id": old_gen or "",
+                    "orphans_cancelled": orphan_count,
+                    "ts": _now().isoformat(),
+                },
+            )
+            return {"ok": True, "orphans_cancelled": orphan_count, "generation_id": gid}
+
+    def _cancel_worker_orphans_locked(self, worker_id: str) -> int:
+        """Cancel all non-terminal tasks assigned to a specific worker_id."""
+        now = _now()
+        count = 0
+        for task in self.tasks.values():
+            if self._task_terminal(task):
+                continue
+            if task.worker_id != worker_id:
+                continue
+            task.cancel_requested = True
+            task.status = TaskStatus.cancelled
+            task.updated_at = now
+            task.lease_expires_at = None
+            if task.waiting_for_task_id:
+                task.waiting_for_task_id = None
+            task.result = {"action": "cancelled", "error": f"engine worker {worker_id} restarted (generation mismatch)"}
+            self._event_task_snapshot("task_cancelled", task)
+            count += 1
+        return count
 
     def write_boot_event(self) -> dict[str, Any]:
         prev = self.eventlog.last_boot_run_id()

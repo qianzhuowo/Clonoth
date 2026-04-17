@@ -211,6 +211,14 @@ def load_memory_catalog(
                 if isinstance(entry.get("scan_depth"), (int, float)):
                     scan_depth = max(0, int(entry["scan_depth"]))
 
+                # node_ids: 逗号分隔字符串或列表，空/不写 = 全局
+                raw_node_ids = entry.get("node_ids")
+                node_ids: list[str] = []
+                if isinstance(raw_node_ids, list):
+                    node_ids = [str(n).strip() for n in raw_node_ids if isinstance(n, str) and str(n).strip()]
+                elif isinstance(raw_node_ids, str) and raw_node_ids.strip():
+                    node_ids = [n.strip() for n in raw_node_ids.split(",") if n.strip()]
+
                 items.append({
                     "book": book,
                     "id": eid,
@@ -220,6 +228,7 @@ def load_memory_catalog(
                     "constant": constant,
                     "priority": priority,
                     "scan_depth": scan_depth,
+                    "node_ids": node_ids,
                 })
         except Exception:
             continue
@@ -240,9 +249,12 @@ def _short_text(s: str, max_chars: int = 120) -> str:
 def build_memory_messages(
     workspace_root: Path,
     *,
+    node_id: str = "",
     instruction_text: str = "",
     history: list[dict[str, Any]] | None = None,
     max_budget_chars: int = 0,
+    memory_mode: str = "all",
+    memory_allow: list[str] | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
     """Build system messages for memory injection.
 
@@ -256,6 +268,16 @@ def build_memory_messages(
     catalog = load_memory_catalog(workspace_root)
     if not catalog:
         return [], []
+
+    # 按 memory_mode allowlist 过滤 book
+    if memory_mode == "allowlist" and memory_allow:
+        catalog = [e for e in catalog if e.get("book") in memory_allow]
+        if not catalog:
+            return [], []
+
+    # 按 node_ids 过滤：空列表 = 全局可见
+    if node_id:
+        catalog = [e for e in catalog if not e.get("node_ids") or node_id in e["node_ids"]]
 
     constant_entries: list[dict[str, Any]] = []
     keyword_entries: list[dict[str, Any]] = []

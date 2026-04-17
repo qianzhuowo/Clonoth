@@ -50,9 +50,13 @@ class ToolContext:
         return False
 
     async def wait_for_approval(self, approval_id: str, poll_interval: float | None = None) -> dict[str, Any]:
+        import time as _time
         interval = float(poll_interval) if poll_interval is not None else float(self.approval_poll_interval_sec or 0.5)
         if interval <= 0:
             interval = 0.5
+        _last_renew = 0.0  # monotonic timestamp of last lease renewal
+        _RENEW_INTERVAL = 30.0  # renew lease every 30s during approval wait
+        _RENEW_LEASE_SEC = 300.0  # request 5-minute lease to survive long waits
         while True:
             if await self.check_cancelled():
                 return {"approval_id": approval_id, "status": "cancelled"}
@@ -61,4 +65,16 @@ class ToolContext:
             approval = r.json()
             if approval.get("status") != "pending":
                 return approval
+            # Renew task lease during approval wait to prevent zombie reaper timeout.
+            # This is defense-in-depth alongside the heartbeat in engine/runner.py.
+            _now_mono = _time.monotonic()
+            if self.task_id and _now_mono - _last_renew >= _RENEW_INTERVAL:
+                try:
+                    await self.http.post(
+                        f"{self.supervisor_url}/v1/tasks/{self.task_id}/renew_lease",
+                        json={"worker_id": self.worker_id, "lease_sec": _RENEW_LEASE_SEC},
+                    )
+                except Exception:
+                    pass  # best-effort; heartbeat is the primary renewal mechanism
+                _last_renew = _now_mono
             await asyncio.sleep(interval)

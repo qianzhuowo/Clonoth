@@ -87,6 +87,32 @@ class OpenAIProvider(BaseProvider):
     It supports tool calling via the `tools` field.
     """
 
+    # ------------------------------------------------------------------
+    #  L3 Provider 层：消息预处理
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _prepare_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """L3: 将 L2 输出转换为 OpenAI API 最终格式。
+
+        【三层管道 L3 实现】两项职责：
+        1. 防御性剥离残留的 _ 开头内部字段（_meta, _dynamic 等），
+           正常情况下 L2 已经剥离，这里做二次保险。
+        2. Prefill Guard：如果最后一条消息是 assistant，追加一条
+           user 消息，避免 Anthropic 系模型（通过 OpenAI 兼容端点
+           访问时）因连续 assistant 消息报错。
+        """
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            # 剥离残留的内部字段（_ 开头的键）
+            clean = {k: v for k, v in msg.items() if not k.startswith('_')}
+            result.append(clean)
+        # Prefill Guard：最后一条是 assistant 时追加 user 占位消息，
+        # 防止某些 API 端点拒绝以 assistant 结尾的消息列表。
+        if result and result[-1].get('role') == 'assistant':
+            result.append({'role': 'user', 'content': '请继续。'})
+        return result
+
     def __init__(
         self,
         *,
@@ -117,9 +143,12 @@ class OpenAIProvider(BaseProvider):
 
         url = f"{self._base_url}/chat/completions"
 
+        # L3: 在发送前对消息做 Provider 层预处理（剥离内部字段 + Prefill Guard）
+        prepared = self._prepare_messages(messages)
+
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": prepared,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
@@ -250,9 +279,12 @@ class OpenAIProvider(BaseProvider):
     ) -> ProviderResponse:
         url = f"{self._base_url}/chat/completions"
 
+        # L3: 在发送前对消息做 Provider 层预处理（剥离内部字段 + Prefill Guard）
+        prepared = self._prepare_messages(messages)
+
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": prepared,
         }
         if tools:
             payload["tools"] = tools

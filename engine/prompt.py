@@ -50,32 +50,12 @@ def _render_variables(text: str, variables: dict[str, str]) -> str:
     return re.sub(r'\{\{(\w+)\}\}', _repl, text)
 
 
-def assemble_prompt(
+def _build_variables(
     workspace_root: Path,
     node: Node,
-    *,
     variables: dict[str, str] | None = None,
-) -> list[dict[str, Any]]:
-    """渲染节点的 prompt 模板，返回多条 system 消息。
-
-    返回 list[{"role": "system", "content": str}]。
-    第一条为静态内容（跨 turn 稳定，利于 prompt cache），
-    第二条为动态内容（含 {{now}}、{{instruction}} 等每 turn 变化的内容）。
-
-    处理顺序：
-    1. 展开 {{include:filename}}（从 config/nodes/ 目录读取）
-    2. 替换 {{变量}} 占位符
-    3. 按 `# %%DYNAMIC%%` 标记拆分静态/动态段
-    """
-    raw = node.prompt.strip() if node.prompt else ""
-    if not raw:
-        return [{"role": "system", "content": DEFAULT_PROMPT}]
-
-    # 第一步：展开 include
-    nodes_dir = workspace_root / "config" / "nodes"
-    expanded = _expand_includes(raw, nodes_dir)
-
-    # 第二步：变量替换
+) -> dict[str, str]:
+    """Build merged template variable dict for prompt rendering."""
     merged: dict[str, str] = {}
     if variables:
         merged.update(variables)
@@ -88,11 +68,104 @@ def assemble_prompt(
     merged.setdefault("os_version", platform.version())
     merged.setdefault("timezone", str(datetime.now().astimezone().tzinfo or "UTC"))
     merged.setdefault("user_language", locale.getdefaultlocale()[0] or "en_US")
+    return merged
 
+
+def _assemble_block_prompt(
+    workspace_root: Path,
+    node: Node,
+    blocks: list,
+    variables: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """Process prompt in block list mode.
+
+    Each block: {role, content?, depth?}
+    Special role "history" marks the conversation history insertion point.
+    Returns processed block list for ai_step to consume.
+    """
+    nodes_dir = workspace_root / "config" / "nodes"
+    merged = _build_variables(workspace_root, node, variables)
+
+    result: list[dict[str, Any]] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+
+        # Skip disabled blocks
+        if block.get("enabled") is False:
+            continue
+
+        role = str(block.get("role") or "").strip()
+        if not role:
+            continue
+
+        # History marker — no content processing
+        if role == "history":
+            result.append({"role": "history"})
+            continue
+
+        content = str(block.get("content") or "").strip()
+        if not content:
+            continue
+
+        # Expand includes and render variables
+        content = _expand_includes(content, nodes_dir)
+        content = _render_variables(content, merged)
+
+        entry: dict[str, Any] = {"role": role, "content": content}
+
+        # Optional depth (parsed for forward-compat; used by ai_step)
+        raw_depth = block.get("depth")
+        if raw_depth is not None:
+            try:
+                entry["depth"] = int(raw_depth)
+            except (ValueError, TypeError):
+                pass
+
+        result.append(entry)
+
+    # Ensure a history marker exists; if user didn't specify one, append at end
+    if not any(isinstance(b, dict) and b.get("role") == "history" for b in result):
+        result.append({"role": "history"})
+
+    return result if result else [{"role": "system", "content": DEFAULT_PROMPT}]
+
+
+def assemble_prompt(
+    workspace_root: Path,
+    node: Node,
+    *,
+    variables: dict[str, str] | None = None,
+) -> list[dict[str, Any]]:
+    """渲染节点的 prompt 模板，返回消息列表。
+
+    字符串模式（prompt 为 str）：
+      返回 list[{"role": "system", "content": str}]（1-2 条）。
+      使用 # %%DYNAMIC%% 标记拆分静态/动态段。
+
+    列表模式（prompt 为 list）：
+      返回 block 列表，可含 {"role": "history"}（历史展开标记）等。
+      不使用 %%DYNAMIC%%，由块排列控制缓存边界。
+    """
+    raw = node.prompt
+
+    # Block list mode
+    if isinstance(raw, list):
+        return _assemble_block_prompt(workspace_root, node, raw, variables)
+
+    # String mode (existing behavior)
+    raw_str = raw.strip() if raw else ""
+    if not raw_str:
+        return [{"role": "system", "content": DEFAULT_PROMPT}]
+
+    nodes_dir = workspace_root / "config" / "nodes"
+    expanded = _expand_includes(raw_str, nodes_dir)
+
+    merged = _build_variables(workspace_root, node, variables)
     rendered = _render_variables(expanded, merged)
+    rendered = rendered.encode('raw_unicode_escape').decode('unicode_escape')
 
-    # 第三步：拆分静态/动态段
-    # 节点 prompt 中可用 `# %%DYNAMIC%%` 标记分隔，标记之前为静态段，之后为动态段
+    # 拆分静态/动态段
     marker = "# %%DYNAMIC%%"
     if marker in rendered:
         idx = rendered.index(marker)

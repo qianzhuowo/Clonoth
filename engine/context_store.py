@@ -1,5 +1,18 @@
 from __future__ import annotations
 
+# ============================================================================
+# DEPRECATED — Child Session 隔离（Phase D）
+#
+# 本模块实现的 node_contexts snapshot 机制已被 child session 方案替代。
+# 子节点的对话历史现在存储在 data/conversations/child_*.jsonl 中，
+# 由 ConversationStore 管理，不再需要完整 messages 数组的 JSON snapshot。
+#
+# 当前保留所有函数供兼容期使用（主节点、compact dispatch 仍在调用）。
+# 待 child session 稳定运行后（约一周），可安全删除本模块。
+#
+# 参考：data/child_session_design.md §七 Phase D
+# ============================================================================
+
 import json
 import os
 import time
@@ -73,42 +86,11 @@ def load_context_snapshot(workspace_root: Path, context_ref: str) -> dict[str, A
     return data if isinstance(data, dict) else None
 
 
-def append_context_message(
-    workspace_root: Path,
-    context_ref: str,
-    *,
-    role: str,
-    content: str,
-) -> dict[str, Any] | None:
-    snapshot = load_context_snapshot(workspace_root, context_ref)
-    if snapshot is None:
-        return None
-    messages = snapshot.get("messages")
-    if not isinstance(messages, list):
-        messages = []
-    messages = list(messages)
-    messages.append({"role": str(role or "user"), "content": str(content or "")})
-    snapshot["messages"] = messages
-    write_context_snapshot(workspace_root, context_ref, snapshot)
-    return snapshot
-
-
-def delete_context_snapshot(workspace_root: Path, context_ref: str) -> bool:
-    """删除单个上下文快照文件。"""
-    ref = (context_ref or "").strip()
-    if not ref:
-        return False
-    try:
-        p = _resolve_ref(workspace_root, ref)
-    except Exception:
-        return False
-    if p.exists() and p.is_file():
-        try:
-            p.unlink()
-            return True
-        except Exception:
-            return False
-    return False
+# 审计报告 Step 1（2026-04-16）：删除 append_context_message 和
+# delete_context_snapshot 两个函数。search_in_files 确认全仓零调用点，
+# 属于无人使用的历史代码。主节点写入走 write_context_snapshot，
+# 清理走 cleanup_session_contexts / cleanup_old_contexts，这两个函数
+# 与当前运行路径无关。
 
 
 def cleanup_session_contexts(

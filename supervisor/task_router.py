@@ -29,14 +29,20 @@ class TaskRouterMixin:
             # 后置记忆提取不对 batch 子 task 触发
             return
 
+        # ---- 压缩 dispatch 结果：compactor 子 task 完成 ----
+        if self._is_compact_dispatch_result(task):
+            self._apply_compact_result_locked(task)
+            return
+
         action = task.result or {}
         act = str(action.get("action") or "").strip()
-        if act == "dispatch":
+        if act == "preempted":
+            self._route_preempted_locked(task, action)
+            return  # preempted 不触发记忆提取
+        elif act == "dispatch":
             self._route_dispatch_locked(task, action)
-        elif act == "finish":
+        elif act in ("finish", "ask"):
             self._route_finish_locked(task, action)
-        elif act == "ask":
-            self._route_ask_locked(task, action)
         elif act == "fail":
             self._route_fail_locked(task, action)
         # cancelled → 不做路由
@@ -52,6 +58,13 @@ class TaskRouterMixin:
         target = str(action.get("target_node") or "").strip()
         dispatch_input = action.get("dispatch_input") if isinstance(action.get("dispatch_input"), dict) else {}
         dispatch_batch = action.get("dispatch_batch")
+
+        # 标记父 task 正在等待压缩 dispatch
+        if dispatch_input.get("_compact_dispatch"):
+            task.input["_compact_dispatch_pending"] = True
+            task.input["_compact_keep_recent"] = int(
+                dispatch_input.get("_compact_keep_recent", 6)
+            )
 
         created_child_ids: list[str] = []
 
@@ -81,14 +94,34 @@ class TaskRouterMixin:
                         batch_index=idx,
                     )
                 else:
+                    _batch_ctx_mode = str(item.get("context_mode") or "accumulate").strip()
+                    _batch_ctx_key = str(item.get("context_key") or "").strip() or None
+                    _batch_input: dict[str, Any] = {
+                        "instruction": str(item.get("instruction") or "").strip(),
+                    }
+                    if _batch_ctx_key:
+                        _batch_input["_context_key"] = _batch_ctx_key
+
+                    # Child Session 隔离（Phase B）：批量委派也走 child session
+                    _b_child_sid, _b_is_new = self.get_or_create_child_session(
+                        task.session_id, item_target, _batch_ctx_key or "", _batch_ctx_mode,
+                    )
+                    _batch_input["child_session_id"] = _b_child_sid
+                    _batch_input["context_mode"] = _batch_ctx_mode
+                    _batch_input["use_context"] = False
+                    if _batch_ctx_mode == "fork":
+                        _batch_input["fork_from_session_id"] = task.session_id
+                    # 审计报告 Step 1（2026-04-16）：删除此处对 _find_last_context_ref_locked
+                    # 的 accumulate fallback 注入。engine/runner.py 在 child_session_id
+                    # 非空时会无条件清空 context_ref（参见 runner.py:514），此注入永远
+                    # 不会被消费。保留只是兼容期死代码，现移除。
+
                     child = self._create_task_locked(
                         session_id=task.session_id,
                         session_generation=task.session_generation,
                         kind=TaskKind.node,
                         node_id=item_target,
-                        input_data={
-                            "instruction": str(item.get("instruction") or "").strip(),
-                        },
+                        input_data=_batch_input,
                         continuation={},
                         source_inbound_seq=task.source_inbound_seq,
                         caller_task_id=task.task_id,
@@ -99,16 +132,35 @@ class TaskRouterMixin:
 
         # ---- 单节点委派 ----
         if not created_child_ids and target:
-            child_ctx_ref = self._find_last_context_ref_locked(task.session_id, target)
+            _ctx_mode = str(dispatch_input.get("context_mode") or "accumulate").strip()
+            _ctx_key = str(dispatch_input.get("context_key") or "").strip() or None
+            _single_input: dict[str, Any] = {
+                "instruction": str(dispatch_input.get("instruction") or "").strip(),
+            }
+            if _ctx_key:
+                _single_input["_context_key"] = _ctx_key
+
+            # Child Session 隔离（Phase B）：用 child session 替代 context_ref
+            _child_sid, _is_new = self.get_or_create_child_session(
+                task.session_id, target, _ctx_key or "", _ctx_mode,
+            )
+            _single_input["child_session_id"] = _child_sid
+            _single_input["context_mode"] = _ctx_mode
+            _single_input["use_context"] = False  # child session 模式不走 _fetch_history
+            if _ctx_mode == "fork":
+                # fork 模式需要告诉 engine 从哪个 session 复制历史
+                _single_input["fork_from_session_id"] = task.session_id
+
+            # 审计报告 Step 1（2026-04-16）：删除此处单节点 dispatch 的 accumulate/fresh
+            # 兼容期 fallback。engine/runner.py:514 在 child_session_id 非空时会无条件
+            # 清空 context_ref，accumulate/fresh 两个分支写的值永远不会被消费。
+
             child = self._create_task_locked(
                 session_id=task.session_id,
                 session_generation=task.session_generation,
                 kind=TaskKind.node,
                 node_id=target,
-                input_data={
-                    "instruction": str(dispatch_input.get("instruction") or "").strip(),
-                    "context_ref": child_ctx_ref,
-                },
+                input_data=_single_input,
                 continuation={},
                 source_inbound_seq=task.source_inbound_seq,
                 caller_task_id=task.task_id,
@@ -123,6 +175,53 @@ class TaskRouterMixin:
             self._event_task_snapshot("task_suspended", task)
 
     # ------------------------------------------------------------------ #
+    #  preempted
+    # ------------------------------------------------------------------ #
+
+    def _route_preempted_locked(self, task: Task, action: dict[str, Any]) -> None:
+        """处理 preempted 结果：保存 context_ref，发射事件，恢复 caller（如有）。"""
+        context_ref = str(action.get("context_ref") or "")
+        task.preempted_context_ref = context_ref
+
+        # 发射 task_preempted 事件给 Bot
+        self.eventlog.append(
+            session_id=task.session_id,
+            component="supervisor",
+            type_="task_preempted",
+            payload={
+                "task_id": task.task_id,
+                "node_id": task.node_id,
+                "context_ref": context_ref,
+                "session_id": task.session_id,
+            },
+            transient=True,
+        )
+
+        # 子节点被 preempt：恢复 suspended 的 caller，注入 child_preempted
+        caller_id = (task.caller_task_id or "").strip()
+        if caller_id:
+            caller = self.tasks.get(caller_id)
+            if caller and caller.status == TaskStatus.suspended:
+                caller.status = TaskStatus.pending
+                caller.waiting_for_task_id = None
+                caller.worker_id = None
+                caller.lease_expires_at = None
+                caller.updated_at = _now()
+                caller.input["resume_data"] = {
+                    "type": "child_preempted",
+                    "child_node_id": str(task.node_id or ""),
+                    "context_ref": context_ref,
+                }
+                caller.input["context_ref"] = str(
+                    caller.result.get("context_ref")
+                    or caller.input.get("context_ref")
+                    or ""
+                )
+                self._event_task_snapshot("task_resumed", caller)
+
+        # 不输出给用户，不注入 inbound
+
+    # ------------------------------------------------------------------ #
     #  finish / ask / fail
     # ------------------------------------------------------------------ #
 
@@ -134,13 +233,6 @@ class TaskRouterMixin:
             "result": result,
         }, result)
 
-    def _route_ask_locked(self, task: Task, action: dict[str, Any]) -> None:
-        result = action.get("result") if isinstance(action.get("result"), dict) else {}
-        self._resume_caller_or_output_locked(task, {
-            "type": "child_ask",
-            "child_node_id": str(task.node_id or task.tool_name or ""),
-            "result": result,
-        }, result)
 
     def _route_fail_locked(self, task: Task, action: dict[str, Any]) -> None:
         error = str(action.get("error") or "未知错误").strip()
@@ -257,7 +349,12 @@ class TaskRouterMixin:
                 self._event_task_snapshot("task_resumed", caller)
                 return
 
-        # 没有 suspended caller → 输出给用户
+        # 没有 suspended caller
+        # 异步 dispatch 子任务完成 → 注入 inbound 通知入口节点
+        if task.input.get("_async_dispatch"):
+            self._inject_async_dispatch_result_locked(task, fallback_result)
+            return
+
         # 系统内部任务（如记忆提取）静默完成，不输出给用户
         if task.input.get("_system_task"):
             return
@@ -267,7 +364,328 @@ class TaskRouterMixin:
             self.append_outbound_message(
                 session_id=task.session_id, text=text,
                 attachments=atts, source_inbound_seq=task.source_inbound_seq,
+                node_id=task.node_id,
             )
+
+
+    # ------------------------------------------------------------------ #
+    #  异步 dispatch 结果注入
+    # ------------------------------------------------------------------ #
+
+    def _inject_async_dispatch_result_locked(
+        self, task: Task, fallback_result: dict[str, Any],
+    ) -> None:
+        """异步 dispatch 子任务完成后，将结果注入 session。
+
+        优先尝试 preempt 当前 running 的入口 task（V2 preempt：engine
+        在 checkpoint 检测到信号后注入消息并继续执行，无需新建 task）。
+        若 session 中没有 running 的入口 task，则走传统 inbound 路径
+        创建新 task。
+
+        此方法在 self._lock 内调用，不可调用会再次获取 _lock 的公开方法。
+        """
+        result_text = str(fallback_result.get("text") or "").strip()
+        result_summary = str(fallback_result.get("summary") or "").strip()
+        caller_node = str(task.input.get("_caller_node_id") or "").strip()
+
+        notify_parts: list[str] = [f"[异步子任务完成] 节点 {task.node_id} 已完成。"]
+        if caller_node:
+            notify_parts[0] = f"[异步子任务完成] {caller_node} 委派的 {task.node_id} 已完成。"
+        if result_summary:
+            notify_parts.append(f"摘要：{result_summary}")
+        if result_text:
+            notify_parts.append(f"结果：\n{result_text}")
+        notify_text = "\n".join(notify_parts)
+
+        result_atts = (
+            fallback_result.get("attachments")
+            if isinstance(fallback_result.get("attachments"), list)
+            else None
+        )
+
+        session_info = self.sessions.get(task.session_id)
+        if not session_info:
+            return
+
+        # 检查 session generation 是否过期
+        current_gen = self._current_session_generation_locked(task.session_id)
+        if task.session_generation and current_gen and task.session_generation != current_gen:
+            return
+
+        # 检查 session 是否已被 cancel
+        if task.session_id in self._cancelled_sessions:
+            return
+
+        # ---- 优先路径：preempt running 的入口 task ----
+        running_entry = self._find_running_entry_task_locked(task.session_id)
+        if running_entry is not None and not running_entry.preempt_requested:
+            running_entry.preempt_requested = True
+            running_entry.preempt_message = notify_text
+            running_entry.preempt_attachments = list(result_atts or [])
+            self.eventlog.append(
+                session_id=task.session_id,
+                component="supervisor",
+                type_="preempt_requested",
+                payload={
+                    "task_id": running_entry.task_id,
+                    "session_id": task.session_id,
+                    "has_message": True,
+                    "reason": "async_dispatch_result",
+                    "source_task_id": task.task_id,
+                },
+                transient=True,
+            )
+            return
+
+        # ---- 次优路径：标记 suspended 的入口 task ----
+        # 入口 task 可能暂时挂起（如等待 compactor），此时无法立即 preempt。
+        # 预设 preempt 标记后，task 恢复为 running 时 engine 会在首次推理
+        # 循环中检测到并注入结果，避免结果丢失。
+        suspended_entry = self._find_suspended_entry_task_locked(task.session_id)
+        if suspended_entry is not None and not suspended_entry.preempt_requested:
+            suspended_entry.preempt_requested = True
+            suspended_entry.preempt_message = notify_text
+            suspended_entry.preempt_attachments = list(result_atts or [])
+            self.eventlog.append(
+                session_id=task.session_id,
+                component="supervisor",
+                type_="preempt_requested",
+                payload={
+                    "task_id": suspended_entry.task_id,
+                    "session_id": task.session_id,
+                    "has_message": True,
+                    "reason": "async_dispatch_result_deferred",
+                    "source_task_id": task.task_id,
+                },
+                transient=True,
+            )
+            return
+
+        # ---- 回退路径：创建 inbound → 新 task ----
+        conv_key = session_info.conversation_key
+        channel = session_info.channel
+        msg_id = f"async_dispatch:{task.task_id}"
+
+        payload: dict[str, Any] = {
+            "channel": channel,
+            "conversation_key": conv_key,
+            "message_id": msg_id,
+            "text": notify_text,
+        }
+        if result_atts:
+            payload["attachments"] = result_atts
+
+        # eventlog 有独立锁，不会与 self._lock 死锁
+        evt = self.eventlog.append(
+            session_id=task.session_id,
+            component="supervisor",
+            type_="inbound_message",
+            payload=payload,
+        )
+        seq = int(evt.get("seq", 0))
+        self._apply_inbound_message(seq=seq, session_id=task.session_id, payload=payload)
+        self._advance_inbound_cursor()
+        self._create_entry_task_for_inbound_locked(
+            inbound_seq=seq, session_id=task.session_id, payload=payload,
+        )
+
+    def _find_entry_task_by_status_locked(self, session_id: str, statuses: set) -> Task | None:
+        """在 session 中查找指定状态的入口 task。
+
+        入口 task 定义：无 caller、非异步 dispatch 子任务、非系统任务。
+        若存在多个符合条件的 task（理论上不应发生），返回最早创建的。
+        """
+        candidate: Task | None = None
+        for t in self.tasks.values():
+            if t.session_id != session_id:
+                continue
+            if t.status not in statuses:
+                continue
+            # 排除：有 caller 的子任务
+            if t.caller_task_id:
+                continue
+            # 排除：异步 dispatch 子任务自身
+            if t.input.get("_async_dispatch"):
+                continue
+            # 排除：系统内部任务
+            if t.input.get("_system_task"):
+                continue
+            if candidate is None or t.created_at < candidate.created_at:
+                candidate = t
+        return candidate
+
+    def _find_running_entry_task_locked(self, session_id: str) -> Task | None:
+        """在 session 中查找 running 状态的入口 task。"""
+        return self._find_entry_task_by_status_locked(session_id, {TaskStatus.running})
+
+    def _find_suspended_entry_task_locked(self, session_id: str) -> Task | None:
+        """在 session 中查找 suspended 状态的入口 task。"""
+        return self._find_entry_task_by_status_locked(session_id, {TaskStatus.suspended})
+
+    # ------------------------------------------------------------------ #
+    #  压缩 dispatch 结果处理
+    # ------------------------------------------------------------------ #
+
+    def _is_compact_dispatch_result(self, task: Task) -> bool:
+        """判断是否是 compactor 子 task 的完成事件。"""
+        caller_id = (task.caller_task_id or "").strip()
+        if not caller_id:
+            return False
+        caller = self.tasks.get(caller_id)
+        if not caller:
+            return False
+        return bool(caller.input.get("_compact_dispatch_pending"))
+
+    def _apply_compact_result_locked(self, task: Task) -> None:
+        """compactor 完成后，对父 task 的上下文执行压缩并恢复父 task。
+
+        Step 2（2026-04-16）：支持两条路径。
+        - ConversationStore 路径：caller 是主节点（flag 开启）或子节点（有 child_session_id），
+          直接操作 data/conversations/{target}.jsonl，用 summary 消息替换中间部分。
+        - 旧 snapshot 路径：flag 关闭时的主节点，沿用 caller.input.context_ref 读写。
+        """
+        from engine.compact import _format_compact_summary, apply_compact_summary
+        from engine.context_store import load_context_snapshot, write_context_snapshot
+
+        caller_id = task.caller_task_id
+        caller = self.tasks.get(caller_id)
+        if not caller or caller.status != TaskStatus.suspended:
+            return
+
+        act = str((task.result or {}).get("action") or "").strip()
+        parent_ctx_ref = str(
+            caller.result.get("context_ref")
+            or caller.input.get("context_ref")
+            or ""
+        ).strip()
+
+        # ---- 选择压缩路径 ----
+        # 1. caller 带 child_session_id → ConversationStore（child session）
+        # 2. caller 无 context_ref + main_session_enabled → ConversationStore（主 session）
+        # 3. 否则 → 旧 snapshot 路径
+        from clonoth_runtime import load_runtime_config
+        _rc = load_runtime_config(self.workspace_root)
+        _main_conv_enabled = bool(
+            _rc.get("engine", {}).get("child_session", {}).get("main_session_enabled", True)
+        )
+        child_sid = str(caller.input.get("child_session_id") or "").strip()
+        target_sid_for_conv = ""
+        if child_sid:
+            target_sid_for_conv = child_sid
+        elif _main_conv_enabled:
+            # Step 2 修复：main_session_enabled=true 时无条件走 ConvStore 路径。
+            # 原条件 `and not parent_ctx_ref` 会被 _persist_ctx 写入的 context_ref 拦住，
+            # 导致 compact 走旧 snapshot 路径，而 runner.py 已改为从 JSONL 读取——读写不一致。
+            target_sid_for_conv = caller.session_id
+
+        if act == "finish":
+            result = (task.result or {}).get("result") or {}
+            raw_summary = str(result.get("text") or "").strip()
+            summary = _format_compact_summary(raw_summary)
+
+            if summary and target_sid_for_conv:
+                # ---- ConversationStore 路径 ----
+                before, after = self._apply_compact_via_conv_store_locked(
+                    target_sid_for_conv, summary,
+                    keep_recent=int(caller.input.get("_compact_keep_recent", 6)),
+                )
+                if after < before:
+                    self._resume_compact_parent_locked(
+                        caller, parent_ctx_ref,
+                        before=before, after=after, success=True,
+                    )
+                    return
+                # before == after：消息太少未压缩，静默恢复
+                self._resume_compact_parent_locked(
+                    caller, parent_ctx_ref,
+                    before=before, after=after, success=False,
+                )
+                return
+
+            if summary and parent_ctx_ref:
+                # ---- 旧 snapshot 路径（flag 关闭时的主节点）----
+                snapshot = load_context_snapshot(self.workspace_root, parent_ctx_ref)
+                if snapshot and isinstance(snapshot.get("messages"), list):
+                    old_messages = snapshot["messages"]
+                    keep_recent = int(caller.input.get("_compact_keep_recent", 6))
+                    compressed = apply_compact_summary(
+                        old_messages, summary, keep_recent=keep_recent,
+                    )
+                    if len(compressed) < len(old_messages):
+                        snapshot["messages"] = compressed
+                        write_context_snapshot(
+                            self.workspace_root, parent_ctx_ref, snapshot,
+                        )
+                        self._resume_compact_parent_locked(
+                            caller, parent_ctx_ref,
+                            before=len(old_messages),
+                            after=len(compressed),
+                            success=True,
+                        )
+                        return
+
+        # 失败路径：静默恢复父 task
+        self._resume_compact_parent_locked(
+            caller, parent_ctx_ref, success=False,
+        )
+
+    def _apply_compact_via_conv_store_locked(
+        self, target_session_id: str, summary: str, *, keep_recent: int,
+    ) -> tuple[int, int]:
+        """Step 2（2026-04-16）：在 ConversationStore 层面执行压缩。
+
+        读取 target session 的 JSONL，用 summary 消息替换中间部分，保留最后
+        keep_recent 条消息。与 engine.compact.apply_compact_summary 的策略一致，
+        但直接操作 Message 对象而非 dict。
+
+        注意 ConversationStore 里没有 system 消息（system prompt 每轮由 ai_step
+        的 assemble_initial_messages 重建），所以无需处理 prefix/inner system。
+
+        Returns: (before_count, after_count)
+        """
+        from uuid import uuid4
+        from datetime import datetime, timezone
+        from engine.conversation_store import ConversationStore, Message, MessageType
+
+        store = ConversationStore(self.workspace_root / "data" / "conversations")
+        msgs = store.load(target_session_id)
+        before = len(msgs)
+
+        # 消息太少（加上 summary 和保留的也不会变短）→ 不压缩
+        if before <= keep_recent + 1:
+            return before, before
+
+        to_keep = msgs[-keep_recent:] if keep_recent > 0 else []
+        summary_msg = Message(
+            id=str(uuid4()),
+            role="user",
+            content="[以下是之前对话的结构化摘要，原始上下文已被压缩]\n\n" + summary,
+            message_type=MessageType.SUMMARY,
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        new_messages = [summary_msg] + to_keep
+        store.replace_all(target_session_id, new_messages)
+        return before, len(new_messages)
+
+    def _resume_compact_parent_locked(
+        self, caller: Task, context_ref: str, *,
+        before: int = 0, after: int = 0, success: bool = True,
+    ) -> None:
+        """恢复等待压缩的父 task。"""
+        caller.status = TaskStatus.pending
+        caller.waiting_for_task_id = None
+        caller.worker_id = None
+        caller.lease_expires_at = None
+        caller.updated_at = _now()
+        caller.input["resume_data"] = {
+            "type": "compact_done",
+            "success": success,
+            "before": before,
+            "after": after,
+        }
+        caller.input["context_ref"] = context_ref
+        caller.input.pop("_compact_dispatch_pending", None)
+        self._event_task_snapshot("task_resumed", caller)
 
 
     # ------------------------------------------------------------------ #

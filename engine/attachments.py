@@ -7,6 +7,7 @@ Before sending to the LLM provider, file:// refs are resolved to base64 data URL
 from __future__ import annotations
 
 import base64
+import io
 import logging
 import mimetypes
 import uuid
@@ -31,6 +32,10 @@ _MIME_MAP = {
 
 # 单图最大 10 MB
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+# LLM 图片压缩参数
+_MAX_LONG_EDGE = 1024
+_JPEG_QUALITY = 85
 
 # Discord CDN 等来源经常返回无意义的 MIME，需要清洗掉以便 fallback 到扩展名猜测
 _USELESS_MIMES = frozenset({
@@ -112,9 +117,15 @@ def save_attachment(
     }
 
 
-def attachments_to_content_parts(attachments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Convert attachment dicts to OpenAI multimodal content parts (with file:// references).
+def attachments_to_content_parts(
+    attachments: list[dict[str, Any]],
+    workspace_root: Path | None = None,  # reserved for future content_files support
+) -> list[dict[str, Any]]:
+    """Convert attachment dicts to OpenAI multimodal content parts.
 
+    Images use file:// references (resolved to base64 later by prepare_messages_for_llm).
+    Text files produce a metadata-only reference (filename + path) without reading content.
+    The AI can use read_file to inspect content, or pass the path via content_files to a child node.
     Only paths under data/attachments/ are accepted.
     """
     parts: list[dict[str, Any]] = []
@@ -126,6 +137,20 @@ def attachments_to_content_parts(attachments: list[dict[str, Any]]) -> list[dict
             continue
         if not _is_allowed_attachment_path(path):
             continue
+
+        att_type = str(att.get("type") or "").strip()
+
+        # Text files: metadata-only reference (do NOT read content into context)
+        if att_type == "file":
+            name = att.get("name") or Path(path).name
+            mime = att.get("mime_type") or "text/plain"
+            parts.append({
+                "type": "text",
+                "text": f"[Attached file: {name} | type: {mime} | path: {path}]",
+            })
+            continue
+
+        # Images: create file:// reference for later resolution
         url = f"{_FILE_SCHEME}{path}"
         parts.append({
             "type": "image_url",
@@ -137,13 +162,14 @@ def attachments_to_content_parts(attachments: list[dict[str, Any]]) -> list[dict
 def build_multimodal_content(
     text: str,
     attachments: list[dict[str, Any]],
+    workspace_root: Path | None = None,
 ) -> list[dict[str, Any]] | str:
-    """Build multimodal content for a message. Returns plain str if no image attachments."""
-    image_parts = attachments_to_content_parts(attachments)
-    if not image_parts:
+    """Build multimodal content for a message. Returns plain str if no attachment parts."""
+    att_parts = attachments_to_content_parts(attachments, workspace_root=workspace_root)
+    if not att_parts:
         return text
     parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
-    parts.extend(image_parts)
+    parts.extend(att_parts)
     return parts
 
 
@@ -177,6 +203,10 @@ def prepare_messages_for_llm(
     cache: dict[str, str | None] = {}
     result: list[dict[str, Any]] = []
     for msg in messages:
+        # Strip internal markers (_dynamic, _ephemeral, _meta, etc.) before sending to LLM API
+        if any(k.startswith("_") for k in msg):
+            msg = {k: v for k, v in msg.items() if not k.startswith("_")}
+
         content = msg.get("content")
         role = msg.get("role", "")
 
@@ -246,8 +276,69 @@ def prepare_messages_for_llm(
     return result
 
 
+def _compress_image_for_llm(data: bytes, mime: str) -> tuple[bytes, str]:
+    """Compress / resize an image for LLM consumption.
+
+    - GIF: extract first frame
+    - Long edge > _MAX_LONG_EDGE: resize proportionally
+    - Convert to JPEG
+    Returns (compressed_bytes, mime_type).
+    """
+    try:
+        from PIL import Image as _PILImage
+
+        img = _PILImage.open(io.BytesIO(data))
+
+        # GIF / animated: take first frame only
+        if getattr(img, "is_animated", False) or img.format == "GIF":
+            img.seek(0)
+
+        # Convert to RGB (handle RGBA / palette transparency / etc.)
+        if img.mode != "RGB":
+            if "A" in img.mode or (img.mode == "P" and "transparency" in img.info):
+                img = img.convert("RGBA")
+                bg = _PILImage.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[3])
+                img = bg
+            else:
+                img = img.convert("RGB")
+
+        # Resize if long edge exceeds limit
+        w, h = img.size
+        long_edge = max(w, h)
+        if long_edge > _MAX_LONG_EDGE:
+            scale = _MAX_LONG_EDGE / long_edge
+            img = img.resize((int(w * scale), int(h * scale)), _PILImage.LANCZOS)
+
+        # Encode as JPEG
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=_JPEG_QUALITY, optimize=True)
+        result = buf.getvalue()
+
+        # If still huge, progressively lower quality
+        if len(result) > _MAX_IMAGE_BYTES:
+            for q in (70, 50, 30):
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=q, optimize=True)
+                result = buf.getvalue()
+                if len(result) <= _MAX_IMAGE_BYTES:
+                    break
+
+        _logger.debug(
+            "image compressed: %d -> %d bytes, %dx%d",
+            len(data), len(result), img.size[0], img.size[1],
+        )
+        return result, "image/jpeg"
+    except Exception as e:
+        _logger.warning("image compression failed, skipping image: %s", e)
+        return b"", mime
+
+
 def _resolve_file_url(url: str, workspace_root: Path) -> str | None:
-    """Resolve a file:// URL to a data: base64 URL."""
+    """Resolve a file:// URL to a data: base64 URL.
+
+    Images are automatically compressed / resized for LLM consumption.
+    """
     rel_path = url[len(_FILE_SCHEME):]
 
     # Only allow paths under data/attachments/
@@ -266,13 +357,26 @@ def _resolve_file_url(url: str, workspace_root: Path) -> str | None:
         return None
 
     try:
-        size = p.stat().st_size
-        if size > _MAX_IMAGE_BYTES:
-            return None
         data = p.read_bytes()
     except Exception:
         return None
 
     mime = _guess_mime_from_path(rel_path)
+
+    # Compress / resize images (skip SVG)
+    if mime.startswith("image/") and mime != "image/svg+xml":
+        data, mime = _compress_image_for_llm(data, mime)
+
+    if not data:
+        _logger.warning("image compression returned empty data, skipping: %s", rel_path)
+        return None
+
+    if len(data) > _MAX_IMAGE_BYTES:
+        _logger.warning(
+            "image too large after compression (%d bytes), skipping: %s",
+            len(data), rel_path,
+        )
+        return None
+
     b64 = base64.b64encode(data).decode("ascii")
     return f"data:{mime};base64,{b64}"

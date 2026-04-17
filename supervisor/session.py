@@ -20,7 +20,11 @@ _ALLOWED_ATT_PREFIX = "data/attachments/"
 def _build_multimodal_content(
     text: str, attachments: list[dict[str, Any]],
 ) -> list[dict[str, Any]] | str:
-    """将文本和图片附件合并为多模态消息内容。"""
+    """将文本和附件合并为多模态消息内容。
+
+    图片附件生成 file:// image_url 引用；
+    文本文件附件生成元数据文本引用（不读内容）。
+    """
     parts: list[dict[str, Any]] = []
     for att in attachments:
         if not isinstance(att, dict):
@@ -28,7 +32,16 @@ def _build_multimodal_content(
         path = str(att.get("path") or "").strip()
         if not path or not path.replace("\\", "/").lstrip("/").startswith(_ALLOWED_ATT_PREFIX):
             continue
-        parts.append({"type": "image_url", "image_url": {"url": f"file://{path}"}})
+        att_type = str(att.get("type") or "").strip()
+        if att_type == "file":
+            # Text file: metadata-only reference
+            from pathlib import Path as _Path
+            name = att.get("name") or _Path(path).name
+            mime = att.get("mime_type") or "text/plain"
+            parts.append({"type": "text", "text": f"[Attached file: {name} | type: {mime} | path: {path}]"})
+        else:
+            # Image: file:// reference
+            parts.append({"type": "image_url", "image_url": {"url": f"file://{path}"}})
     if not parts:
         return text
     return [{"type": "text", "text": text}] + parts
@@ -270,20 +283,29 @@ class SessionMixin:
 
     def get_or_create_session(self, *, channel: str, conversation_key: str) -> str:
         with self._lock:
-            if conversation_key in self.conversation_map:
-                return self.conversation_map[conversation_key]
+            # 方案 C: 检查映射指向的 session 是否真实存在，清除幽灵映射
+            existing_sid = self.conversation_map.get(conversation_key)
+            if existing_sid is not None:
+                if existing_sid in self.sessions:
+                    return existing_sid
+                # 幽灵映射：conversation_map 有记录但 sessions 中无对应条目，清除
+                self.conversation_map.pop(conversation_key, None)
 
             session_id = str(uuid.uuid4())
             created_at = _now()
 
-            self.sessions[session_id] = SessionInfo(
+            info = SessionInfo(
                 session_id=session_id,
                 channel=channel,
                 conversation_key=conversation_key,
                 created_at=created_at,
                 updated_at=created_at,
             )
+            self.sessions[session_id] = info
             self.conversation_map[conversation_key] = session_id
+
+            # 方案 A: 持久化到 sessions.json
+            self._session_store.on_session_created(info)
 
             self.eventlog.append(
                 session_id=session_id,
@@ -305,6 +327,7 @@ class SessionMixin:
         text: str | None = None,
         attachments: list[dict[str, Any]] | None = None,
         source_inbound_seq: int | None = None,
+        node_id: str | None = None,
     ) -> dict[str, Any]:
         text_clean = str(text or "").strip()
         if not text_clean and not attachments:
@@ -339,6 +362,8 @@ class SessionMixin:
                 payload["attachments"] = list(attachments)
             if src_seq is not None:
                 payload["source_inbound_seq"] = src_seq
+            if node_id:
+                payload["node_id"] = node_id
 
             evt = self.eventlog.append(
                 session_id=session_id,
@@ -361,12 +386,50 @@ class SessionMixin:
 
         Next inbound message with this conversation_key will create a fresh session.
         Also cleans up node_contexts for the old session.
+
+        Child Session 隔离（Phase C）：级联清理所有关联的 child session，
+        包括 JSONL 文件、映射表条目、sessions.json 标记。
         """
         with self._lock:
             old_session_id = self.conversation_map.pop(conversation_key, None)
             if not old_session_id:
                 return {"ok": False, "error": f"conversation not found: {conversation_key}"}
-            return {"ok": True, "old_session_id": old_session_id, "conversation_key": conversation_key}
+
+            # 方案 A: 标记 session 为已重置
+            self._session_store.on_session_reset(old_session_id)
+
+            # Child Session 隔离（Phase C）：级联清理所有关联的 child session
+            cleared_children = 0
+            conv_dir = self.workspace_root / "data" / "conversations"
+
+            # 删除主 session 的 JSONL
+            main_jsonl = conv_dir / f"{old_session_id}.jsonl"
+            if main_jsonl.exists():
+                try:
+                    main_jsonl.unlink()
+                except Exception:
+                    pass
+
+            # 删除所有关联 child session 的 JSONL 并标记 reset
+            child_ids = self.parent_children.pop(old_session_id, set())
+            for child_sid in child_ids:
+                child_jsonl = conv_dir / f"{child_sid}.jsonl"
+                if child_jsonl.exists():
+                    try:
+                        child_jsonl.unlink()
+                    except Exception:
+                        pass
+                self._session_store.on_session_reset(child_sid)
+                cleared_children += 1
+
+            # 清理 child_session_map 中所有以 old_session_id 为 parent 的条目
+            keys_to_remove = [k for k in self.child_session_map if k[0] == old_session_id]
+            for k in keys_to_remove:
+                del self.child_session_map[k]
+
+            return {"ok": True, "old_session_id": old_session_id,
+                    "conversation_key": conversation_key,
+                    "cleared_children": cleared_children}
 
     def session_messages(self, *, session_id: str, limit: int = 50) -> list[dict[str, Any]]:
         msgs: list[dict[str, Any]] = []

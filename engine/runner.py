@@ -32,6 +32,11 @@ from .tool_step import result_to_raw, summarize_result
 # Phase 1 (Session Conversation Store): 导入 ConversationStore 用于影子写入，
 # 在每个 node task 执行时实例化并挂载到 RunContext，供 ai_step 影子写入消息。
 from .conversation_store import ConversationStore, Message, MessageType
+# Phase 0/1: Signal System — 导入信号总线初始化和桥接函数。
+# 在 _run_node_task 中初始化 bus 并安装 EventLog 桥接，使 LLM 调用信号
+# 自动转发到 data/events.jsonl 供监控使用。
+from engine.signals import get_bus
+from engine.signals.bridge import install_event_bridge
 
 
 def _collect_node_info(workspace_root: Path, node_ids: list[str]) -> list[dict[str, str]]:
@@ -620,6 +625,15 @@ async def _run_node_task(
             source_task_id=task_id,
         )
         _conv_store.append(_target_sid, _user_msg)
+
+    # Phase 0/1: Signal System — 初始化信号总线并安装 EventLog 桥接。
+    # get_bus() 返回全局单例，install_event_bridge 是幂等的（多次调用只注册一次）。
+    # 读取 runtime.yaml 中的 signals.enabled 配置决定是否启用。
+    _signals_cfg = runtime_cfg.get("engine", {}).get("signals", {})
+    _sig_bus = get_bus()
+    _sig_bus.enabled = bool(_signals_cfg.get("enabled", True))
+    _bridge_patterns = _signals_cfg.get("bridge_patterns")
+    install_event_bridge(_sig_bus, patterns=_bridge_patterns)
 
     action = await run_ai_node(
         rctx=rctx, provider=provider, registry=registry, node=node,

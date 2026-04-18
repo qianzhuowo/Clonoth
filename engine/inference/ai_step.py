@@ -51,6 +51,9 @@ from toolbox.context import ToolContext
 from .tool_format import create_tool_formatter, build_llm_messages
 from .message_model import MessageMeta, set_message_meta
 from providers.base import ToolCall, ProviderResponse
+# Phase 2 Signal System: 导入信号总线，用于发射 tool.call 和 task.error 信号。
+# get_bus() 返回全局单例 SignalBus，Signal 是不可变事件数据类。
+from ..signals import Signal, get_bus
 
 if TYPE_CHECKING:
     from ..context import RunContext
@@ -339,18 +342,21 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
 
     # 将 LLM 的工具调用决策追加到对话历史
     _assistant_msg = ls.formatter.build_assistant_message(resp, resp.text or "", resp.tool_calls)
+    # [refactor 2026-04-18] raw_parts → metadata, thinking_text → reasoning, has_thinking → has_reasoning
+    # provider_meta 由 ProviderResponse 透传；engine 只搬运不解读
+    # [fix 2026-04-18] provider 名称改为动态获取，不再硬编码 "openai"。
+    # ls.provider.name 由 BaseProvider.name 提供，各 provider 子类在初始化时传入。
+    _provider_name = getattr(ls.provider, 'name', '') or 'unknown'
     _tc_meta = MessageMeta(
-        provider="openai",
+        provider=_provider_name,
         tool_mode=getattr(ls.node, 'tool_mode', 'native'),
         message_type="assistant",
         timestamp=datetime.now(timezone.utc).isoformat(),
-        raw_parts=[{
-            "text": resp.text or "",
-            "tool_calls": [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in (resp.tool_calls or [])],
-        }] if resp else [],
+        metadata={_provider_name: resp.provider_meta} if resp.provider_meta else {},
         tool_call_ids=[tc.id for tc in (resp.tool_calls or [])],
-        thinking_text="",
-        has_thinking=False,
+        reasoning=resp.reasoning or "",
+        has_reasoning=bool(resp.reasoning),
+        inline_data=resp.inline_data or [],
         usage=dict(ls.last_usage) if ls.last_usage else {},
     )
     set_message_meta(_assistant_msg, _tc_meta)
@@ -444,7 +450,12 @@ async def _execute_real_tools(
             break
         _t_name = _rtc["name"]
         _t_args = _rtc["arguments"]
-        _t_result = await ls.registry.execute(name=_t_name, arguments=_t_args, ctx=_tool_ctx)
+        # Phase 2 Signal: tool.call span 包裹每个工具的执行过程。
+        # 自动发射 tool.call.start（含工具名和参数摘要）和 tool.call.end（含 elapsed_ms 和 error）。
+        # span 是同步 contextmanager，在 async 函数中直接 with 即可。
+        _args_summary = _short(json.dumps(_t_args, ensure_ascii=False, default=str), 200)
+        with get_bus().span('tool.call', payload={'tool': _t_name, 'args_summary': _args_summary}):
+            _t_result = await ls.registry.execute(name=_t_name, arguments=_t_args, ctx=_tool_ctx)
         if isinstance(_t_result, dict) and _t_result.get("cancelled"):
             break
 
@@ -605,6 +616,19 @@ async def run_ai_node(
                 "before": resume_data.get("before", 0),
                 "after": resume_data.get("after", 0),
             })
+            # Phase 3 Signal: compact.done — context compaction completed
+            _c_before = resume_data.get("before", 0)
+            _c_after = resume_data.get("after", 0)
+            get_bus().emit(Signal(
+                name="compact.done",
+                payload={
+                    "node_id": node.id,
+                    "success": resume_data.get("success", True),
+                    "before_tokens": _c_before,
+                    "after_tokens": _c_after,
+                    "ratio": round(_c_after / _c_before, 2) if _c_before > 0 else 0,
+                },
+            ))
 
     # ---- 构建工具列表 ----
     tool_specs = _filter_tool_specs(node, registry.list_specs())
@@ -695,6 +719,7 @@ async def run_ai_node(
         if not resp.tool_calls:
             _parsed = formatter.parse_tool_calls(resp)
             if _parsed:
+                # [refactor 2026-04-18] thinking → reasoning，同步新增 inline_data / provider_meta
                 resp = ProviderResponse(
                     ok=True,
                     text=formatter.get_plain_text(resp),
@@ -702,9 +727,11 @@ async def run_ai_node(
                         ToolCall(id=p.id, name=p.name, arguments=p.arguments)
                         for p in _parsed
                     ],
-                    thinking=resp.thinking,
+                    reasoning=resp.reasoning,
                     status_code=resp.status_code,
                     usage=resp.usage,
+                    inline_data=resp.inline_data,
+                    provider_meta=resp.provider_meta,
                 )
 
         if resp.tool_calls:
@@ -718,6 +745,26 @@ async def run_ai_node(
             return action
 
     # ---- 达到最大步数 ----
+    # Phase 2 Signal: max_steps 超限时发射 task.error 信号。
+    # 从消息历史中反向查找最后执行的工具名，附带到 payload 中，便于监控和告警定位。
+    _last_tool = ""
+    for _m in reversed(ls.messages):
+        _c = _m.get("content", "")
+        if isinstance(_c, str) and _c.startswith('Tool result for "'):
+            _last_tool = _c.split('"')[1]
+            break
+    get_bus().emit(Signal(
+        name="task.error",
+        payload={
+            "error_type": "MaxStepsExceeded",
+            "steps": max_steps,
+            "max_steps": max_steps,
+            "last_tool": _last_tool,
+            "node_id": ls.node.id,
+            "task_id": ls.rctx.task_id,
+            "severity": "error",
+        },
+    ))
     ctx_ref = _persist_ctx(ls, max_steps)
     return TaskAction(
         action=ACTION_FAIL, node_id=ls.node.id,

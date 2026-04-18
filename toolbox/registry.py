@@ -298,7 +298,7 @@ class ToolRegistry:
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "path": {"type": "string"},
+                        "path": {"type": "string", "description": "Directory or file path to search in (relative or absolute). Supports single file. Default '.'"},
                         "mode": {"type": "string", "description": "search (default) or replace", "enum": ["search", "replace"]},
                         "pattern": {"type": "string", "description": "file glob pattern, e.g. '*.py', '**/*.js'. Default '**/*'"},
                         "isRegex": {"type": "boolean", "description": "treat query as regex. Default false"},

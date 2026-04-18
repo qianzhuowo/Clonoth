@@ -183,7 +183,8 @@ class NativeToolFormatter(ToolFormatter):
         """Native（Fake Native）模式 L2 读取转换。
 
         从同级 tool_calls 字段读取工具调用，拼接为 [Tool call history record] 文本。
-        兼容旧消息：没有 tool_calls 字段时，回退到 _meta.raw_parts。
+        兼容旧消息：没有 tool_calls 字段时，回退到 _meta.metadata.legacy.raw_parts
+        或 _meta.raw_parts（旧快照）。
         """
         clean = {k: v for k, v in message_dict.items()
                  if not k.startswith('_') and k != 'tool_calls'}
@@ -191,11 +192,18 @@ class NativeToolFormatter(ToolFormatter):
         # 优先从同级 tool_calls 字段读取（新格式）
         tool_calls = list(message_dict.get('tool_calls', []))
 
-        # 回退：旧消息没有 tool_calls 字段，从 _meta.raw_parts 提取
+        # [refactor 2026-04-18] raw_parts → metadata.legacy.raw_parts
+        # 回退：旧消息没有 tool_calls 字段，从 _meta 中提取
         if not tool_calls:
             meta = message_dict.get('_meta', {})
             if isinstance(meta, dict):
-                for part in meta.get('raw_parts', []):
+                # 新格式：metadata.legacy.raw_parts（由 from_dict 迁移而来）
+                _legacy = (meta.get('metadata') or {}).get('legacy') or {}
+                _raw_parts = _legacy.get('raw_parts', [])
+                # 旧格式兼容：直接读 raw_parts
+                if not _raw_parts:
+                    _raw_parts = meta.get('raw_parts', [])
+                for part in _raw_parts:
                     if isinstance(part, dict) and 'tool_calls' in part:
                         tool_calls.extend(part['tool_calls'])
 
@@ -508,7 +516,8 @@ class JsonToolFormatter(ToolFormatter):
         """JSON 模式 L2 读取转换：从 tool_calls 重建 <<<TOOL_CALL>>> 块拼入 content。
 
         从同级 tool_calls 字段读取工具调用。
-        兼容旧消息：没有 tool_calls 字段时，回退到 _meta.raw_parts。
+        兼容旧消息：没有 tool_calls 字段时，回退到 _meta.metadata.legacy.raw_parts
+        或 _meta.raw_parts（旧快照）。
         """
         clean = {k: v for k, v in message_dict.items()
                  if not k.startswith('_') and k != 'tool_calls'}
@@ -516,11 +525,18 @@ class JsonToolFormatter(ToolFormatter):
         # 优先从同级 tool_calls 字段读取（新格式）
         tool_calls = list(message_dict.get('tool_calls', []))
 
-        # 回退：旧消息没有 tool_calls 字段，从 _meta.raw_parts 提取
+        # [refactor 2026-04-18] raw_parts → metadata.legacy.raw_parts
+        # 回退：旧消息没有 tool_calls 字段，从 _meta 中提取
         if not tool_calls:
             meta = message_dict.get('_meta', {})
             if isinstance(meta, dict):
-                for part in meta.get('raw_parts', []):
+                # 新格式：metadata.legacy.raw_parts
+                _legacy = (meta.get('metadata') or {}).get('legacy') or {}
+                _raw_parts = _legacy.get('raw_parts', [])
+                # 旧格式兼容：直接读 raw_parts
+                if not _raw_parts:
+                    _raw_parts = meta.get('raw_parts', [])
+                for part in _raw_parts:
                     if isinstance(part, dict) and 'tool_calls' in part:
                         tool_calls.extend(part['tool_calls'])
 

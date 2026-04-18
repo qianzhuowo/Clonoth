@@ -1,4 +1,32 @@
 """Task 路由 mixin —— 处理 task 完成后的统一分发逻辑。"""
+# Architecture Notes:
+#
+# Two dispatch mechanisms coexist:
+#   1. SYNC dispatch (_route_dispatch_locked):
+#      Used ONLY by compactor (context compression). The parent task enters
+#      'suspended' state and waits for the compactor child to finish, then
+#      gets resumed. This is necessary because compression must complete
+#      before the parent can continue using context.
+#
+#   2. ASYNC dispatch (dispatch-async API → _inject_async_dispatch_result_locked):
+#      Used by dispatch_node/dispatch_nodes pseudo-tools. The parent task
+#      does NOT suspend; it continues running freely (can reply, call tools,
+#      finish, chat with user, etc.). When the child completes, the result
+#      is injected back into the session via one of three paths:
+#        a) Preempt: if session has a running entry task → inject via preempt
+#        b) Deferred preempt: if entry task is suspended (e.g. waiting for
+#           compactor) → mark preempt for when it resumes
+#        c) Inbound: if no active entry task → create new inbound message
+#
+# Known race condition (2026-04-18) — FIXED:
+#   If a child completes and sets preempt_requested on a running entry task,
+#   but the engine has already decided to finish that task (TaskAction with
+#   action='finish' has been returned but complete_task hasn't been called
+#   yet), the preempt_message will never be consumed.
+#   Fix: complete_task now checks for unconsumed preempt_message after
+#   routing and calls _inject_orphaned_preempt_as_inbound_locked to
+#   re-inject it as a synthetic inbound message.
+
 from __future__ import annotations
 
 import uuid
@@ -55,6 +83,12 @@ class TaskRouterMixin:
     # ------------------------------------------------------------------ #
 
     def _route_dispatch_locked(self, task: Task, action: dict[str, Any]) -> None:
+        """Sync dispatch: parent suspends until child completes.
+
+        ONLY used by compactor (context compression). Normal dispatch_node
+        calls go through the async dispatch API and never reach this method.
+        See file-level architecture notes for details.
+        """
         target = str(action.get("target_node") or "").strip()
         dispatch_input = action.get("dispatch_input") if isinstance(action.get("dispatch_input"), dict) else {}
         dispatch_batch = action.get("dispatch_batch")
@@ -329,7 +363,18 @@ class TaskRouterMixin:
     def _resume_caller_or_output_locked(
         self, task: Task, resume_data: dict[str, Any], fallback_result: dict[str, Any],
     ) -> None:
-        """尝试恢复 caller 节点。如果没有 caller，把 fallback_result 输出给用户。"""
+        """Handle child task completion: resume caller or output to user.
+
+        For SYNC dispatch children (compactor): caller_task_id is set,
+        so we try to resume the suspended caller directly.
+
+        For ASYNC dispatch children: caller_task_id is None (set in
+        dispatch-async API), so we fall through to _inject_async_dispatch_result_locked
+        which handles the three injection paths (preempt/deferred/inbound).
+
+        For orphaned children (caller finished/cancelled): output directly
+        to user via outbound message.
+        """
         # 优先尝试直接唤醒 suspended 的 caller
         caller_id = (task.caller_task_id or "").strip()
         if caller_id:
@@ -417,6 +462,12 @@ class TaskRouterMixin:
             return
 
         # ---- 优先路径：preempt running 的入口 task ----
+        # Path A: Session has a running entry task → inject result via preempt V2.
+        # Engine will detect preempt_requested at its next checkpoint (inside
+        # streaming loop or at step boundary) and inject the message.
+        # CAVEAT: If the entry task is about to finish (engine already returned
+        # a 'finish' TaskAction), the preempt will never be consumed. See
+        # file-level architecture notes for the known race condition.
         running_entry = self._find_running_entry_task_locked(task.session_id)
         if running_entry is not None and not running_entry.preempt_requested:
             running_entry.preempt_requested = True
@@ -438,6 +489,9 @@ class TaskRouterMixin:
             return
 
         # ---- 次优路径：标记 suspended 的入口 task ----
+        # Path B: Entry task is suspended (typically waiting for compactor).
+        # Pre-set preempt so that when the task resumes and hits its first
+        # checkpoint, the child result will be injected.
         # 入口 task 可能暂时挂起（如等待 compactor），此时无法立即 preempt。
         # 预设 preempt 标记后，task 恢复为 running 时 engine 会在首次推理
         # 循环中检测到并注入结果，避免结果丢失。
@@ -462,6 +516,12 @@ class TaskRouterMixin:
             return
 
         # ---- 回退路径：创建 inbound → 新 task ----
+        # Path C: No running or suspended entry task in session.
+        # Create a synthetic inbound message to spawn a new entry task that
+        # will process the child's result. This happens when:
+        #   - The entry task already finished before the child returned
+        #   - The entry task was cancelled
+        #   - A preempt was already pending (preempt_requested=True)
         conv_key = session_info.conversation_key
         channel = session_info.channel
         msg_id = f"async_dispatch:{task.task_id}"
@@ -487,6 +547,77 @@ class TaskRouterMixin:
         self._advance_inbound_cursor()
         self._create_entry_task_for_inbound_locked(
             inbound_seq=seq, session_id=task.session_id, payload=payload,
+        )
+
+    def _inject_orphaned_preempt_as_inbound_locked(self, task: Task) -> None:
+        """Compensate for the finish-preempt race condition.
+
+        Called from complete_task when a task transitions to completed/failed
+        but still carries an unconsumed preempt_message.  This means the
+        engine finished before it could check the preempt flag, so the
+        child-task result that was injected via preempt (Path A/B) was
+        never delivered.
+
+        Recovery: create a synthetic inbound message identical to Path C
+        in _inject_async_dispatch_result_locked, so that a new entry task
+        picks up the orphaned result.
+
+        Must be called while self._lock is held.
+        """
+        session_info = self.sessions.get(task.session_id)
+        if not session_info:
+            return
+
+        # Bail out if session generation is stale — the result is no
+        # longer relevant to the current conversation.
+        current_gen = self._current_session_generation_locked(task.session_id)
+        if task.session_generation and current_gen and task.session_generation != current_gen:
+            return
+
+        notify_text = task.preempt_message
+        result_atts = list(task.preempt_attachments) if task.preempt_attachments else None
+
+        conv_key = session_info.conversation_key
+        channel = session_info.channel
+        msg_id = f"orphaned_preempt:{task.task_id}"
+
+        payload: dict[str, Any] = {
+            "channel": channel,
+            "conversation_key": conv_key,
+            "message_id": msg_id,
+            "text": notify_text,
+        }
+        if result_atts:
+            payload["attachments"] = result_atts
+
+        evt = self.eventlog.append(
+            session_id=task.session_id,
+            component="supervisor",
+            type_="inbound_message",
+            payload=payload,
+        )
+        seq = int(evt.get("seq", 0))
+        self._apply_inbound_message(seq=seq, session_id=task.session_id, payload=payload)
+        self._advance_inbound_cursor()
+        self._create_entry_task_for_inbound_locked(
+            inbound_seq=seq, session_id=task.session_id, payload=payload,
+        )
+
+        # Clear preempt state to prevent double-processing.
+        task.preempt_message = ""
+        task.preempt_attachments = []
+
+        self.eventlog.append(
+            session_id=task.session_id,
+            component="supervisor",
+            type_="orphaned_preempt_reinjected",
+            payload={
+                "task_id": task.task_id,
+                "session_id": task.session_id,
+                "msg_id": msg_id,
+                "reason": "finish_preempt_race",
+            },
+            transient=True,
         )
 
     def _find_entry_task_by_status_locked(self, session_id: str, statuses: set) -> Task | None:

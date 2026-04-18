@@ -645,7 +645,14 @@ def create_app(
     # ---- 异步委派 API ----
     @app.post("/v1/tasks/dispatch-async")
     async def dispatch_async(request: Request) -> dict[str, Any]:
-        """异步委派子节点：创建子任务后立即返回 task_id，父任务不挂起。"""
+        """Async dispatch: create child task without suspending the caller.
+
+        Key difference from sync dispatch (_route_dispatch_locked):
+        - caller_task_id is intentionally set to None
+        - Parent task continues running freely
+        - When child completes, _resume_caller_or_output_locked sees no
+          caller → routes to _inject_async_dispatch_result_locked
+        """
         st: SupervisorState = app.state.state
         body = await request.json()
 

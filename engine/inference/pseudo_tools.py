@@ -339,15 +339,31 @@ def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | No
 #  工具 spec 相关
 # ---------------------------------------------------------------------------
 
+# 异步工具提示：当 spec 中 async_mode=True 时，在 description 末尾追加说明，
+# 让 LLM 知道该工具后台执行、结果通过 preempt 自动回传，无需等待。
+_ASYNC_TOOL_HINT = (
+    "\n\n⚡ This is an async tool. Execution runs in background; "
+    "result will be delivered automatically via preempt when ready. "
+    "You can continue working or finish — no need to wait."
+)
+
+
 def _to_openai_tools(specs: list[dict]) -> list[dict]:
-    return [{
-        "type": "function",
-        "function": {
-            "name": s["name"],
-            "description": s.get("description", ""),
-            "parameters": s.get("input_schema", {"type": "object", "properties": {}, "required": []}),
-        },
-    } for s in specs]
+    result = []
+    for s in specs:
+        desc = s.get("description", "")
+        # 异步工具追加执行模式说明到 description
+        if s.get("async_mode"):
+            desc += _ASYNC_TOOL_HINT
+        result.append({
+            "type": "function",
+            "function": {
+                "name": s["name"],
+                "description": desc,
+                "parameters": s.get("input_schema", {"type": "object", "properties": {}, "required": []}),
+            },
+        })
+    return result
 
 
 def _filter_tool_specs(node: "Node", all_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:

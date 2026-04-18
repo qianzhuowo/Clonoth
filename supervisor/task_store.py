@@ -392,11 +392,23 @@ class TaskStoreMixin:
     # ---- preempt ----
 
     def preempt_task(self, task_id: str, message: str = "", attachments: list | None = None) -> bool:
-        """标记单个 task 为 preempt_requested。不影响 session 状态。"""
+        """标记单个 task 为 preempt_requested。不影响 session 状态。
+
+        如果 task 已终态（completed/failed/cancelled），直接走孤儿补偿路径，
+        将 preempt 消息作为 synthetic inbound 注入——复用子节点的同一条补偿通道。
+        """
         with self._lock:
             task = self.tasks.get(task_id)
-            if task is None or task.status not in (TaskStatus.running, TaskStatus.pending):
+            if task is None:
                 return False
+            if task.status not in (TaskStatus.running, TaskStatus.pending):
+                # Task 已终态，走孤儿补偿：复用 _inject_orphaned_preempt_as_inbound_locked
+                task.preempt_requested = True
+                task.preempt_message = message
+                if attachments:
+                    task.preempt_attachments = attachments
+                self._inject_orphaned_preempt_as_inbound_locked(task)
+                return True
             task.preempt_requested = True
             task.preempt_message = message
             if attachments:
@@ -516,6 +528,14 @@ class TaskStoreMixin:
                 task.lease_expires_at = None
                 task.result = dict(result or {})
                 self._event_task_snapshot("task_cancelled", task, component="engine")
+                # ---- Orphaned preempt check on cancel path (2026-04-18) ----
+                # Even when the task is cancelled (user cancel or session
+                # generation mismatch), a child's preempt result may already
+                # be sitting unconsumed.  Re-inject it so it is not silently
+                # lost — the new session generation will decide whether to
+                # process or discard it.
+                if task.preempt_requested and task.preempt_message:
+                    self._inject_orphaned_preempt_as_inbound_locked(task)
                 return task
 
             task.result = dict(result or {})
@@ -532,4 +552,16 @@ class TaskStoreMixin:
 
             self._event_task_snapshot("task_completed", task, component="engine")
             self._route_completed_task_locked(task)
+
+            # ---- Fix for finish-preempt race condition (2026-04-18) ----
+            # If a child task's result was injected via preempt (Path A/B in
+            # task_router) but the engine already had a finish/ask TaskAction
+            # queued before it could consume the preempt, the preempt_message
+            # is still sitting unconsumed on this task.  Re-inject it as a
+            # synthetic inbound message so a new entry task picks it up.
+            # No need to filter by action type — any terminal action that
+            # leaves an unconsumed preempt_message is a race we must handle.
+            if task.preempt_requested and task.preempt_message:
+                self._inject_orphaned_preempt_as_inbound_locked(task)
+
             return task

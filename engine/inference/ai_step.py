@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -57,6 +60,50 @@ from ..signals import Signal, get_bus
 
 if TYPE_CHECKING:
     from ..context import RunContext
+
+
+# ---------------------------------------------------------------------------
+#  异步工具跟踪表（Async Tool Tracking）
+#  key = async_tool_id (8 位 hex), value = 状态字典
+#  用于关联异步工具的启动占位消息与 preempt 回传结果。
+#  done/failed 条目保留 5 分钟后自动清理，防止无限增长。
+# ---------------------------------------------------------------------------
+_async_tool_tasks: dict[str, dict] = {}
+
+# 清理阈值：done/failed 条目保留秒数
+_ASYNC_TRACK_RETAIN_SEC = 300  # 5 minutes
+
+
+def _cleanup_async_tracker() -> None:
+    """清理已完成超过 _ASYNC_TRACK_RETAIN_SEC 的条目。
+
+    在每次新增 tracking 条目时调用，避免 map 无限增长。
+    只清理 status 为 done 或 failed 且 finished_at 已过期的条目。
+    """
+    now = time.monotonic()
+    expired = [
+        k for k, v in _async_tool_tasks.items()
+        if v.get("status") in ("done", "failed")
+        and now - v.get("finished_at", now) > _ASYNC_TRACK_RETAIN_SEC
+    ]
+    for k in expired:
+        del _async_tool_tasks[k]
+
+
+def get_async_tool_tasks() -> list[dict]:
+    """导出当前所有异步工具跟踪条目，供外部查询。
+
+    返回列表，每项包含 async_id, tool_name, status, elapsed 等字段。
+    """
+    result = []
+    now = time.monotonic()
+    for aid, info in _async_tool_tasks.items():
+        entry = {"async_id": aid, **info}
+        # 对 running 状态补算已经过的时间
+        if info.get("status") == "running" and "started_at" in info:
+            entry["elapsed"] = round(now - info["started_at"], 1)
+        result.append(entry)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +461,100 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
 
 
 # ---------------------------------------------------------------------------
+#  异步工具后台执行器
+# ---------------------------------------------------------------------------
+
+async def _run_async_tool(
+    registry: ToolRegistry,
+    http: "httpx.AsyncClient",
+    supervisor_url: str,
+    task_id: str,
+    tool_name: str,
+    tool_args: dict,
+    tool_ctx: ToolContext,
+    async_tool_id: str,
+) -> None:
+    """后台执行异步工具，完成后通过 preempt 注入结果。
+
+    异步工具支持（2026-04-18）：
+    由 _execute_real_tools 中 asyncio.create_task 启动，不阻塞主推理循环。
+    工具完成后 POST preempt 到 supervisor，supervisor 将结果注入到当前 task。
+    信号 span 在此函数内发射，因为主循环已继续执行。
+
+    async_tool_id 参数（2026-04-18 tracking 机制）：
+    用于关联 tracking map 条目，完成/失败时更新状态并在 preempt 消息中携带 id，
+    使 LLM 能将 preempt 回传与先前的占位消息对应起来。
+
+    注意：此函数只接收必要的轻量参数，不持有 _LoopState 引用，
+    避免后台协程运行期间将整个对话历史 pin 在内存中。
+    """
+    _started = time.monotonic()
+    try:
+        # Phase 2 Signal: 异步工具的 tool.call span 在后台函数内发射
+        _args_summary = _short(json.dumps(tool_args, ensure_ascii=False, default=str), 200)
+        with get_bus().span('tool.call', payload={'tool': tool_name, 'args_summary': _args_summary, 'async': True}):
+            result = await registry.execute(name=tool_name, arguments=tool_args, ctx=tool_ctx)
+
+        _elapsed = time.monotonic() - _started
+        _summary = summarize_result(tool_name, result)
+        _fmt, raw = result_to_raw(tool_name, result)
+
+        # [2026-04-18 tracking] 更新 tracking map：标记完成，记录耗时
+        _async_tool_tasks[async_tool_id] = {
+            "tool_name": tool_name,
+            "status": "done",
+            "task_id": task_id,
+            "started_at": _started,
+            "finished_at": time.monotonic(),
+            "elapsed": round(_elapsed, 1),
+        }
+
+        # 构建 preempt payload，将完整工具结果通过 preempt 回传给当前 task
+        # [2026-04-18 tracking] preempt 消息头部携带 async_tool_id，便于 LLM 关联
+        preempt_text = (
+            f'\u2705 Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
+            f'\nSummary: {_summary}\nResult:\n{raw}'
+        )
+
+        # 收集附件（如生图工具产生的图片路径）
+        attachments: list[str] = []
+        if isinstance(result, dict) and isinstance(result.get("attachments"), list):
+            for a in result["attachments"]:
+                if isinstance(a, dict) and a.get("path"):
+                    attachments.append(str(a["path"]))
+                elif isinstance(a, str):
+                    attachments.append(a)
+
+        payload: dict = {"message": preempt_text}
+        if attachments:
+            payload["attachment_paths"] = attachments
+
+        await http.post(
+            f"{supervisor_url}/v1/tasks/{task_id}/preempt",
+            json=payload,
+        )
+    except Exception as e:
+        # [2026-04-18 tracking] 更新 tracking map：标记失败
+        _async_tool_tasks[async_tool_id] = {
+            "tool_name": tool_name,
+            "status": "failed",
+            "task_id": task_id,
+            "started_at": _started,
+            "finished_at": time.monotonic(),
+            "elapsed": round(time.monotonic() - _started, 1),
+            "error": str(e),
+        }
+        # 失败也要通知，避免 LLM 永远等不到结果
+        try:
+            await http.post(
+                f"{supervisor_url}/v1/tasks/{task_id}/preempt",
+                json={"message": f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}'},
+            )
+        except Exception:
+            pass  # 双重失败时静默，避免未处理异常泄漏到事件循环
+
+
+# ---------------------------------------------------------------------------
 #  真实工具执行
 # ---------------------------------------------------------------------------
 
@@ -450,6 +591,60 @@ async def _execute_real_tools(
             break
         _t_name = _rtc["name"]
         _t_args = _rtc["arguments"]
+
+        # 异步工具分流（2026-04-18）：查询 spec 判断该工具是否为 async_mode。
+        # async_mode 工具由后台协程执行，主循环立即得到占位结果继续推理；
+        # 同步工具保持原有 await 行为。
+        _spec = ls.registry.get_spec(_t_name)
+        _is_async = _spec.get("async_mode", False) if _spec else False
+
+        if _is_async:
+            # ---- 异步工具：后台执行，不阻塞主推理循环 ----
+            # [2026-04-18 tracking] 生成 8 位 hex id，写入 tracking map，传给后台协程。
+            # 占位消息和 preempt 回传都携带此 id，LLM 可据此关联。
+            # 每次新增前顺便清理过期条目，防止 map 无限增长。
+            _cleanup_async_tracker()
+            _async_id = uuid.uuid4().hex[:8]
+            _async_tool_tasks[_async_id] = {
+                "tool_name": _t_name,
+                "status": "running",
+                "started_at": time.monotonic(),
+                "task_id": ls.rctx.task_id,
+            }
+            # 使用 asyncio.create_task 启动后台协程。该 task 运行在事件循环级别，
+            # 不受 worker_loop 的 _active task set 管理，因此不会在主 task finish 时被取消。
+            # 工具完成后通过 _run_async_tool 内的 preempt POST 回传结果。
+            asyncio.create_task(
+                _run_async_tool(
+                    registry=ls.registry,
+                    http=ls.rctx.http,
+                    supervisor_url=ls.rctx.supervisor_url,
+                    task_id=ls.rctx.task_id,
+                    tool_name=_t_name,
+                    tool_args=_t_args,
+                    tool_ctx=_tool_ctx,
+                    async_tool_id=_async_id,
+                ),
+                name=f"async_tool_{_t_name}_{_async_id}",
+            )
+            # 立即追加占位结果，告知 LLM 该工具已在后台运行，附带 tracking id
+            _tool_entries.append({
+                "name": _t_name,
+                "args": _t_args,
+                "format": "text",
+                "raw_inline": f'\u23f3 Async tool "{_t_name}" started (id: {_async_id}). Result will be delivered via preempt when ready.',
+                "truncated": False,
+                "ref": "",
+                "summary": f"异步执行已启动 (id: {_async_id})，结果将通过 preempt 自动回传",
+            })
+            await ls.rctx.emit_event("handoff_progress", {
+                "message": f"[{ls.node.id}] {_t_name}: 异步执行已启动",
+                "node_id": ls.node.id,
+                "task_id": ls.rctx.task_id,
+            })
+            continue
+
+        # ---- 同步工具：阻塞等待执行完成（原有逻辑）----
         # Phase 2 Signal: tool.call span 包裹每个工具的执行过程。
         # 自动发射 tool.call.start（含工具名和参数摘要）和 tool.call.end（含 elapsed_ms 和 error）。
         # span 是同步 contextmanager，在 async 函数中直接 with 即可。

@@ -265,9 +265,14 @@ def prepare_messages_for_llm(
                             "image_url": {"url": resolved},
                         })
                     else:
-                        # 解析失败（文件不存在等），跳过这个图片，不传给 API。
-                        # 原样传递 file:// URL 会导致 API 报 octet-stream 错误。
-                        _logger.warning("attachment resolve failed, skipping: %s", rel_path)
+                        # [缺陷修复] 解析失败时注入占位文本，让 LLM 知道用户发过图片。
+                        # 之前是完全静默跳过，LLM 完全不知道用户发了图片，导致回复不连贯。
+                        # 原样传递 file:// URL 会导致 API 报 octet-stream 错误，所以不能保留原 URL。
+                        _logger.warning("attachment resolve failed, injecting placeholder: %s", rel_path)
+                        new_content.append({
+                            "type": "text",
+                            "text": "[Image unavailable]",
+                        })
                     continue  # 无论成功失败都 continue，不 fallback 到 append(part)
             new_content.append(part)  # 非 file:// 的 part 原样保留
         new_msg["content"] = new_content

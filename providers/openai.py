@@ -121,8 +121,7 @@ class OpenAIProvider(BaseProvider):
         base_url: str | None,
         model: str,
     ) -> None:
-        # [fix 2026-04-18] 传入 name="openai"，供 engine 动态获取 provider 名称
-        super().__init__(model=model, name="openai")
+        super().__init__(model=model)
 
         k = (api_key or "").strip()
         if not k:
@@ -175,13 +174,10 @@ class OpenAIProvider(BaseProvider):
                         msg = body.decode("utf-8", errors="replace").strip()
                     if not msg:
                         msg = f"HTTP {status}"
-                    # [fix 2026-04-18] 补齐 inline_data / provider_meta，与成功路径风格一致
-                    return ProviderResponse(ok=False, error=msg, status_code=status, inline_data=[], provider_meta={})
+                    return ProviderResponse(ok=False, error=msg, status_code=status)
 
                 text_parts: list[str] = []
-                # [refactor 2026-04-18] thinking_parts → reasoning_parts，
-                # 变量名与 ProviderResponse.reasoning 对齐
-                reasoning_parts: list[str] = []
+                thinking_parts: list[str] = []
                 # index -> {id, name, arguments_parts}
                 tc_map: dict[int, dict[str, Any]] = {}
 
@@ -217,11 +213,9 @@ class OpenAIProvider(BaseProvider):
                             await on_text(content)
 
                     # 思维链 (reasoning_content / thinking)
-                    # 注意：delta 字段名是 API 定义的，不改；只改内部变量名
                     reasoning = delta.get("reasoning_content") or delta.get("thinking")
                     if isinstance(reasoning, str) and reasoning:
-                        reasoning_parts.append(reasoning)
-                        # on_thinking 回调签名暂不改名（engine 接口，后续再统一）
+                        thinking_parts.append(reasoning)
                         if on_thinking:
                             await on_thinking(reasoning)
 
@@ -249,9 +243,7 @@ class OpenAIProvider(BaseProvider):
                                 tc_map[idx]["arg_parts"].append(arg_chunk)
 
                 text = "".join(text_parts) if text_parts else None
-                # [refactor 2026-04-18] thinking_text 局部变量 → reasoning_text，
-                # 与 ProviderResponse.reasoning 字段对齐
-                reasoning_text = "".join(reasoning_parts) if reasoning_parts else None
+                thinking_text = "".join(thinking_parts) if thinking_parts else None
 
                 tool_calls: list[ToolCall] = []
                 for idx in sorted(tc_map.keys()):
@@ -270,16 +262,13 @@ class OpenAIProvider(BaseProvider):
                             args = fallback if fallback is not None else {"_raw": raw_args}
                     tool_calls.append(ToolCall(id=tc_data["id"], name=name.strip(), arguments=args))
 
-                # [refactor 2026-04-18] thinking= → reasoning=，新增 inline_data / provider_meta
                 return ProviderResponse(
                     ok=True, text=text, tool_calls=tool_calls,
-                    reasoning=reasoning_text, status_code=status, usage=stream_usage,
-                    inline_data=[], provider_meta={},
+                    thinking=thinking_text, status_code=status, usage=stream_usage,
                 )
 
         except Exception as e:
-            # [fix 2026-04-18] 补齐 inline_data / provider_meta，与成功路径风格一致
-            return ProviderResponse(ok=False, error=str(e) or type(e).__name__, inline_data=[], provider_meta={})
+            return ProviderResponse(ok=False, error=str(e) or type(e).__name__)
 
 
     async def chat(
@@ -309,8 +298,7 @@ class OpenAIProvider(BaseProvider):
         try:
             r = await self._http.post(url, headers=headers, json=payload)
         except Exception as e:
-            # [fix 2026-04-18] 补齐 inline_data / provider_meta，与成功路径风格一致
-            return ProviderResponse(ok=False, error=str(e) or type(e).__name__, inline_data=[], provider_meta={})
+            return ProviderResponse(ok=False, error=str(e) or type(e).__name__)
 
         status = int(r.status_code)
 
@@ -330,30 +318,28 @@ class OpenAIProvider(BaseProvider):
             if not msg:
                 msg = f"HTTP {status}"
 
-            # [fix 2026-04-18] 补齐 inline_data / provider_meta，与成功路径风格一致
             return ProviderResponse(
                 ok=False,
                 error=msg,
                 status_code=status,
                 raw=data if isinstance(data, dict) else None,
-                inline_data=[], provider_meta={},
             )
 
         if not isinstance(data, dict):
-            return ProviderResponse(ok=False, error="invalid JSON response", status_code=status, inline_data=[], provider_meta={})
+            return ProviderResponse(ok=False, error="invalid JSON response", status_code=status)
 
         try:
             choices = data.get("choices")
             if not isinstance(choices, list) or not choices:
-                return ProviderResponse(ok=False, error="missing choices", status_code=status, raw=data, inline_data=[], provider_meta={})
+                return ProviderResponse(ok=False, error="missing choices", status_code=status, raw=data)
 
             choice0 = choices[0]
             if not isinstance(choice0, dict):
-                return ProviderResponse(ok=False, error="invalid choices[0]", status_code=status, raw=data, inline_data=[], provider_meta={})
+                return ProviderResponse(ok=False, error="invalid choices[0]", status_code=status, raw=data)
 
             msg = choice0.get("message")
             if not isinstance(msg, dict):
-                return ProviderResponse(ok=False, error="missing message", status_code=status, raw=data, inline_data=[], provider_meta={})
+                return ProviderResponse(ok=False, error="missing message", status_code=status, raw=data)
 
             content = msg.get("content")
             text = content if isinstance(content, str) else None
@@ -397,8 +383,7 @@ class OpenAIProvider(BaseProvider):
             # 解析 usage
             usage = _extract_usage(data)
 
-            # [refactor 2026-04-18] 非流式也补齐 inline_data / provider_meta（OpenAI 目前不用）
-            return ProviderResponse(ok=True, text=text, tool_calls=tool_calls, status_code=status, usage=usage, inline_data=[], provider_meta={})
+            return ProviderResponse(ok=True, text=text, tool_calls=tool_calls, status_code=status, usage=usage)
 
         except Exception as e:
-            return ProviderResponse(ok=False, error=f"failed to parse response: {e}", status_code=status, raw=data, inline_data=[], provider_meta={})
+            return ProviderResponse(ok=False, error=f"failed to parse response: {e}", status_code=status, raw=data)

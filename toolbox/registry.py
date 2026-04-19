@@ -298,7 +298,7 @@ class ToolRegistry:
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "path": {"type": "string", "description": "Directory or file path to search in (relative or absolute). Supports single file. Default '.'"},
+                        "path": {"type": "string"},
                         "mode": {"type": "string", "description": "search (default) or replace", "enum": ["search", "replace"]},
                         "pattern": {"type": "string", "description": "file glob pattern, e.g. '*.py', '**/*.js'. Default '**/*'"},
                         "isRegex": {"type": "boolean", "description": "treat query as regex. Default false"},
@@ -535,9 +535,6 @@ class ToolRegistry:
                 "name": name,
                 "description": desc,
                 "input_schema": schema,
-                # 异步工具支持：内建工具默认同步执行。
-                # async_mode=True 的工具由引擎后台协程执行，不阻塞主推理循环。
-                "async_mode": False,
             }
             self._tool_funcs[name] = func
 
@@ -583,9 +580,6 @@ class ToolRegistry:
                 "name": name,
                 "description": description,
                 "input_schema": input_schema,
-                # 异步工具支持：外部工具可在 SPEC dict 中声明 "async_mode": True，
-                # 标识该工具为后台异步执行，引擎将不阻塞等待其结果。
-                "async_mode": bool(spec.get("async_mode", False)),
             }
             self._tool_funcs[name] = _make_script_tool(
                 script_path=py.resolve(), timeout_sec=timeout_sec,
@@ -595,13 +589,6 @@ class ToolRegistry:
 
     def list_specs(self) -> list[dict[str, Any]]:
         return list(self._tool_specs.values())
-
-    def get_spec(self, name: str) -> dict[str, Any] | None:
-        """返回指定工具的 spec dict，不存在则返回 None。
-
-        异步工具支持：ai_step 用此方法查询 async_mode 字段以决定分流。
-        """
-        return self._tool_specs.get(name)
 
     async def execute(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> dict[str, Any]:
         if name not in self._tool_funcs:
@@ -654,8 +641,6 @@ class ToolRegistry:
                     "name": reg_name,
                     "description": f"[MCP:{cid}] {desc}" if desc else f"[MCP:{cid}] {raw_name}",
                     "input_schema": schema,
-                    # 异步工具支持：MCP 工具默认同步执行
-                    "async_mode": False,
                 }
                 self._tool_funcs[reg_name] = _make_mcp_tool(self.workspace_root, cid, raw_name)
                 count += 1

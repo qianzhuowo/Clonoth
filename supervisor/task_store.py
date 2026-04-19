@@ -344,8 +344,9 @@ class TaskStoreMixin:
                     count += 1
                 elif t.status == TaskStatus.running:
                     if t.cancel_requested:
-                        # 已标记取消但 worker 未响应；如果 lease 已过期，直接终结
-                        if t.lease_expires_at and t.lease_expires_at < now:
+                        # 已标记取消但 worker 未响应；如果 lease 已过期或从未获得 lease，直接终结
+                        # fix: lease_expires_at 为 None 时也视为 worker 已死，避免永久僵尸
+                        if not t.lease_expires_at or t.lease_expires_at < now:
                             t.status = TaskStatus.cancelled
                             t.lease_expires_at = None
                             t.updated_at = now
@@ -354,8 +355,9 @@ class TaskStoreMixin:
                     else:
                         t.cancel_requested = True
                         t.updated_at = now
-                        # 如果 lease 已过期，worker 大概率已死，直接终结
-                        if t.lease_expires_at and t.lease_expires_at < now:
+                        # 如果 lease 已过期或从未获得 lease，worker 大概率已死，直接终结
+                        # fix: lease_expires_at 为 None 时同样强制终结，防止无 lease 任务成为永久僵尸
+                        if not t.lease_expires_at or t.lease_expires_at < now:
                             t.status = TaskStatus.cancelled
                             t.lease_expires_at = None
                             self._event_task_snapshot("task_cancelled", t)
@@ -392,23 +394,11 @@ class TaskStoreMixin:
     # ---- preempt ----
 
     def preempt_task(self, task_id: str, message: str = "", attachments: list | None = None) -> bool:
-        """标记单个 task 为 preempt_requested。不影响 session 状态。
-
-        如果 task 已终态（completed/failed/cancelled），直接走孤儿补偿路径，
-        将 preempt 消息作为 synthetic inbound 注入——复用子节点的同一条补偿通道。
-        """
+        """标记单个 task 为 preempt_requested。不影响 session 状态。"""
         with self._lock:
             task = self.tasks.get(task_id)
-            if task is None:
+            if task is None or task.status not in (TaskStatus.running, TaskStatus.pending):
                 return False
-            if task.status not in (TaskStatus.running, TaskStatus.pending):
-                # Task 已终态，走孤儿补偿：复用 _inject_orphaned_preempt_as_inbound_locked
-                task.preempt_requested = True
-                task.preempt_message = message
-                if attachments:
-                    task.preempt_attachments = attachments
-                self._inject_orphaned_preempt_as_inbound_locked(task)
-                return True
             task.preempt_requested = True
             task.preempt_message = message
             if attachments:
@@ -528,14 +518,6 @@ class TaskStoreMixin:
                 task.lease_expires_at = None
                 task.result = dict(result or {})
                 self._event_task_snapshot("task_cancelled", task, component="engine")
-                # ---- Orphaned preempt check on cancel path (2026-04-18) ----
-                # Even when the task is cancelled (user cancel or session
-                # generation mismatch), a child's preempt result may already
-                # be sitting unconsumed.  Re-inject it so it is not silently
-                # lost — the new session generation will decide whether to
-                # process or discard it.
-                if task.preempt_requested and task.preempt_message:
-                    self._inject_orphaned_preempt_as_inbound_locked(task)
                 return task
 
             task.result = dict(result or {})
@@ -552,16 +534,4 @@ class TaskStoreMixin:
 
             self._event_task_snapshot("task_completed", task, component="engine")
             self._route_completed_task_locked(task)
-
-            # ---- Fix for finish-preempt race condition (2026-04-18) ----
-            # If a child task's result was injected via preempt (Path A/B in
-            # task_router) but the engine already had a finish/ask TaskAction
-            # queued before it could consume the preempt, the preempt_message
-            # is still sitting unconsumed on this task.  Re-inject it as a
-            # synthetic inbound message so a new entry task picks it up.
-            # No need to filter by action type — any terminal action that
-            # leaves an unconsumed preempt_message is a race we must handle.
-            if task.preempt_requested and task.preempt_message:
-                self._inject_orphaned_preempt_as_inbound_locked(task)
-
             return task

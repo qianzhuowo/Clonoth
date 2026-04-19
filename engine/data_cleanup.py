@@ -27,7 +27,6 @@ EVENTS_BACKUPS = 3
 TEMP_MAX_AGE = 24 * 3600              # 24 h
 ARTIFACT_MAX_AGE = 24 * 3600          # 24 h
 ATTACH_MAX_AGE = 24 * 3600            # 24 h
-LOG_MAX_AGE = 7 * 24 * 3600           # 7 days
 
 TEMP_GLOBS = [
     "chat_dump_*", "chat_chunk_*", "chat_compact_*", "chat_messages_*",
@@ -165,8 +164,6 @@ def main():
                          max_age=ARTIFACT_MAX_AGE, label="artifacts")),
         (purge_dir, dict(directory=DATA_DIR / "attachments",
                          max_age=ATTACH_MAX_AGE, label="attachments", recursive=True)),
-        (purge_dir, dict(directory=DATA_DIR / "logs",
-                         max_age=LOG_MAX_AGE, label="logs")),
     ]
 
     for fn, kw in tasks:

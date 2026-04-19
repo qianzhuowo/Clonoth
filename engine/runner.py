@@ -28,15 +28,10 @@ from .model import resolve_provider
 from .context_store import load_context_snapshot
 
 from .node import Node, load_node
-from .tool_step import result_to_raw, summarize_result
+from .tool_step import result_to_raw, summarize_result, write_artifact
 # Phase 1 (Session Conversation Store): 导入 ConversationStore 用于影子写入，
 # 在每个 node task 执行时实例化并挂载到 RunContext，供 ai_step 影子写入消息。
 from .conversation_store import ConversationStore, Message, MessageType
-# Phase 0/1: Signal System — 导入信号总线初始化和桥接函数。
-# 在 _run_node_task 中初始化 bus 并安装 EventLog 桥接，使 LLM 调用信号
-# 自动转发到 data/events.jsonl 供监控使用。
-from engine.signals import get_bus
-from engine.signals.bridge import install_event_bridge
 
 
 def _collect_node_info(workspace_root: Path, node_ids: list[str]) -> list[dict[str, str]]:
@@ -87,6 +82,11 @@ def _message_to_history_dict(msg: Message) -> dict[str, Any]:
     需要转为与 snapshot messages 相同的 dict 格式，供 ai_step 的消息组装使用。
     """
     d: dict[str, Any] = {"role": msg.role, "content": msg.content}
+    # [缺陷修复] ConversationStore 加载的历史消息可能包含多模态 content（list 类型），
+    # 其中的 file:// 图片引用在 24h 后会因 data_cleanup 清理附件文件而失效。
+    # 与旧的 _fetch_history 路径保持一致，在加载时就剥离图片引用为纯文本占位符。
+    if isinstance(d["content"], list):
+        d["content"] = _strip_images_from_content(d["content"])
     if msg.meta:
         d["_meta"] = msg.meta
     return d
@@ -626,15 +626,6 @@ async def _run_node_task(
         )
         _conv_store.append(_target_sid, _user_msg)
 
-    # Phase 0/1: Signal System — 初始化信号总线并安装 EventLog 桥接。
-    # get_bus() 返回全局单例，install_event_bridge 是幂等的（多次调用只注册一次）。
-    # 读取 runtime.yaml 中的 signals.enabled 配置决定是否启用。
-    _signals_cfg = runtime_cfg.get("engine", {}).get("signals", {})
-    _sig_bus = get_bus()
-    _sig_bus.enabled = bool(_signals_cfg.get("enabled", True))
-    _bridge_patterns = _signals_cfg.get("bridge_patterns")
-    install_event_bridge(_sig_bus, patterns=_bridge_patterns)
-
     action = await run_ai_node(
         rctx=rctx, provider=provider, registry=registry, node=node,
         instruction=instruction,
@@ -701,9 +692,12 @@ async def _run_tool_task(
 
     summary = summarize_result(tool_name, result)
     fmt, raw = result_to_raw(tool_name, result)
-    # [2026-04-17] 移除工具结果截断机制：不再对 raw 做 max_inline 截断和 artifact 写入，
-    # 直接将完整结果传递给下游，避免信息丢失。
-    raw_inline = raw
+    max_inline = 8000
+    truncated = len(raw) > max_inline
+    ref = ""
+    if truncated:
+        ref = await write_artifact(ws_root, task_id, str(input_data.get("call_id") or task_id), tool_name, fmt, raw)
+    raw_inline = raw if not truncated else raw[:max_inline] + "\n...<truncated>"
 
     await kctx.emit_event("handoff_progress", {
         "message": f"[tool] {tool_name}: {summary}",
@@ -719,8 +713,8 @@ async def _run_tool_task(
             "text": raw_inline,
             "attachments": tool_attachments,
             "format": fmt,
-            "truncated": False,  # [2026-04-17] 截断机制已移除，保留字段兼容下游
-            "ref": "",
+            "truncated": truncated,
+            "ref": ref,
             # 旧字段保留供 tool_trace 格式化用
             "raw_format": fmt,
             "raw_inline": raw_inline,

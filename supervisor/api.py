@@ -235,8 +235,9 @@ def create_app(
                 continue
             # 收割僵尸：running + lease 过期超过 grace period
             # 但如果 session 有 pending approval，跳过回收（等审批是合法阻塞）
-            if (task.status == TaskStatus.running and task.lease_expires_at
-                    and task.lease_expires_at + _GRACE < now
+            # fix: lease_expires_at 为 None 时也视为僵尸，避免无 lease 的 running 任务永远无法被收割
+            if (task.status == TaskStatus.running
+                    and (not task.lease_expires_at or task.lease_expires_at + _GRACE < now)
                     and not _has_pending_approval):
                 task.status = TaskStatus.failed
                 task.updated_at = now
@@ -645,14 +646,7 @@ def create_app(
     # ---- 异步委派 API ----
     @app.post("/v1/tasks/dispatch-async")
     async def dispatch_async(request: Request) -> dict[str, Any]:
-        """Async dispatch: create child task without suspending the caller.
-
-        Key difference from sync dispatch (_route_dispatch_locked):
-        - caller_task_id is intentionally set to None
-        - Parent task continues running freely
-        - When child completes, _resume_caller_or_output_locked sees no
-          caller → routes to _inject_async_dispatch_result_locked
-        """
+        """异步委派子节点：创建子任务后立即返回 task_id，父任务不挂起。"""
         st: SupervisorState = app.state.state
         body = await request.json()
 

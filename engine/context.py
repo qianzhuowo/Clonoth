@@ -6,9 +6,6 @@ from typing import Any
 
 import httpx
 
-# 桥接信号系统：让所有 emit_event 调用自动走 SignalBus
-from engine.signals import Signal, get_bus
-
 
 @dataclass
 class RunContext:
@@ -36,8 +33,6 @@ class RunContext:
     async def emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.source_inbound_seq is not None:
             payload.setdefault("source_inbound_seq", self.source_inbound_seq)
-        # Bridge emit_event → SignalBus，用 dict(payload) 复制避免后续修改影响信号订阅方
-        get_bus().emit(Signal(name=event_type, payload=dict(payload)))
         try:
             await self.http.post(
                 f"{self.supervisor_url}/v1/sessions/{self.session_id}/events",

@@ -24,11 +24,10 @@ class MessageMeta:
 
     这些信息不发送给 LLM，仅用于引擎内部追踪和跨 provider 兼容。
 
-    [refactor 2026-04-18] 字段重命名与结构调整：
-      - raw_parts → metadata：provider 自治命名空间 {provider_name: {...}}
-      - thinking_text → reasoning：统一思维链字段命名
-      - has_thinking → has_reasoning
-      from_dict 向后兼容旧快照中的 raw_parts / thinking_text / has_thinking
+    分两层：
+      - Raw 层 (raw_parts)：原始 provider 响应结构，仅 engine 使用
+      - 提取层 (thinking_text, has_thinking, inline_data)：写入时从 raw_parts
+        一次性提取的便捷字段，供 bot/前端/debug 使用
     """
     # ── 通用字段 ──
     provider: str = ""              # 生成该消息的 provider (claude/gemini/openai)
@@ -36,18 +35,19 @@ class MessageMeta:
     message_type: str = ""          # user_input / tool_result / assistant / system
     timestamp: str = ""             # ISO 格式生成时间
 
-    # ── Provider 元数据命名空间 ──
-    # [refactor 2026-04-18] 替代旧 raw_parts，结构为 {provider_name: {provider 自定义内容}}
-    # engine 只搬运不解读，各 provider 自行决定存什么
-    metadata: dict = field(default_factory=dict)
+    # ── Raw 层（仅 engine 使用）──
+    raw_parts: list = field(default_factory=list)
+    # 原始 provider 响应的 content blocks / parts 数组，原样保存
+    # Claude: [{type: "thinking", text, signature}, {type: "text", text}, {type: "tool_use", ...}]
+    # Gemini: [{text, thoughtSignature}, {functionCall, thoughtSignature}, {inlineData}]
+    # OpenAI: [{...}] 或为空
 
     tool_call_ids: list[str] = field(default_factory=list)
-    # 原始 tool_call id 列表
+    # 原始 tool_call id 列表（从 raw_parts 也能提取，但常用所以冗余一份）
 
-    # ── 提取层（bot/前端可读）──
-    # [refactor 2026-04-18] thinking_text → reasoning, has_thinking → has_reasoning
-    reasoning: str = ""             # 思维链正文（给 debug/展示用）
-    has_reasoning: bool = False     # 快速判断是否含思维链
+    # ── 提取层（bot/前端可读，写入时从 raw_parts 一次性提取）──
+    thinking_text: str = ""         # 思维链正文（给 debug/展示用）
+    has_thinking: bool = False      # 快速判断是否含思维链
     inline_data: list = field(default_factory=list)
     # 附件引用列表（图片等 inlineData 的 mime_type + 引用信息，不含原始 base64）
 
@@ -56,10 +56,7 @@ class MessageMeta:
     # {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
 
     def to_dict(self) -> dict[str, Any]:
-        """序列化为可 JSON 持久化的 dict。省略空值/默认值字段以节省空间。
-
-        [refactor 2026-04-18] 使用新字段名 metadata/reasoning/has_reasoning 序列化。
-        """
+        """序列化为可 JSON 持久化的 dict。省略空值/默认值字段以节省空间。"""
         d: dict[str, Any] = {}
         if self.provider:
             d["provider"] = self.provider
@@ -69,14 +66,14 @@ class MessageMeta:
             d["message_type"] = self.message_type
         if self.timestamp:
             d["timestamp"] = self.timestamp
-        if self.metadata:
-            d["metadata"] = self.metadata
+        if self.raw_parts:
+            d["raw_parts"] = self.raw_parts
         if self.tool_call_ids:
             d["tool_call_ids"] = list(self.tool_call_ids)
-        if self.reasoning:
-            d["reasoning"] = self.reasoning
-        if self.has_reasoning:
-            d["has_reasoning"] = True
+        if self.thinking_text:
+            d["thinking_text"] = self.thinking_text
+        if self.has_thinking:
+            d["has_thinking"] = True
         if self.inline_data:
             d["inline_data"] = self.inline_data
         if self.usage:
@@ -85,39 +82,18 @@ class MessageMeta:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> MessageMeta:
-        """从 dict 反序列化。
-
-        [refactor 2026-04-18] 向后兼容旧快照：
-          - thinking_text → reasoning
-          - has_thinking  → has_reasoning
-          - raw_parts     → metadata["legacy"]（旧数据迁移）
-        新快照优先读取新字段名。
-        """
+        """从 dict 反序列化。向后兼容旧快照中的 thinking_signature 字段（忽略）。"""
         if not isinstance(data, dict):
             return cls()
-
-        # ── 向后兼容：metadata 优先新字段，回退 raw_parts → metadata.legacy ──
-        metadata = data.get("metadata")
-        if not metadata:
-            _old_raw_parts = data.get("raw_parts")
-            if _old_raw_parts:
-                metadata = {"legacy": {"raw_parts": list(_old_raw_parts)}}
-            else:
-                metadata = {}
-
-        # ── 向后兼容：reasoning 优先新字段，回退 thinking_text ──
-        reasoning = str(data.get("reasoning") or data.get("thinking_text") or "")
-        has_reasoning = bool(data.get("has_reasoning") or data.get("has_thinking"))
-
         return cls(
             provider=str(data.get("provider") or ""),
             tool_mode=str(data.get("tool_mode") or "native"),
             message_type=str(data.get("message_type") or ""),
             timestamp=str(data.get("timestamp") or ""),
-            metadata=dict(metadata),
+            raw_parts=list(data.get("raw_parts") or []),
             tool_call_ids=list(data.get("tool_call_ids") or []),
-            reasoning=reasoning,
-            has_reasoning=has_reasoning,
+            thinking_text=str(data.get("thinking_text") or ""),
+            has_thinking=bool(data.get("has_thinking")),
             inline_data=list(data.get("inline_data") or []),
             usage=dict(data.get("usage") or {}),
         )

@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import asyncio
-import time
 from typing import Any
 
 from .stream_buffer import _StreamBuffer
@@ -14,11 +13,6 @@ from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
 from .loop_state import _LoopState, _persist_ctx, _short
 # message_to_llm 反序列化：在发送 LLM 前做格式转换（role 修正 + 内部字段剥离）
 from .tool_format import build_llm_messages
-# Phase 1: Signal System — 引入信号总线，用于 LLM 调用的可观测性
-# 在 while True 循环前发射 llm.call.start，在 return resp 前发射 llm.call.end，
-# 在重试路径发射 llm.retry，在不可重试失败时发射 llm.error。
-from engine.signals import Signal, get_bus
-from engine.signals.types import make_span_id
 
 
 # ---------------------------------------------------------------------------
@@ -54,15 +48,6 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     resp = None
     _retry_attempt = 0
 
-    # Phase 1: Signal System — 初始化信号总线，发射 llm.call.start
-    # 不使用 span 上下文管理器，避免整个函数体缩进变动。
-    # 手动在关键路径发射 start/end/retry/error 信号。
-    _bus = get_bus()
-    _span_id = make_span_id()
-    _sig_payload = {"model": getattr(ls.provider, 'model', 'unknown'), "provider": type(ls.provider).__name__}
-    _sig_t0 = time.monotonic()
-    _bus.emit(Signal(name="llm.call.start", payload=_sig_payload, span_id=_span_id))
-
     while True:
         text_buf: _StreamBuffer | None = None
         think_buf: _StreamBuffer | None = None
@@ -93,12 +78,8 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     await text_buf.flush()
                     await think_buf.flush()
                     if text_buf.flushed_any or think_buf.flushed_any:
-                        # [refactor 2026-04-18] has_thinking → has_reasoning 事件字段对齐
-                        await ls.rctx.emit_event("stream_end", {"node_id": ls.node.id, "has_text": text_buf.flushed_any, "has_reasoning": think_buf.flushed_any})
+                        await ls.rctx.emit_event("stream_end", {"node_id": ls.node.id, "has_text": text_buf.flushed_any, "has_thinking": think_buf.flushed_any})
                     await ls.rctx.emit_event("cancel_acknowledged", {"node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step})
-                    # Phase 1: Signal — 取消时也发射 end 信号
-                    _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
-                    _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, "cancelled": True}, span_id=_span_id))
                     return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id, summary="任务已被用户取消。")
                 if not ls.preempt_after_step and ls.preempt_inject_info is None:
                     _pi_s = await ls.rctx.check_preempted()
@@ -110,11 +91,10 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
             await text_buf.flush()
             await think_buf.flush()
             if text_buf.flushed_any or think_buf.flushed_any:
-                # [refactor 2026-04-18] has_thinking → has_reasoning 事件字段对齐
                 await ls.rctx.emit_event("stream_end", {
                     "node_id": ls.node.id,
                     "has_text": text_buf.flushed_any,
-                    "has_reasoning": think_buf.flushed_any,
+                    "has_thinking": think_buf.flushed_any,
                 })
             if resp.ok and resp.tool_calls:
                 ls.use_stream = False
@@ -135,9 +115,6 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     except (asyncio.CancelledError, Exception):
                         pass
                     await ls.rctx.emit_event("cancel_acknowledged", {"node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step})
-                    # Phase 1: Signal — 取消时也发射 end 信号
-                    _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
-                    _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, "cancelled": True}, span_id=_span_id))
                     return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id, summary="任务已被用户取消。")
                 if not ls.preempt_after_step and ls.preempt_inject_info is None:
                     _pi_n = await ls.rctx.check_preempted()
@@ -182,13 +159,6 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 "error": _retry_reason,
                 "status_code": resp.status_code,
             })
-            # Phase 1: Signal — 发射重试信号（与现有 emit_event 并行）
-            _bus.emit(Signal(
-                name="llm.retry",
-                payload={**_sig_payload, "attempt": _retry_attempt, "error": _retry_reason,
-                         "error_type": "retryable", "status_code": resp.status_code},
-                span_id=_span_id,
-            ))
             _waited = 0.0
             while _waited < _delay:
                 _sleep_step = min(0.5, _delay - _waited)
@@ -198,9 +168,6 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     await ls.rctx.emit_event("cancel_acknowledged", {
                         "node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step,
                     })
-                    # Phase 1: Signal — 重试等待期间取消，发射 end 信号
-                    _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
-                    _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, "cancelled": True}, span_id=_span_id))
                     return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id, summary="任务已被用户取消。")
                 if not ls.preempt_after_step and ls.preempt_inject_info is None:
                     _pi_r = await ls.rctx.check_preempted()
@@ -213,21 +180,6 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
             continue  # 重试
 
         break  # 成功或不可重试，退出重试循环
-
-    # Phase 1: Signal — 循环结束，发射 llm.call.end 信号
-    # 此时 resp 可能是成功响应，也可能是不可重试的失败响应
-    _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
-    _end_payload = {**_sig_payload, "elapsed_ms": _elapsed, "attempt": _retry_attempt + 1, "ok": resp.ok}
-    if not resp.ok:
-        _end_payload["error"] = resp.error or "unknown"
-        # Phase 1: Signal — 不可重试错误，额外发射 llm.error 信号
-        _bus.emit(Signal(
-            name="llm.error",
-            payload={**_sig_payload, "error": resp.error or "unknown", "retryable": False,
-                     "status_code": resp.status_code},
-            span_id=_span_id,
-        ))
-    _bus.emit(Signal(name="llm.call.end", payload=_end_payload, span_id=_span_id))
 
     return resp
 

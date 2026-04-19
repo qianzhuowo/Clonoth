@@ -40,6 +40,9 @@ class Node:
     skill_access: SkillAccess = field(default_factory=SkillAccess)
     memory_access: MemoryAccess = field(default_factory=MemoryAccess)
     tool_mode: str = "native"  # "native" | "json"
+    # hybrid output_mode: 纯文本输出不再 reject 重试，直接作为隐式 finish 投递给用户。
+    # tool_only = 现有行为（强制 finish）；hybrid = 允许纯文本直接投递。
+    output_mode: str = "tool_only"  # "tool_only" | "hybrid"
     delegate_targets: list[str] = field(default_factory=list)
 
 
@@ -127,6 +130,16 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         raw_tool_mode = str((_rt.get("engine") or {}).get("tool_mode") or "native").strip().lower()
     tool_mode = raw_tool_mode if raw_tool_mode in {"native", "json"} else "native"
 
+    # output_mode — 节点 yaml 优先，否则用 runtime.yaml engine.output_mode 全局默认
+    # hybrid 模式下纯文本输出直接投递给用户，不 reject 不重试（RFC: rfc_hybrid_output_mode.md）
+    _node_om = data.get("output_mode")
+    if _node_om is not None:
+        raw_output_mode = str(_node_om).strip().lower()
+    else:
+        _rt_om = load_runtime_config(workspace_root)
+        raw_output_mode = str((_rt_om.get("engine") or {}).get("output_mode") or "tool_only").strip().lower()
+    output_mode = raw_output_mode if raw_output_mode in {"tool_only", "hybrid"} else "tool_only"
+
     # delegate_targets
     dt_raw = data.get("delegate_targets")
     delegate_targets: list[str] = [
@@ -146,5 +159,6 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         skill_access=sa,
         memory_access=ma,
         tool_mode=tool_mode,
+        output_mode=output_mode,
         delegate_targets=delegate_targets,
     )

@@ -183,8 +183,7 @@ class NativeToolFormatter(ToolFormatter):
         """Native（Fake Native）模式 L2 读取转换。
 
         从同级 tool_calls 字段读取工具调用，拼接为 [Tool call history record] 文本。
-        兼容旧消息：没有 tool_calls 字段时，回退到 _meta.metadata.legacy.raw_parts
-        或 _meta.raw_parts（旧快照）。
+        兼容旧消息：没有 tool_calls 字段时，回退到 _meta.raw_parts。
         """
         clean = {k: v for k, v in message_dict.items()
                  if not k.startswith('_') and k != 'tool_calls'}
@@ -192,18 +191,11 @@ class NativeToolFormatter(ToolFormatter):
         # 优先从同级 tool_calls 字段读取（新格式）
         tool_calls = list(message_dict.get('tool_calls', []))
 
-        # [refactor 2026-04-18] raw_parts → metadata.legacy.raw_parts
-        # 回退：旧消息没有 tool_calls 字段，从 _meta 中提取
+        # 回退：旧消息没有 tool_calls 字段，从 _meta.raw_parts 提取
         if not tool_calls:
             meta = message_dict.get('_meta', {})
             if isinstance(meta, dict):
-                # 新格式：metadata.legacy.raw_parts（由 from_dict 迁移而来）
-                _legacy = (meta.get('metadata') or {}).get('legacy') or {}
-                _raw_parts = _legacy.get('raw_parts', [])
-                # 旧格式兼容：直接读 raw_parts
-                if not _raw_parts:
-                    _raw_parts = meta.get('raw_parts', [])
-                for part in _raw_parts:
+                for part in meta.get('raw_parts', []):
                     if isinstance(part, dict) and 'tool_calls' in part:
                         tool_calls.extend(part['tool_calls'])
 
@@ -397,14 +389,11 @@ class JsonToolFormatter(ToolFormatter):
         2. JSON 解析失败时尝试 raw_decode 提取第一个对象
         3. 检测到开始标记但无结束标记时，尝试到文本末尾截取
 
-        【修复：compactor 泄漏问题 / Fix 2】
-        当模型在同一轮输出自由正文（tool_call 块之外的文本）+ 非 finish 工具调用时，
-        将自由正文反向包装为合成的 reply(text=<自由正文>) 工具调用，追加到调用列表末尾。
-        从上游视角等价于模型显式调用了 reply。
-
-        不做包装的两种情形：
-        - 本轮调用列表中已包含 finish：finish 轮保持纯净单通道，自由正文走原路径（被丢弃/日志）。
-        - 自由正文为空或无任何工具调用：保留原语义（后者走 _handle_plaintext_response 的重试）。
+        正文处理策略：
+        模型在工具调用之外输出的自由正文（plain text）不会被投递给用户，
+        但会通过 build_assistant_message 保留在 assistant 消息的 content 字段中，
+        使 LLM 在下一轮能看到自己说过的话（经 message_to_llm 重建为模型可消费格式）。
+        用户可见的输出只通过 finish / reply 工具调用产生。
         """
         if not response.text:
             return []
@@ -444,16 +433,10 @@ class JsonToolFormatter(ToolFormatter):
                         arguments=arguments,
                     ))
 
-        # 【Fix 2】自由正文反向包装为 reply tool_call：
-        # 仅在解析出至少 1 个工具调用、且调用列表中不含 finish、且自由正文非空时生效。
-        if calls and not any(c.name == "finish" for c in calls):
-            plain = self.get_plain_text(response)
-            if plain and plain.strip():
-                calls.append(ParsedToolCall(
-                    id=f"jt_{uuid.uuid4().hex[:8]}",
-                    name="reply",
-                    arguments={"text": plain.strip()},
-                ))
+        # 自由正文不合成为 reply：正文保留在 build_assistant_message 存储的
+        # assistant 消息 content 中，LLM 下轮可见，用户不可见。
+        # 原 Fix 2 在此处把正文合成为 reply tool_call 追加到 calls 尾部，
+        # 导致模型已显式调用 reply 时产生重复消息，现已删除。
 
         return calls
 
@@ -516,8 +499,7 @@ class JsonToolFormatter(ToolFormatter):
         """JSON 模式 L2 读取转换：从 tool_calls 重建 <<<TOOL_CALL>>> 块拼入 content。
 
         从同级 tool_calls 字段读取工具调用。
-        兼容旧消息：没有 tool_calls 字段时，回退到 _meta.metadata.legacy.raw_parts
-        或 _meta.raw_parts（旧快照）。
+        兼容旧消息：没有 tool_calls 字段时，回退到 _meta.raw_parts。
         """
         clean = {k: v for k, v in message_dict.items()
                  if not k.startswith('_') and k != 'tool_calls'}
@@ -525,18 +507,11 @@ class JsonToolFormatter(ToolFormatter):
         # 优先从同级 tool_calls 字段读取（新格式）
         tool_calls = list(message_dict.get('tool_calls', []))
 
-        # [refactor 2026-04-18] raw_parts → metadata.legacy.raw_parts
-        # 回退：旧消息没有 tool_calls 字段，从 _meta 中提取
+        # 回退：旧消息没有 tool_calls 字段，从 _meta.raw_parts 提取
         if not tool_calls:
             meta = message_dict.get('_meta', {})
             if isinstance(meta, dict):
-                # 新格式：metadata.legacy.raw_parts
-                _legacy = (meta.get('metadata') or {}).get('legacy') or {}
-                _raw_parts = _legacy.get('raw_parts', [])
-                # 旧格式兼容：直接读 raw_parts
-                if not _raw_parts:
-                    _raw_parts = meta.get('raw_parts', [])
-                for part in _raw_parts:
+                for part in meta.get('raw_parts', []):
                     if isinstance(part, dict) and 'tool_calls' in part:
                         tool_calls.extend(part['tool_calls'])
 

@@ -42,7 +42,8 @@ from ..protocol import (
     ACTION_CANCELLED,
     ACTION_PREEMPTED,
 )
-from ..tool_step import result_to_raw, summarize_result, write_artifact
+# [2026-04-17] write_artifact 移除：截断机制已废弃，不再写 artifact 文件
+from ..tool_step import result_to_raw, summarize_result
 from ..compact import should_compact, _format_messages_for_summary
 from clonoth_runtime import get_int, get_float, load_runtime_config
 from toolbox.context import ToolContext
@@ -51,6 +52,9 @@ from toolbox.context import ToolContext
 from .tool_format import create_tool_formatter, build_llm_messages
 from .message_model import MessageMeta, set_message_meta
 from providers.base import ToolCall, ProviderResponse
+# Phase 2 Signal System: 导入信号总线，用于发射 tool.call 和 task.error 信号。
+# get_bus() 返回全局单例 SignalBus，Signal 是不可变事件数据类。
+from ..signals import Signal, get_bus
 
 if TYPE_CHECKING:
     from ..context import RunContext
@@ -339,18 +343,21 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
 
     # 将 LLM 的工具调用决策追加到对话历史
     _assistant_msg = ls.formatter.build_assistant_message(resp, resp.text or "", resp.tool_calls)
+    # [refactor 2026-04-18] raw_parts → metadata, thinking_text → reasoning, has_thinking → has_reasoning
+    # provider_meta 由 ProviderResponse 透传；engine 只搬运不解读
+    # [fix 2026-04-18] provider 名称改为动态获取，不再硬编码 "openai"。
+    # ls.provider.name 由 BaseProvider.name 提供，各 provider 子类在初始化时传入。
+    _provider_name = getattr(ls.provider, 'name', '') or 'unknown'
     _tc_meta = MessageMeta(
-        provider="openai",
+        provider=_provider_name,
         tool_mode=getattr(ls.node, 'tool_mode', 'native'),
         message_type="assistant",
         timestamp=datetime.now(timezone.utc).isoformat(),
-        raw_parts=[{
-            "text": resp.text or "",
-            "tool_calls": [{"id": tc.id, "name": tc.name, "arguments": tc.arguments} for tc in (resp.tool_calls or [])],
-        }] if resp else [],
+        metadata={_provider_name: resp.provider_meta} if resp.provider_meta else {},
         tool_call_ids=[tc.id for tc in (resp.tool_calls or [])],
-        thinking_text="",
-        has_thinking=False,
+        reasoning=resp.reasoning or "",
+        has_reasoning=bool(resp.reasoning),
+        inline_data=resp.inline_data or [],
         usage=dict(ls.last_usage) if ls.last_usage else {},
     )
     set_message_meta(_assistant_msg, _tc_meta)
@@ -412,8 +419,8 @@ async def _execute_real_tools(
     ls: _LoopState, real_tool_calls: list[dict[str, Any]], step: int,
 ) -> TaskAction | None:
     """批量执行真实工具调用，将结果追加到 messages。"""
-    _rt_cfg = load_runtime_config(ls.rctx.workspace_root)
-    _max_inline = get_int(_rt_cfg, "engine.tool_trace.max_inline_chars", 8000, min_value=1000, max_value=200_000)
+    # [2026-04-17] 移除 _max_inline / _rt_cfg：截断机制已废弃，不再需要读取 runtime config 中的
+    # engine.tool_trace.max_inline_chars 配置项。
 
     await ls.rctx.emit_event("handoff_progress", {
         "message": f"[{ls.node.id}] 执行 {len(real_tool_calls)} 个工具",
@@ -441,30 +448,36 @@ async def _execute_real_tools(
             break
         _t_name = _rtc["name"]
         _t_args = _rtc["arguments"]
-        _t_result = await ls.registry.execute(name=_t_name, arguments=_t_args, ctx=_tool_ctx)
-        if isinstance(_t_result, dict) and _t_result.get("cancelled"):
-            break
+        # Phase 2 Signal: tool.call span 包裹每个工具的执行过程。
+        # 自动发射 tool.call.start（含工具名和参数摘要）和 tool.call.end（含 elapsed_ms 和 error）。
+        # span 是同步 contextmanager，在 async 函数中直接 with 即可。
+        _args_summary = _short(json.dumps(_t_args, ensure_ascii=False, default=str), 200)
+        with get_bus().span('tool.call', payload={'tool': _t_name, 'args_summary': _args_summary}):
+            _t_result = await ls.registry.execute(name=_t_name, arguments=_t_args, ctx=_tool_ctx)
+        # [硬取消-场景1] 工具返回 cancelled 时，仍将结果存入 _tool_entries 再 break。
+        # 确保 assistant 的 tool_use 有对应 tool_result 配对，
+        # 模型下次看到的是「我调了工具但被用户取消了」而非 tool_use 悬空无响应。
+        _t_cancelled = isinstance(_t_result, dict) and _t_result.get("cancelled")
 
         _t_summary = summarize_result(_t_name, _t_result)
         _t_fmt, _t_raw = result_to_raw(_t_name, _t_result)
-        _t_truncated = len(_t_raw) > _max_inline
-        _t_ref = ""
-        if _t_truncated:
-            _t_ref = await write_artifact(
-                ls.rctx.workspace_root, ls.rctx.task_id or ls.run_id,
-                _rtc["id"], _t_name, _t_fmt, _t_raw,
-            )
-        _t_raw_inline = _t_raw if not _t_truncated else _t_raw[:_max_inline] + "\n...<truncated>"
+        # [2026-04-17] 移除工具结果截断机制：不再截断、不再写 artifact，直接传完整结果。
+        _t_raw_inline = _t_raw
 
         _tool_entries.append({
             "name": _t_name,
             "args": _t_args,
             "format": _t_fmt,
             "raw_inline": _t_raw_inline,
-            "truncated": _t_truncated,
-            "ref": _t_ref,
+            "truncated": False,  # [2026-04-17] 截断机制已移除，保留字段兼容 format_tool_trace
+            "ref": "",
             "summary": _t_summary,
         })
+
+        # [硬取消-场景1] 已取消的工具结果已存入 entries（上方 append），不处理附件和进度事件，
+        # 直接退出循环。未执行的后续工具被跳过（循环顶部 check_cancelled），不产生 tool_result。
+        if _t_cancelled:
+            break
 
         if isinstance(_t_result, dict) and isinstance(_t_result.get("attachments"), list):
             _tool_atts.extend(_t_result["attachments"])
@@ -480,8 +493,7 @@ async def _execute_real_tools(
     if _tool_entries:
         for _entry in _tool_entries:
             _result_body = _entry["raw_inline"]
-            if _entry.get("truncated") and _entry.get("ref"):
-                _result_body += f"\n(Truncated. Full output: {_entry['ref']})"
+            # [2026-04-17] 截断机制已移除，不再追加 truncated 提示
             _tool_msg = {
                 "role": "user",
                 "content": f'Tool result for "{_entry["name"]}":\n{_result_body}',
@@ -522,15 +534,17 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
     if getattr(ls.node, 'output_mode', 'tool_only') == 'hybrid':
         # 写入 assistant 消息到对话历史 + ConversationStore，与 _handle_tool_calls 对齐
         _assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
+        # [refactor 2026-04-18] 与 _handle_tool_calls 对齐：动态 provider 名、metadata/reasoning 新字段
+        _provider_name = getattr(ls.provider, 'name', '') or 'unknown'
         _implicit_meta = MessageMeta(
-            provider="openai",
+            provider=_provider_name,
             tool_mode=getattr(ls.node, 'tool_mode', 'native'),
             message_type="assistant",
             timestamp=datetime.now(timezone.utc).isoformat(),
-            raw_parts=[{"text": text, "tool_calls": []}] if resp else [],
+            metadata={},
             tool_call_ids=[],
-            thinking_text="",
-            has_thinking=False,
+            reasoning="",
+            has_reasoning=False,
             usage=dict(ls.last_usage) if ls.last_usage else {},
         )
         set_message_meta(_assistant_msg, _implicit_meta)
@@ -638,6 +652,13 @@ async def run_ai_node(
     if resume_data:
         messages.extend(_build_resume_messages(resume_data))
         if str(resume_data.get("type") or "") == "compact_done":
+            # Phase 2 Signal: compact.done 信号，通过 SignalBus 发射供监控使用
+            get_bus().emit(Signal(name="compact.done", payload={
+                "node_id": node.id,
+                "success": resume_data.get("success", True),
+                "before": resume_data.get("before", 0),
+                "after": resume_data.get("after", 0),
+            }))
             await rctx.emit_event("compact_done", {
                 "node_id": node.id,
                 "success": resume_data.get("success", True),
@@ -741,7 +762,8 @@ async def run_ai_node(
                         ToolCall(id=p.id, name=p.name, arguments=p.arguments)
                         for p in _parsed
                     ],
-                    thinking=resp.thinking,
+                    # [refactor 2026-04-18] thinking → reasoning
+                    reasoning=resp.reasoning,
                     status_code=resp.status_code,
                     usage=resp.usage,
                 )

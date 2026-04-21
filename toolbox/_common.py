@@ -2,12 +2,36 @@
 from __future__ import annotations
 
 import os
+import signal
 from pathlib import Path
 from typing import Any
 
 from clonoth_runtime import classify_path, load_policy_config, parse_extra_roots
 
 from .context import ToolContext
+
+
+# ---------------------------------------------------------------------------
+#  Process management
+# ---------------------------------------------------------------------------
+
+
+def kill_process_group(proc: "asyncio.subprocess.Process") -> None:
+    """Kill the entire process group to avoid orphaned children holding pipes.
+
+    Why: proc.kill() only kills the direct child (shell). Grandchild processes
+    (e.g. PM2 daemon) inherit stdout/stderr pipe fds. communicate() waits for
+    pipe EOF, so if grandchildren still hold the pipe, the gather(waiter) hangs
+    forever. Using start_new_session=True + os.killpg kills the whole tree.
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        # Fallback: kill just the direct process if killpg fails
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
 
 # ---------------------------------------------------------------------------

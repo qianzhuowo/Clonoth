@@ -10,22 +10,6 @@ def _sanitize(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", (s or "x").strip() or "x")[:80]
 
 
-async def write_artifact(
-    workspace_root: Path,
-    run_id: str,
-    tool_call_id: str,
-    tool_name: str,
-    raw_format: str,
-    raw_text: str,
-) -> str:
-    """把工具原始输出写入 artifact 文件，返回相对路径。"""
-    d = workspace_root / "data" / "artifacts" / str(run_id or "unknown")
-    d.mkdir(parents=True, exist_ok=True)
-    ext = ".json" if raw_format == "json" else ".txt"
-    path = d / f"{_sanitize(tool_call_id)}_{_sanitize(tool_name)}{ext}"
-    path.write_text(raw_text, encoding="utf-8")
-    return str(path.relative_to(workspace_root))
-
 
 def result_to_raw(tool_name: str, result: Any) -> tuple[str, str]:
     """把工具结果转为 (format, raw_text)。"""

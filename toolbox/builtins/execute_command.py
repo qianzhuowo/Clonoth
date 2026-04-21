@@ -8,7 +8,7 @@ from typing import Any
 from clonoth_runtime import get_float, get_int, load_runtime_config
 
 from ..context import ToolContext
-from .._common import request_guard, safe_subprocess_env
+from .._common import kill_process_group, request_guard, safe_subprocess_env
 
 
 async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -50,6 +50,10 @@ async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=safe_subprocess_env(),
+            # Fix: run in new session so os.killpg can kill the entire process
+            # tree, preventing orphaned grandchildren from holding pipe fds and
+            # causing communicate() to hang forever.
+            start_new_session=True,
         )
         waiter = asyncio.create_task(proc.communicate())
         started = time.monotonic()
@@ -59,12 +63,21 @@ async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
                 stdout_bytes, stderr_bytes = waiter.result()
                 break
             if await ctx.check_cancelled():
-                proc.kill()
-                await asyncio.gather(waiter, return_exceptions=True)
+                # Fix: kill entire process group, not just the shell
+                kill_process_group(proc)
+                # Fix: 5s safety timeout on gather — if killpg didn't clean
+                # all grandchildren, don't hang forever waiting for pipe EOF
+                try:
+                    await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
                 return {"ok": False, "error": "task cancelled", "cancelled": True}
             if time.monotonic() - started >= timeout_sec:
-                proc.kill()
-                await asyncio.gather(waiter, return_exceptions=True)
+                kill_process_group(proc)
+                try:
+                    await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
                 return {"ok": False, "error": f"timeout after {timeout_sec}s"}
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace")

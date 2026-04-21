@@ -360,12 +360,15 @@ class TaskRouterMixin:
             return
         text = str(fallback_result.get("text") or fallback_result.get("summary") or "").strip()
         atts = fallback_result.get("attachments") if isinstance(fallback_result.get("attachments"), list) else None
-        if text or atts:
-            self.append_outbound_message(
-                session_id=task.session_id, text=text,
-                attachments=atts, source_inbound_seq=task.source_inbound_seq,
-                node_id=task.node_id,
-            )
+        # [Fix] finish(text="") 空文本时也产出 outbound_message 事件。
+        # 原先 `if text or atts:` 导致空文本 finish 不发事件，
+        # Bot 侧 trigger 和 status_msg（含 stream_delta 累积的原始标记预览）永远无法清理。
+        # 去掉守卫后，Bot 侧 send_reply 会跳过 Discord 发送但正常执行清理收尾。
+        self.append_outbound_message(
+            session_id=task.session_id, text=text,
+            attachments=atts, source_inbound_seq=task.source_inbound_seq,
+            node_id=task.node_id,
+        )
 
 
     # ------------------------------------------------------------------ #

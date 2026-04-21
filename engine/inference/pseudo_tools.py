@@ -16,6 +16,11 @@ if TYPE_CHECKING:
 
 _PSEUDO_TOOL_NAMES = frozenset({"dispatch_node", "dispatch_nodes", "finish", "reply", "switch_node", "compact_context", "preempt_task"})
 
+# [RFC 2026-04-20] finish 升级为真实 API 工具：tool_result 固定内容。
+# 仅用于满足 API 的 tool_use/tool_result 配对校验和下一轮对话历史格式合法性。
+# finish 调用后循环即终止，模型不会看到此内容。
+FINISH_TOOL_RESULT_CONTENT = "completed"
+
 
 # ---------------------------------------------------------------------------
 #  v3 伪工具 spec 构建

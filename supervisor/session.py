@@ -330,7 +330,10 @@ class SessionMixin:
         node_id: str | None = None,
     ) -> dict[str, Any]:
         text_clean = str(text or "").strip()
-        if not text_clean and not attachments:
+        # [Fix] 当 source_inbound_seq 存在时，允许空文本通过。
+        # 空 outbound_message 事件用于触发 Bot 侧 trigger/status_msg 的清理收尾。
+        # 仅在无 source_inbound_seq（如 API 直接调用发消息）时仍拒绝空消息。
+        if not text_clean and not attachments and source_inbound_seq is None:
             return {"ok": False, "reason": "empty"}
 
         src_seq: int | None = None

@@ -70,9 +70,25 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         return await _handle_pseudo_dispatch_nodes(ls, args)
 
     # ---- 终止型伪工具：finish / switch_node ----
-    ctx_ref = _persist_ctx(ls, step + 1)
 
     if pseudo_call.name == "finish":
+        # [RFC 2026-04-20] finish 升级为真实 API 工具：在 _persist_ctx 之前构造
+        # tool_result("completed") 存入历史，确保 Native 模式下 tool_use/tool_result
+        # 配对完整。此内容不会被模型看到（循环即将终止），仅用于 API 配对校验
+        # 和下一轮对话历史格式合法性。与 reply 伪工具的 tool_result 写入路径对齐。
+        from .pseudo_tools import FINISH_TOOL_RESULT_CONTENT
+        from .ai_step import _shadow_write  # 延迟导入避免循环依赖
+        _finish_parsed = ParsedToolCall(
+            id=getattr(pseudo_call, "id", "") or "",
+            name="finish",
+            arguments=dict(args),
+        )
+        _finish_result_msg = ls.formatter.format_tool_result(_finish_parsed, FINISH_TOOL_RESULT_CONTENT)
+        set_message_meta(_finish_result_msg, MessageMeta(message_type="tool_result"))
+        ls.messages.append(_finish_result_msg)
+        _shadow_write(ls, _finish_result_msg, MessageType.TOOL_RESULT)
+
+        ctx_ref = _persist_ctx(ls, step + 1)
         summary_text = str(args.get("summary") or "").strip()
         result_text = str(args.get("text") or "").strip()
         _selected_paths = args.get("attachment_paths")
@@ -95,7 +111,9 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             summary=_short(summary_text or result_text, 240),
         )
 
+    # switch_node 也需要 ctx_ref，单独计算
     if pseudo_call.name == "switch_node":
+        ctx_ref = _persist_ctx(ls, step + 1)
         switch_target = str(args.get("target") or "").strip()
         switch_text = str(args.get("text") or "").strip()
         try:

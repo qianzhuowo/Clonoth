@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable
 from clonoth_runtime import get_float, load_runtime_config
 
 from . import builtins as _builtins
+from ._common import kill_process_group as _kill_process_group
 from ._common import safe_subprocess_env as _safe_subprocess_env
 from . import mcp_runtime
 
@@ -109,6 +110,10 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(root) if isinstance(root, Path) else None,
                 env=_safe_subprocess_env(),
+                # Fix: run in new session so os.killpg can kill the entire
+                # process tree, preventing orphaned grandchildren from holding
+                # pipe fds and causing communicate() to hang forever.
+                start_new_session=True,
             )
             waiter = asyncio.create_task(proc.communicate(input=input_json.encode("utf-8")))
             started = asyncio.get_running_loop().time()
@@ -119,18 +124,27 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                     break
                 try:
                     if hasattr(ctx, "check_cancelled") and await ctx.check_cancelled():
-                        proc.kill()
-                        await asyncio.gather(waiter, return_exceptions=True)
+                        # Fix: kill entire process group, not just the interpreter
+                        _kill_process_group(proc)
+                        # Fix: 5s safety timeout — if killpg didn't clean all
+                        # grandchildren, don't hang forever waiting for pipe EOF
+                        try:
+                            await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            pass
                         return {"ok": False, "error": "script task cancelled", "cancelled": True}
                 except Exception:
                     pass
                 if asyncio.get_running_loop().time() - started >= timeout_val:
-                    proc.kill()
-                    await asyncio.gather(waiter, return_exceptions=True)
+                    _kill_process_group(proc)
+                    try:
+                        await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pass
                     return {"ok": False, "error": f"script timeout after {timeout_val}s"}
         except asyncio.TimeoutError:
             try:
-                proc.kill()  # type: ignore[union-attr]
+                _kill_process_group(proc)  # type: ignore[union-attr]
             except Exception:
                 pass
             return {"ok": False, "error": f"script timeout after {timeout_val}s"}
@@ -298,7 +312,7 @@ class ToolRegistry:
                     "type": "object",
                     "properties": {
                         "query": {"type": "string"},
-                        "path": {"type": "string"},
+                        "path": {"type": "string", "description": "Directory or file path to search in (relative or absolute). Supports single file. Default '.'"},
                         "mode": {"type": "string", "description": "search (default) or replace", "enum": ["search", "replace"]},
                         "pattern": {"type": "string", "description": "file glob pattern, e.g. '*.py', '**/*.js'. Default '**/*'"},
                         "isRegex": {"type": "boolean", "description": "treat query as regex. Default false"},

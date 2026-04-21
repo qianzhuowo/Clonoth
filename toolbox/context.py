@@ -36,13 +36,23 @@ class ToolContext:
         return r.json()
 
     async def check_cancelled(self) -> bool:
+        # [硬取消] 显式 2s 超时，防止 supervisor 无响应时拖延 cancel 检测。
+        # 工具层的 cancel 轮询间隔为 0.2s（execute_command / script tool），
+        # 如果 HTTP 请求无超时，单次 check 可能阻塞远超轮询间隔。
+        # 超时后 except 兜底返回 False，下次轮询再试。
         try:
             if self.task_id:
-                r = await self.http.get(f"{self.supervisor_url}/v1/tasks/{self.task_id}/cancelled")
+                r = await self.http.get(
+                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/cancelled",
+                    timeout=2.0,
+                )
                 if r.status_code == 200:
                     return bool(r.json().get("cancelled", False))
             else:
-                r = await self.http.get(f"{self.supervisor_url}/v1/sessions/{self.session_id}/cancelled")
+                r = await self.http.get(
+                    f"{self.supervisor_url}/v1/sessions/{self.session_id}/cancelled",
+                    timeout=2.0,
+                )
                 if r.status_code == 200:
                     return bool(r.json().get("cancelled", False))
         except Exception:

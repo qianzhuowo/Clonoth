@@ -191,11 +191,18 @@ class NativeToolFormatter(ToolFormatter):
         # 优先从同级 tool_calls 字段读取（新格式）
         tool_calls = list(message_dict.get('tool_calls', []))
 
-        # 回退：旧消息没有 tool_calls 字段，从 _meta.raw_parts 提取
+        # [refactor 2026-04-18] raw_parts → metadata.legacy.raw_parts
+        # 回退：旧消息没有 tool_calls 字段，从 _meta 中提取
         if not tool_calls:
             meta = message_dict.get('_meta', {})
             if isinstance(meta, dict):
-                for part in meta.get('raw_parts', []):
+                # 新格式：metadata.legacy.raw_parts（由 from_dict 迁移而来）
+                _legacy = (meta.get('metadata') or {}).get('legacy') or {}
+                _raw_parts = _legacy.get('raw_parts', [])
+                # 旧格式兼容：直接读 raw_parts
+                if not _raw_parts:
+                    _raw_parts = meta.get('raw_parts', [])
+                for part in _raw_parts:
                     if isinstance(part, dict) and 'tool_calls' in part:
                         tool_calls.extend(part['tool_calls'])
 
@@ -507,11 +514,18 @@ class JsonToolFormatter(ToolFormatter):
         # 优先从同级 tool_calls 字段读取（新格式）
         tool_calls = list(message_dict.get('tool_calls', []))
 
-        # 回退：旧消息没有 tool_calls 字段，从 _meta.raw_parts 提取
+        # [refactor 2026-04-18] raw_parts → metadata.legacy.raw_parts
+        # 回退：旧消息没有 tool_calls 字段，从 _meta 中提取
         if not tool_calls:
             meta = message_dict.get('_meta', {})
             if isinstance(meta, dict):
-                for part in meta.get('raw_parts', []):
+                # 新格式：metadata.legacy.raw_parts（由 from_dict 迁移而来）
+                _legacy = (meta.get('metadata') or {}).get('legacy') or {}
+                _raw_parts = _legacy.get('raw_parts', [])
+                # 旧格式兼容：直接读 raw_parts
+                if not _raw_parts:
+                    _raw_parts = meta.get('raw_parts', [])
+                for part in _raw_parts:
                     if isinstance(part, dict) and 'tool_calls' in part:
                         tool_calls.extend(part['tool_calls'])
 

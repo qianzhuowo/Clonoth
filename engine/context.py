@@ -6,6 +6,9 @@ from typing import Any
 
 import httpx
 
+# 桥接信号系统：让所有 emit_event 调用自动走 SignalBus
+from engine.signals import Signal, get_bus
+
 
 @dataclass
 class RunContext:
@@ -33,6 +36,8 @@ class RunContext:
     async def emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.source_inbound_seq is not None:
             payload.setdefault("source_inbound_seq", self.source_inbound_seq)
+        # Bridge emit_event → SignalBus，用 dict(payload) 复制避免后续修改影响信号订阅方
+        get_bus().emit(Signal(name=event_type, payload=dict(payload)))
         try:
             await self.http.post(
                 f"{self.supervisor_url}/v1/sessions/{self.session_id}/events",
@@ -42,13 +47,23 @@ class RunContext:
             pass
 
     async def check_cancelled(self) -> bool:
+        # [硬取消] 显式 2s 超时，防止 supervisor 无响应时拖延 cancel 检测。
+        # 工具执行和 LLM 流式轮询每 0.2-0.3s 调用一次 check_cancelled，
+        # 如果 HTTP 请求无超时限制，单次调用可能阻塞数十秒，导致 cancel 响应延迟。
+        # 超时后 except 兜底返回 False，下次轮询再试。
         try:
             if self.task_id:
-                r = await self.http.get(f"{self.supervisor_url}/v1/tasks/{self.task_id}/cancelled")
+                r = await self.http.get(
+                    f"{self.supervisor_url}/v1/tasks/{self.task_id}/cancelled",
+                    timeout=2.0,
+                )
                 if r.status_code == 200:
                     return bool(r.json().get("cancelled", False))
             else:
-                r = await self.http.get(f"{self.supervisor_url}/v1/sessions/{self.session_id}/cancelled")
+                r = await self.http.get(
+                    f"{self.supervisor_url}/v1/sessions/{self.session_id}/cancelled",
+                    timeout=2.0,
+                )
                 if r.status_code == 200:
                     return bool(r.json().get("cancelled", False))
         except Exception:

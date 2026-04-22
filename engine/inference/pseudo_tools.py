@@ -71,6 +71,13 @@ def _dispatch_node_spec(targets: list[str], downstream_info: list[dict[str, str]
                         "type": "string",
                         "description": "上下文继承标识（仅 accumulate 模式有效）。用于精确指定继承哪个实例的上下文历史。同一 context_key 的历次任务共享上下文链。不填则按 target 节点 ID 查找（默认行为）。并发 dispatch 同一 target 多个实例时，应为每个实例指定不同的 context_key。",
                     },
+                    # [2026-04-22] 新增 attachment_paths：允许父节点将文件附件传递给子节点。
+                    # 路径为 workspace-relative，图片注入为多模态内容，其他文件作为引用。
+                    "attachment_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "File paths (relative to workspace root) to attach to the child node's initial context. Images are injected as multimodal content; other files as references the child can read_file.",
+                    },
                 },
                 "required": ["target", "instruction"],
             },
@@ -123,6 +130,12 @@ def _dispatch_nodes_spec(targets: list[str], downstream_info: list[dict[str, str
                                     "type": "string",
                                     "description": "上下文继承标识（仅 accumulate 模式有效）。同一 context_key 的历次任务共享上下文链。并发 dispatch 同一 target 多个实例时，应为每个实例指定不同的 context_key。",
                                 },
+                                # [2026-04-22] 新增 attachment_paths：与 dispatch_node 同理。
+                                "attachment_paths": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "File paths (relative to workspace root) to attach to this child node instance.",
+                                },
                             },
                             "required": ["target", "instruction"],
                         },
@@ -150,13 +163,8 @@ def _finish_spec() -> dict:
             "name": "finish",
             "description": (
                 "Submit the final result and terminate this node immediately.\n\n"
-                "CRITICAL: Once you call finish, the node exits. No further tool calls "
-                "will be executed — not in this turn, not after. If you still have tools "
-                "to call, call them FIRST, then finish in a later turn.\n\n"
-                "IMPORTANT: Do NOT call finish in the same turn as other tool calls. "
-                "Execute all other tools first, then call finish ALONE in a separate turn. "
-                "The engine will defer finish to run last as a safety net, but relying on "
-                "this is bad practice.\n\n"
+                "CRITICAL: Once you call finish, the node exits. If you have other tools to call (like execute_command or save_memory), you MUST wait for them to complete (`ok`) before calling finish.\n\n"
+                "Do NOT send your final report via `reply` while waiting for tools. Just call the tools silently, wait for the next turn, and put your ENTIRE final report in the `finish` tool's text.\n\n"
                 "The `text` parameter is the ACTUAL DELIVERABLE — the content the caller "
                 "or user will receive. Put your real output here (full answer, full data, "
                 "full summary), not a status report of what you did. If the caller expects "

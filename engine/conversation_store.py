@@ -44,6 +44,7 @@ class Message:
     source_node_id: str = ""         # 产生该消息的节点 ID
     source_task_id: str = ""         # 产生该消息的 task ID
     ephemeral: bool = False          # 临时消息（dynamic context 等），不持久化到 store
+    tool_calls: list = field(default_factory=list)  # assistant 消息的工具调用列表
 
     def to_dict(self) -> dict:
         """序列化为存储格式。仅包含非空字段以减小 JSONL 体积。"""
@@ -60,6 +61,8 @@ class Message:
             d["source_task_id"] = self.source_task_id
         if self.ephemeral:
             d["ephemeral"] = True
+        if self.tool_calls:
+            d["tool_calls"] = self.tool_calls
         return d
 
     @classmethod
@@ -75,6 +78,7 @@ class Message:
             source_node_id=data.get("source_node_id", ""),
             source_task_id=data.get("source_task_id", ""),
             ephemeral=data.get("ephemeral", False),
+            tool_calls=data.get("tool_calls", []),
         )
 
 

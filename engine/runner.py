@@ -95,6 +95,8 @@ def _message_to_history_dict(msg: Message) -> dict[str, Any]:
         d["content"] = _strip_images_from_content(d["content"])
     if msg.meta:
         d["_meta"] = msg.meta
+    if msg.tool_calls:
+        d["tool_calls"] = msg.tool_calls
     return d
 
 

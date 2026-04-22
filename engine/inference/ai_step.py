@@ -95,6 +95,7 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
             meta=msg_dict.get('_meta', {}),
             source_node_id=getattr(ls.node, 'id', ''),
             source_task_id=getattr(ls.rctx, 'task_id', ''),
+            tool_calls=msg_dict.get('tool_calls', []),
         )
         # Child Session 隔离（Phase B）：子节点写入自己的 child session JSONL，
         # 不再写入父 session。无 child_session_id 时仍写入 parent session（主节点路径）。

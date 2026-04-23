@@ -742,7 +742,7 @@ async def run_ai_node(
         if action is not None:
             return action
 
-        _update_dynamic_vars(ls)
+        # _update_dynamic_vars(ls)  # Disabled to prevent intra-task prompt cache invalidation
 
         result = await _call_llm_with_retry(ls, step)
         if isinstance(result, TaskAction):

@@ -352,15 +352,32 @@ def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | No
 #  工具 spec 相关
 # ---------------------------------------------------------------------------
 
+# [2026-04-23] 异步工具提示：当 spec 中 async_mode=True 时，在 description 末尾追加说明，
+# 告知模型该工具为后台执行、结果通过 preempt 自动回传。从 commit 7d10197 恢复。
+_ASYNC_TOOL_HINT = (
+    "\n\n⚡ This is an async tool. Execution runs in background; "
+    "result will be delivered automatically via preempt when ready. "
+    "You can continue working or finish — no need to wait."
+)
+
+
 def _to_openai_tools(specs: list[dict]) -> list[dict]:
-    return [{
-        "type": "function",
-        "function": {
-            "name": s["name"],
-            "description": s.get("description", ""),
-            "parameters": s.get("input_schema", {"type": "object", "properties": {}, "required": []}),
-        },
-    } for s in specs]
+    # [2026-04-23] 恢复 async_mode 支持：遍历 spec 列表，对 async_mode=True 的工具
+    # 在 description 末尾追加 _ASYNC_TOOL_HINT，使模型知道该工具为异步执行。
+    result = []
+    for s in specs:
+        desc = s.get("description", "")
+        if s.get("async_mode"):
+            desc += _ASYNC_TOOL_HINT
+        result.append({
+            "type": "function",
+            "function": {
+                "name": s["name"],
+                "description": desc,
+                "parameters": s.get("input_schema", {"type": "object", "properties": {}, "required": []}),
+            },
+        })
+    return result
 
 
 def _filter_tool_specs(node: "Node", all_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:

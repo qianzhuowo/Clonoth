@@ -604,6 +604,10 @@ class ToolRegistry:
     def list_specs(self) -> list[dict[str, Any]]:
         return list(self._tool_specs.values())
 
+    def get_spec(self, name: str) -> dict[str, Any] | None:
+        """按名称获取单个工具的 spec，不存在返回 None。"""
+        return self._tool_specs.get(name)
+
     async def execute(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> dict[str, Any]:
         if name not in self._tool_funcs:
             return {"ok": False, "error": f"tool not found: {name}"}

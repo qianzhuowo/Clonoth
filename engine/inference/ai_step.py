@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import asyncio
+import time
+import uuid
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -58,6 +61,51 @@ from ..signals import Signal, get_bus
 
 if TYPE_CHECKING:
     from ..context import RunContext
+
+
+# ---------------------------------------------------------------------------
+#  异步工具跟踪表（Async Tool Tracking）
+#  [2026-04-23] 从 commit 7d10197 恢复，在 864a333 大扫除中被误删。
+#  key = async_tool_id (8 位 hex), value = 状态字典
+#  用于关联异步工具的启动占位消息与 preempt 回传结果。
+#  done/failed 条目保留 5 分钟后自动清理，防止无限增长。
+# ---------------------------------------------------------------------------
+_async_tool_tasks: dict[str, dict] = {}
+
+# 清理阈值：done/failed 条目保留秒数
+_ASYNC_TRACK_RETAIN_SEC = 300  # 5 minutes
+
+
+def _cleanup_async_tracker() -> None:
+    """清理已完成超过 _ASYNC_TRACK_RETAIN_SEC 的条目。
+
+    在每次新增 tracking 条目时调用，避免 map 无限增长。
+    只清理 status 为 done 或 failed 且 finished_at 已过期的条目。
+    """
+    now = time.monotonic()
+    expired = [
+        k for k, v in _async_tool_tasks.items()
+        if v.get("status") in ("done", "failed")
+        and now - v.get("finished_at", now) > _ASYNC_TRACK_RETAIN_SEC
+    ]
+    for k in expired:
+        del _async_tool_tasks[k]
+
+
+def get_async_tool_tasks() -> list[dict]:
+    """导出当前所有异步工具跟踪条目，供外部查询。
+
+    返回列表，每项包含 async_id, tool_name, status, elapsed 等字段。
+    """
+    result = []
+    now = time.monotonic()
+    for aid, info in _async_tool_tasks.items():
+        entry = {"async_id": aid, **info}
+        # 对 running 状态补算已经过的时间
+        if info.get("status") == "running" and "started_at" in info:
+            entry["elapsed"] = round(now - info["started_at"], 1)
+        result.append(entry)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +461,83 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
 
 
 # ---------------------------------------------------------------------------
+#  异步工具后台执行器
+#  [2026-04-23] 从 commit 7d10197 恢复，在 864a333 大扫除中被误删。
+#  当工具 spec 标记 async_mode=True 时，工具在后台 asyncio.Task 中执行，
+#  完成后通过 preempt API 将结果注入回当前任务的对话流。
+# ---------------------------------------------------------------------------
+
+async def _run_async_tool(
+    registry: ToolRegistry,
+    http: "httpx.AsyncClient",
+    supervisor_url: str,
+    task_id: str,
+    tool_name: str,
+    tool_args: dict,
+    tool_ctx: ToolContext,
+    async_tool_id: str,
+) -> None:
+    """后台执行异步工具，完成后通过 preempt 注入结果。"""
+    _started = time.monotonic()
+    try:
+        _args_summary = _short(json.dumps(tool_args, ensure_ascii=False, default=str), 200)
+        with get_bus().span('tool.call', payload={'tool': tool_name, 'args_summary': _args_summary, 'async': True}):
+            result = await registry.execute(name=tool_name, arguments=tool_args, ctx=tool_ctx)
+
+        _elapsed = time.monotonic() - _started
+        _summary = summarize_result(tool_name, result)
+        _fmt, raw = result_to_raw(tool_name, result)
+
+        _async_tool_tasks[async_tool_id] = {
+            "tool_name": tool_name,
+            "status": "done",
+            "task_id": task_id,
+            "started_at": _started,
+            "finished_at": time.monotonic(),
+            "elapsed": round(_elapsed, 1),
+        }
+
+        preempt_text = (
+            f'\u2705 Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
+            f'\nSummary: {_summary}\nResult:\n{raw}'
+        )
+
+        attachments: list[str] = []
+        if isinstance(result, dict) and isinstance(result.get("attachments"), list):
+            for a in result["attachments"]:
+                if isinstance(a, dict) and a.get("path"):
+                    attachments.append(str(a["path"]))
+                elif isinstance(a, str):
+                    attachments.append(a)
+
+        payload: dict = {"message": preempt_text}
+        if attachments:
+            payload["attachment_paths"] = attachments
+
+        await http.post(
+            f"{supervisor_url}/v1/tasks/{task_id}/preempt",
+            json=payload,
+        )
+    except Exception as e:
+        _async_tool_tasks[async_tool_id] = {
+            "tool_name": tool_name,
+            "status": "failed",
+            "task_id": task_id,
+            "started_at": _started,
+            "finished_at": time.monotonic(),
+            "elapsed": round(time.monotonic() - _started, 1),
+            "error": str(e),
+        }
+        try:
+            await http.post(
+                f"{supervisor_url}/v1/tasks/{task_id}/preempt",
+                json={"message": f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}'},
+            )
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 #  真实工具执行
 # ---------------------------------------------------------------------------
 
@@ -449,6 +574,52 @@ async def _execute_real_tools(
             break
         _t_name = _rtc["name"]
         _t_args = _rtc["arguments"]
+
+        # [2026-04-23] 异步工具分流：查询 spec 判断该工具是否为 async_mode。
+        # 若是，则在后台 asyncio.Task 中执行，不阻塞当前推理循环，
+        # 结果通过 preempt API 异步回传。从 commit 7d10197 恢复。
+        _spec = ls.registry.get_spec(_t_name)
+        _is_async = _spec.get("async_mode", False) if _spec else False
+
+        if _is_async:
+            _cleanup_async_tracker()
+            _async_id = uuid.uuid4().hex[:8]
+            _async_tool_tasks[_async_id] = {
+                "tool_name": _t_name,
+                "status": "running",
+                "started_at": time.monotonic(),
+                "task_id": ls.rctx.task_id,
+            }
+            asyncio.create_task(
+                _run_async_tool(
+                    registry=ls.registry,
+                    http=ls.rctx.http,
+                    supervisor_url=ls.rctx.supervisor_url,
+                    task_id=ls.rctx.task_id,
+                    tool_name=_t_name,
+                    tool_args=_t_args,
+                    tool_ctx=_tool_ctx,
+                    async_tool_id=_async_id,
+                ),
+                name=f"async_tool_{_t_name}_{_async_id}",
+            )
+            _tool_entries.append({
+                "name": _t_name,
+                "args": _t_args,
+                "format": "text",
+                "raw_inline": f'\u23f3 Async tool "{_t_name}" started (id: {_async_id}). Result will be delivered via preempt when ready.',
+                "truncated": False,
+                "ref": "",
+                "summary": f"异步执行已启动 (id: {_async_id})，结果将通过 preempt 自动回传",
+            })
+            await ls.rctx.emit_event("handoff_progress", {
+                "message": f"[{ls.node.id}] {_t_name}: 异步执行已启动",
+                "node_id": ls.node.id,
+                "task_id": ls.rctx.task_id,
+            })
+            continue
+
+        # ---- 同步工具：阻塞等待执行完成（原有逻辑）----
         # Phase 2 Signal: tool.call span 包裹每个工具的执行过程。
         # 自动发射 tool.call.start（含工具名和参数摘要）和 tool.call.end（含 elapsed_ms 和 error）。
         # span 是同步 contextmanager，在 async 函数中直接 with 即可。

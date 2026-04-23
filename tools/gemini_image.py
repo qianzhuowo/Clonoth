@@ -11,11 +11,12 @@ Requires GEMINI_API_KEY environment variable.
 
 SPEC = {
     "name": "gemini_image",
+    "async_mode": True,
     "description": (
         "Generate an image using Gemini (Nano Banana). "
         "Provide a text prompt describing the desired image. "
         "Optionally specify aspect_ratio (1:1, 3:4, 4:3, 9:16, 16:9) and "
-        "model (gemini-2.5-flash-image, gemini-3-pro-image-preview, gemini-3.1-flash-image-preview). "
+        "model (gemini-3-pro-image-preview, gemini-2.5-flash-image, gemini-3.1-flash-image-preview). "
         "Returns the generated image path under data/attachments/."
     ),
     "input_schema": {
@@ -34,12 +35,16 @@ SPEC = {
                 "type": "string",
                 "description": "Gemini image model to use. Default: gemini-2.5-flash-image",
             },
+            "image_path": {
+                "type": "string",
+                "description": "Optional path to an input image (relative to workspace root) to use as a reference.",
+            },
         },
         "required": ["prompt"],
     },
 }
 
-TIMEOUT_SEC = 120
+TIMEOUT_SEC = 240
 
 if __name__ == "__main__":
     import json
@@ -72,20 +77,76 @@ if __name__ == "__main__":
     if aspect_ratio not in {"1:1", "3:4", "4:3", "9:16", "16:9"}:
         aspect_ratio = "1:1"
 
-    model = str(args.get("model") or "gemini-2.5-flash-image").strip()
+    model = str(args.get("model") or "gemini-3-pro-image-preview").strip()
+    image_path = str(args.get("image_path") or "").strip()
 
-    # ---- API Key ----
+    # ---- API Key & Base URL from env or .env file ----
+    def _load_dotenv():
+        """Fallback: read .env file if env vars missing."""
+        env_path = Path.cwd() / ".env"
+        kv = {}
+        if env_path.exists():
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                kv[k.strip()] = v.strip().strip("'\"")
+        return kv
+
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        fail("GEMINI_API_KEY environment variable is not set")
+        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    base_url = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
+    if not api_key or not base_url:
+        dotenv = _load_dotenv()
+        if not api_key:
+            api_key = dotenv.get("GEMINI_API_KEY", "") or dotenv.get("OPENAI_API_KEY", "")
+        if not base_url:
+            base_url = dotenv.get("OPENAI_BASE_URL", "").rstrip("/")
+    if not api_key:
+        fail("No API key found in env or .env file")
 
     # ---- 构建请求 ----
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    if base_url.endswith("/v1"):
+        base_url = base_url[:-3]
+    if not base_url:
+        base_url = "https://generativelanguage.googleapis.com"
+    url = f"{base_url}/v1beta/models/{model}:generateContent?key={api_key}"
+
+    parts = []
+    if image_path:
+        img_file = Path.cwd() / image_path
+        if not img_file.exists():
+            fail(f"Input image not found: {image_path}")
+        
+        mime_type = "image/png"
+        ext = img_file.suffix.lower()
+        if ext in [".jpg", ".jpeg"]:
+            mime_type = "image/jpeg"
+        elif ext == ".webp":
+            mime_type = "image/webp"
+        elif ext == ".gif":
+            mime_type = "image/gif"
+            
+        try:
+            b64_data = base64.b64encode(img_file.read_bytes()).decode("utf-8")
+            parts.append({
+                "inlineData": {
+                    "mimeType": mime_type,
+                    "data": b64_data
+                }
+            })
+        except Exception as e:
+            fail(f"Failed to read input image: {e}")
+
+    parts.append({"text": prompt_text})
 
     body = {
         "contents": [
             {
-                "parts": [{"text": prompt_text}]
+                "role": "user",
+                "parts": parts
             }
         ],
         "generationConfig": {
@@ -106,7 +167,7 @@ if __name__ == "__main__":
 
     # ---- 发送请求 ----
     try:
-        with urllib_request.urlopen(req, timeout=100) as resp:
+        with urllib_request.urlopen(req, timeout=180) as resp:
             resp_data = json.loads(resp.read().decode("utf-8"))
     except HTTPError as e:
         error_body = ""

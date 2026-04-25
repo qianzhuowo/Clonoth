@@ -93,8 +93,12 @@ def _message_to_history_dict(msg: Message) -> dict[str, Any]:
     # 与旧的 _fetch_history 路径保持一致，在加载时就剥离图片引用为纯文本占位符。
     if isinstance(d["content"], list):
         d["content"] = _strip_images_from_content(d["content"])
-    if msg.meta:
-        d["_meta"] = msg.meta
+    _meta = dict(msg.meta) if msg.meta else {}
+    # P6 Snip Compact: 将 source_task_id 透传到 _meta，供 snip_history 按 task 过滤
+    if msg.source_task_id:
+        _meta["source_task_id"] = msg.source_task_id
+    if _meta:
+        d["_meta"] = _meta
     if msg.tool_calls:
         d["tool_calls"] = msg.tool_calls
     return d
@@ -665,7 +669,54 @@ async def _run_node_task(
         "source_inbound_seq": source_inbound_seq,
     })
 
-    return action.to_dict()
+    # P0 Task 内核化 + P3 轮摘要：先生成摘要，再写入 TaskRecord
+    _turn_summary = ""
+    _tool_call_count = len(rctx.tool_call_log)
+    _total_tokens = (rctx.total_usage.get("total_tokens") or 0) if rctx.total_usage else 0
+    # P3 轮摘要门控：tool_call_count >= 3 或 total_tokens >= 4000
+    if action.action in ("finish", "fail") and (_tool_call_count >= 3 or _total_tokens >= 4000):
+        try:
+            from engine.turn_summary import generate_turn_summary
+            _summary_model = get_str(runtime_cfg, "engine.turn_summary.model", "gemini-3-flash-preview").strip()
+            _summary_enabled = get_bool(runtime_cfg, "engine.turn_summary.enabled", True)
+            if _summary_enabled and _conv_store:
+                _turn_summary = await generate_turn_summary(
+                    conv_store=_conv_store,
+                    session_id=child_session_id or session_id,
+                    task_id=task_id,
+                    llm_http=llm_http,
+                    api_key=api_key,
+                    base_url=base_url,
+                    model=_summary_model,
+                )
+        except Exception as _ts_err:
+            print(f"[engine] Turn summary failed (non-critical): {_ts_err}", flush=True)
+
+    try:
+        from engine.task_record import TaskRecord, write_task_record
+        _record = TaskRecord(
+            task_id=task_id,
+            session_id=session_id,
+            node_id=node.id,
+            action=action.action,
+            first_message_id=rctx.first_shadow_message_id,
+            last_message_id=rctx.last_shadow_message_id,
+            step_count=rctx.completed_steps,
+            tool_call_count=_tool_call_count,
+            token_usage=dict(rctx.total_usage) if rctx.total_usage else {},
+            summary=_turn_summary or action.summary or "",
+            error=action.error or "",
+            child_session_id=child_session_id,
+        )
+        write_task_record(ws_root, _record)
+    except Exception as _tr_err:
+        print(f"[engine] Failed to write task record: {_tr_err}", flush=True)
+
+    _result = action.to_dict()
+    # P3 记忆提取互斥：传递本轮使用的工具名列表，供 supervisor 判断是否跳过提取
+    if rctx.tool_call_log:
+        _result["_tool_names"] = list(set(tc["name"] for tc in rctx.tool_call_log))
+    return _result
 
 
 async def _run_tool_task(

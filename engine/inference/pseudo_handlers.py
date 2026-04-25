@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes as _mimetypes
+from pathlib import Path
 from typing import Any
 
 from .resume_builder import _select_attachments
@@ -17,6 +19,32 @@ from .loop_state import _LoopState, _persist_ctx, _short
 from .tool_format import ParsedToolCall
 from .message_model import MessageMeta, set_message_meta
 from ..conversation_store import MessageType
+
+
+# ---------------------------------------------------------------------------
+#  [2026-04-22] 辅助函数：将 workspace-relative 路径列表转换为 attachment dict 列表。
+#  用于 dispatch_node / dispatch_nodes 伪工具，让父节点能将文件附件传给子节点。
+#  仅检查文件是否存在并猜测 MIME 类型，不读取文件内容。
+# ---------------------------------------------------------------------------
+def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
+    """Convert workspace-relative file paths to attachment dicts for dispatch."""
+    result = []
+    for p in paths:
+        p_str = str(p).strip()
+        if not p_str:
+            continue
+        full = workspace_root / p_str
+        if not full.exists():
+            continue
+        mime = _mimetypes.guess_type(str(full))[0] or "application/octet-stream"
+        att_type = "image" if mime.startswith("image/") else "file"
+        result.append({
+            "type": att_type,
+            "path": p_str,
+            "mime_type": mime,
+            "name": full.name,
+        })
+    return result
 
 
 async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAction | None:
@@ -210,18 +238,25 @@ async def _handle_pseudo_dispatch_node(ls: _LoopState, args: dict) -> None:
     instr = str(args.get("instruction") or "").strip()
     ctx_mode = str(args.get("context_mode") or "accumulate").strip()
     ctx_key = str(args.get("context_key") or "").strip() or None
+    # [2026-04-22] 从参数中提取 attachment_paths，转换为 attachment dicts 传给子节点
+    attachment_paths = args.get("attachment_paths") or []
+    attachments = _paths_to_attachments(attachment_paths, ls.rctx.workspace_root)
     try:
+        payload: dict[str, Any] = {
+            "session_id": ls.rctx.session_id,
+            "session_generation": ls.rctx.session_generation,
+            "node_id": target,
+            "instruction": instr,
+            "context_mode": ctx_mode,
+            "context_key": ctx_key,
+            "caller_node_id": ls.node.id,
+        }
+        # [2026-04-22] 仅在有附件时附加，避免无谓的空列表
+        if attachments:
+            payload["attachments"] = attachments
         _dispatch_resp = await ls.rctx.http.post(
             f"{ls.rctx.supervisor_url}/v1/tasks/dispatch-async",
-            json={
-                "session_id": ls.rctx.session_id,
-                "session_generation": ls.rctx.session_generation,
-                "node_id": target,
-                "instruction": instr,
-                "context_mode": ctx_mode,
-                "context_key": ctx_key,
-                "caller_node_id": ls.node.id,
-            },
+            json=payload,
             timeout=10.0,
         )
         if _dispatch_resp.status_code == 200:
@@ -240,20 +275,25 @@ async def _handle_pseudo_dispatch_node(ls: _LoopState, args: dict) -> None:
 
 async def _do_one_dispatch(
     ls: _LoopState, _t_target: str, _t_instr: str, _t_ctx_mode: str, _t_ctx_key: str | None,
+    attachments: list | None = None,  # [2026-04-22] 新增：传递附件给子节点
 ) -> dict:
     """执行单个异步委派请求，供 dispatch_nodes 批量调用。"""
     try:
+        payload: dict[str, Any] = {
+            "session_id": ls.rctx.session_id,
+            "session_generation": ls.rctx.session_generation,
+            "node_id": _t_target,
+            "instruction": _t_instr,
+            "context_mode": _t_ctx_mode,
+            "context_key": _t_ctx_key,
+            "caller_node_id": ls.node.id,
+        }
+        # [2026-04-22] 仅在有附件时附加
+        if attachments:
+            payload["attachments"] = attachments
         _dispatch_resp = await ls.rctx.http.post(
             f"{ls.rctx.supervisor_url}/v1/tasks/dispatch-async",
-            json={
-                "session_id": ls.rctx.session_id,
-                "session_generation": ls.rctx.session_generation,
-                "node_id": _t_target,
-                "instruction": _t_instr,
-                "context_mode": _t_ctx_mode,
-                "context_key": _t_ctx_key,
-                "caller_node_id": ls.node.id,
-            },
+            json=payload,
             timeout=10.0,
         )
         if _dispatch_resp.status_code == 200:
@@ -271,6 +311,7 @@ async def _handle_pseudo_dispatch_nodes(ls: _LoopState, args: dict) -> None:
     if not isinstance(tasks_list, list) or not tasks_list:
         _dispatch_result = json.dumps({"success": False, "error": "tasks 列表为空或格式错误"}, ensure_ascii=False)
     else:
+        # [2026-04-22] 从每个 task_item 中提取 attachment_paths 并转换，传给 _do_one_dispatch
         _coros = [
             _do_one_dispatch(
                 ls,
@@ -278,6 +319,9 @@ async def _handle_pseudo_dispatch_nodes(ls: _LoopState, args: dict) -> None:
                 str(_task_item.get("instruction") or "").strip(),
                 str(_task_item.get("context_mode") or "accumulate").strip(),
                 str(_task_item.get("context_key") or "").strip() or None,
+                attachments=_paths_to_attachments(
+                    _task_item.get("attachment_paths") or [], ls.rctx.workspace_root,
+                ) or None,
             )
             for _task_item in tasks_list
         ]

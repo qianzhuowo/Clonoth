@@ -658,6 +658,8 @@ def create_app(
         context_key = str(body.get("context_key") or "").strip() or None
         source_inbound_seq = body.get("source_inbound_seq")
         caller_node_id = str(body.get("caller_node_id") or "").strip()
+        # [2026-04-22] 读取父节点传来的附件列表，透传到 input_data 供 runner.py 消费
+        attachments = body.get("attachments")
 
         if not session_id or not node_id:
             raise HTTPException(status_code=400, detail="session_id and node_id required")
@@ -669,6 +671,9 @@ def create_app(
             "_async_dispatch": True,
             "_caller_node_id": caller_node_id,
         }
+        # [2026-04-22] 将附件列表注入 input_data，runner.py L594 已支持读取 input_data["attachments"]
+        if attachments and isinstance(attachments, list):
+            input_data["attachments"] = attachments
         if context_key:
             input_data["_context_key"] = context_key
 

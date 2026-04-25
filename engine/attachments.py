@@ -18,7 +18,10 @@ from typing import Any
 _logger = logging.getLogger(__name__)
 
 _FILE_SCHEME = "file://"
-_ALLOWED_PREFIX = "data/attachments/"
+# [2026-04-22] 放宽为 data/ 前缀，使 data/ 下的非 attachments 文件（如 data/news_raw_*.md、
+# data/chat_messages_*.json）也能作为附件传递。安全风险可控——仍限制在 workspace 的 data/ 内，
+# 不会暴露源码或配置文件。
+_ALLOWED_PREFIX = "data/"
 
 _MIME_MAP = {
     ".png": "image/png",
@@ -119,14 +122,13 @@ def save_attachment(
 
 def attachments_to_content_parts(
     attachments: list[dict[str, Any]],
-    workspace_root: Path | None = None,  # reserved for future content_files support
+    workspace_root: Path | None = None,  # [2026-04-22] 用于解析文本文件的完整路径并读取内容
 ) -> list[dict[str, Any]]:
     """Convert attachment dicts to OpenAI multimodal content parts.
 
     Images use file:// references (resolved to base64 later by prepare_messages_for_llm).
-    Text files produce a metadata-only reference (filename + path) without reading content.
-    The AI can use read_file to inspect content, or pass the path via content_files to a child node.
-    Only paths under data/attachments/ are accepted.
+    Text files (<=100KB) are read and injected inline; larger files get metadata-only reference.
+    Only paths under data/ are accepted.
     """
     parts: list[dict[str, Any]] = []
     for att in attachments:
@@ -140,14 +142,57 @@ def attachments_to_content_parts(
 
         att_type = str(att.get("type") or "").strip()
 
-        # Text files: metadata-only reference (do NOT read content into context)
+        # [2026-04-22] Text files: read content inline if <=100KB, otherwise metadata-only.
+        # 之前只注入一行元数据引用，LLM 无法直接看到文件内容，需要额外调用 read_file。
+        # 改为：小文件直接注入完整内容到上下文，减少不必要的工具调用轮次。
+        # 大文件（>100KB）保持 metadata-only，避免撑爆上下文窗口。
+        _TEXT_FILE_MAX_BYTES = 102400  # 100KB
         if att_type == "file":
             name = att.get("name") or Path(path).name
             mime = att.get("mime_type") or "text/plain"
-            parts.append({
-                "type": "text",
-                "text": f"[Attached file: {name} | type: {mime} | path: {path}]",
-            })
+            metadata = f"[Attached file: {name} | type: {mime} | path: {path}]"
+
+            # 尝试读取文件内容（需要 workspace_root 来解析相对路径）
+            if workspace_root is not None:
+                full_path = workspace_root / path
+                try:
+                    file_size = full_path.stat().st_size
+                    if file_size <= _TEXT_FILE_MAX_BYTES:
+                        # 小文件：注入元数据 + 完整内容
+                        file_content = full_path.read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        parts.append({
+                            "type": "text",
+                            "text": f"{metadata}\n---\n{file_content}\n---",
+                        })
+                    else:
+                        # 大文件：metadata-only + 大小提示
+                        size_kb = file_size / 1024
+                        parts.append({
+                            "type": "text",
+                            "text": (
+                                f"{metadata}\n"
+                                f"(File too large to inject: {size_kb:.1f}KB > 100KB limit. "
+                                f"Use read_file to inspect content.)"
+                            ),
+                        })
+                except Exception as exc:
+                    # 读取失败（文件不存在、权限等）：metadata-only + 错误提示
+                    _logger.warning("failed to read attached file %s: %s", path, exc)
+                    parts.append({
+                        "type": "text",
+                        "text": (
+                            f"{metadata}\n"
+                            f"(Failed to read file content: {exc})"
+                        ),
+                    })
+            else:
+                # 没有 workspace_root，退回 metadata-only 行为
+                parts.append({
+                    "type": "text",
+                    "text": metadata,
+                })
             continue
 
         # Images: create file:// reference for later resolution

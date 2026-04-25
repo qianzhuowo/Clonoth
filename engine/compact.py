@@ -19,6 +19,124 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+#  Auto-compact circuit breaker (session-level)
+#  [2026-04-24] P1.5 熔断器：连续 N 次压缩失败后暂停自动压缩，
+#  避免每个新 task 的 _LoopState 重置 compacted=False 后反复浪费 API 调用。
+#  _compact_failures 是 module-level dict，进程重启自然清零，无需持久化。
+# ---------------------------------------------------------------------------
+
+_MAX_CONSECUTIVE_FAILURES = 3
+_compact_failures: dict[str, int] = {}  # session_id → consecutive failure count
+
+
+def record_compact_failure(session_id: str) -> None:
+    """Record a compact failure. After MAX failures, is_compact_circuit_open returns True."""
+    count = _compact_failures.get(session_id, 0) + 1
+    _compact_failures[session_id] = count
+    if count >= _MAX_CONSECUTIVE_FAILURES:
+        logger.warning(
+            "Compact circuit breaker tripped for session %s after %d consecutive failures",
+            session_id, count,
+        )
+
+
+def record_compact_success(session_id: str) -> None:
+    """Reset failure counter on success."""
+    _compact_failures.pop(session_id, None)
+
+
+def is_compact_circuit_open(session_id: str) -> bool:
+    """Return True if compact should be skipped (too many consecutive failures)."""
+    return _compact_failures.get(session_id, 0) >= _MAX_CONSECUTIVE_FAILURES
+
+
+# ---------------------------------------------------------------------------
+#  P1 Microcompact — time-based tool_result cleanup
+#  When last assistant message is older than gap_minutes (cache expired),
+#  clear old tool_result contents, keeping only the most recent ones.
+# ---------------------------------------------------------------------------
+
+_MICROCOMPACT_PLACEHOLDER = "[tool result cleared — cache expired]"
+
+
+def microcompact_messages(
+    messages: list[dict[str, Any]],
+    *,
+    gap_minutes: int = 60,
+    keep_recent: int = 5,
+    min_tool_results: int = 3,
+) -> tuple[list[dict[str, Any]], int]:
+    """Time-based microcompact: clear old tool_result contents.
+
+    Triggered when the last assistant message is older than gap_minutes,
+    indicating the provider's prompt cache has likely expired.
+    Clears tool_result content for all but the most recent `keep_recent` results.
+
+    Returns (messages, cleared_count). Messages are modified in-place.
+    """
+    from datetime import datetime, timezone
+
+    # Find last assistant message timestamp
+    last_assistant_ts = None
+    for msg in reversed(messages):
+        meta = msg.get("_meta", {})
+        if isinstance(meta, dict):
+            mt = meta.get("message_type", "")
+            if mt == "assistant" or msg.get("role") == "assistant":
+                ts_str = meta.get("timestamp", "")
+                if ts_str:
+                    try:
+                        last_assistant_ts = datetime.fromisoformat(ts_str)
+                        if last_assistant_ts.tzinfo is None:
+                            last_assistant_ts = last_assistant_ts.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        pass
+                break
+
+    if last_assistant_ts is None:
+        return messages, 0
+
+    now = datetime.now(timezone.utc)
+    gap = (now - last_assistant_ts).total_seconds() / 60.0
+    if gap < gap_minutes:
+        return messages, 0
+
+    # Collect tool_result indices
+    tr_indices: list[int] = []
+    for i, msg in enumerate(messages):
+        meta = msg.get("_meta", {})
+        is_tr = False
+        if isinstance(meta, dict) and meta.get("message_type") == "tool_result":
+            is_tr = True
+        elif isinstance(msg.get("content"), str) and msg["content"].startswith('Tool result for "'):
+            is_tr = True
+        if is_tr:
+            tr_indices.append(i)
+
+    if len(tr_indices) < min_tool_results:
+        return messages, 0
+
+    # Clear all but the last `keep_recent` tool results
+    to_clear = tr_indices[:-keep_recent] if keep_recent > 0 else tr_indices
+    cleared = 0
+    for idx in to_clear:
+        content = messages[idx].get("content", "")
+        if isinstance(content, str) and content != _MICROCOMPACT_PLACEHOLDER:
+            # Preserve the tool name header, clear the body
+            first_line = content.split("\n", 1)[0]
+            messages[idx]["content"] = first_line + "\n" + _MICROCOMPACT_PLACEHOLDER
+            cleared += 1
+
+    if cleared:
+        logger.info(
+            "microcompact: cleared %d/%d tool_results (gap=%.0fmin, kept=%d recent)",
+            cleared, len(tr_indices), gap, keep_recent,
+        )
+
+    return messages, cleared
+
+
+# ---------------------------------------------------------------------------
 #  Summary formatting
 # ---------------------------------------------------------------------------
 

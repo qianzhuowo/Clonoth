@@ -32,6 +32,12 @@ class RunContext:
     # 非空时，_shadow_write 和 ConversationStore 操作写入此 session 而非 parent session_id。
     # 主节点和无 child session 的场景下为空字符串。
     child_session_id: str = ""
+    # P0 Task 内核化：task 级数据采集字段
+    tool_call_log: list = field(default_factory=list)   # [{name: str, args_summary: str}]
+    total_usage: dict = field(default_factory=dict)      # accumulated {prompt_tokens, completion_tokens, total_tokens}
+    first_shadow_message_id: str = ""   # UUID of first message written to ConversationStore
+    last_shadow_message_id: str = ""    # UUID of last message written to ConversationStore
+    completed_steps: int = 0             # actual step count from ai_step loop
 
     async def emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.source_inbound_seq is not None:

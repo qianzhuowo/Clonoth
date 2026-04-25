@@ -216,6 +216,42 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
             resp = None
             continue  # 重试
 
+        # ---------------------------------------------------------------
+        # P5a Reactive Compact: 检测 "request too long" 类错误时，剥离旧
+        # tool_result 内容并重试一次。目的是在 413 / context_length_exceeded
+        # 等不可重试错误触发时提供一层安全网，而不是直接报错给用户。
+        # 只尝试一次（_reactive_compact_done 标记），避免无限循环。
+        # ---------------------------------------------------------------
+        if not resp.ok and not _is_retryable_error(resp):
+            _err_text = (resp.error or "").lower()
+            _is_too_long = (
+                resp.status_code == 413
+                or "too long" in _err_text
+                or "too large" in _err_text
+                or "context_length" in _err_text
+                or "max_tokens" in _err_text
+                or "maximum context" in _err_text
+                or "token limit" in _err_text
+            )
+            if _is_too_long and not getattr(ls, '_reactive_compact_done', False):
+                ls._reactive_compact_done = True  # 只尝试一次
+                # 从尾部往前找 tool_result，保留最近 3 个，清除其余
+                from engine.compact import microcompact_messages
+                _, _rc_cleared = microcompact_messages(
+                    ls.messages, gap_minutes=0, keep_recent=3, min_tool_results=1,
+                )
+                if _rc_cleared:
+                    await ls.rctx.emit_event("reactive_compact", {
+                        "node_id": ls.node.id, "step": step,
+                        "cleared": _rc_cleared, "error": resp.error or "",
+                    })
+                    # 重建 llm_messages：microcompact 原地修改了 ls.messages，
+                    # 需要重新走 build_llm_messages + prepare 流程
+                    _formatted = build_llm_messages(ls.messages, ls.formatter) if ls.formatter else ls.messages
+                    llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
+                    resp = None
+                    continue  # 重试
+
         break  # 成功或不可重试，退出重试循环
 
     # Phase 1: Signal — 循环结束，发射 llm.call.end 信号

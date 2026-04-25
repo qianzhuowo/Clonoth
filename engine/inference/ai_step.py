@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import logging
 import time
 import uuid
 from datetime import datetime, timezone
@@ -47,7 +48,9 @@ from ..protocol import (
 )
 # [2026-04-17] write_artifact 移除：截断机制已废弃，不再写 artifact 文件
 from ..tool_step import result_to_raw, summarize_result
-from ..compact import should_compact, _format_messages_for_summary
+# [2026-04-24] P1.5 熔断器：新增 record_compact_failure, record_compact_success, is_compact_circuit_open
+# 用于在连续压缩失败时跳过自动压缩，避免浪费 API 调用。
+from ..compact import should_compact, _format_messages_for_summary, record_compact_failure, record_compact_success, is_compact_circuit_open
 from clonoth_runtime import get_int, get_float, load_runtime_config
 from toolbox.context import ToolContext
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
@@ -58,6 +61,8 @@ from providers.base import ToolCall, ProviderResponse
 # Phase 2 Signal System: 导入信号总线，用于发射 tool.call 和 task.error 信号。
 # get_bus() 返回全局单例 SignalBus，Signal 是不可变事件数据类。
 from ..signals import Signal, get_bus
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from ..context import RunContext
@@ -151,6 +156,10 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
         store.append(target_session, msg)
         # Phase 3: 记录最后一次影子写入的 message id，供 snapshot 持久化使用
         ls.last_shadow_message_id = msg_id
+        # P0 Task 内核化：追踪 first/last message ID 到 RunContext
+        if not ls.rctx.first_shadow_message_id:
+            ls.rctx.first_shadow_message_id = msg_id
+        ls.rctx.last_shadow_message_id = msg_id
     except Exception:
         pass  # best-effort, never break main flow
 
@@ -260,8 +269,35 @@ async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
     """上下文压缩检查。如需压缩则返回 DISPATCH action。"""
     if ls.compacted or ls.compact_threshold <= 0:
         return None
+    # [2026-04-24] P1.5 熔断器：连续压缩失败达到阈值时跳过自动压缩
+    if is_compact_circuit_open(ls.rctx.session_id):
+        return None
     if not should_compact(ls.messages, ls.compact_threshold, ls.last_prompt_tokens):
         return None
+
+    # ---------------------------------------------------------------
+    # P6 Snip Compact (Level 2): 用已有轮摘要替换旧 task 消息链
+    # 在 dispatch LLM compactor 前先尝试，可能免去 LLM 调用
+    # ---------------------------------------------------------------
+    try:
+        from engine.task_record import snip_history, load_task_records
+        _snip_sid = ls.rctx.child_session_id or ls.rctx.session_id
+        _snip_records = load_task_records(ls.rctx.workspace_root, _snip_sid)
+        if _snip_records:
+            _snipped, _snip_count = snip_history(ls.messages, _snip_records)
+            if _snip_count > 0:
+                ls.messages = _snipped
+                await ls.rctx.emit_event("snip_compact", {
+                    "node_id": ls.node.id, "step": step,
+                    "snipped_tasks": _snip_count,
+                })
+                # Re-check: snip 可能已经把上下文降到阈值以下
+                if not should_compact(ls.messages, ls.compact_threshold):
+                    logger.info("snip_compact resolved over-threshold, skipping LLM compact")
+                    ls.compacted = True
+                    return None
+    except Exception as _snip_err:
+        logger.warning("snip_compact failed, falling through to LLM compact: %s", _snip_err)
 
     ls.compacted = True
     try:
@@ -269,6 +305,26 @@ async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
         conversation_text = _format_messages_for_summary(
             [m for m in ls.messages if m.get("role") != "system" and not m.get("_dynamic")]
         )
+        # ---------------------------------------------------------------
+        # P5b PTL Retry: 压缩请求本身过长时截断
+        # compactor 节点也有模型上下文上限，如果待压缩的对话文本超过
+        # 这个上限，压缩请求自身就会 413。这里在发送前做预截断：
+        # 保留尾部（最近的对话），丢弃头部（最旧的部分），并对齐到
+        # 消息分隔符边界，避免截断产生不完整消息。
+        # ~100K tokens ≈ 300K chars（按 3 字符/token 估算）
+        # ---------------------------------------------------------------
+        _ptl_max_chars = 300000
+        if len(conversation_text) > _ptl_max_chars:
+            _ptl_original_len = len(conversation_text)
+            conversation_text = conversation_text[-_ptl_max_chars:]
+            # 找到第一个完整消息边界（--- 分隔符），丢弃截断的不完整消息
+            _first_sep = conversation_text.find("\n\n---\n\n")
+            if _first_sep > 0:
+                conversation_text = conversation_text[_first_sep + len("\n\n---\n\n"):]
+            await ls.rctx.emit_event("ptl_truncated", {
+                "node_id": ls.node.id, "step": step,
+                "original_chars": _ptl_original_len,
+            })
         if conversation_text.strip():
             ctx_ref = _persist_ctx(ls, step)
             return TaskAction(
@@ -286,6 +342,8 @@ async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
                 },
             )
     except Exception as compact_err:
+        # [2026-04-24] P1.5 熔断器：记录压缩失败，累计达阈值后自动跳过
+        record_compact_failure(ls.rctx.session_id)
         await ls.rctx.emit_event("compact_failed", {
             "node_id": ls.node.id, "step": step, "error": str(compact_err),
         })
@@ -389,6 +447,9 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
                 "name": tc.name,
                 "arguments": dict(tc.arguments or {}),
             })
+            # P0 Task 内核化：记录工具调用摘要
+            _args_str = str(tc.arguments or {})[:200]
+            ls.rctx.tool_call_log.append({"name": tc.name, "args_summary": _args_str})
 
     # 将 LLM 的工具调用决策追加到对话历史
     _assistant_msg = ls.formatter.build_assistant_message(resp, resp.text or "", resp.tool_calls)
@@ -824,6 +885,8 @@ async def run_ai_node(
     if resume_data:
         messages.extend(_build_resume_messages(resume_data))
         if str(resume_data.get("type") or "") == "compact_done":
+            # [2026-04-24] P1.5 熔断器：压缩成功时重置失败计数
+            record_compact_success(rctx.session_id)
             # Phase 2 Signal: compact.done 信号，通过 SignalBus 发射供监控使用
             get_bus().emit(Signal(name="compact.done", payload={
                 "node_id": node.id,
@@ -909,6 +972,13 @@ async def run_ai_node(
 
         await _inject_preempt_message(ls, step)
 
+        # P1 Microcompact: 距上次 assistant 回复 ≥60min 时清除旧 tool_result
+        if step == step_count:  # 只在本轮第一步检查（避免循环内重复）
+            from engine.compact import microcompact_messages
+            _, _mc_cleared = microcompact_messages(ls.messages)
+            if _mc_cleared:
+                logger.info("microcompact cleared %d tool_results", _mc_cleared)
+
         action = await _check_and_compact(ls, step)
         if action is not None:
             return action
@@ -919,6 +989,15 @@ async def run_ai_node(
         if isinstance(result, TaskAction):
             return result
         resp = result
+
+        # P0 Task 内核化：记录实际完成的步数
+        ls.rctx.completed_steps = step + 1
+
+        # P0 Task 内核化：累加 token 用量
+        if resp.usage and isinstance(resp.usage, dict):
+            for _uk in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                if _uk in resp.usage:
+                    ls.rctx.total_usage[_uk] = ls.rctx.total_usage.get(_uk, 0) + resp.usage[_uk]
 
         if not resp.ok:
             return _build_failure_action(ls, resp, step)

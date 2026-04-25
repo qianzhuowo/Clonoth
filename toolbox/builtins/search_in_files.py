@@ -22,8 +22,22 @@ from .._common import resolve_and_classify, guard_external_read, request_guard
 #  Helpers
 # ---------------------------------------------------------------------------
 
-_SKIP_DIRS = frozenset({".git", "__pycache__", "node_modules", ".venv", "venv", ".tox"})
-_SKIP_SUFFIXES = frozenset({".pyc", ".pyo", ".so", ".dll", ".exe", ".bin", ".whl", ".egg"})
+_SKIP_DIRS = frozenset({
+    ".git", "__pycache__", "node_modules", ".venv", "venv", ".tox",
+    # Data dirs that can contain huge JSONL / build artifacts
+    "conversations", "node_contexts", "artifacts", "logs",
+    # Common build output dirs
+    "dist", "build", ".next", ".nuxt", ".output", ".turbo",
+    ".cache", ".parcel-cache", "coverage",
+})
+_SKIP_SUFFIXES = frozenset({
+    ".pyc", ".pyo", ".so", ".dll", ".exe", ".bin", ".whl", ".egg",
+    ".jsonl", ".log",
+})
+
+# Hard limit on total chars returned in search results to prevent context explosion
+_MAX_TOTAL_RESULT_CHARS = 50_000
+_MAX_CONTEXT_LINE_CHARS = 500
 
 
 def _match_pattern(rel_path: str, pattern: str) -> bool:
@@ -36,10 +50,20 @@ def _match_pattern(rel_path: str, pattern: str) -> bool:
 
 
 def _get_context(lines: list[str], line_idx: int, n: int = 1) -> str:
-    """Return ±n lines of context around *line_idx*, with line-number prefixes."""
+    """Return ±n lines of context around *line_idx*, with line-number prefixes.
+
+    Each line is capped at _MAX_CONTEXT_LINE_CHARS to prevent single-line
+    files (e.g. JSONL) from blowing up the result.
+    """
     start = max(0, line_idx - n)
     end = min(len(lines), line_idx + n + 1)
-    return "\n".join(f"{i + 1}: {lines[i]}" for i in range(start, end))
+    parts = []
+    for i in range(start, end):
+        line = lines[i]
+        if len(line) > _MAX_CONTEXT_LINE_CHARS:
+            line = line[:_MAX_CONTEXT_LINE_CHARS] + "...<truncated>"
+        parts.append(f"{i + 1}: {line}")
+    return "\n".join(parts)
 
 
 def _line_col(text: str, pos: int) -> tuple[int, int]:
@@ -103,6 +127,7 @@ async def _do_search(
 ) -> dict[str, Any]:
     matches: list[dict[str, Any]] = []
     truncated = False
+    total_chars = 0
 
     for p, rel in _collect_files(root, pattern, max_file_size, ctx.workspace_root):
         try:
@@ -115,16 +140,22 @@ async def _do_search(
         for m in regex.finditer(text):
             line, col = _line_col(text, m.start())
             context = _get_context(lines, line - 1, n=1)
+            match_text = m.group()
+            if len(match_text) > _MAX_CONTEXT_LINE_CHARS:
+                match_text = match_text[:_MAX_CONTEXT_LINE_CHARS] + "...<truncated>"
+
+            entry_chars = len(context) + len(match_text) + len(rel) + 50
+            total_chars += entry_chars
 
             matches.append({
                 "file": rel,
                 "line": line,
                 "column": col,
-                "match": m.group(),
+                "match": match_text,
                 "context": context,
             })
 
-            if len(matches) >= max_results:
+            if len(matches) >= max_results or total_chars >= _MAX_TOTAL_RESULT_CHARS:
                 truncated = True
                 break
 

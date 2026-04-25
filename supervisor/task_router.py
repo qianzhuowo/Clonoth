@@ -696,7 +696,13 @@ class TaskRouterMixin:
     # ------------------------------------------------------------------ #
 
     def _maybe_trigger_memory_extract_locked(self, task: Task) -> None:
-        """入口节点 finish 后，检查是否需要创建记忆提取后置任务。"""
+        """入口节点 finish 后，检查是否需要创建记忆提取后置任务。
+
+        P3 改进 (2026-04-25):
+          - 互斥：主节点已调 save_memory 时跳过（避免重复存储）
+          - 缩窄范围：只提取当前 task 的消息，不发全量 session 历史
+          - 门控保持消息增量计数（兼容旧逻辑）
+        """
         # 仅对入口节点的 finish 动作触发
         act = str((task.result or {}).get("action") or "").strip()
         if act != "finish" or task.kind != TaskKind.node:
@@ -710,6 +716,11 @@ class TaskRouterMixin:
         if task.node_id != entry_node_id:
             return
         if not get_bool(runtime_cfg, "memory.auto_extract.enabled", False):
+            return
+
+        # P3 互斥：主节点这轮已调 save_memory → 跳过提取
+        _tool_names = (task.result or {}).get("_tool_names") or []
+        if "save_memory" in _tool_names:
             return
 
         # 门控：消息数量
@@ -726,15 +737,69 @@ class TaskRouterMixin:
         if current_count - last_count < min_increment:
             return
 
-        # 构建对话摘要作为 instruction
-        transcript = self._format_transcript_for_extract(msgs)
+        # P3 缩窄范围：只提取当前 task 的消息，不发全量 session 历史
+        # 通过 task_id 过滤 ConversationStore 消息
+        _task_msgs = []
+        try:
+            from pathlib import Path
+            from engine.conversation_store import ConversationStore
+            _store = ConversationStore(Path(self.workspace_root) / "data" / "conversations")
+            _all_msgs = _store.load(task.session_id)
+            _task_msgs = [m for m in _all_msgs if m.source_task_id == task.task_id]
+        except Exception:
+            pass
+
+        if _task_msgs:
+            # 使用 task 级消息
+            _parts: list[str] = []
+            for _tm in _task_msgs:
+                if _tm.role == "system":
+                    continue
+                _c = _tm.content or ""
+                if len(_c) > 2000:
+                    _c = _c[:2000] + "...<truncated>"
+                _parts.append(f"[{_tm.role}]\n{_c}")
+            transcript = "\n\n---\n\n".join(_parts)
+        else:
+            # fallback：旧方式全量格式化
+            transcript = self._format_transcript_for_extract(msgs)
+
         if not transcript.strip():
             return
+
+        # P4b 预注入：扫描已有记忆清单，注入 instruction 防重复
+        _existing_memories = ""
+        try:
+            import yaml as _yaml
+            _mem_dir = Path(self.workspace_root) / "data" / "memory"
+            if _mem_dir.exists():
+                _mem_lines: list[str] = []
+                for _yf in sorted(_mem_dir.glob("*.yaml")):
+                    try:
+                        with open(_yf, "r", encoding="utf-8") as _f:
+                            _book_data = _yaml.safe_load(_f) or {}
+                        _bname = str(_book_data.get("book") or _yf.stem)
+                        for _e in (_book_data.get("entries") or []):
+                            if isinstance(_e, dict):
+                                _eid = str(_e.get("id") or "")
+                                _ec = str(_e.get("content") or "")[:80]
+                                if _eid:
+                                    _mem_lines.append(f"  - [{_bname}] {_eid}: {_ec}")
+                    except Exception:
+                        continue
+                if _mem_lines:
+                    _existing_memories = "\n\n[已有记忆清单 — 避免重复创建]\n" + "\n".join(_mem_lines) + "\n"
+        except Exception:
+            pass
 
         # 更新游标
         self._memory_extract_msg_counts[task.session_id] = current_count
 
         # 创建后置任务
+        _full_instruction = transcript
+        if _existing_memories:
+            _full_instruction = _existing_memories + "\n---\n\n" + transcript
+
         extractor_node = get_str(runtime_cfg, "memory.auto_extract.node_id", "system.memory_extractor").strip()
         self._create_task_locked(
             session_id=task.session_id,
@@ -742,7 +807,7 @@ class TaskRouterMixin:
             kind=TaskKind.node,
             node_id=extractor_node,
             input_data={
-                "instruction": transcript,
+                "instruction": _full_instruction,
                 "_system_task": True,
             },
             continuation={},

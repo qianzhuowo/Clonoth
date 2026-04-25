@@ -241,11 +241,6 @@ def load_memory_catalog(
 #  Message building
 # ---------------------------------------------------------------------------
 
-def _short_text(s: str, max_chars: int = 120) -> str:
-    s = (s or "").strip()
-    return s if len(s) <= max_chars else s[:max_chars] + "…"
-
-
 def build_memory_messages(
     workspace_root: Path,
     *,
@@ -281,16 +276,12 @@ def build_memory_messages(
 
     constant_entries: list[dict[str, Any]] = []
     keyword_entries: list[dict[str, Any]] = []
-    index_only: list[dict[str, Any]] = []
 
     for entry in catalog:
         if entry["constant"]:
             constant_entries.append(entry)
         elif entry["keywords"]:
             keyword_entries.append(entry)
-        else:
-            # no keywords and not constant → index only
-            index_only.append(entry)
 
     # keyword matching
     dynamic_entries: list[dict[str, Any]] = []
@@ -300,8 +291,6 @@ def build_memory_messages(
         )
         if _match_keywords(entry["compiled_keywords"], scan_text):
             dynamic_entries.append(entry)
-        else:
-            index_only.append(entry)
 
     # budget enforcement
     if max_budget_chars > 0:
@@ -323,8 +312,6 @@ def build_memory_messages(
                     kept_constant.append(e)
                 else:
                     kept_dynamic.append(e)
-            else:
-                index_only.append(e)
         constant_entries = kept_constant
         dynamic_entries = kept_dynamic
 
@@ -341,7 +328,7 @@ def build_memory_messages(
         parts.append("\n[/MEMORY:CONSTANT]")
         static_msgs.append({"role": "system", "content": "\n".join(parts)})
 
-    # dynamic + index block
+    # dynamic block (ACTIVE only, no INDEX)
     dynamic_parts: list[str] = []
     if dynamic_entries:
         dynamic_parts.append("[MEMORY:ACTIVE]")
@@ -349,19 +336,6 @@ def build_memory_messages(
             dynamic_parts.append(f"\n## {e['id']}\n")
             dynamic_parts.append(e["content"])
         dynamic_parts.append("\n[/MEMORY:ACTIVE]")
-
-    if index_only:
-        if dynamic_parts:
-            dynamic_parts.append("")
-        dynamic_parts.append("[MEMORY:INDEX]")
-        dynamic_parts.append(
-            "以下记忆未激活。如需查看详情，可用 list_memories 工具。"
-        )
-        for e in index_only:
-            dynamic_parts.append(
-                f"- {e['id']}（{e['book']}）：{_short_text(e['content'])}"
-            )
-        dynamic_parts.append("[/MEMORY:INDEX]")
 
     if dynamic_parts:
         dynamic_msgs.append({"role": "system", "content": "\n".join(dynamic_parts)})

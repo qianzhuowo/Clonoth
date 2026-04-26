@@ -99,7 +99,8 @@ class EventRouter:
         "task_created,task_completed,task_cancelled,"
         "node_started,node_completed,cancel_requested,"
         "context_reset,inbound_accepted,task_preempted,"
-        "compact_start,compact_done,compact_failed"
+        "compact_start,compact_done,compact_failed,snip_compact,"
+    "engine_registered"
     )
 
     def __init__(
@@ -448,8 +449,14 @@ class EventRouter:
         label = "▶ 节点启动" if event.type == "node_started" else "✓ 节点完成"
         msg = f"{label}: {node_name}"
 
+        # 隔离系统任务：system.* 节点严禁回退到主触发，必须作为独立子任务日志处理
+        is_system = (node_id or "").startswith("system.")
+
         # 查找关联 trigger（精确 + session fallback）
-        result = self._state.resolve_trigger(src_seq, event.session_id)
+        # 系统任务不参与 fallback，防止日志串台到主频道
+        result = None
+        if not is_system:
+            result = self._state.resolve_trigger(src_seq, event.session_id)
 
         # 入口节点 → 主任务进度
         if result and node_id == self._entry_node_id:
@@ -464,9 +471,26 @@ class EventRouter:
         # 非入口节点 → 子任务日志
         elif node_id and node_id != self._entry_node_id:
             task_key = p.get("task_id") or f"{node_id}:{event.session_id}"
-            child_state = self._state.get_child_state(task_key)
-            if child_state:
-                child_state.lines.append(msg)
+            # 自动创建子任务状态：确保 ▶ 节点启动 等生命周期事件不丢失
+            child_state, is_new = self._state.get_or_create_child_state(
+                task_key, prefix=node_id,
+            )
+            child_state.lines.append(msg)
+
+            if is_new:
+                # 新创建：通知适配器创建消息
+                conv_key = self._state.get_conversation_key(event.session_id) or ""
+                try:
+                    await self._cb.create_child_progress(
+                        task_key, child_state,
+                        trigger=None,  # 系统任务或孤儿任务无关联 trigger
+                        conversation_key=conv_key,
+                        session_id=event.session_id,
+                    )
+                except Exception:
+                    pass
+            else:
+                # 已存在：仅刷新显示
                 try:
                     await self._cb.update_child_progress(task_key, child_state)
                 except Exception:
@@ -486,12 +510,17 @@ class EventRouter:
         """
         p = event.payload
         node_id = p.get("node_id", "")
+        # 过滤系统内部节点（如 turn_summarizer），不推送进度
+        if (node_id or "").startswith("system."):
+            return
         src_seq = int(p.get("source_inbound_seq") or 0)
         hp_msg = (p.get("message") or "").strip()
+        is_system = (node_id or "").startswith("system.")
 
         # 主节点进度
         if (
-            src_seq
+            not is_system
+            and src_seq
             and src_seq in self._state.triggers
             and node_id == self._entry_node_id
         ):
@@ -776,7 +805,10 @@ class EventRouter:
         main_state = self._state.get_or_create_main_state(trigger_seq)
 
         # 根据事件类型生成状态消息
-        if event.type == "compact_start":
+        if event.type == "snip_compact":
+            snipped = p.get("snipped_tasks", 0)
+            msg = f"✂️ 轮摘要替换：压缩了 {snipped} 个旧任务"
+        elif event.type == "compact_start":
             msg = "🗜️ 上下文压缩中…"
         elif event.type == "compact_done":
             before = p.get("before", 0)
@@ -863,6 +895,22 @@ class EventRouter:
         if ia_seq:
             self._state.accept_watermark(ia_seq)
 
+    # ------------------------------------------------------------------
+    #  engine_registered — Engine 重启检测
+    # ------------------------------------------------------------------
+
+    async def _handle_engine_registered(self, event: Event) -> None:
+        """Handle engine_registered: notify adapter when engine restarts."""
+        p = event.payload
+        prev_gen = (p.get("previous_generation_id") or "").strip()
+        if not prev_gen:
+            # First boot, not a restart — skip
+            return
+        try:
+            await self._cb.on_engine_restarted(p)
+        except Exception as e:
+            logger.error("on_engine_restarted callback error: %s", e)
+
     # ==================================================================
     #  Handler 分发表
     #  类变量，映射 event.type → 处理器方法。
@@ -888,6 +936,8 @@ class EventRouter:
         "compact_start":     _handle_compact,
         "compact_done":      _handle_compact,
         "compact_failed":    _handle_compact,
+        "snip_compact":      _handle_compact,
         "context_reset":     _handle_context_reset,
         "inbound_accepted":  _handle_inbound_accepted,
+        "engine_registered": _handle_engine_registered,
     }

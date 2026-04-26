@@ -10,7 +10,7 @@ At invocation this file runs as a subprocess:
   - Sensitive env vars are stripped
 """
 
-SPEC = {'description': '清空指定 Discord 频道的对话上下文（Bot 端历史 + Engine session 上下文）。channel_id 为 Discord 频道 ID。',
+SPEC = {'description': '清空指定 Discord 频道的对话上下文（Bot 端历史 + Engine session 上下文）。⚠️ 仅在用户明确要求清理/重置上下文时才可调用，禁止 AI 自行决定调用。副作用：会断开当前 session 的所有子任务回调链。channel_id 为 Discord 频道 ID。',
  'input_schema': {'properties': {'channel_id': {'description': 'Discord 频道 ID', 'type': 'string'}},
                   'required': ['channel_id'],
                   'type': 'object'},

@@ -1,0 +1,25 @@
+# 轮摘要节点：由 supervisor 在 task 完成后按需触发，替代原先 runner.py 中的阻塞式 LLM 调用。
+# 创建于 2026-04-25，参照 system.compactor.yaml 模式。
+id: system.turn_summarizer
+type: ai
+name: "轮摘要节点"
+description: "生成任务执行摘要。系统内部节点，对用户不可见。"
+model: gemini-3-flash-preview
+tool_access:
+  mode: none
+skills:
+  mode: none
+prompt: |
+  Summarize this task execution concisely in 200-400 tokens.
+  Include:
+  - What the user requested
+  - What tools were used and key outcomes
+  - What was accomplished or failed
+  - Any important decisions or findings
+
+  Output only the summary text. No tags, no headers, no formatting.
+
+  **IMPORTANT**: Your entire output must be passed as the `text` parameter of the finish tool.
+  Free prose outside of tool calls is NOT delivered. Only finish() reaches the caller.
+
+  Do NOT call reply. You are an internal node and do not interact with users directly.

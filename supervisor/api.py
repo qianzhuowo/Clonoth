@@ -560,41 +560,62 @@ def create_app(
                     type_="outbound_message",
                     payload=_restart_outbound_payload,
                 )
-            pm.restart_engine()
-            # ---- 清理旧 engine 遗留的孤儿 task ----
-            _orphan_count = st.cancel_orphaned_tasks()
-            if _orphan_count:
+            # Deferred engine restart: return HTTP 200 first, then kill+restart.
+            # This ensures the tool call in the dying engine receives its response
+            # and can shadow_write the tool_result before being terminated.
+            _restart_session_id = inp.session_id
+            _restart_target = inp.target
+
+            def _deferred_engine_restart() -> None:
+                time.sleep(1)  # let HTTP response reach engine first
+                try:
+                    pm.stop_engine()
+                    pm.start_engine()
+                    # Brief health check: verify engine process is alive
+                    time.sleep(0.5)
+                    _alive = any(p.popen.poll() is None for p in pm.engines)
+                    if not _alive:
+                        st.eventlog.append(
+                            session_id=_restart_session_id or "__system__",
+                            component="supervisor",
+                            type_="outbound_message",
+                            payload={"text": "❌ Engine 重启失败：进程启动后立即退出。"},
+                        )
+                        return
+                except Exception as exc:
+                    st.eventlog.append(
+                        session_id=_restart_session_id or "__system__",
+                        component="supervisor",
+                        type_="outbound_message",
+                        payload={"text": f"❌ Engine 重启失败：{exc}"},
+                    )
+                    return
+                # ---- 清理旧 engine 遗留的孤儿 task ----
+                _orphan_count = st.cancel_orphaned_tasks()
+                if _orphan_count:
+                    st.eventlog.append(
+                        session_id="__system__",
+                        component="supervisor",
+                        type_="orphan_cleanup",
+                        payload={
+                            "count": _orphan_count,
+                            "trigger": "engine_restart",
+                            "ts": _now().isoformat(),
+                        },
+                    )
                 st.eventlog.append(
                     session_id="__system__",
                     component="supervisor",
-                    type_="orphan_cleanup",
-                    payload={
-                        "count": _orphan_count,
-                        "trigger": "engine_restart",
-                        "ts": _now().isoformat(),
-                    },
+                    type_="restart_completed",
+                    payload={"target": _restart_target, "ts": _now().isoformat()},
                 )
-            st.eventlog.append(
-                session_id="__system__",
-                component="supervisor",
-                type_="restart_completed",
-                payload={"target": inp.target, "ts": _now().isoformat()},
-            )
-            if inp.session_id:
-                _si = st.sessions.get(inp.session_id)
-                if _si:
-                    _restart_evt = st.eventlog.append(
-                        session_id=inp.session_id,
-                        component="supervisor",
-                        type_="inbound_message",
-                        payload={
-                            "channel": _si.channel,
-                            "conversation_key": _si.conversation_key,
-                            "text": "[系统通知] Engine 重启已完成，新代码已生效。",
-                        },
-                    )
-                    st.record_inbound_message_event(_restart_evt)
-            return RestartOut(scheduled=True, target=inp.target)
+                # Defer restart notification — will be injected in register_engine()
+                # after orphan cleanup, so the task won't be reaped.
+                if _restart_session_id:
+                    st._pending_restart_notify = _restart_session_id
+
+            threading.Thread(target=_deferred_engine_restart, daemon=True, name="restart-engine").start()
+            return RestartOut(scheduled=True, target=_restart_target)
 
         # --no-shell 模式下没有 _watch_shell 线程，需要直接退出
         # 先停 engine，再延迟退出让 HTTP 响应发出去

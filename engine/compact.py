@@ -251,11 +251,24 @@ def apply_compact_summary(
 
     to_keep = conversation[-keep_recent:] if keep_recent > 0 else []
 
+    # P6.5 Metadata Preservation: 收集被压缩掉的消息所属的 source_task_id，
+    # 存入摘要消息的 _meta 中，防止 L2 snip 因 ID 丢失而重复触发 L3 LLM 压缩。
+    _compressed = conversation[:-keep_recent] if keep_recent > 0 else conversation
+    _compressed_tids = set()
+    for _m in _compressed:
+        _tid = _m.get("_meta", {}).get("source_task_id")
+        if _tid:
+            _compressed_tids.add(str(_tid))
+
     summary_msg: dict[str, Any] = {
         "role": "user",
         "content": (
             "[以下是之前对话的结构化摘要，原始上下文已被压缩]\n\n" + summary
         ),
+        "_meta": {
+            "source_task_id": "compact_summary",
+            "compressed_task_ids": list(_compressed_tids),
+        }
     }
 
     result: list[dict[str, Any]] = []

@@ -50,7 +50,12 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
     nid = (node_id or "").strip()
     if not nid:
         return None
-    data = load_yaml_dict(workspace_root / "config" / "nodes" / f"{nid}.yaml")
+    # 系统节点目录分离：优先从 engine/system_nodes/ 加载内建系统节点，
+    # 找不到时回退到 config/nodes/ 用户配置目录。确保系统节点跟随代码仓库同步。
+    _sys_path = workspace_root / "engine" / "system_nodes" / f"{nid}.yaml"
+    _usr_path = workspace_root / "config" / "nodes" / f"{nid}.yaml"
+    _node_path = _sys_path if _sys_path.is_file() else _usr_path
+    data = load_yaml_dict(_node_path)
     if not isinstance(data, dict):
         return None
     # kind 默认 "node"，允许省略

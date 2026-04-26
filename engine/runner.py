@@ -57,19 +57,27 @@ def _collect_node_info(workspace_root: Path, node_ids: list[str]) -> list[dict[s
 
 def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> list[dict[str, str]]:
     """发现可切换的根节点（不被任何其他节点 delegate_targets 引用的节点），排除当前节点。"""
-    nodes_dir = workspace_root / "config" / "nodes"
-    if not nodes_dir.is_dir():
-        return []
+    # 系统节点目录分离：扫描 engine/system_nodes/ 和 config/nodes/ 两个目录，
+    # 合并结果，engine 内建目录优先（同 id 跳过后扫到的）。
+    nodes_dirs = [
+        workspace_root / "engine" / "system_nodes",
+        workspace_root / "config" / "nodes",
+    ]
     all_nodes: list[dict[str, Any]] = []
     all_targets: set[str] = set()
-    for f in sorted(nodes_dir.iterdir()):
-        if f.suffix not in (".yaml", ".yml") or f.name.startswith("_"):
+    seen_ids: set[str] = set()
+    for nodes_dir in nodes_dirs:
+        if not nodes_dir.is_dir():
             continue
-        n = load_node(workspace_root, f.stem)
-        if n is None or n.type != "ai":
-            continue
-        all_nodes.append({"id": n.id, "name": n.name, "description": n.description or n.name})
-        all_targets.update(n.delegate_targets)
+        for f in sorted(nodes_dir.iterdir()):
+            if f.suffix not in (".yaml", ".yml") or f.name.startswith("_"):
+                continue
+            n = load_node(workspace_root, f.stem)
+            if n is None or n.type != "ai" or n.id in seen_ids:
+                continue
+            seen_ids.add(n.id)
+            all_nodes.append({"id": n.id, "name": n.name, "description": n.description or n.name})
+            all_targets.update(n.delegate_targets)
     # 根节点 = 不被任何节点 delegate 引用的节点
     roots = [n for n in all_nodes if n["id"] not in all_targets]
     if not roots:
@@ -669,28 +677,11 @@ async def _run_node_task(
         "source_inbound_seq": source_inbound_seq,
     })
 
-    # P0 Task 内核化 + P3 轮摘要：先生成摘要，再写入 TaskRecord
-    _turn_summary = ""
+    # P0 Task 内核化：写入 TaskRecord（轮摘要改为 supervisor 后置触发独立节点生成，
+    # 不再在 runner 中做阻塞式 LLM 调用。见 supervisor/task_router.py 的
+    # _maybe_trigger_turn_summary_locked）
     _tool_call_count = len(rctx.tool_call_log)
     _total_tokens = (rctx.total_usage.get("total_tokens") or 0) if rctx.total_usage else 0
-    # P3 轮摘要门控：tool_call_count >= 3 或 total_tokens >= 4000
-    if action.action in ("finish", "fail") and (_tool_call_count >= 3 or _total_tokens >= 4000):
-        try:
-            from engine.turn_summary import generate_turn_summary
-            _summary_model = get_str(runtime_cfg, "engine.turn_summary.model", "gemini-3-flash-preview").strip()
-            _summary_enabled = get_bool(runtime_cfg, "engine.turn_summary.enabled", True)
-            if _summary_enabled and _conv_store:
-                _turn_summary = await generate_turn_summary(
-                    conv_store=_conv_store,
-                    session_id=child_session_id or session_id,
-                    task_id=task_id,
-                    llm_http=llm_http,
-                    api_key=api_key,
-                    base_url=base_url,
-                    model=_summary_model,
-                )
-        except Exception as _ts_err:
-            print(f"[engine] Turn summary failed (non-critical): {_ts_err}", flush=True)
 
     try:
         from engine.task_record import TaskRecord, write_task_record
@@ -704,7 +695,7 @@ async def _run_node_task(
             step_count=rctx.completed_steps,
             tool_call_count=_tool_call_count,
             token_usage=dict(rctx.total_usage) if rctx.total_usage else {},
-            summary=_turn_summary or action.summary or "",
+            summary=action.summary or "",
             error=action.error or "",
             child_session_id=child_session_id,
         )
@@ -713,6 +704,9 @@ async def _run_node_task(
         print(f"[engine] Failed to write task record: {_tr_err}", flush=True)
 
     _result = action.to_dict()
+    # 轮摘要节点化：传递 _tool_call_count 和 _total_tokens 给 supervisor 做门控判断
+    _result["_tool_call_count"] = _tool_call_count
+    _result["_total_tokens"] = _total_tokens
     # P3 记忆提取互斥：传递本轮使用的工具名列表，供 supervisor 判断是否跳过提取
     if rctx.tool_call_log:
         _result["_tool_names"] = list(set(tc["name"] for tc in rctx.tool_call_log))

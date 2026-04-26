@@ -524,3 +524,21 @@ class AdapterCallbacks(Protocol):
                               中附带关联的 MainTaskState（如有）。
         """
         ...
+
+    async def on_engine_restarted(
+        self,
+        payload: dict[str, Any],
+    ) -> None:
+        """Engine worker restarted (generation changed).
+
+        Triggered when engine_registered event has a non-empty
+        previous_generation_id, indicating a restart rather than first boot.
+
+        Adapter should notify relevant channels that the engine has restarted.
+
+        Args:
+            payload: engine_registered event payload containing:
+                worker_id, generation_id, previous_generation_id,
+                orphans_cancelled, ts.
+        """
+        ...

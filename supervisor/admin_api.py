@@ -120,27 +120,38 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
     # ----- Nodes -----
     @router.get("/nodes")
     def list_nodes() -> list[dict[str, Any]]:
-        nodes_dir = workspace_root / "config" / "nodes"
-        if not nodes_dir.exists():
-            return []
+        # 系统节点目录分离：扫描 engine/system_nodes/ 和 config/nodes/ 两个目录，
+        # engine 内建目录优先，同 id 节点只保留首次出现的。
+        dirs = [
+            workspace_root / "engine" / "system_nodes",
+            workspace_root / "config" / "nodes",
+        ]
         res = []
-        for f in nodes_dir.glob("*.yaml"):
-            data = _read_yaml(f)
-            ta_raw = data.get("tool_access", {})
-            if isinstance(ta_raw, str):
-                ta_raw = {"mode": ta_raw}
-            elif not isinstance(ta_raw, dict):
-                ta_raw = {"mode": "none"}
-            res.append({
-                "id": data.get("id", f.stem),
-                "name": data.get("name", ""),
-                "type": data.get("type", ""),
-                "model": data.get("model", ""),
-                "tool_access": ta_raw,
-                "skills": data.get("skills", {}),
-                "description": data.get("description", ""),
-                "delegate_targets": list(data.get("delegate_targets") or []),
-            })
+        seen_ids: set[str] = set()
+        for nodes_dir in dirs:
+            if not nodes_dir.exists():
+                continue
+            for f in nodes_dir.glob("*.yaml"):
+                data = _read_yaml(f)
+                nid = data.get("id", f.stem)
+                if nid in seen_ids:
+                    continue
+                seen_ids.add(nid)
+                ta_raw = data.get("tool_access", {})
+                if isinstance(ta_raw, str):
+                    ta_raw = {"mode": ta_raw}
+                elif not isinstance(ta_raw, dict):
+                    ta_raw = {"mode": "none"}
+                res.append({
+                    "id": nid,
+                    "name": data.get("name", ""),
+                    "type": data.get("type", ""),
+                    "model": data.get("model", ""),
+                    "tool_access": ta_raw,
+                    "skills": data.get("skills", {}),
+                    "description": data.get("description", ""),
+                    "delegate_targets": list(data.get("delegate_targets") or []),
+                })
         return res
 
     @router.get("/nodes/{node_id}/raw")

@@ -35,9 +35,10 @@ SPEC = {
                 "type": "string",
                 "description": "Gemini image model to use. Default: gemini-2.5-flash-image",
             },
-            "image_path": {
-                "type": "string",
-                "description": "Optional path to an input image (relative to workspace root) to use as a reference.",
+            "image_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Optional list of paths to input images (relative to workspace root) to use as references.",
             },
         },
         "required": ["prompt"],
@@ -78,7 +79,14 @@ if __name__ == "__main__":
         aspect_ratio = "1:1"
 
     model = str(args.get("model") or "gemini-3-pro-image-preview").strip()
-    image_path = str(args.get("image_path") or "").strip()
+    
+    raw_image_paths = args.get("image_paths") or args.get("image_path") or []
+    if isinstance(raw_image_paths, str):
+        image_paths = [raw_image_paths]
+    elif isinstance(raw_image_paths, list):
+        image_paths = raw_image_paths
+    else:
+        image_paths = []
 
     # ---- API Key & Base URL from env or .env file ----
     def _load_dotenv():
@@ -115,10 +123,14 @@ if __name__ == "__main__":
     url = f"{base_url}/v1beta/models/{model}:generateContent?key={api_key}"
 
     parts = []
-    if image_path:
-        img_file = Path.cwd() / image_path
+    for img_path in image_paths:
+        img_path = str(img_path).strip()
+        if not img_path:
+            continue
+            
+        img_file = Path.cwd() / img_path
         if not img_file.exists():
-            fail(f"Input image not found: {image_path}")
+            fail(f"Input image not found: {img_path}")
         
         mime_type = "image/png"
         ext = img_file.suffix.lower()
@@ -138,7 +150,7 @@ if __name__ == "__main__":
                 }
             })
         except Exception as e:
-            fail(f"Failed to read input image: {e}")
+            fail(f"Failed to read input image {img_path}: {e}")
 
     parts.append({"text": prompt_text})
 

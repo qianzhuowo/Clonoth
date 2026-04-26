@@ -75,6 +75,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self.session_entry_overrides: dict[str, str] = {}  # session_id -> node_id (AI switch)
         self._session_context_usage: dict[str, dict[str, Any]] = {}  # session_id -> latest usage
         self._engine_generations: dict[str, str] = {}  # worker_id -> generation_id (Direction 2)
+        self._pending_restart_notify: str | None = None  # session_id to notify after engine registers
 
         # ---- Child Session 隔离（Phase A）：映射表 ----
         # (parent_session_id, node_id, context_key) → child_session_id
@@ -490,6 +491,27 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     "ts": _now().isoformat(),
                 },
             )
+
+            # ---- Deferred restart notification ----
+            # Injected here (after orphan cleanup) so the new task gets the
+            # current generation and won't be reaped as an orphan.
+            if self._pending_restart_notify:
+                _notify_sid = self._pending_restart_notify
+                self._pending_restart_notify = None  # consume once
+                _si = self.sessions.get(_notify_sid)
+                if _si:
+                    _restart_evt = self.eventlog.append(
+                        session_id=_notify_sid,
+                        component="supervisor",
+                        type_="inbound_message",
+                        payload={
+                            "channel": _si.channel,
+                            "conversation_key": _si.conversation_key,
+                            "text": "[系统通知] Engine 重启已完成，新代码已生效。",
+                        },
+                    )
+                    self.record_inbound_message_event(_restart_evt)
+
             return {"ok": True, "orphans_cancelled": orphan_count, "generation_id": gid}
 
     def _cancel_worker_orphans_locked(self, worker_id: str) -> int:

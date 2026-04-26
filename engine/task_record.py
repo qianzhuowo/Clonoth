@@ -104,23 +104,26 @@ def snip_history(
     records: list["TaskRecord"],
     *,
     keep_recent_tasks: int = 2,
-) -> tuple[list[dict], int]:
-    """Replace old task message chains with their summaries.
+    max_snip: int = 2,
+) -> tuple[list[dict], int, set[str]]:
+    """Replace old task message chains with their summaries (incremental).
 
-    For tasks that have a summary in their TaskRecord and are not among
-    the most recent `keep_recent_tasks`, replace all messages belonging
-    to that task with a single summary message.
+    Each compaction trigger replaces at most *max_snip* oldest eligible tasks.
+    The caller should treat any snip_count > 0 as "compaction done for this
+    round" and skip LLM compaction.  Only when snip_count == 0 (all eligible
+    tasks already snipped) should the caller fall through to LLM compaction.
 
     Args:
         messages: History dicts (from ConversationStore → _message_to_history_dict).
         records: TaskRecords for this session.
         keep_recent_tasks: Number of most recent tasks to keep unsnipped.
+        max_snip: Maximum number of tasks to snip per invocation.
 
     Returns:
-        (snipped_messages, snip_count) — modified message list and number of tasks snipped.
+        (snipped_messages, snip_count, snipped_task_ids)
     """
     if not records or not messages:
-        return messages, 0
+        return messages, 0, set()
 
     # Build lookup: task_id → summary (only for tasks that have one)
     summaries: dict[str, str] = {}
@@ -129,50 +132,112 @@ def snip_history(
             summaries[r.task_id] = r.summary
 
     if not summaries:
-        return messages, 0
+        return messages, 0, set()
 
     # Identify task_ids to keep (most recent N by order of appearance in records)
     recent_task_ids: set[str] = set()
     for r in records[-keep_recent_tasks:]:
         recent_task_ids.add(r.task_id)
 
-    # Identify which task_ids to snip
-    snip_task_ids: set[str] = set()
-    for tid, summary in summaries.items():
-        if tid not in recent_task_ids:
-            snip_task_ids.add(tid)
+    # Collect eligible task_ids in order of appearance (oldest first)
+    # Also exclude tasks that have already been snipped (content starts with marker)
+    _SNIP_MARKER = "[Task summary \u2014 original messages snipped]"
+    already_snipped: set[str] = set()
+    for msg in messages:
+        content = msg.get("content", "")
+        meta = msg.get("_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
 
-    if not snip_task_ids:
-        return messages, 0
+        # 场景1：显式标记为已摘要的消息块
+        if isinstance(content, str) and content.startswith(_SNIP_MARKER):
+            tid = str(meta.get("source_task_id") or "")
+            if tid:
+                already_snipped.add(tid)
 
-    # Build snipped message list
+        # 场景2：LLM 全量压缩摘要块，提取其包含的所有任务 ID
+        if "[以下是之前对话的结构化摘要" in str(content):
+            c_tids = meta.get("compressed_task_ids")
+            if isinstance(c_tids, list):
+                for _ctid in c_tids:
+                    already_snipped.add(str(_ctid))
+
+    eligible_ordered: list[str] = []
+    _seen_elig: set[str] = set()
+    for r in records:
+        tid = r.task_id
+        if (tid and tid in summaries
+                and tid not in recent_task_ids
+                and tid not in already_snipped
+                and tid not in _seen_elig):
+            eligible_ordered.append(tid)
+            _seen_elig.add(tid)
+
+    if not eligible_ordered:
+        return messages, 0, set()
+
+    # Incremental: snip at most max_snip oldest tasks
+    to_snip = eligible_ordered[:max_snip]
+    to_snip_set = set(to_snip)
+
     result: list[dict] = []
     seen_snipped: set[str] = set()
     for msg in messages:
         meta = msg.get("_meta", {})
-        task_id = ""
+        msg_tid = ""
         if isinstance(meta, dict):
-            # Messages from ConversationStore carry source_task_id in meta
-            task_id = str(meta.get("source_task_id") or "")
-
-        if task_id in snip_task_ids:
-            # Replace first message of this task with summary, skip the rest
-            if task_id not in seen_snipped:
-                seen_snipped.add(task_id)
+            msg_tid = str(meta.get("source_task_id") or "")
+        if msg_tid in to_snip_set:
+            if msg_tid not in seen_snipped:
+                seen_snipped.add(msg_tid)
                 result.append({
                     "role": "user",
-                    "content": f"[Task summary — original messages snipped]\n{summaries[task_id]}",
+                    "content": f"[Task summary \u2014 original messages snipped]\n{summaries[msg_tid]}",
+                    "_meta": {"source_task_id": msg_tid},
                 })
-            # else: skip this message (part of snipped task)
         else:
             result.append(msg)
 
     snip_count = len(seen_snipped)
     if snip_count:
-        log.info("snip_history: snipped %d tasks, %d → %d messages",
-                 snip_count, len(messages), len(result))
+        log.info("snip_history: incremental snip %d/%d eligible tasks, %d → %d messages",
+                 snip_count, len(eligible_ordered), len(messages), len(result))
 
-    return result, snip_count
+    return result, snip_count, seen_snipped
+
+
+def snip_store(
+    store_messages: list,
+    records: list["TaskRecord"],
+    snipped_task_ids: set[str],
+) -> list:
+    """Apply snip to ConversationStore Message list for persistence.
+
+    Mirrors the replacement done by snip_history but operates on
+    ConversationStore Message objects so the result can be written
+    back via replace_all.
+    """
+    from engine.conversation_store import Message
+    from uuid import uuid4
+
+    summaries = {r.task_id: r.summary for r in records if r.summary and r.task_id}
+    result = []
+    seen: set[str] = set()
+    for msg in store_messages:
+        tid = msg.source_task_id or ""
+        if tid in snipped_task_ids:
+            if tid not in seen:
+                seen.add(tid)
+                result.append(Message(
+                    id=str(uuid4()),
+                    role="user",
+                    content=f"[Task summary — original messages snipped]\n{summaries.get(tid, '')}",
+                    message_type="summary",
+                    source_task_id=tid,
+                ))
+        else:
+            result.append(msg)
+    return result
 
 
 def load_task_records(ws_root: Path, session_id: str) -> list[TaskRecord]:

@@ -1,6 +1,7 @@
 """Task 路由 mixin —— 处理 task 完成后的统一分发逻辑。"""
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
@@ -8,6 +9,9 @@ from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
 
 from ._helpers import _now
 from .types import Task, TaskKind, TaskStatus
+
+
+log = logging.getLogger(__name__)
 
 
 class TaskRouterMixin:
@@ -34,6 +38,11 @@ class TaskRouterMixin:
             self._apply_compact_result_locked(task)
             return
 
+        # ---- 轮摘要 dispatch 结果：summarizer 子 task 完成 ----
+        if self._is_turn_summary_result(task):
+            self._apply_turn_summary_result_locked(task)
+            return
+
         action = task.result or {}
         act = str(action.get("action") or "").strip()
         if act == "preempted":
@@ -49,6 +58,9 @@ class TaskRouterMixin:
 
         # 后置触发：检查是否需要创建记忆提取任务
         self._maybe_trigger_memory_extract_locked(task)
+
+        # 后置触发：检查是否需要创建轮摘要任务
+        self._maybe_trigger_turn_summary_locked(task)
 
     # ------------------------------------------------------------------ #
     #  dispatch
@@ -659,12 +671,21 @@ class TaskRouterMixin:
             return before, before
 
         to_keep = msgs[-keep_recent:] if keep_recent > 0 else []
+
+        # P6.5 Metadata Preservation: 收集被压缩掉的消息所属的 source_task_id，
+        # 存入 summary 消息的 meta 中。L2 snip_history 据此判断哪些 task 已被
+        # LLM 压缩过，避免因 ID 丢失而反复 fall through 到 LLM compact。
+        to_remove = msgs[:-keep_recent] if keep_recent > 0 else list(msgs)
+        compressed_task_ids = list({m.source_task_id for m in to_remove if m.source_task_id})
+
         summary_msg = Message(
             id=str(uuid4()),
             role="user",
             content="[以下是之前对话的结构化摘要，原始上下文已被压缩]\n\n" + summary,
             message_type=MessageType.SUMMARY,
             created_at=datetime.now(timezone.utc).isoformat(),
+            source_task_id="compact_summary",
+            meta={"compressed_task_ids": compressed_task_ids},
         )
         new_messages = [summary_msg] + to_keep
         store.replace_all(target_session_id, new_messages)
@@ -690,6 +711,126 @@ class TaskRouterMixin:
         caller.input.pop("_compact_dispatch_pending", None)
         self._event_task_snapshot("task_resumed", caller)
 
+
+    # ------------------------------------------------------------------ #
+    #  Turn Summary — 非阻塞轮摘要节点化
+    #  原先在 engine/runner.py 中做阻塞式 LLM 调用生成轮摘要，
+    #  改为 supervisor 在 task 完成后按需触发独立的 system.turn_summarizer 节点。
+    #  Created: 2026-04-25
+    # ------------------------------------------------------------------ #
+
+    def _is_turn_summary_result(self, task: Task) -> bool:
+        """判断是否是 turn_summarizer 子 task 的完成事件。"""
+        return bool(task.input.get("_turn_summary_dispatch"))
+
+    def _apply_turn_summary_result_locked(self, task: Task) -> None:
+        """summarizer 完成后，将摘要回写到 TaskRecord。
+
+        write_task_record 是 append 模式（追加到 JSONL），所以回写 summary 时
+        会追加一条新记录。同一 task_id 出现多次时，后者覆盖前者——
+        snip_history 遍历全部 records 取最后一条有 summary 的。
+        """
+        act = str((task.result or {}).get("action") or "").strip()
+        if act != "finish":
+            return
+
+        result = (task.result or {}).get("result") or {}
+        summary = str(result.get("text") or "").strip()
+        if not summary or len(summary) < 50:
+            return
+
+        target_task_id = str(task.input.get("_target_task_id") or "").strip()
+        target_session_id = str(task.input.get("_target_session_id") or "").strip()
+        if not target_task_id or not target_session_id:
+            return
+
+        # 回写 TaskRecord：追加一条 updated record
+        try:
+            from engine.task_record import TaskRecord, write_task_record, load_task_records
+            from pathlib import Path
+            records = load_task_records(Path(self.workspace_root), target_session_id)
+            for r in records:
+                if r.task_id == target_task_id:
+                    r.summary = summary
+                    write_task_record(Path(self.workspace_root), r)
+                    log.info("Turn summary written for task %s: %d chars", target_task_id[:12], len(summary))
+                    break
+        except Exception as e:
+            log.warning("Failed to write turn summary for task %s: %s", target_task_id[:12], e)
+
+    def _maybe_trigger_turn_summary_locked(self, task: Task) -> None:
+        """Task 完成后，检查是否需要创建轮摘要后置任务。
+
+        门控条件：
+        - 仅对 finish/fail 的 node 类型 task 触发
+        - 不对系统内部任务触发（避免递归）
+        - tool_call_count >= 3 或 total_tokens >= 4000
+        - runtime.yaml 中 engine.turn_summary.enabled 为 true
+        """
+        act = str((task.result or {}).get("action") or "").strip()
+        if act not in ("finish", "fail") or task.kind != TaskKind.node:
+            return
+        # 不对系统内部任务触发
+        if task.input.get("_system_task"):
+            return
+
+        runtime_cfg = load_runtime_config(self.workspace_root)
+        if not get_bool(runtime_cfg, "engine.turn_summary.enabled", True):
+            return
+
+        # 门控：仅针对长工具链，短任务不触发
+        min_calls = get_int(runtime_cfg, "engine.turn_summary.min_tool_calls", 3)
+        _tool_call_count = (task.result or {}).get("_tool_call_count", 0)
+        if _tool_call_count < min_calls:
+            return
+
+        # 格式化 task 消息，作为 summarizer 的输入
+        _instruction = ""
+        try:
+            from pathlib import Path
+            from engine.conversation_store import ConversationStore
+            _store = ConversationStore(Path(self.workspace_root) / "data" / "conversations")
+            _child_sid = task.input.get("child_session_id") or ""
+            _load_sid = _child_sid if _child_sid else task.session_id
+            _all_msgs = _store.load(_load_sid)
+            _task_msgs = [m for m in _all_msgs if m.source_task_id == task.task_id]
+            if not _task_msgs:
+                return
+            _parts: list[str] = []
+            for _m in _task_msgs:
+                _c = _m.content or ""
+                if len(_c) > 5000:
+                    _c = _c[:5000] + "\n...[truncated]"
+                _parts.append(f"[{_m.role}]\n{_c}")
+            _instruction = "\n\n---\n\n".join(_parts)
+        except Exception as e:
+            log.warning("Failed to format task messages for turn summary: %s", e)
+            return
+
+        if not _instruction.strip():
+            return
+
+        # 截断（保持在 ~30K chars，与原 turn_summary.py 一致）
+        if len(_instruction) > 30000:
+            _instruction = _instruction[:30000] + "\n...[truncated]"
+
+        summarizer_node = get_str(runtime_cfg, "engine.turn_summary.node_id", "system.turn_summarizer").strip()
+        self._create_task_locked(
+            session_id=task.session_id,
+            session_generation=task.session_generation,
+            kind=TaskKind.node,
+            node_id=summarizer_node,
+            input_data={
+                "instruction": _instruction,
+                "_system_task": True,
+                "_turn_summary_dispatch": True,
+                "_target_task_id": task.task_id,
+                "_target_session_id": task.session_id,
+            },
+            continuation={},
+            source_inbound_seq=None,
+            caller_task_id=None,
+        )
 
     # ------------------------------------------------------------------ #
     #  后置记忆提取
@@ -737,24 +878,23 @@ class TaskRouterMixin:
         if current_count - last_count < min_increment:
             return
 
-        # P3 缩窄范围：只提取当前 task 的消息，不发全量 session 历史
-        # 通过 task_id 过滤 ConversationStore 消息
-        _task_msgs = []
+        # P3→修正：提取「上次游标到当前」之间所有 task 的消息
+        # 避免只取当前 task 导致中间 task 被永久跳过
+        _range_msgs = []
         try:
             from pathlib import Path
             from engine.conversation_store import ConversationStore
             _store = ConversationStore(Path(self.workspace_root) / "data" / "conversations")
             _all_msgs = _store.load(task.session_id)
-            _task_msgs = [m for m in _all_msgs if m.source_task_id == task.task_id]
+            # 取非 system 消息，按存储顺序截取 last_count → current_count 区间
+            _non_sys = [m for m in _all_msgs if m.role != "system"]
+            _range_msgs = _non_sys[last_count:current_count]
         except Exception:
             pass
 
-        if _task_msgs:
-            # 使用 task 级消息
+        if _range_msgs:
             _parts: list[str] = []
-            for _tm in _task_msgs:
-                if _tm.role == "system":
-                    continue
+            for _tm in _range_msgs:
                 _c = _tm.content or ""
                 if len(_c) > 2000:
                     _c = _c[:2000] + "...<truncated>"

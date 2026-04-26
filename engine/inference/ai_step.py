@@ -280,22 +280,34 @@ async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
     # 在 dispatch LLM compactor 前先尝试，可能免去 LLM 调用
     # ---------------------------------------------------------------
     try:
-        from engine.task_record import snip_history, load_task_records
+        from engine.task_record import snip_history, snip_store, load_task_records
         _snip_sid = ls.rctx.child_session_id or ls.rctx.session_id
         _snip_records = load_task_records(ls.rctx.workspace_root, _snip_sid)
         if _snip_records:
-            _snipped, _snip_count = snip_history(ls.messages, _snip_records)
+            # Incremental: snip a few oldest tasks per trigger
+            _snipped, _snip_count, _snipped_ids = snip_history(
+                ls.messages, _snip_records,
+            )
             if _snip_count > 0:
                 ls.messages = _snipped
+                # Persist to ConversationStore so next load sees snipped version
+                _store = getattr(ls.rctx, 'conversation_store', None)
+                if _store:
+                    try:
+                        _stored = _store.load(_snip_sid)
+                        _persisted = snip_store(_stored, _snip_records, _snipped_ids)
+                        _store.replace_all(_snip_sid, _persisted)
+                    except Exception as _pe:
+                        logger.warning("failed to persist snipped history: %s", _pe)
                 await ls.rctx.emit_event("snip_compact", {
                     "node_id": ls.node.id, "step": step,
                     "snipped_tasks": _snip_count,
                 })
-                # Re-check: snip 可能已经把上下文降到阈值以下
-                if not should_compact(ls.messages, ls.compact_threshold):
-                    logger.info("snip_compact resolved over-threshold, skipping LLM compact")
-                    ls.compacted = True
-                    return None
+                # Snipped something → done for this round, continue task
+                logger.info("snip_compact: replaced %d tasks, skipping LLM compact", _snip_count)
+                ls.compacted = True
+                return None
+            # snip_count == 0 → all eligible already snipped, fall through to LLM
     except Exception as _snip_err:
         logger.warning("snip_compact failed, falling through to LLM compact: %s", _snip_err)
 

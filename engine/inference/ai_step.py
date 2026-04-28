@@ -201,11 +201,13 @@ async def _inject_preempt_message(ls: _LoopState, step: int) -> None:
     ls.messages = [m for m in ls.messages if not m.get("_dynamic")]
 
     # 2. 重建 dynamic context（skill + memory 的 dynamic 部分）
+    from .message_assembly import _conversational_history
+    _scan_history = _conversational_history(ls.history)
     _inj_skill_s, _inj_skill_d = build_skill_messages(
         ls.rctx.workspace_root,
         node_id=ls.node.id,
         instruction_text=_new_instruction,
-        history=ls.history,
+        history=_scan_history,
         skill_mode=ls.node.skill_access.mode,
         skill_allow=ls.node.skill_access.allow,
         max_budget_chars=get_int(ls.runtime_cfg, "skills.max_budget_chars", 0, min_value=0),
@@ -217,7 +219,7 @@ async def _inject_preempt_message(ls: _LoopState, step: int) -> None:
             ls.rctx.workspace_root,
             node_id=ls.node.id,
             instruction_text=_new_instruction,
-            history=ls.history,
+            history=_scan_history,
             max_budget_chars=get_int(ls.runtime_cfg, "memory.max_budget_chars", 0, min_value=0),
             memory_mode=ls.node.memory_access.mode,
             memory_allow=ls.node.memory_access.allow,
@@ -454,6 +456,19 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         if tc.name in _PSEUDO_TOOL_NAMES:
             pseudo_calls.append(tc)
         else:
+            # 【Fix】真工具权限校验：工具必须在节点的授权列表内才能执行
+            if tc.name not in ls.allowed_real_tools:
+                logger.warning("node %s attempted unauthorized tool call: %s (allowed: %s)",
+                               ls.node.id, tc.name, ls.allowed_real_tools)
+                _err_msg = ls.formatter.format_tool_result(
+                    tc,
+                    f"Error: Tool '{tc.name}' is not in this node's allowed tool list. "
+                    f"Use finish() to provide your output directly.",
+                )
+                ls.messages.append(_err_msg)
+                _shadow_write(ls, _err_msg, message_type="tool_result")
+                continue
+
             real_tool_calls.append({
                 "id": tc.id,
                 "name": tc.name,
@@ -523,9 +538,58 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
 
     # finish 最后执行（同轮真实工具已完成）
     if _finish_call:
-        action = await _handle_pseudo_tool(ls, _finish_call, step)
-        if action is not None:
-            return action
+        # ---------------------------------------------------------------
+        # Preempt V3 需求2: finish 拦截
+        # 在执行 finish 之前再次检查 preempt 状态。如果有待注入的 preempt
+        # 消息（用户在 LLM 推理/工具执行期间发了新消息），拦截 finish：
+        # 不产生 TaskAction(FINISH)，改为塞一个假 tool_result 维持 native
+        # 模式下 tool_use/tool_result 的配对完整性（Claude API 强校验），
+        # 然后让主循环继续——下一轮 _inject_preempt_message 注入新用户消息。
+        #
+        # 同时补全 V2 遗漏：preempt_after_step（无消息 preempt）在只有 finish
+        # 没有真工具的场景下也需要被检查，此前会跳过导致 finish 照常执行。
+        # ---------------------------------------------------------------
+        if ls.preempt_inject_info is None and not ls.preempt_after_step:
+            _pi_finish = await ls.rctx.check_preempted()
+            if _pi_finish.get("preempted"):
+                if _pi_finish.get("message"):
+                    ls.preempt_inject_info = _pi_finish
+                else:
+                    ls.preempt_after_step = True
+
+        if ls.preempt_inject_info is not None:
+            # 有消息的 preempt：拦截 finish，塞假 tool_result，任务继续
+            from .tool_format import ParsedToolCall as _FinishPTC
+            _finish_parsed = _FinishPTC(
+                id=getattr(_finish_call, "id", "") or "",
+                name="finish",
+                arguments=dict(_finish_call.arguments or {}),
+            )
+            _intercept_msg = ls.formatter.format_tool_result(
+                _finish_parsed,
+                "\u26a0\ufe0f Preempted: new user input received. Task continues.",
+            )
+            set_message_meta(_intercept_msg, MessageMeta(message_type="tool_result"))
+            ls.messages.append(_intercept_msg)
+            _shadow_write(ls, _intercept_msg, MessageType.TOOL_RESULT)
+            await ls.rctx.emit_event("preempt_finish_intercepted", {
+                "node_id": ls.node.id,
+                "task_id": ls.rctx.task_id,
+                "step": step,
+            })
+            # 不 return TaskAction — 函数返回 None，主循环 continue 到下一轮
+        elif ls.preempt_after_step:
+            # 无消息的 preempt：与真工具后的 preempt_after_step 路径对齐，
+            # 保存上下文后退出任务
+            ctx_ref = _persist_ctx(ls, step + 1)
+            return TaskAction(
+                action=ACTION_PREEMPTED, node_id=ls.node.id,
+                context_ref=ctx_ref, summary="任务被软打断，上下文已保存。",
+            )
+        else:
+            action = await _handle_pseudo_tool(ls, _finish_call, step)
+            if action is not None:
+                return action
 
     # 无终止型动作 → 继续下一轮推理
     if pseudo_calls or real_tool_calls:
@@ -545,12 +609,13 @@ async def _run_async_tool(
     http: "httpx.AsyncClient",
     supervisor_url: str,
     task_id: str,
+    session_id: str,
     tool_name: str,
     tool_args: dict,
     tool_ctx: ToolContext,
     async_tool_id: str,
 ) -> None:
-    """后台执行异步工具，完成后通过 preempt 注入结果。"""
+    """后台执行异步工具，完成后通过 session 级 API 注入结果。"""
     _started = time.monotonic()
     try:
         _args_summary = _short(json.dumps(tool_args, ensure_ascii=False, default=str), 200)
@@ -587,8 +652,9 @@ async def _run_async_tool(
         if attachments:
             payload["attachment_paths"] = attachments
 
+        # 使用 session 级 API，复用三级回退逻辑
         await http.post(
-            f"{supervisor_url}/v1/tasks/{task_id}/preempt",
+            f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
             json=payload,
         )
     except Exception as e:
@@ -603,7 +669,7 @@ async def _run_async_tool(
         }
         try:
             await http.post(
-                f"{supervisor_url}/v1/tasks/{task_id}/preempt",
+                f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
                 json={"message": f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}'},
             )
         except Exception:
@@ -669,6 +735,7 @@ async def _execute_real_tools(
                     http=ls.rctx.http,
                     supervisor_url=ls.rctx.supervisor_url,
                     task_id=ls.rctx.task_id,
+                    session_id=ls.rctx.session_id,
                     tool_name=_t_name,
                     tool_args=_t_args,
                     tool_ctx=_tool_ctx,
@@ -915,6 +982,7 @@ async def run_ai_node(
 
     # ---- 构建工具列表 ----
     tool_specs = _filter_tool_specs(node, registry.list_specs())
+    _allowed_real_tools = {s.get("name") for s in tool_specs if s.get("name")}
     openai_tools = _to_openai_tools(tool_specs) if tool_specs else []
 
     delegate_targets = list(node.delegate_targets)
@@ -959,6 +1027,7 @@ async def run_ai_node(
         collected_attachments=collected_attachments,
         tool_produced_attachments=_tool_produced_attachments,
         formatter=formatter,
+        allowed_real_tools=_allowed_real_tools,
         compact_threshold=get_int(runtime_cfg, "engine.compact.threshold_tokens", 100_000, min_value=0),
         compact_keep_recent=get_int(runtime_cfg, "engine.compact.keep_recent", 6, min_value=2, max_value=50),
         compacted=False,
@@ -1000,6 +1069,15 @@ async def run_ai_node(
         result = await _call_llm_with_retry(ls, step)
         if isinstance(result, TaskAction):
             return result
+        # ---------------------------------------------------------------
+        # Preempt V3 需求1: _call_llm_with_retry 返回 None 表示流式输出
+        # 在思考阶段被 preempt 截断。partial assistant message 已丢弃（不存
+        # 历史），preempt 消息已存储在 ls.preempt_inject_info 中。
+        # 跳到下一轮循环顶部，由 _inject_preempt_message 注入新用户消息后
+        # 重新推理。与 cancel 的区别：不终止 task，继续循环。
+        # ---------------------------------------------------------------
+        if result is None:
+            continue
         resp = result
 
         # P0 Task 内核化：记录实际完成的步数

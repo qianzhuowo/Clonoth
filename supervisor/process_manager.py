@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +53,7 @@ class ProcessManager:
         self.shell_cli: ManagedProcess | None = None
         self._stopped = False
         self._restart_pending = False
+        self._restarting_engine = False  # restart engine 期间抑制信号退出
 
         # 日志函数：写日志文件而不是终端（终端留给 TUI）
         self._log = log_func or (lambda msg: print(msg))
@@ -99,6 +101,15 @@ class ProcessManager:
             prev_handler = signal.getsignal(sig)
 
             def _handler(signum, frame, _prev=prev_handler):
+                import traceback as _tb
+                try:
+                    _sname = signal.Signals(signum).name
+                except (ValueError, AttributeError):
+                    _sname = str(signum)
+                _tname = threading.current_thread().name
+                # restart engine 期间信号泄漏到 supervisor，忽略不退出
+                if self._restarting_engine:
+                    return
                 self._cleanup()
                 # 调用原有的 handler
                 if callable(_prev) and _prev not in (signal.SIG_IGN, signal.SIG_DFL):
@@ -159,6 +170,7 @@ class ProcessManager:
             stderr=stderr,
             creationflags=creationflags,
             preexec_fn=preexec_fn,
+            start_new_session=True,  # engine 独立进程组，杀 engine 不波及 supervisor
         )
         self._log(f"[process_manager] spawned {name} pid={p.pid}")
         return ManagedProcess(name=name, popen=p, log_path=log_path)
@@ -221,6 +233,7 @@ class ProcessManager:
         except Exception:
             try:
                 p.kill()
+                p.wait(timeout=5)  # reap after SIGKILL to release ports
             except Exception:
                 pass
         self._log(f"[process_manager] stopped {proc.name} pid={p.pid}")

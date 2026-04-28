@@ -6,6 +6,7 @@ import socket
 import atexit
 import io
 import signal
+import sys
 import threading
 import time
 import os
@@ -63,6 +64,7 @@ def main() -> None:
     # 如果端口被占用就立即退出，不会误删 restart_pending.json 或取消任务
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+            _s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             _s.bind((args.host, args.port))
     except OSError as e:
         _log(f"[supervisor] 端口 {args.host}:{args.port} 已被占用: {e}")
@@ -209,6 +211,9 @@ def main() -> None:
             # 退出码 75 = 请求重启（由 main.py 外层循环检测）
             _code = 75 if restart else 0
             _log(f"[supervisor] exit code={_code}")
+            import traceback as _tb
+            _log(f'[DIAG] _watch_shell os._exit({_code}) stack:\n{"" .join(_tb.format_stack())}')
+            import time as _t; _t.sleep(0.5)  # 确保日志写出
             os._exit(_code)
 
         threading.Thread(target=_watch_shell, daemon=True, name="shell-watcher").start()
@@ -233,7 +238,11 @@ def main() -> None:
     }
 
     _log(f"[supervisor] starting uvicorn on {args.host}:{args.port}")
-    uvicorn.run(
+    # 用 Server API 替代 uvicorn.run()，禁用 uvicorn 的信号捕获。
+    # uvicorn.run() 会安装自己的 SIGTERM/SIGINT handler 并在收到信号时
+    # 调用 sys.exit(0)，导致 restart engine 时 supervisor 被意外杀死。
+    import asyncio
+    _uvi_config = uvicorn.Config(
         app,
         host=args.host,
         port=args.port,
@@ -241,6 +250,17 @@ def main() -> None:
         access_log=access_log,
         log_config=_uvi_log_cfg,
     )
+    _uvi_server = uvicorn.Server(_uvi_config)
+    _uvi_server.install_signal_handlers = lambda: None  # 禁用 uvicorn 信号捕获
+    # 用 loop.run_until_complete 替代 asyncio.run()，后者会重装 SIGINT handler
+    # 信号处理交给 process_manager._install_signal_handlers + _restarting_engine flag
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
+    try:
+        _loop.run_until_complete(_uvi_server.serve())
+    finally:
+        _loop.close()
+    _log("[DIAG] uvicorn server exited! supervisor about to exit")
 
 
 if __name__ == "__main__":

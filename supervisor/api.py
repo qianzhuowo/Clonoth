@@ -212,6 +212,27 @@ def create_app(
         result = st.consume_preempt_message(task_id)
         return {"ok": True, **result}
 
+    @app.post("/v1/sessions/{session_id}/async_tool_result")
+    async def session_async_tool_result(session_id: str, request: Request) -> dict[str, Any]:
+        """Engine 调用：异步工具完成后注入结果到 session。
+
+        复用子节点三级回退：preempt running → 标记 suspended → 创建 inbound。
+        """
+        body = {}
+        try:
+            body = await request.json()
+        except Exception:
+            pass
+        msg = body.get("message", "")
+        atts = body.get("attachment_paths", [])
+        st: SupervisorState = app.state.state
+        if session_id not in st.sessions:
+            raise HTTPException(status_code=404, detail="session not found")
+        result = st.inject_async_result(session_id, text=msg, attachments=atts)
+        if not result.get("ok"):
+            raise HTTPException(status_code=500, detail=result.get("error", "unknown"))
+        return result
+
     @app.get("/v1/sessions/{session_id}/running_tasks")
     async def session_running_tasks(session_id: str) -> dict[str, Any]:
         """Bot 查询当前 session 中 running/pending 状态的 task 列表。
@@ -531,9 +552,12 @@ def create_app(
             },
         )
 
-        if inp.target == "engine":
-            if pm is None:
-                raise HTTPException(status_code=409, detail="process manager not enabled")
+        # 2026.4.28: restart engine 暂时禁用，统一走 restart all
+        # 原因：engine 子进程终止时会向 supervisor 泄露信号（SIGINT/SIGTERM），
+        # 导致 uvicorn 触发优雅退出，supervisor 跟着一起死。
+        # 根因是 uvicorn.run() 会覆盖手动设置的信号 handler，
+        # 目前未找到稳定的隔离方案，暂时所有重启统一走 restart all。
+        if inp.target == "engine_DISABLED":
             # 重新加载 .env，确保修改后的环境变量在 supervisor 进程中生效
             try:
                 from dotenv import load_dotenv
@@ -568,8 +592,10 @@ def create_app(
 
             def _deferred_engine_restart() -> None:
                 time.sleep(1)  # let HTTP response reach engine first
+                pm._restarting_engine = True  # 抑制信号 handler 退出
                 try:
                     pm.stop_engine()
+                    time.sleep(1)  # 等待延迟信号消散
                     pm.start_engine()
                     # Brief health check: verify engine process is alive
                     time.sleep(0.5)
@@ -583,6 +609,7 @@ def create_app(
                         )
                         return
                 except Exception as exc:
+                    pm._restarting_engine = False
                     st.eventlog.append(
                         session_id=_restart_session_id or "__system__",
                         component="supervisor",
@@ -613,6 +640,7 @@ def create_app(
                 # after orphan cleanup, so the task won't be reaped.
                 if _restart_session_id:
                     st._pending_restart_notify = _restart_session_id
+                pm._restarting_engine = False  # 清除信号抑制
 
             threading.Thread(target=_deferred_engine_restart, daemon=True, name="restart-engine").start()
             return RestartOut(scheduled=True, target=_restart_target)
@@ -654,9 +682,20 @@ def create_app(
             time.sleep(1)
             if pm is not None:
                 try:
-                    pm.stop_engine()
+                    pm.stop_all()  # stop engine + shell, with wait
                 except Exception:
                     pass
+                # Double-check: wait for all engine processes to be reaped
+                for _eng in getattr(pm, 'engines', []):
+                    try:
+                        _eng.popen.wait(timeout=5)
+                    except Exception:
+                        pass
+            import traceback as _tb
+            _msg = f'[DIAG] os._exit(75) called from api.py! stack:\n{"" .join(_tb.format_stack())}'
+            print(_msg, flush=True)
+            import sys as _sys; _sys.stdout.flush(); _sys.stderr.flush()
+            import time as _t; _t.sleep(0.5)  # 确保日志写出
             os._exit(75)  # main.py 外层循环检测到 75 会重启
 
         if pm is not None:

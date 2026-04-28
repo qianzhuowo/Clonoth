@@ -213,7 +213,16 @@ def build_multimodal_content(
     att_parts = attachments_to_content_parts(attachments, workspace_root=workspace_root)
     if not att_parts:
         return text
-    parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    # Collect image paths from attachments for inline annotation
+    _img_paths = [
+        str(a.get("path", ""))
+        for a in attachments
+        if str(a.get("type", "")).strip() != "file" and a.get("path")
+    ]
+    _annotated = text
+    if _img_paths:
+        _annotated = text + "\n[Attached images: " + ", ".join(_img_paths) + "]"
+    parts: list[dict[str, Any]] = [{"type": "text", "text": _annotated}]
     parts.extend(att_parts)
     return parts
 

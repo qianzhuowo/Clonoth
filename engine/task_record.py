@@ -162,6 +162,19 @@ def snip_history(
                 for _ctid in c_tids:
                     already_snipped.add(str(_ctid))
 
+    # Collect task_ids that actually have messages in this message list.
+    # Child tasks (ereuna_coder, system.compactor, etc.) write their messages
+    # to child session JSONLs, not the main session — their task_ids won't
+    # appear in messages, so snipping them would waste max_snip slots and
+    # always fall through to LLM compaction.
+    present_task_ids: set[str] = set()
+    for msg in messages:
+        _pmeta = msg.get("_meta", {})
+        if isinstance(_pmeta, dict):
+            _ptid = str(_pmeta.get("source_task_id") or "")
+            if _ptid:
+                present_task_ids.add(_ptid)
+
     eligible_ordered: list[str] = []
     _seen_elig: set[str] = set()
     for r in records:
@@ -169,7 +182,8 @@ def snip_history(
         if (tid and tid in summaries
                 and tid not in recent_task_ids
                 and tid not in already_snipped
-                and tid not in _seen_elig):
+                and tid not in _seen_elig
+                and tid in present_task_ids):
             eligible_ordered.append(tid)
             _seen_elig.add(tid)
 

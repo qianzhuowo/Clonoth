@@ -292,6 +292,11 @@ def build_memory_messages(
         if _match_keywords(entry["compiled_keywords"], scan_text):
             dynamic_entries.append(entry)
 
+    # Deterministic ordering: sort by id within each group so identical
+    # match sets always produce byte-identical output (prompt cache friendly).
+    constant_entries.sort(key=lambda e: e.get("id", ""))
+    dynamic_entries.sort(key=lambda e: e.get("id", ""))
+
     # budget enforcement
     if max_budget_chars > 0:
         all_injectable: list[tuple[str, dict[str, Any]]] = []
@@ -312,6 +317,9 @@ def build_memory_messages(
                     kept_constant.append(e)
                 else:
                     kept_dynamic.append(e)
+        # Re-sort by id after budget truncation for deterministic output
+        kept_constant.sort(key=lambda e: e.get("id", ""))
+        kept_dynamic.sort(key=lambda e: e.get("id", ""))
         constant_entries = kept_constant
         dynamic_entries = kept_dynamic
 

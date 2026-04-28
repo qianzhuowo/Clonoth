@@ -304,10 +304,10 @@ def build_skill_messages(
         else:
             index_only_skills.append(s)
 
-    # --- sort by order --------------------------------------------------
-    constant_skills.sort(key=lambda x: x["order"])
-    dynamic_skills.sort(key=lambda x: x["order"])
-    index_only_skills.sort(key=lambda x: x["order"])
+    # --- sort by order (secondary: name for deterministic byte output) ---
+    constant_skills.sort(key=lambda x: (x["order"], x.get("name", "")))
+    dynamic_skills.sort(key=lambda x: (x["order"], x.get("name", "")))
+    index_only_skills.sort(key=lambda x: (x["order"], x.get("name", "")))
 
     # --- budget enforcement ---------------------------------------------
     if max_budget_chars > 0:
@@ -334,8 +334,8 @@ def build_skill_messages(
             else:
                 index_only_skills.append(s)
 
-        kept_constant.sort(key=lambda x: x["order"])
-        kept_dynamic.sort(key=lambda x: x["order"])
+        kept_constant.sort(key=lambda x: (x["order"], x.get("name", "")))
+        kept_dynamic.sort(key=lambda x: (x["order"], x.get("name", "")))
         constant_skills = kept_constant
         dynamic_skills = kept_dynamic
 

@@ -218,9 +218,14 @@ async def _fetch_history(rctx: RunContext, limit: int = 40) -> list[dict[str, An
                         # Strip image_url parts from historical messages to avoid
                         # re-encoding large base64 images on every turn.
                         # Current turn's images are passed separately via attachments.
-                        result.append({"role": str(m.get("role")), "content": _strip_images_from_content(content)})
+                        entry: dict[str, Any] = {"role": str(m.get("role")), "content": _strip_images_from_content(content)}
                     else:
-                        result.append({"role": str(m.get("role")), "content": str(content)})
+                        entry = {"role": str(m.get("role")), "content": str(content)}
+                    # Preserve message_type for downstream keyword scan filtering
+                    _mt = m.get("message_type")
+                    if _mt:
+                        entry["message_type"] = str(_mt)
+                    result.append(entry)
                 return result
     except Exception:
         pass

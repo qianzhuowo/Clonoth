@@ -42,7 +42,13 @@ def _is_retryable_error(resp) -> bool:
 # ---------------------------------------------------------------------------
 
 async def _call_llm_with_retry(ls: _LoopState, step: int):
-    """LLM 调用（含重试）。返回 ProviderResponse 或 TaskAction(CANCELLED)。"""
+    """LLM 调用（含重试）。
+
+    返回值：
+      - ProviderResponse: 正常完成
+      - TaskAction(CANCELLED): 被取消
+      - None: 思考阶段被 preempt 截断，partial message 已丢弃
+    """
     tools_arg = ls.openai_tools if ls.openai_tools else None
     # 反序列化方向：先用 build_llm_messages 做格式转换（修正跨模式 role、剥离 _meta 等内部字段），
     # 再用 prepare_messages_for_llm 处理图片 file:// → base64 解析。
@@ -108,6 +114,45 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     if _pi_s.get("preempted"):
                         if _pi_s.get("message"):
                             ls.preempt_inject_info = _pi_s
+                            # -------------------------------------------------------
+                            # Preempt V3 需求1: 思考阶段截断
+                            # 如果 LLM 尚未产出任何 text token（仍在 thinking 阶段
+                            # 或尚未开始输出），立即截断流式输出，丢弃这条不完整的
+                            # assistant message（不存历史），让主循环在下一轮迭代
+                            # 由 _inject_preempt_message 注入 preempt 消息后重新推理。
+                            # text 阶段已开始输出时，维持现行等待逻辑不变（等流结束）。
+                            # 与 cancel 的区别：break 后不终止 task，回到主循环继续。
+                            # -------------------------------------------------------
+                            _in_thinking_phase = not text_buf.flushed_any and text_buf.is_empty
+                            if _in_thinking_phase:
+                                stream_task.cancel()
+                                try:
+                                    await stream_task
+                                except (asyncio.CancelledError, Exception):
+                                    pass
+                                # 清理 buffer 状态：flush 残留的 thinking tokens
+                                await text_buf.flush()
+                                await think_buf.flush()
+                                if text_buf.flushed_any or think_buf.flushed_any:
+                                    await ls.rctx.emit_event("stream_end", {
+                                        "node_id": ls.node.id,
+                                        "has_text": text_buf.flushed_any,
+                                        "has_reasoning": think_buf.flushed_any,
+                                    })
+                                await ls.rctx.emit_event("preempt_thinking_truncated", {
+                                    "node_id": ls.node.id,
+                                    "task_id": ls.rctx.task_id,
+                                    "step": step,
+                                })
+                                # Signal System: 发射 llm.call.end 标记截断
+                                _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
+                                _bus.emit(Signal(name="llm.call.end", payload={
+                                    **_sig_payload, "elapsed_ms": _elapsed,
+                                    "preempt_truncated": True,
+                                }, span_id=_span_id))
+                                # 返回 None 通知 ai_step 跳过本次响应处理，
+                                # 直接 continue 到主循环顶部重新推理
+                                return None
                         else:
                             ls.preempt_after_step = True
             await text_buf.flush()

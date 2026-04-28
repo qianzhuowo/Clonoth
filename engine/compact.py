@@ -217,7 +217,7 @@ def apply_compact_summary(
     messages: list[dict[str, Any]],
     summary: str,
     *,
-    keep_recent: int = 6,
+    keep_recent: int = 2,
 ) -> list[dict[str, Any]]:
     """Apply a pre-generated summary to compress messages.
 
@@ -246,19 +246,54 @@ def apply_compact_summary(
         else:
             conversation.append(msg)
 
-    if len(conversation) <= keep_recent:
+    # --- 按 task 边界划分 segments ---
+    # 每个 segment 是一个 task 的所有连续消息，无 task_id 的连续消息归为匿名 segment
+    segments: list[list[dict[str, Any]]] = []
+    _cur_seg: list[dict[str, Any]] = []
+    _cur_tid: str = ""
+    for msg in conversation:
+        _meta = msg.get("_meta") or {}
+        _tid = _meta.get("source_task_id", "") if isinstance(_meta, dict) else ""
+        if _tid != _cur_tid and _cur_seg:
+            segments.append(_cur_seg)
+            _cur_seg = []
+        _cur_tid = _tid
+        _cur_seg.append(msg)
+    if _cur_seg:
+        segments.append(_cur_seg)
+
+    # keep_recent 现在是「保留最近 N 个完整 task segment」
+    keep_recent = max(keep_recent, 1)  # 至少保留当前活跃 task
+    if len(segments) <= keep_recent:
         return messages
 
-    to_keep = conversation[-keep_recent:] if keep_recent > 0 else []
+    kept_segments = segments[-keep_recent:]
+    compressed_segments = segments[:-keep_recent]
+    to_keep: list[dict[str, Any]] = []
+    for seg in kept_segments:
+        to_keep.extend(seg)
 
     # P6.5 Metadata Preservation: 收集被压缩掉的消息所属的 source_task_id，
     # 存入摘要消息的 _meta 中，防止 L2 snip 因 ID 丢失而重复触发 L3 LLM 压缩。
-    _compressed = conversation[:-keep_recent] if keep_recent > 0 else conversation
+    # [2026-04-26] 累积继承：当旧的 compact_summary 被再次压缩时，
+    # 继承其 compressed_task_ids，避免更早被压缩的任务 ID 丢失。
+    _compressed: list[dict[str, Any]] = []
+    for seg in compressed_segments:
+        _compressed.extend(seg)
     _compressed_tids = set()
     for _m in _compressed:
-        _tid = _m.get("_meta", {}).get("source_task_id")
+        _meta = _m.get("_meta", {})
+        if not isinstance(_meta, dict):
+            _meta = {}
+        _tid = _meta.get("source_task_id")
         if _tid:
             _compressed_tids.add(str(_tid))
+        # 继承旧摘要中已记录的 compressed_task_ids
+        _old_ctids = _meta.get("compressed_task_ids")
+        if isinstance(_old_ctids, list):
+            for _ctid in _old_ctids:
+                if _ctid:
+                    _compressed_tids.add(str(_ctid))
 
     summary_msg: dict[str, Any] = {
         "role": "user",
@@ -291,9 +326,22 @@ def apply_compact_summary(
 def _format_messages_for_summary(
     messages: list[dict[str, Any]],
 ) -> str:
-    """Format messages into plain text for the summary LLM."""
+    """Format messages into plain text for the summary LLM.
+
+    Inserts ``=== TASK [task_id] ===`` markers when source_task_id changes,
+    so the compactor LLM can see task boundaries.
+    """
     parts: list[str] = []
+    _prev_tid: str = ""
     for m in messages:
+        # Task boundary detection
+        _meta = m.get("_meta") or {}
+        _tid = _meta.get("source_task_id", "") if isinstance(_meta, dict) else ""
+        if _tid and _tid != _prev_tid:
+            parts.append(f"=== TASK [{_tid}] ===")
+            _prev_tid = _tid
+        elif not _tid and _prev_tid:
+            _prev_tid = ""
         role = str(m.get("role", "unknown"))
         content = m.get("content", "")
         if isinstance(content, str):

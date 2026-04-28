@@ -12,6 +12,33 @@ from ..prompt import assemble_prompt
 from clonoth_runtime import get_int
 
 
+def _conversational_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Filter history to only real conversation messages for keyword scanning.
+
+    Excludes:
+      - tool_result messages (tool execution output)
+      - _dynamic injections (previously injected dynamic context)
+      - messages with no text content (pure tool_call assistants)
+    Keeps everything else: user_input, summary, assistant with text,
+    and legacy messages without message_type.
+    """
+    result: list[dict[str, Any]] = []
+    for m in history:
+        # Skip old dynamic context injections
+        if m.get("_dynamic"):
+            continue
+        # Skip tool execution results
+        if m.get("message_type") == "tool_result":
+            continue
+        # Only include messages with actual text content
+        role = m.get("role", "")
+        if role in ("user", "assistant"):
+            content = m.get("content", "")
+            if isinstance(content, str) and content.strip():
+                result.append(m)
+    return result
+
+
 def assemble_initial_messages(
     *,
     workspace_root: Path,
@@ -43,11 +70,12 @@ def assemble_initial_messages(
     ))
     system_prompt = assemble_prompt(workspace_root, node, variables=prompt_vars)
     skill_budget = get_int(runtime_cfg, "skills.max_budget_chars", 0, min_value=0)
+    _scan_history = _conversational_history(history)
     skill_static, skill_dynamic = build_skill_messages(
         workspace_root,
         node_id=node.id,
         instruction_text=instruction,
-        history=history,
+        history=_scan_history,
         skill_mode=node.skill_access.mode,
         skill_allow=node.skill_access.allow,
         max_budget_chars=skill_budget,
@@ -59,7 +87,7 @@ def assemble_initial_messages(
             workspace_root,
             node_id=node.id,
             instruction_text=instruction,
-            history=history,
+            history=_scan_history,
             max_budget_chars=get_int(
                 runtime_cfg, "memory.max_budget_chars", 0, min_value=0,
             ),

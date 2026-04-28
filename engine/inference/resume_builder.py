@@ -85,11 +85,9 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
     # v2: compact_done (compactor 子 task 完成后恢复)
     if rtype == "compact_done":
         success = resume_data.get("success", True)
-        if success:
-            before = resume_data.get("before", 0)
-            after = resume_data.get("after", 0)
-            return [{"role": "user", "content": f"[上下文已压缩：{before} → {after} 条消息]"}]
-        return []  # 压缩失败，静默跳过
+        # 压缩只动上方旧消息，当前 task 消息链完整保留，LLM 无需感知。
+        # 注入假 user 消息反而会破坏工具调用的角色链。
+        return []
 
     # v1: tool_results
     if rtype == "tool_results":

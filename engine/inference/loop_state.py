@@ -118,6 +118,9 @@ class _LoopState:
     # ---- 工具格式 ----
     formatter: ToolFormatter | None = None
 
+    # ---- 已授权的真工具名集合（由 _filter_tool_specs 输出决定）----
+    allowed_real_tools: set = field(default_factory=set)
+
     # ---- Phase 3 (Session Conversation Store): 最近一次 shadow write 的 Message.id ----
     # 由 _shadow_write() 更新，_persist_ctx() 写入 snapshot 的 last_message_id 字段，
     # 为后续 snapshot 瘦身（不再存完整 messages 数组）做准备。

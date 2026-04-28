@@ -504,6 +504,88 @@ class TaskRouterMixin:
             inbound_seq=seq, session_id=task.session_id, payload=payload,
         )
 
+    def inject_async_result(self, session_id: str, text: str, attachments: list | None = None) -> dict[str, Any]:
+        """注入异步工具结果到 session，复用三级回退逻辑。
+
+        1. preempt running 入口 task
+        2. 标记 suspended 入口 task
+        3. 创建 inbound → 新 task
+        """
+        with self._lock:
+            session_info = self.sessions.get(session_id)
+            if not session_info:
+                return {"ok": False, "error": "session not found"}
+
+            result_atts = list(attachments or [])
+
+            # ---- 优先路径：preempt running 的入口 task ----
+            running_entry = self._find_running_entry_task_locked(session_id)
+            if running_entry is not None and not running_entry.preempt_requested:
+                running_entry.preempt_requested = True
+                running_entry.preempt_message = text
+                running_entry.preempt_attachments = result_atts
+                self.eventlog.append(
+                    session_id=session_id,
+                    component="supervisor",
+                    type_="preempt_requested",
+                    payload={
+                        "task_id": running_entry.task_id,
+                        "session_id": session_id,
+                        "has_message": True,
+                        "reason": "async_tool_result",
+                    },
+                    transient=True,
+                )
+                return {"ok": True, "strategy": "preempt_running", "task_id": running_entry.task_id}
+
+            # ---- 次优路径：标记 suspended 的入口 task ----
+            suspended_entry = self._find_suspended_entry_task_locked(session_id)
+            if suspended_entry is not None and not suspended_entry.preempt_requested:
+                suspended_entry.preempt_requested = True
+                suspended_entry.preempt_message = text
+                suspended_entry.preempt_attachments = result_atts
+                self.eventlog.append(
+                    session_id=session_id,
+                    component="supervisor",
+                    type_="preempt_requested",
+                    payload={
+                        "task_id": suspended_entry.task_id,
+                        "session_id": session_id,
+                        "has_message": True,
+                        "reason": "async_tool_result_deferred",
+                    },
+                    transient=True,
+                )
+                return {"ok": True, "strategy": "preempt_suspended", "task_id": suspended_entry.task_id}
+
+            # ---- 回退路径：创建 inbound → 新 task ----
+            conv_key = session_info.conversation_key
+            channel = session_info.channel
+            msg_id = f"async_tool_result:{session_id}"
+
+            payload: dict[str, Any] = {
+                "channel": channel,
+                "conversation_key": conv_key,
+                "message_id": msg_id,
+                "text": text,
+            }
+            if result_atts:
+                payload["attachments"] = [{"path": p} for p in result_atts]
+
+            evt = self.eventlog.append(
+                session_id=session_id,
+                component="supervisor",
+                type_="inbound_message",
+                payload=payload,
+            )
+            seq = int(evt.get("seq", 0))
+            self._apply_inbound_message(seq=seq, session_id=session_id, payload=payload)
+            self._advance_inbound_cursor()
+            self._create_entry_task_for_inbound_locked(
+                inbound_seq=seq, session_id=session_id, payload=payload,
+            )
+            return {"ok": True, "strategy": "inbound"}
+
     def _find_entry_task_by_status_locked(self, session_id: str, statuses: set) -> Task | None:
         """在 session 中查找指定状态的入口 task。
 
@@ -675,8 +757,20 @@ class TaskRouterMixin:
         # P6.5 Metadata Preservation: 收集被压缩掉的消息所属的 source_task_id，
         # 存入 summary 消息的 meta 中。L2 snip_history 据此判断哪些 task 已被
         # LLM 压缩过，避免因 ID 丢失而反复 fall through 到 LLM compact。
+        # [2026-04-26] 累积继承：旧 compact_summary 被再次压缩时，
+        # 继承其 meta.compressed_task_ids，防止历史 ID 丢失。
         to_remove = msgs[:-keep_recent] if keep_recent > 0 else list(msgs)
-        compressed_task_ids = list({m.source_task_id for m in to_remove if m.source_task_id})
+        _ctid_set: set[str] = set()
+        for _rm in to_remove:
+            if _rm.source_task_id:
+                _ctid_set.add(_rm.source_task_id)
+            _rm_meta = _rm.meta if isinstance(_rm.meta, dict) else {}
+            _old_ctids = _rm_meta.get("compressed_task_ids")
+            if isinstance(_old_ctids, list):
+                for _ctid in _old_ctids:
+                    if _ctid:
+                        _ctid_set.add(str(_ctid))
+        compressed_task_ids = list(_ctid_set)
 
         summary_msg = Message(
             id=str(uuid4()),
@@ -907,47 +1001,24 @@ class TaskRouterMixin:
         if not transcript.strip():
             return
 
-        # P4b 预注入：扫描已有记忆清单，注入 instruction 防重复
-        _existing_memories = ""
-        try:
-            import yaml as _yaml
-            _mem_dir = Path(self.workspace_root) / "data" / "memory"
-            if _mem_dir.exists():
-                _mem_lines: list[str] = []
-                for _yf in sorted(_mem_dir.glob("*.yaml")):
-                    try:
-                        with open(_yf, "r", encoding="utf-8") as _f:
-                            _book_data = _yaml.safe_load(_f) or {}
-                        _bname = str(_book_data.get("book") or _yf.stem)
-                        for _e in (_book_data.get("entries") or []):
-                            if isinstance(_e, dict):
-                                _eid = str(_e.get("id") or "")
-                                _ec = str(_e.get("content") or "")[:80]
-                                if _eid:
-                                    _mem_lines.append(f"  - [{_bname}] {_eid}: {_ec}")
-                    except Exception:
-                        continue
-                if _mem_lines:
-                    _existing_memories = "\n\n[已有记忆清单 — 避免重复创建]\n" + "\n".join(_mem_lines) + "\n"
-        except Exception:
-            pass
+        # [2026-04-26] 删除 P4b 预注入逻辑：700+ 条记忆清单会污染主 session 历史并撑爆上下文。
+        # extractor 节点的 system prompt 已包含防重复指令，无需额外注入。
 
         # 更新游标
         self._memory_extract_msg_counts[task.session_id] = current_count
 
-        # 创建后置任务
-        _full_instruction = transcript
-        if _existing_memories:
-            _full_instruction = _existing_memories + "\n---\n\n" + transcript
-
+        from uuid import uuid4
         extractor_node = get_str(runtime_cfg, "memory.auto_extract.node_id", "system.memory_extractor").strip()
+        # [2026-04-26] 增加 child_session_id 隔离，防止系统任务的 instruction 写入主 session JSONL
+        _child_sid = f"child_{uuid4().hex[:12]}"
         self._create_task_locked(
             session_id=task.session_id,
             session_generation=task.session_generation,
             kind=TaskKind.node,
             node_id=extractor_node,
             input_data={
-                "instruction": _full_instruction,
+                "instruction": transcript,
+                "child_session_id": _child_sid,
                 "_system_task": True,
             },
             continuation={},

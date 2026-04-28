@@ -716,7 +716,11 @@ class EventRouter:
             )
             # 判断是否 DM 场景（影响适配器的清理策略）
             result = self._state.resolve_trigger(src_seq, event.session_id)
-            is_dm = result[1].is_dm if result else False
+            if result:
+                is_dm = result[1].is_dm
+            else:
+                # system 任务或孤儿任务无关联 trigger，回退到 session_dm_channels 判断
+                is_dm = self._state.get_dm_channel(event.session_id) is not None
             try:
                 await self._cb.finalize_child_progress(
                     task_key, child_state, status, is_dm=is_dm,

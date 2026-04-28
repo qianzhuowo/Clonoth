@@ -7,7 +7,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import subprocess
 import threading
 import time
 import uuid
@@ -124,6 +126,7 @@ class SchedulerThread:
         self._last_dream_fired: str = ""       # 防同分钟重复
         self._dream_last_session_count: int = 0  # 上次 dream 时的 session 数
         self._thread: threading.Thread | None = None
+        self._running_scripts: set[str] = set()  # 防重入
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
@@ -167,48 +170,115 @@ class SchedulerThread:
             if not cron_match(cron_expr, now):
                 continue
 
-            # 匹配成功，注入 inbound
+            # 匹配成功
             self._last_fired[sid] = now_key
             once = bool(s.get("once", False))
+            stype = str(s.get("type") or "message").strip()
 
-            text = str(s.get("text") or f"[scheduled:{sid}]").strip()
-            conv_key = str(s.get("conversation_key") or f"scheduler:{sid}").strip()
-            msg_id = f"scheduler:{sid}:{uuid.uuid4()}"
-            entry_node_id = str(s.get("entry_node_id") or "").strip()
-
-            # 从 conversation_key 提取 channel（如 "discord:123" -> "discord"）
-            if ":" in conv_key:
-                channel = conv_key.split(":", 1)[0]
+            if stype == "script":
+                self._fire_script(s, sid)
             else:
-                channel = "scheduler"
-
-            try:
-                session_id = self._state.get_or_create_session(
-                    channel=channel, conversation_key=conv_key,
-                )
-                evt = self._state.eventlog.append(
-                    session_id=session_id,
-                    component="scheduler",
-                    type_="inbound_message",
-                    payload={
-                        "channel": channel,
-                        "conversation_key": conv_key,
-                        "message_id": msg_id,
-                        "text": text,
-                        "schedule_id": sid,
-                        "entry_node_id": entry_node_id,
-                    },
-                )
-                self._state.record_inbound_message_event(evt)
-                log.info(f"[scheduler] fired: {sid} -> session={session_id}")
-            except Exception as e:
-                log.warning(f"[scheduler] inject failed for {sid}: {e}")
+                self._fire_message(s, sid)
 
             if once:
                 self._remove_schedule(sid)
 
         # 系统级定时任务：记忆整理（dream）
         self._tick_dream(now, now_key)
+
+    def _inject_inbound(self, sid: str, text: str, conv_key: str, entry_node_id: str = "", attachments: list | None = None) -> None:
+        """共用的 inbound 注入逻辑。"""
+        msg_id = f"scheduler:{sid}:{uuid.uuid4()}"
+        if ":" in conv_key:
+            channel = conv_key.split(":", 1)[0]
+        else:
+            channel = "scheduler"
+        try:
+            session_id = self._state.get_or_create_session(
+                channel=channel, conversation_key=conv_key,
+            )
+            payload: dict[str, Any] = {
+                "channel": channel,
+                "conversation_key": conv_key,
+                "message_id": msg_id,
+                "text": text,
+                "schedule_id": sid,
+                "entry_node_id": entry_node_id,
+            }
+            if attachments:
+                payload["attachments"] = attachments
+            evt = self._state.eventlog.append(
+                session_id=session_id,
+                component="scheduler",
+                type_="inbound_message",
+                payload=payload,
+            )
+            self._state.record_inbound_message_event(evt)
+            log.info(f"[scheduler] fired: {sid} -> session={session_id}")
+        except Exception as e:
+            log.warning(f"[scheduler] inject failed for {sid}: {e}")
+
+    def _fire_message(self, s: dict, sid: str) -> None:
+        """type=message：直接注入文本（原有逻辑）。"""
+        text = str(s.get("text") or f"[scheduled:{sid}]").strip()
+        conv_key = str(s.get("conversation_key") or f"scheduler:{sid}").strip()
+        entry_node_id = str(s.get("entry_node_id") or "").strip()
+        self._inject_inbound(sid, text, conv_key, entry_node_id)
+
+    def _fire_script(self, s: dict, sid: str) -> None:
+        """type=script：执行脚本，stdout JSON 解析后注入 inbound。"""
+        command = str(s.get("command") or "").strip()
+        if not command:
+            log.error(f"[scheduler] script {sid}: missing 'command' field")
+            return
+        if sid in self._running_scripts:
+            log.warning(f"[scheduler] script {sid}: still running, skipping")
+            return
+        self._running_scripts.add(sid)
+        try:
+            timeout = int(s.get("timeout") or 30)
+            silent = bool(s.get("silent", True))
+            text_prefix = str(s.get("text") or "").strip()
+            conv_key = str(s.get("conversation_key") or f"scheduler:{sid}").strip()
+            entry_node_id = str(s.get("entry_node_id") or "").strip()
+            result = subprocess.run(
+                command, shell=True, capture_output=True, text=True,
+                timeout=timeout, cwd=str(self._workspace_root),
+            )
+            if result.stderr and result.stderr.strip():
+                log.warning(f"[scheduler] script {sid} stderr: {result.stderr.strip()[:500]}")
+            if result.returncode != 0:
+                log.error(f"[scheduler] script {sid} exited with rc={result.returncode}")
+                return
+            stdout = (result.stdout or "").strip()
+            if not stdout:
+                if silent:
+                    log.debug(f"[scheduler] script {sid}: empty stdout, silent skip")
+                else:
+                    log.info(f"[scheduler] script {sid}: empty stdout, injecting prefix")
+                    if text_prefix:
+                        self._inject_inbound(sid, text_prefix, conv_key, entry_node_id)
+                return
+            # 解析 JSON
+            try:
+                data = json.loads(stdout)
+            except json.JSONDecodeError as e:
+                log.error(f"[scheduler] script {sid}: invalid JSON output: {e}")
+                return
+            body_text = str(data.get("text") or "").strip()
+            if not body_text:
+                log.error(f"[scheduler] script {sid}: JSON missing 'text' field")
+                return
+            if text_prefix:
+                body_text = text_prefix + "\n" + body_text
+            attachments = data.get("attachments") or None
+            self._inject_inbound(sid, body_text, conv_key, entry_node_id, attachments)
+        except subprocess.TimeoutExpired:
+            log.error(f"[scheduler] script {sid}: timed out after {s.get('timeout', 30)}s")
+        except Exception as e:
+            log.error(f"[scheduler] script {sid}: unexpected error: {e}")
+        finally:
+            self._running_scripts.discard(sid)
 
     def _remove_schedule(self, sid: str) -> None:
         try:

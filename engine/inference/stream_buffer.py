@@ -27,6 +27,11 @@ class _StreamBuffer:
         if now - self._last_flush >= 0.15 or buf_len >= 60:
             await self.flush()
 
+    @property
+    def is_empty(self) -> bool:
+        """缓冲区是否为空（无待 flush 内容）。"""
+        return not self._buf
+
     async def flush(self) -> None:
         if not self._buf:
             return

@@ -594,6 +594,7 @@ class ToolRegistry:
                 "name": name,
                 "description": description,
                 "input_schema": input_schema,
+                "async_mode": bool(spec.get("async_mode", False)),
             }
             self._tool_funcs[name] = _make_script_tool(
                 script_path=py.resolve(), timeout_sec=timeout_sec,

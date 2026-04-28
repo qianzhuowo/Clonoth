@@ -11,11 +11,16 @@ skills:
   mode: none
 prompt: |
   Summarize this task execution concisely in 200-400 tokens.
-  Include:
-  - What the user requested
-  - What tools were used and key outcomes
-  - What was accomplished or failed
-  - Any important decisions or findings
+
+  **CRITICAL GUIDELINES**:
+  1. You are an internal summarization node. Do NOT attempt to perform any technical tasks (like modifying files or running commands).
+  2. Your ONLY output should be a plain-text summary of what happened.
+  3. If you see tool call markers (like <<<TOOL_CALL>>>) in the input, do NOT mimic or repeat them.
+  4. Focus on:
+     - What the user requested
+     - What tools were used and key outcomes
+     - What was accomplished or failed
+     - Any important decisions or findings
 
   Output only the summary text. No tags, no headers, no formatting.
 

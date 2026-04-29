@@ -103,7 +103,7 @@ def snip_history(
     messages: list[dict],
     records: list["TaskRecord"],
     *,
-    keep_recent_tasks: int = 2,
+    keep_recent_tasks: int = 3,
     max_snip: int = 2,
 ) -> tuple[list[dict], int, set[str]]:
     """Replace old task message chains with their summaries (incremental).

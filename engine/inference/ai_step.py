@@ -1053,12 +1053,54 @@ async def run_ai_node(
 
         await _inject_preempt_message(ls, step)
 
-        # P1 Microcompact: 距上次 assistant 回复 ≥60min 时清除旧 tool_result
+        # P1 Microcompact + Proactive Snip: 闲置时主动减压
         if step == step_count:  # 只在本轮第一步检查（避免循环内重复）
             from engine.compact import microcompact_messages
             _, _mc_cleared = microcompact_messages(ls.messages)
             if _mc_cleared:
-                logger.info("microcompact cleared %d tool_results", _mc_cleared)
+                logger.info("microcompact: cleared %d tool_results", _mc_cleared)
+
+            # Proactive Snip: 按闲置时长渐进式替换旧 task 为摘要
+            # 每超过 1 小时替换 2 个，保留最近 3 个 task + 活跃 task
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                from engine.task_record import snip_history, snip_store, load_task_records
+                _last_ts = None
+                for _m in reversed(ls.messages):
+                    _mm = _m.get("_meta", {})
+                    if isinstance(_mm, dict) and (_mm.get("message_type") == "assistant" or _m.get("role") == "assistant"):
+                        _ts_str = _mm.get("timestamp", "")
+                        if _ts_str:
+                            try:
+                                _last_ts = _dt.fromisoformat(_ts_str)
+                                if _last_ts.tzinfo is None:
+                                    _last_ts = _last_ts.replace(tzinfo=_tz.utc)
+                            except Exception:
+                                pass
+                        break
+                if _last_ts is not None:
+                    _gap_hours = (_dt.now(_tz.utc) - _last_ts).total_seconds() / 3600.0
+                    if _gap_hours >= 1.0:
+                        _proactive_max = max(int(_gap_hours) * 2, 2)  # 2 per hour, no cap — keep_recent_tasks=3 is the floor
+                        _snip_sid = ls.rctx.child_session_id or ls.rctx.session_id
+                        _snip_records = load_task_records(ls.rctx.workspace_root, _snip_sid)
+                        if _snip_records:
+                            _snipped, _snip_count, _snipped_ids = snip_history(
+                                ls.messages, _snip_records,
+                                keep_recent_tasks=3, max_snip=_proactive_max,
+                            )
+                            if _snip_count > 0:
+                                ls.messages = _snipped
+                                _store = getattr(ls.rctx, 'conversation_store', None)
+                                if _store:
+                                    try:
+                                        _persisted = snip_store(_store.load(_snip_sid), _snip_records, _snipped_ids)
+                                        _store.replace_all(_snip_sid, _persisted)
+                                    except Exception as _pe:
+                                        logger.warning("proactive snip persist failed: %s", _pe)
+                                logger.info("proactive snip: replaced %d tasks (gap=%.1fh, max=%d)", _snip_count, _gap_hours, _proactive_max)
+            except Exception as _ps_err:
+                logger.warning("proactive snip failed: %s", _ps_err)
 
         action = await _check_and_compact(ls, step)
         if action is not None:

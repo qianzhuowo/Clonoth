@@ -867,6 +867,9 @@ class TaskRouterMixin:
         # 不对系统内部任务触发
         if task.input.get("_system_task"):
             return
+        # 子节点任务（有 caller_task_id）用完即丢，不需要轮摘要
+        if task.caller_task_id:
+            return
 
         runtime_cfg = load_runtime_config(self.workspace_root)
         if not get_bool(runtime_cfg, "engine.turn_summary.enabled", True):

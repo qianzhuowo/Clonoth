@@ -27,11 +27,20 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     if len(parts) != 5:
         return {"ok": False, "error": "cron must be 5 fields: minute hour day month weekday"}
 
+    stype = str(args.get("type") or "message").strip()
+    if stype not in ("message", "script"):
+        return {"ok": False, "error": f"invalid type: {stype}, must be 'message' or 'script'"}
+
     text = str(args.get("text") or "").strip()
-    if not text:
-        return {"ok": False, "error": "empty text"}
+    if stype == "message" and not text:
+        return {"ok": False, "error": "empty text (required for message type)"}
+
+    command = str(args.get("command") or "").strip()
+    if stype == "script" and not command:
+        return {"ok": False, "error": "empty command (required for script type)"}
 
     conv_key = str(args.get("conversation_key") or f"scheduler:{sid}").strip()
+    entry_node_id = str(args.get("entry_node_id") or "").strip()
     workflow_id = str(args.get("workflow_id") or "").strip()
     enabled = bool(args.get("enabled", True))
     once = bool(args.get("once", False))
@@ -41,15 +50,27 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         return err
 
     schedules = load_schedules(ctx.workspace_root)
-    entry = {
+    entry: dict[str, Any] = {
         "id": sid,
         "cron": cron_expr,
-        "text": text,
         "conversation_key": conv_key,
-        "workflow_id": workflow_id,
         "enabled": enabled,
         "once": once,
     }
+    if stype == "script":
+        entry["type"] = "script"
+        entry["command"] = command
+        timeout = int(args.get("timeout") or 30)
+        entry["timeout"] = max(5, min(timeout, 300))
+        entry["silent"] = bool(args.get("silent", True))
+        if text:
+            entry["text"] = text
+    else:
+        entry["text"] = text
+    if entry_node_id:
+        entry["entry_node_id"] = entry_node_id
+    if workflow_id:
+        entry["workflow_id"] = workflow_id
 
     replaced = False
     for i, s in enumerate(schedules):

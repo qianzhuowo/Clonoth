@@ -440,20 +440,26 @@ class ToolRegistry:
             (
                 "create_schedule",
                 "Create or update a scheduled task in data/schedules.yaml. "
-                "The task fires as an inbound message at the specified cron time (UTC). "
+                "Supports type='message' (default, injects text as inbound) and type='script' "
+                "(runs a shell command, parses stdout JSON for inbound injection). "
                 "Requires approval.",
                 {
                     "type": "object",
                     "properties": {
                         "id": {"type": "string", "description": "unique schedule id"},
                         "cron": {"type": "string", "description": "5-field cron: minute hour day month weekday (UTC)"},
-                        "text": {"type": "string", "description": "message text injected as inbound"},
+                        "text": {"type": "string", "description": "message text injected as inbound (for message type); prefix text (for script type)"},
+                        "type": {"type": "string", "enum": ["message", "script"], "description": "schedule type: message (default) or script"},
+                        "command": {"type": "string", "description": "shell command to run (required for script type)"},
+                        "timeout": {"type": "integer", "description": "script timeout in seconds (default 30, script type only)"},
+                        "silent": {"type": "boolean", "description": "if true, skip inbound when script stdout is empty (default true, script type only)"},
                         "conversation_key": {"type": "string", "description": "conversation key (default: scheduler:{id})"},
+                        "entry_node_id": {"type": "string", "description": "optional entry node override for the injected inbound"},
                         "workflow_id": {"type": "string", "description": "optional workflow override"},
                         "enabled": {"type": "boolean"},
                         "once": {"type": "boolean", "description": "if true, auto-delete after first trigger"},
                     },
-                    "required": ["id", "cron", "text"],
+                    "required": ["id", "cron"],
                 },
                 _builtins.create_schedule,
             ),

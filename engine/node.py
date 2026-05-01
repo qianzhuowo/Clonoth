@@ -39,10 +39,14 @@ class Node:
     tool_access: ToolAccess = field(default_factory=ToolAccess)
     skill_access: SkillAccess = field(default_factory=SkillAccess)
     memory_access: MemoryAccess = field(default_factory=MemoryAccess)
-    tool_mode: str = "native"  # "native" | "json"
+    # [2026-05-01] 默认工具模式改为 fake-native。
+    # 原因：旧 native 实际是文本化 fake-native；未显式配置的节点应继续旧行为。
+    tool_mode: str = "fake-native"  # "fake-native" | "native" | "json"
     # hybrid output_mode: 纯文本输出不再 reject 重试，直接作为隐式 finish 投递给用户。
     # tool_only = 现有行为（强制 finish）；hybrid = 允许纯文本直接投递。
     output_mode: str = "tool_only"  # "tool_only" | "hybrid"
+    provider: str = ""  # "" | "openai" | "anthropic" | "gemini" | "openai-responses"
+    provider_options: dict = field(default_factory=dict)  # 透传给 provider 的参数（thinking/reasoning 等）
     delegate_targets: list[str] = field(default_factory=list)
 
 
@@ -126,14 +130,16 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
     else:
         ma = MemoryAccess()
 
-    # tool_mode — 节点 yaml 优先，否则用 runtime.yaml engine.tool_mode 全局默认
+    # tool_mode — 节点 yaml 优先，否则用 runtime.yaml engine.tool_mode 全局默认。
+    # [2026-05-01] 支持 fake-native / native / json 三种值，并兼容旧写法 fake_native。
+    # 空值或非法值回退到 fake-native，目的：不把旧节点静默切到新的真 native。
     _node_tm = data.get("tool_mode")
     if _node_tm is not None:
-        raw_tool_mode = str(_node_tm).strip().lower()
+        raw_tool_mode = str(_node_tm).strip().lower().replace("_", "-")
     else:
         _rt = load_runtime_config(workspace_root)
-        raw_tool_mode = str((_rt.get("engine") or {}).get("tool_mode") or "native").strip().lower()
-    tool_mode = raw_tool_mode if raw_tool_mode in {"native", "json"} else "native"
+        raw_tool_mode = str((_rt.get("engine") or {}).get("tool_mode") or "fake-native").strip().lower().replace("_", "-")
+    tool_mode = raw_tool_mode if raw_tool_mode in {"fake-native", "native", "json"} else "fake-native"
 
     # output_mode — 节点 yaml 优先，否则用 runtime.yaml engine.output_mode 全局默认
     # hybrid 模式下纯文本输出直接投递给用户，不 reject 不重试（RFC: rfc_hybrid_output_mode.md）
@@ -144,6 +150,14 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         _rt_om = load_runtime_config(workspace_root)
         raw_output_mode = str((_rt_om.get("engine") or {}).get("output_mode") or "tool_only").strip().lower()
     output_mode = raw_output_mode if raw_output_mode in {"tool_only", "hybrid"} else "tool_only"
+
+    # provider — 节点 yaml 可指定 provider 类型
+    raw_provider = str(data.get("provider") or "").strip().lower()
+    provider = raw_provider if raw_provider in {"", "openai", "anthropic", "gemini", "openai-responses"} else ""
+
+    # provider_options — 透传给 provider 的参数（如 Anthropic thinking、OpenAI reasoning 等）
+    raw_po = data.get("provider_options")
+    provider_options = dict(raw_po) if isinstance(raw_po, dict) else {}
 
     # delegate_targets
     dt_raw = data.get("delegate_targets")
@@ -165,5 +179,7 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         memory_access=ma,
         tool_mode=tool_mode,
         output_mode=output_mode,
+        provider=provider,
+        provider_options=provider_options,
         delegate_targets=delegate_targets,
     )

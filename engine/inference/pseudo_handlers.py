@@ -76,7 +76,12 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 arguments=dict(args),
             )
             tool_msg = ls.formatter.format_tool_result(_parsed, "ok")
-            set_message_meta(tool_msg, MessageMeta(message_type="tool_result"))
+            # [2026-05-01] 工具结果记录当前 tool_mode。
+            # 目的：真 native 的 role=tool 结果在下一轮继续由 NativeToolFormatter 透传。
+            set_message_meta(tool_msg, MessageMeta(
+                tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+                message_type="tool_result",
+            ))
             ls.messages.append(tool_msg)
             _shadow_write(ls, tool_msg, MessageType.TOOL_RESULT)
         return None
@@ -112,7 +117,11 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             arguments=dict(args),
         )
         _finish_result_msg = ls.formatter.format_tool_result(_finish_parsed, FINISH_TOOL_RESULT_CONTENT)
-        set_message_meta(_finish_result_msg, MessageMeta(message_type="tool_result"))
+        # [2026-05-01] finish 结果同样记录当前 tool_mode，保持 native 工具配对可恢复。
+        set_message_meta(_finish_result_msg, MessageMeta(
+            tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+            message_type="tool_result",
+        ))
         ls.messages.append(_finish_result_msg)
         _shadow_write(ls, _finish_result_msg, MessageType.TOOL_RESULT)
 

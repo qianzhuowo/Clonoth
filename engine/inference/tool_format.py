@@ -2,8 +2,9 @@
 
 提供 ToolFormatter ABC，封装工具定义注入、响应解析、结果格式化三个环节。
 当前实现：
-  - NativeToolFormatter: 使用 OpenAI function calling（现有行为）
-  - JsonToolFormatter:   使用 JSON 文本块内嵌工具调用
+  - NativeToolFormatter:     真原生工具调用，保留 assistant.tool_calls 与 role=tool 结果
+  - FakeNativeToolFormatter: 旧的 fake-native 文本历史兼容模式
+  - JsonToolFormatter:       使用 JSON 文本块内嵌工具调用
 
 设计目标：
   让 ai_step 的推理循环不直接依赖 OpenAI tool calling 格式，
@@ -52,7 +53,9 @@ class ToolFormatter(ABC):
     6. message_to_llm: 将存储格式的消息转换为当前模式的 LLM API 格式（反序列化方向）
     """
 
-    # 子类应覆盖此属性，标识当前 formatter 的模式名（"native" / "json"）。
+    # [2026-05-01] formatter 拆分为 native / fake-native / json 三种模式。
+    # 目的：让真原生工具调用不再复用旧的 fake-native 文本历史转换。
+    # 子类应覆盖此属性，标识当前 formatter 的模式名（"native" / "fake-native" / "json"）。
     # build_llm_messages 根据此值判断消息是否需要跨模式转换。
     mode: str = ""
 
@@ -65,8 +68,8 @@ class ToolFormatter(ABC):
         """将工具定义注入到调用参数中。
 
         返回 (修改后的 system_prompt, API tools 参数或 None)。
-        native 模式: prompt 不变, 返回 tools 列表。
-        json 模式:   工具定义注入 prompt, 返回 None（不传 tools 参数）。
+        native/fake-native 模式: prompt 不变, 返回 tools 列表。
+        json 模式:              工具定义注入 prompt, 返回 None（不传 tools 参数）。
         """
         ...
 
@@ -74,8 +77,8 @@ class ToolFormatter(ABC):
     def parse_tool_calls(self, response: ProviderResponse) -> list[ParsedToolCall]:
         """从 LLM 响应中提取工具调用。
 
-        native 模式: 直接转换 response.tool_calls。
-        json 模式:   从 response.text 中解析特定标记块。
+        native/fake-native 模式: 直接转换 response.tool_calls。
+        json 模式:              从 response.text 中解析特定标记块。
         """
         ...
 
@@ -83,8 +86,8 @@ class ToolFormatter(ABC):
     def format_tool_result(self, call: ParsedToolCall, result_text: str) -> dict[str, Any]:
         """将工具执行结果格式化为消息 dict。
 
-        native 模式: 返回 {role: "user", content: ...}（当前行为）。
-        json 模式:   返回带特定标记的文本消息。
+        native 模式:      返回 role=tool + tool_call_id 的真原生工具结果。
+        fake-native/json: 返回 user 文本消息，维持旧格式兼容。
         """
         ...
 
@@ -139,16 +142,20 @@ class ToolFormatter(ABC):
 
 
 # ---------------------------------------------------------------------------
-#  Native 模式：OpenAI function calling（现有行为）
+#  Native 模式：真正原生 tool calling
 # ---------------------------------------------------------------------------
 
 class NativeToolFormatter(ToolFormatter):
-    """使用 OpenAI 原生 function calling 的工具格式。
+    """使用真正原生 tool calling 的工具格式。
 
-    这是当前系统的默认行为，不改变任何现有逻辑。
+    [2026-05-01] 新增真 native formatter，原因是旧 NativeToolFormatter
+    实际会把 assistant.tool_calls 压成 user 文本，不能满足原生工具调用
+    对 assistant.tool_calls 与 role=tool/tool_call_id 配对的要求。
+    这里保留 L1 存储中的结构化 tool_calls，并剥离内部字段后直接交给
+    provider 层处理，避免在 L2 再做 fake-native 文本转换。
     """
 
-    # 标识当前 formatter 模式，供 build_llm_messages 判断是否需要跨模式转换
+    # 标识当前 formatter 模式，供 build_llm_messages 判断是否需要跨模式转换。
     mode = "native"
 
     def inject_tool_definitions(
@@ -173,14 +180,99 @@ class NativeToolFormatter(ToolFormatter):
         ]
 
     def format_tool_result(self, call: ParsedToolCall, result_text: str) -> dict[str, Any]:
-        """Native 模式：与现有 ai_step 中的格式一致。"""
+        """Native 模式：生成 role=tool 的真原生工具结果消息。"""
+        return {
+            "role": "tool",
+            "tool_call_id": call.id,
+            "name": call.name,
+            "content": result_text,
+        }
+
+    def message_to_llm(self, message_dict: dict) -> dict:
+        """Native 模式 L2 读取转换。
+
+        [2026-05-01] 真 native 的目标是保留 assistant.tool_calls 与
+        role=tool/tool_call_id。剥离内部字段后，将存储格式的 tool_calls
+        转换回 chat/completions API 格式：
+        存储: {id, name, arguments(dict)}
+        API:  {id, type: "function", function: {name, arguments: "<json>"}}
+        """
+        clean = {k: v for k, v in message_dict.items() if not k.startswith('_')}
+        # 将简化存储格式的 tool_calls 转换回 API 原生格式
+        if 'tool_calls' in clean and isinstance(clean['tool_calls'], list):
+            api_calls = []
+            for tc in clean['tool_calls']:
+                if isinstance(tc, dict):
+                    args = tc.get('arguments', {})
+                    args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
+                    api_calls.append({
+                        'id': tc.get('id', ''),
+                        'type': 'function',
+                        'function': {
+                            'name': tc.get('name', ''),
+                            'arguments': args_str,
+                        },
+                    })
+            clean['tool_calls'] = api_calls
+        return clean
+
+    def build_retry_hint(self) -> str:
+        """Native 模式：提示使用 finish 工具，与 fake-native 保持一致。"""
+        return (
+            "[SYSTEM] Your response was rejected because you did not use the finish tool. "
+            "Plain text output is NOT accepted as a valid response. "
+            "You MUST call the finish tool to submit your response, or use reply for intermediate progress. "
+            "If you need more information, call finish with your question as text.\n\n"
+            "请使用 finish 工具提交你的最终回复。直接输出纯文本不会被系统接受。"
+        )
+
+
+# ---------------------------------------------------------------------------
+#  Fake Native 模式：旧的文本化原生工具调用兼容层
+# ---------------------------------------------------------------------------
+
+class FakeNativeToolFormatter(ToolFormatter):
+    """旧 NativeToolFormatter 的兼容实现。
+
+    [2026-05-01] 旧实现命名为 FakeNativeToolFormatter，原因是它并不
+    保留原生 role=assistant/tool_calls 与 role=tool，而是把工具调用历史
+    写成 [Tool call history record: ...] 文本并改为 role=user。
+    保留此类的目的，是让旧配置和旧消息历史可以继续按原行为工作。
+    """
+
+    # 标识当前 formatter 模式，供 build_llm_messages 判断是否需要跨模式转换。
+    mode = "fake-native"
+
+    def inject_tool_definitions(
+        self,
+        tools: list[dict[str, Any]],
+        system_prompt: str,
+    ) -> tuple[str, list[dict[str, Any]] | None]:
+        """Fake Native 模式：prompt 不变，原样返回 tools 列表。"""
+        return system_prompt, tools if tools else None
+
+    def parse_tool_calls(self, response: ProviderResponse) -> list[ParsedToolCall]:
+        """Native 模式：直接转换 ProviderResponse.tool_calls。"""
+        if not response.tool_calls:
+            return []
+        return [
+            ParsedToolCall(
+                id=tc.id,
+                name=tc.name,
+                arguments=dict(tc.arguments or {}),
+            )
+            for tc in response.tool_calls
+        ]
+
+    def format_tool_result(self, call: ParsedToolCall, result_text: str) -> dict[str, Any]:
+        """Fake Native 模式：维持旧的 user 文本工具结果格式。"""
         return {
             "role": "user",
             "content": f'Tool result for "{call.name}":\n{result_text}',
         }
 
     def message_to_llm(self, message_dict: dict) -> dict:
-        """Native（Fake Native）模式 L2 读取转换。
+        """Fake Native 模式 L2 读取转换。
 
         从同级 tool_calls 字段读取工具调用，拼接为 [Tool call history record] 文本。
         兼容旧消息：没有 tool_calls 字段时，回退到 _meta.raw_parts。
@@ -223,7 +315,7 @@ class NativeToolFormatter(ToolFormatter):
         return clean
 
     def build_retry_hint(self) -> str:
-        """Native 模式：提示使用 finish 工具。
+        """Fake Native 模式：提示使用 finish 工具。
         改动：加强提示措辞，中英双语明确拒绝纯文本，提高模型遵从率。
         """
         return (
@@ -496,7 +588,7 @@ class JsonToolFormatter(ToolFormatter):
         return super().build_assistant_message(response, plain, tool_calls)
 
     def format_tool_result(self, call: ParsedToolCall, result_text: str) -> dict[str, Any]:
-        """格式化工具结果为 user 消息。与 NativeToolFormatter 保持一致。"""
+        """格式化工具结果为 user 消息。与 FakeNativeToolFormatter 保持一致。"""
         return {
             "role": "user",
             "content": f'Tool result for "{call.name}":\n{result_text}',
@@ -566,18 +658,34 @@ class JsonToolFormatter(ToolFormatter):
 #  工厂函数
 # ---------------------------------------------------------------------------
 
-def create_tool_formatter(mode: str = "native") -> ToolFormatter:
+def _normalize_tool_mode(mode: str | None) -> str:
+    """归一化工具模式名称。
+
+    [2026-05-01] 新增 fake-native 后需要同时兼容历史写法 fake_native。
+    空值和未知值统一落到 fake-native，目的不是静默启用新 native，
+    而是保护未显式配置 tool_mode 的旧节点与旧历史。
+    """
+    raw = str(mode or "fake-native").strip().lower().replace("_", "-")
+    if raw in {"native", "fake-native", "json"}:
+        return raw
+    return "fake-native"
+
+
+def create_tool_formatter(mode: str = "fake-native") -> ToolFormatter:
     """根据 mode 创建对应的 ToolFormatter 实例。
 
     Args:
-        mode: "native" 或 "json"。默认 "native"。
+        mode: "native"、"fake-native" 或 "json"。默认 "fake-native"。
 
     Returns:
         ToolFormatter 实例。
     """
-    if mode == "json":
+    normalized = _normalize_tool_mode(mode)
+    if normalized == "json":
         return JsonToolFormatter()
-    return NativeToolFormatter()
+    if normalized == "native":
+        return NativeToolFormatter()
+    return FakeNativeToolFormatter()
 
 
 # ---------------------------------------------------------------------------
@@ -594,8 +702,9 @@ def build_llm_messages(
     每个 formatter 只处理自己模式的消息，内部零 if 补丁。
 
     路由规则：
-    - 没有 _meta 或 tool_mode 的老消息 → NativeToolFormatter（老消息都是 native 格式）
-    - tool_mode='native' → NativeToolFormatter
+    - 没有 _meta 或 tool_mode 的老消息 → FakeNativeToolFormatter（旧消息都是 fake-native 文本兼容格式）
+    - tool_mode='fake-native' → FakeNativeToolFormatter
+    - tool_mode='native' → NativeToolFormatter（真原生结构化工具调用）
     - tool_mode='json' → JsonToolFormatter
 
     跳过 _ephemeral 消息（retry hint 等），保留 _dynamic 消息（动态上下文）。
@@ -614,11 +723,13 @@ def build_llm_messages(
         if isinstance(meta, dict):
             msg_mode = meta.get('tool_mode', '')
 
-        # 【重构】老消息（无 _meta / 无 tool_mode）默认视为 native 格式，
-        # 确保它们始终由 NativeToolFormatter 透传，不会被错误地路由到
-        # JsonToolFormatter 做不属于它的跨模式 role 修补。
+        # [2026-05-01] 老消息（无 _meta / 无 tool_mode）默认视为 fake-native。
+        # 原因：历史上的 native 名称实际就是 fake-native；如果把无标记旧消息
+        # 当作新的真 native，会错误保留或发送旧文本化历史之外的结构。
         if not msg_mode:
-            msg_mode = 'native'
+            msg_mode = 'fake-native'
+        else:
+            msg_mode = _normalize_tool_mode(msg_mode)
 
         if msg_mode == current_formatter.mode:
             msg_formatter = current_formatter

@@ -37,6 +37,34 @@ def _is_retryable_error(resp) -> bool:
     return True
 
 
+def _build_messages_for_provider(
+    messages: list[dict[str, Any]],
+    formatter: Any,
+    provider: Any,
+) -> list[dict[str, Any]]:
+    """Build the message view that should be handed to the provider.
+
+    [2026-05-01] OpenAI Responses native tools need the L1 storage view: the
+    assistant message still has Clonoth's structured ``tool_calls`` field and
+    provider metadata.  FakeNativeToolFormatter would collapse that data into
+    user text, and true NativeToolFormatter would strip provider metadata.
+    Therefore the Responses provider bypasses L2 for both native and fake-native
+    modes, then performs its own final API conversion.  Other providers keep
+    the existing L2 formatter path.
+    """
+    provider_name = getattr(provider, "name", "") or ""
+    formatter_mode = getattr(formatter, "mode", "") if formatter else ""
+    # [2026-05-01] Responses conversion needs storage-level tool_calls and _meta.
+    # Bypass both true native and fake-native L2; fake-native would text-collapse,
+    # while true native would strip provider metadata needed for raw_output replay.
+    # Gemini also needs _meta for raw_parts (thoughtSignature + functionCall round-trip)
+    if provider_name in {"openai-responses", "gemini"} and formatter_mode in {"native", "fake-native"}:
+        # Keep storage-level tool_calls/_meta for the provider, but match
+        # build_llm_messages by dropping ephemeral retry/control messages.
+        return [dict(msg) for msg in messages if not msg.get("_ephemeral")]
+    return build_llm_messages(messages, formatter) if formatter else messages
+
+
 # ---------------------------------------------------------------------------
 #  LLM 调用（含重试）
 # ---------------------------------------------------------------------------
@@ -54,7 +82,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     # 再用 prepare_messages_for_llm 处理图片 file:// → base64 解析。
     # build_llm_messages 会跳过 _ephemeral 消息（retry hint 等），但保留 _dynamic（动态上下文）。
     # 注意：不能修改 ls.messages 本身，它是运行时状态。
-    _formatted = build_llm_messages(ls.messages, ls.formatter) if ls.formatter else ls.messages
+    _formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
     llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
 
     resp = None
@@ -292,7 +320,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     })
                     # 重建 llm_messages：microcompact 原地修改了 ls.messages，
                     # 需要重新走 build_llm_messages + prepare 流程
-                    _formatted = build_llm_messages(ls.messages, ls.formatter) if ls.formatter else ls.messages
+                    _formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
                     llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
                     resp = None
                     continue  # 重试

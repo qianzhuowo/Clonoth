@@ -32,7 +32,9 @@ class MessageMeta:
     """
     # ── 通用字段 ──
     provider: str = ""              # 生成该消息的 provider (claude/gemini/openai)
-    tool_mode: str = "native"       # native / json — 该消息使用的工具调用格式
+    # [2026-05-01] 默认工具模式改为 fake-native。
+    # 原因：历史上的 native 实际是文本化 fake-native；无标记旧消息必须按旧格式读取。
+    tool_mode: str = "fake-native"  # fake-native / native / json — 该消息使用的工具调用格式
     message_type: str = ""          # user_input / tool_result / assistant / system
     timestamp: str = ""             # ISO 格式生成时间
 
@@ -63,7 +65,9 @@ class MessageMeta:
         d: dict[str, Any] = {}
         if self.provider:
             d["provider"] = self.provider
-        if self.tool_mode and self.tool_mode != "native":
+        # [2026-05-01] 只省略 fake-native 默认值；真 native 必须显式写入，
+        # 目的：下一轮 build_llm_messages 能把真 native 历史路由到 NativeToolFormatter。
+        if self.tool_mode and self.tool_mode != "fake-native":
             d["tool_mode"] = self.tool_mode
         if self.message_type:
             d["message_type"] = self.message_type
@@ -111,7 +115,7 @@ class MessageMeta:
 
         return cls(
             provider=str(data.get("provider") or ""),
-            tool_mode=str(data.get("tool_mode") or "native"),
+            tool_mode=str(data.get("tool_mode") or "fake-native"),
             message_type=str(data.get("message_type") or ""),
             timestamp=str(data.get("timestamp") or ""),
             metadata=dict(metadata),
@@ -134,7 +138,8 @@ class SnapshotMeta:
     存储于 snapshot["meta"] 字段中，与现有 v1 格式兼容（v1 无此字段）。
     """
     provider: str = ""           # 当前使用的 provider
-    tool_mode: str = "native"    # 当前工具调用格式
+    # [2026-05-01] 快照默认也改为 fake-native，避免旧快照被解释为真 native。
+    tool_mode: str = "fake-native"  # 当前工具调用格式
     message_metas: dict[str, dict[str, Any]] = field(default_factory=dict)
     # key = 消息索引（字符串），value = MessageMeta.to_dict()
     # 只记录有实际元数据的消息，空 meta 不占位
@@ -144,7 +149,9 @@ class SnapshotMeta:
         d: dict[str, Any] = {}
         if self.provider:
             d["provider"] = self.provider
-        if self.tool_mode and self.tool_mode != "native":
+        # [2026-05-01] 与 MessageMeta 保持一致：fake-native 是兼容默认值，
+        # 真 native 和 json 都需要显式持久化。
+        if self.tool_mode and self.tool_mode != "fake-native":
             d["tool_mode"] = self.tool_mode
         if self.message_metas:
             d["message_metas"] = dict(self.message_metas)
@@ -157,7 +164,7 @@ class SnapshotMeta:
             return cls()
         return cls(
             provider=str(data.get("provider") or ""),
-            tool_mode=str(data.get("tool_mode") or "native"),
+            tool_mode=str(data.get("tool_mode") or "fake-native"),
             message_metas=dict(data.get("message_metas") or {}),
         )
 

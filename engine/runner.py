@@ -109,6 +109,13 @@ def _message_to_history_dict(msg: Message) -> dict[str, Any]:
         d["_meta"] = _meta
     if msg.tool_calls:
         d["tool_calls"] = msg.tool_calls
+    # [2026-05-01] 恢复 true native role=tool 消息的配对字段。
+    # 怎么改：ConversationStore.Message 新增 tool_call_id/name，这里转回 history dict。
+    # 目的：build_llm_messages 在 native 模式下能原样透传 role=tool + tool_call_id。
+    if getattr(msg, "tool_call_id", ""):
+        d["tool_call_id"] = msg.tool_call_id
+    if getattr(msg, "name", ""):
+        d["name"] = msg.name
     return d
 
 
@@ -598,12 +605,47 @@ async def _run_node_task(
     entry_node_id = get_str(runtime_cfg, "shell.entry_node_id", "bootstrap.shell_orchestrator").strip()
 
     rp = resolve_provider(ws_root, node, default_model)
-    provider = OpenAIProvider(
-        http=llm_http,
-        api_key=rp.api_key or api_key,
-        base_url=rp.base_url or base_url or None,
-        model=rp.model,
-    )
+    _po = getattr(node, 'provider_options', {}) or {}
+    # Per-provider API key + base_url fallback from env vars
+    import os as _os
+    _gemini_key = rp.api_key or _os.environ.get("GEMINI_API_KEY", "") or api_key
+    _gemini_url = rp.base_url or _os.environ.get("GEMINI_BASE_URL", "") or None
+    _anthropic_key = rp.api_key or _os.environ.get("ANTHROPIC_API_KEY", "") or api_key
+    _anthropic_url = rp.base_url or _os.environ.get("ANTHROPIC_BASE_URL", "") or None
+    if rp.provider_type == "anthropic":
+        from providers.anthropic import AnthropicProvider
+        provider = AnthropicProvider(
+            http=llm_http,
+            api_key=_anthropic_key,
+            base_url=_anthropic_url or None,
+            model=rp.model,
+            provider_options=_po,
+        )
+    elif rp.provider_type == "openai-responses":
+        from providers.openai_responses import OpenAIResponsesProvider
+        provider = OpenAIResponsesProvider(
+            http=llm_http,
+            api_key=rp.api_key or api_key,
+            base_url=rp.base_url or base_url or None,
+            model=rp.model,
+            provider_options=_po,
+        )
+    elif rp.provider_type == "gemini":
+        from providers.gemini import GeminiProvider
+        provider = GeminiProvider(
+            http=llm_http,
+            api_key=_gemini_key,
+            base_url=_gemini_url or None,
+            model=rp.model,
+            provider_options=_po,
+        )
+    else:
+        provider = OpenAIProvider(
+            http=llm_http,
+            api_key=rp.api_key or api_key,
+            base_url=rp.base_url or base_url or None,
+            model=rp.model,
+        )
 
     await rctx.emit_event("node_started", {
         "task_id": task_id, "node_id": node.id,

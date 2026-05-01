@@ -36,7 +36,10 @@ class MessageType:
 @dataclass
 class Message:
     id: str                          # UUID，全局唯一
-    role: str                        # user / assistant / system
+    # [2026-05-01] role 增加 tool。
+    # 原因：真 native formatter 会生成 role=tool 消息；存储层必须原样保存，
+    # 目的：下一轮恢复历史时仍能满足原生工具调用的 tool_call_id 配对要求。
+    role: str                        # user / assistant / system / tool
     content: str                     # 消息文本内容
     message_type: str = ""           # MessageType 常量，细分类型
     created_at: str = ""             # ISO 8601 时间戳
@@ -45,6 +48,11 @@ class Message:
     source_task_id: str = ""         # 产生该消息的 task ID
     ephemeral: bool = False          # 临时消息（dynamic context 等），不持久化到 store
     tool_calls: list = field(default_factory=list)  # assistant 消息的工具调用列表
+    # [2026-05-01] 新增 role=tool 的原生工具结果字段。
+    # 怎么改：把 tool_call_id 与 name 作为 Message 的一等字段参与 JSONL 序列化。
+    # 目的：ConversationStore 读取后可以还原 OpenAI/Responses 等原生工具历史。
+    tool_call_id: str = ""           # role=tool 消息关联的 assistant.tool_calls[].id
+    name: str = ""                   # role=tool 消息关联的工具名
 
     def to_dict(self) -> dict:
         """序列化为存储格式。仅包含非空字段以减小 JSONL 体积。"""
@@ -63,6 +71,12 @@ class Message:
             d["ephemeral"] = True
         if self.tool_calls:
             d["tool_calls"] = self.tool_calls
+        # [2026-05-01] 持久化原生 role=tool 结果的配对字段。
+        # 原因：只保存 role/content 会丢失 tool_call_id，下一轮发送给 LLM 时无法配对。
+        if self.tool_call_id:
+            d["tool_call_id"] = self.tool_call_id
+        if self.name:
+            d["name"] = self.name
         return d
 
     @classmethod
@@ -79,6 +93,10 @@ class Message:
             source_task_id=data.get("source_task_id", ""),
             ephemeral=data.get("ephemeral", False),
             tool_calls=data.get("tool_calls", []),
+            # [2026-05-01] 反序列化 role=tool 的配对字段。
+            # 目的：从 JSONL 恢复的历史与运行时内存消息保持同一结构。
+            tool_call_id=str(data.get("tool_call_id") or ""),
+            name=str(data.get("name") or ""),
         )
 
 

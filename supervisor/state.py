@@ -98,6 +98,15 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         self.rebuild_from_events(eventlog.events)
 
+        # BUG FIX (2026-04-29): 重启后清空 session_entry_overrides。
+        # rebuild_from_events 会回放 node_switch 事件，恢复旧的入口节点覆盖。
+        # 但重启后所有任务已死，覆盖指向的节点（如 bootstrap.cmd_reviewer）
+        # 的上下文已丢失。如果不清空，用户消息会被路由到错误的节点。
+        # 例：ereuna_main 曾 switch_node 到 cmd_reviewer，但 cmd_reviewer
+        # 完成后未切回默认节点，重启后该覆盖从事件回放中恢复，导致用户
+        # 在 discord 频道发消息时被错误地路由到 cmd_reviewer。
+        self.session_entry_overrides.clear()
+
     # ------------------------------------------------------------------ #
     #  事件回放
     # ------------------------------------------------------------------ #

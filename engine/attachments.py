@@ -257,9 +257,13 @@ def prepare_messages_for_llm(
     cache: dict[str, str | None] = {}
     result: list[dict[str, Any]] = []
     for msg in messages:
-        # Strip internal markers (_dynamic, _ephemeral, _meta, etc.) before sending to LLM API
-        if any(k.startswith("_") for k in msg):
-            msg = {k: v for k, v in msg.items() if not k.startswith("_")}
+        # [2026-05-01] Keep _meta until the provider layer runs. Native
+        # providers, especially OpenAI Responses, need provider metadata to
+        # round-trip raw output/reasoning items and rebuild native tool history.
+        # Other transient internal flags are still removed here; providers are
+        # responsible for never copying _meta into the final API payload.
+        if any(k.startswith("_") and k != "_meta" for k in msg):
+            msg = {k: v for k, v in msg.items() if not k.startswith("_") or k == "_meta"}
 
         content = msg.get("content")
         role = msg.get("role", "")

@@ -55,7 +55,7 @@ from clonoth_runtime import get_int, get_float, load_runtime_config
 from toolbox.context import ToolContext
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
 # 此处导入供外部通过 ai_step 模块访问（如测试、调试）。
-from .tool_format import create_tool_formatter, build_llm_messages
+from .tool_format import ParsedToolCall, create_tool_formatter, build_llm_messages
 from .message_model import MessageMeta, set_message_meta
 from providers.base import ToolCall, ProviderResponse
 # Phase 2 Signal System: 导入信号总线，用于发射 tool.call 和 task.error 信号。
@@ -149,6 +149,10 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
             source_node_id=getattr(ls.node, 'id', ''),
             source_task_id=getattr(ls.rctx, 'task_id', ''),
             tool_calls=msg_dict.get('tool_calls', []),
+            # [2026-05-01] 影子写入时保留原生 role=tool 的配对字段。
+            # 原因：ConversationStore 是下一轮历史来源；丢失 tool_call_id 会破坏 true native。
+            tool_call_id=str(msg_dict.get('tool_call_id') or ''),
+            name=str(msg_dict.get('name') or ''),
         )
         # Child Session 隔离（Phase B）：子节点写入自己的 child session JSONL，
         # 不再写入父 session。无 child_session_id 时仍写入 parent session（主节点路径）。
@@ -465,6 +469,12 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
                     f"Error: Tool '{tc.name}' is not in this node's allowed tool list. "
                     f"Use finish() to provide your output directly.",
                 )
+                # [2026-05-01] 工具结果必须带当前 tool_mode。
+                # 目的：真 native 的 role=tool 消息在下一轮仍由 NativeToolFormatter 透传。
+                set_message_meta(_err_msg, MessageMeta(
+                    tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+                    message_type="tool_result",
+                ))
                 ls.messages.append(_err_msg)
                 _shadow_write(ls, _err_msg, message_type="tool_result")
                 continue
@@ -487,7 +497,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     _provider_name = getattr(ls.provider, 'name', '') or 'unknown'
     _tc_meta = MessageMeta(
         provider=_provider_name,
-        tool_mode=getattr(ls.node, 'tool_mode', 'native'),
+        tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
         message_type="assistant",
         timestamp=datetime.now(timezone.utc).isoformat(),
         metadata={_provider_name: resp.provider_meta} if resp.provider_meta else {},
@@ -569,7 +579,11 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
                 _finish_parsed,
                 "\u26a0\ufe0f Preempted: new user input received. Task continues.",
             )
-            set_message_meta(_intercept_msg, MessageMeta(message_type="tool_result"))
+            # [2026-05-01] 写入当前 tool_mode，避免真 native 的拦截结果被当作旧 fake-native。
+            set_message_meta(_intercept_msg, MessageMeta(
+                tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+                message_type="tool_result",
+            ))
             ls.messages.append(_intercept_msg)
             _shadow_write(ls, _intercept_msg, MessageType.TOOL_RESULT)
             await ls.rctx.emit_event("preempt_finish_intercepted", {
@@ -581,6 +595,23 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         elif ls.preempt_after_step:
             # 无消息的 preempt：与真工具后的 preempt_after_step 路径对齐，
             # 保存上下文后退出任务
+            # [2026-05-01] 补写 finish 的 tool_result，确保 native 模式下
+            # functionCall/functionResponse 严格 1:1 配对（Gemini 强校验）
+            from .tool_format import ParsedToolCall as _FinishPTC2
+            _finish_parsed2 = _FinishPTC2(
+                id=getattr(_finish_call, "id", "") or "",
+                name="finish",
+                arguments=dict(_finish_call.arguments or {}),
+            )
+            _preempt_result = ls.formatter.format_tool_result(
+                _finish_parsed2, "preempted",
+            )
+            set_message_meta(_preempt_result, MessageMeta(
+                tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+                message_type="tool_result",
+            ))
+            ls.messages.append(_preempt_result)
+            _shadow_write(ls, _preempt_result, MessageType.TOOL_RESULT)
             ctx_ref = _persist_ctx(ls, step + 1)
             return TaskAction(
                 action=ACTION_PREEMPTED, node_id=ls.node.id,
@@ -744,6 +775,7 @@ async def _execute_real_tools(
                 name=f"async_tool_{_t_name}_{_async_id}",
             )
             _tool_entries.append({
+                "id": _rtc.get("id", ""),
                 "name": _t_name,
                 "args": _t_args,
                 "format": "text",
@@ -777,6 +809,7 @@ async def _execute_real_tools(
         _t_raw_inline = _t_raw
 
         _tool_entries.append({
+            "id": _rtc.get("id", ""),
             "name": _t_name,
             "args": _t_args,
             "format": _t_fmt,
@@ -806,11 +839,21 @@ async def _execute_real_tools(
         for _entry in _tool_entries:
             _result_body = _entry["raw_inline"]
             # [2026-04-17] 截断机制已移除，不再追加 truncated 提示
-            _tool_msg = {
-                "role": "user",
-                "content": f'Tool result for "{_entry["name"]}":\n{_result_body}',
-            }
-            set_message_meta(_tool_msg, MessageMeta(message_type="tool_result"))
+            # [2026-05-01] 真实工具结果统一走 formatter.format_tool_result。
+            # 原因：真 native 需要 role=tool + tool_call_id，而旧代码在这里手写 user 文本，
+            # 会绕过新 NativeToolFormatter。fake-native/json 仍由各自 formatter 生成旧文本。
+            _tool_msg = ls.formatter.format_tool_result(
+                ParsedToolCall(
+                    id=str(_entry.get("id") or ""),
+                    name=str(_entry["name"]),
+                    arguments=dict(_entry.get("args") or {}),
+                ),
+                _result_body,
+            )
+            set_message_meta(_tool_msg, MessageMeta(
+                tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+                message_type="tool_result",
+            ))
             ls.messages.append(_tool_msg)
             # Phase 1: 影子写入 tool_result 消息到 ConversationStore
             _shadow_write(ls, _tool_msg, MessageType.TOOL_RESULT)
@@ -850,7 +893,7 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
         _provider_name = getattr(ls.provider, 'name', '') or 'unknown'
         _implicit_meta = MessageMeta(
             provider=_provider_name,
-            tool_mode=getattr(ls.node, 'tool_mode', 'native'),
+            tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
             message_type="assistant",
             timestamp=datetime.now(timezone.utc).isoformat(),
             metadata={},
@@ -990,8 +1033,11 @@ async def run_ai_node(
         openai_tools.append(_dispatch_node_spec(delegate_targets, downstream_info))
         openai_tools.append(_dispatch_nodes_spec(delegate_targets, downstream_info))
 
-    _sw_targets = [info["id"] for info in (switch_info or [])]
-    openai_tools.append(_switch_node_spec(_sw_targets, switch_info, current_node_id=node.id, current_node_name=node.name))
+    # switch_node 仅对非系统节点注入（系统节点如 memory_extractor 不应切换入口）
+    _is_system_task = bool((rctx.task_context or {}).get("is_system_task"))
+    if not _is_system_task:
+        _sw_targets = [info["id"] for info in (switch_info or [])]
+        openai_tools.append(_switch_node_spec(_sw_targets, switch_info, current_node_id=node.id, current_node_name=node.name))
 
     openai_tools.append(_finish_spec())
     openai_tools.append(_reply_spec())

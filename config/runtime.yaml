@@ -1,0 +1,103 @@
+# Clonoth runtime tuning config
+#
+# - 本文件可以提交到仓库。
+# - 敏感信息应放在环境变量或 data/config.yaml 中。
+
+version: 1
+
+engine:
+  max_steps: 32
+  streaming: true
+  history_limit: 80
+  poll_interval_sec: 1.0
+
+  compact:
+    threshold_tokens: 100000   # prompt token 数超过此值时触发自动压缩（优先用 LLM 返回的真实值，无则按字符估算）
+    keep_recent: 6             # 压缩时保留最近的消息条数
+
+  retry:
+    max_retries: 3             # LLM 调用失败时最大重试次数（0 = 不重试）
+    initial_delay_sec: 1.0     # 首次重试等待秒数
+    max_delay_sec: 30.0        # 退避等待上限秒数
+    backoff_multiplier: 2.0    # 指数退避倍数
+    # 可重试的 HTTP 状态码：429(限流) 500 502 503 504(服务端错误)
+
+  approval_poll_interval_sec: 0.5
+
+  http:
+    client_timeout_sec: 60.0
+
+  supervisor:
+    health_timeout_sec: 2.0
+    wait_poll_interval_sec: 0.5
+
+  tool_trace:
+    max_inline_chars: 8000
+    max_progress_arg_chars: 320
+
+  model: ""
+
+providers:
+  openai:
+    timeout_sec: 60.0
+
+meta:
+  execute_command:
+    default_timeout_sec: 90.0
+    max_output_chars: 12000
+
+  git:
+    diff_max_chars: 600000
+
+  search:
+    max_file_size_bytes: 3000000
+    max_matches: 100
+
+tools:
+  command:
+    default_timeout_sec: 60.0
+
+skills:
+  max_budget_chars: 0       # 0 = no limit; max total chars of skill body to inject
+
+memory:
+  max_budget_chars: 0       # 0 = no limit; max total chars of memory content to inject
+
+  auto_extract:
+    enabled: false            # true = 入口节点 finish 后由 supervisor 创建记忆提取后置任务
+    node_id: "system.memory_extractor"  # 记忆提取节点 id
+    min_messages: 4           # 会话中非 system 消息少于此数时跳过
+    min_increment: 10         # 自上次提取后新增消息数达到此值才再次触发
+
+  dream:
+    enabled: false            # true = 启用定期记忆整理（dream）
+    cron: "0 3 * * *"         # 触发时间，默认每天凌晨 3 点（UTC）。用户可按自己时区调整
+    node_id: "system.dream"   # 记忆整理节点 id
+    min_sessions: 0           # 距上次 dream 后至少有 N 个不同 session 活动过才触发（0 = 不检查）
+    conversation_key: "system:dream"  # dream 会话标识
+
+shell:
+  default_conversation_key: "cli:default"
+  mode: tui   # tui | cli
+  tui:
+    theme: dark
+    show_thinking: true
+    auto_scroll: true
+    node_panel: false
+    max_message_height: 50
+  entry_node_id: "bootstrap.shell_orchestrator"
+
+  http:
+    client_timeout_sec: 10.0
+
+  supervisor:
+    health_timeout_sec: 2.0
+    wait_poll_interval_sec: 0.5
+
+  events_poll_interval_sec: 0.5
+
+supervisor:
+  process_manager:
+    stop_wait_timeout_sec: 5.0
+    shell_new_console: false
+    engine_workers: 2

@@ -40,8 +40,26 @@ class TaskStoreMixin:
             session_id=task.session_id,
             component=component,
             type_=event_type,
-            payload=task.model_dump(mode="json"),
+            payload=self._event_payload_for_task(task),
         )
+
+    def _event_payload_for_task(self, task: Task) -> dict[str, Any]:
+        """Build a task snapshot payload safe for long-term event storage."""
+        payload = task.model_dump(mode="json")
+        result = payload.get("result")
+        if isinstance(result, dict) and "dispatch_input" in result:
+            # Why: dispatch_input can contain a full child prompt or compacted
+            # conversation text, and the same stale result used to be repeated in
+            # task_started/task_suspended snapshots. How: copy the serialized
+            # result and remove only dispatch_input from the event payload while
+            # leaving the live Task object untouched. Purpose: reduce future
+            # events.jsonl growth and replay memory without changing routing,
+            # which reads task.result before or outside event serialization.
+            slim_result = dict(result)
+            slim_result.pop("dispatch_input", None)
+            slim_result["dispatch_input_omitted"] = True
+            payload["result"] = slim_result
+        return payload
 
     def _apply_task_snapshot(self, payload: dict[str, Any]) -> None:
         try:

@@ -11,6 +11,8 @@ from typing import Any
 
 SYSTEM_SESSION_ID = "__system__"
 _MAX_MEMORY_EVENTS = 5000
+_MAX_MEMORY_EVENT_BYTES = 64 * 1024 * 1024
+_TAIL_READ_BLOCK_BYTES = 1024 * 1024
 
 
 def _now() -> datetime:
@@ -57,24 +59,62 @@ class EventLog:
             return
 
         max_seq = 0
-        with self._path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    evt = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                self._events.append(evt)
-                seq = evt.get("seq")
-                if isinstance(seq, int) and seq > max_seq:
-                    max_seq = seq
+        recent_events: list[dict[str, Any]] = []
+        # Why: ClonothZX can have hundreds of megabytes of historical events,
+        # including old windows with very large task snapshots. How: read only a
+        # bounded tail of the JSONL file, then parse that tail. Purpose: avoid the
+        # startup RSS spike caused by parsing every old line or by sliding a
+        # 5000-event window across historical large snapshots.
+        for line in self._read_recent_lines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            recent_events.append(evt)
+            seq = evt.get("seq")
+            if isinstance(seq, int) and seq > max_seq:
+                max_seq = seq
 
         self._seq = max_seq
-        # Cap in-memory list on startup to prevent OOM from huge files
-        if len(self._events) > _MAX_MEMORY_EVENTS:
-            self._events = self._events[-_MAX_MEMORY_EVENTS:]
+        self._events = recent_events[-_MAX_MEMORY_EVENTS:]
+
+    def _read_recent_lines(self) -> list[str]:
+        """Return raw JSONL lines from the bounded file tail."""
+        chunks: list[bytes] = []
+        total_read = 0
+        newline_count = 0
+        with self._path.open("rb") as f:
+            f.seek(0, 2)
+            pos = f.tell()
+            while pos > 0 and newline_count <= _MAX_MEMORY_EVENTS and total_read < _MAX_MEMORY_EVENT_BYTES:
+                read_size = min(_TAIL_READ_BLOCK_BYTES, pos, _MAX_MEMORY_EVENT_BYTES - total_read)
+                if read_size <= 0:
+                    break
+                pos -= read_size
+                f.seek(pos)
+                chunk = f.read(read_size)
+                chunks.append(chunk)
+                total_read += len(chunk)
+                newline_count += chunk.count(b"\n")
+
+            # Why: if the bounded tail starts in the middle of a line, parsing it
+            # would create a spurious JSON error and could displace a real event.
+            # How: check the byte just before the buffer; if it is not a newline,
+            # drop the first split line. Purpose: keep only complete JSONL rows.
+            starts_with_complete_line = pos == 0
+            if pos > 0:
+                f.seek(pos - 1)
+                starts_with_complete_line = f.read(1) == b"\n"
+
+        data = b"".join(reversed(chunks))
+        raw_lines = data.splitlines()
+        if not starts_with_complete_line and raw_lines:
+            raw_lines = raw_lines[1:]
+        raw_lines = raw_lines[-_MAX_MEMORY_EVENTS:]
+        return [line.decode("utf-8", errors="replace") for line in raw_lines]
 
     def append(
         self,

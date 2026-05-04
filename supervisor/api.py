@@ -339,11 +339,17 @@ def create_app(
     async def session_events(
         session_id: str,
         after_seq: int = Query(0, ge=0),
+        limit: int = Query(5000, ge=1, le=5000),
     ) -> list[Event]:
         st: SupervisorState = app.state.state
         evts = st.list_events(session_id=session_id, after_seq=after_seq)
         out: list[Event] = []
         for e in evts:
+            # Why: session event payloads can include large task snapshots. How:
+            # stop conversion once the requested page size is reached. Purpose:
+            # keep per-session polling from serializing the whole memory window.
+            if len(out) >= limit:
+                break
             try:
                 out.append(
                     Event(
@@ -366,6 +372,7 @@ def create_app(
     async def global_events(
         after_seq: int = Query(0, ge=0),
         types: str = Query("", description="comma-separated event types to filter"),
+        limit: int = Query(5000, ge=1, le=5000),
     ) -> list[Event]:
         st: SupervisorState = app.state.state
         evts = st.eventlog.list_all_events(after_seq=after_seq)
@@ -374,7 +381,14 @@ def create_app(
         for e in evts:
             if type_filter and str(e.get("type")) not in type_filter:
                 continue
+            if len(out) >= limit:
+                break
             try:
+                # Why: /v1/events may contain large task snapshots even with the
+                # in-memory ring bounded. How: honor the explicit page limit
+                # during conversion instead of materializing every cached Event.
+                # Purpose: prevent polling/debug requests from serializing many
+                # megabytes when the caller asks for a small page.
                 out.append(Event(
                     schema_version=int(e.get("schema_version", 1)),
                     seq=int(e.get("seq", 0)),

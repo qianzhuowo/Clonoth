@@ -1,10 +1,9 @@
 """伪工具运行时处理。
 
-从 ai_step.py 抽出。处理 7 种伪工具的执行逻辑。
+从 ai_step.py 抽出。处理静态伪工具和 dispatch:{target_id} 动态伪工具的执行逻辑。
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import mimetypes as _mimetypes
 from pathlib import Path
@@ -17,14 +16,17 @@ from .loop_state import _LoopState, _persist_ctx, _short
 # 【Fix 3】reply 工具结果统一走 formatter.format_tool_result，需要 ParsedToolCall 构造、
 # MessageMeta 标注 message_type、MessageType 影子写入。延迟导入 _shadow_write 避免循环依赖。
 from .tool_format import ParsedToolCall
+from .pseudo_tools import _dispatch_target_from_tool_name
 from .message_model import MessageMeta, set_message_meta
 from ..conversation_store import MessageType
 
 
 # ---------------------------------------------------------------------------
 #  [2026-04-22] 辅助函数：将 workspace-relative 路径列表转换为 attachment dict 列表。
-#  用于 dispatch_node / dispatch_nodes 伪工具，让父节点能将文件附件传给子节点。
-#  仅检查文件是否存在并猜测 MIME 类型，不读取文件内容。
+#  [2026-05-04] 现在只服务 dispatch:{target_id} 动态伪工具。
+#  为什么：旧聚合委派工具已删除，但动态委派仍需把父节点文件传给子节点。
+#  怎么做：保留路径到 attachment dict 的转换函数，删除旧分支调用。
+#  目的：让动态 dispatch 的附件行为保持不变。
 # ---------------------------------------------------------------------------
 def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
     """Convert workspace-relative file paths to attachment dicts for dispatch."""
@@ -94,13 +96,14 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     if pseudo_call.name == "preempt_task":
         return await _handle_pseudo_preempt_task(ls, args)
 
-    # dispatch_node: 非终止，异步委派
-    if pseudo_call.name == "dispatch_node":
-        return await _handle_pseudo_dispatch_node(ls, args)
-
-    # dispatch_nodes: 非终止，批量异步委派
-    if pseudo_call.name == "dispatch_nodes":
-        return await _handle_pseudo_dispatch_nodes(ls, args)
+    # [2026-05-04] dispatch:{target_id}: 非终止，固定目标异步委派。
+    # Why: dynamic per-target tools remove the target parameter from the schema.
+    # How: extract target_id from the tool name and pass it to the shared dispatch
+    # sender. Purpose: keep supervisor API behavior identical while making target
+    # selection happen at tool registration time.
+    _fixed_dispatch_target = _dispatch_target_from_tool_name(pseudo_call.name)
+    if _fixed_dispatch_target:
+        return await _handle_pseudo_dispatch(ls, {**args, "target": _fixed_dispatch_target})
 
     # ---- 终止型伪工具：finish / switch_node ----
 
@@ -241,8 +244,8 @@ async def _handle_pseudo_preempt_task(ls: _LoopState, args: dict) -> None:
     return None
 
 
-async def _handle_pseudo_dispatch_node(ls: _LoopState, args: dict) -> None:
-    """处理 dispatch_node 伪工具。始终返回 None（非终止）。"""
+async def _handle_pseudo_dispatch(ls: _LoopState, args: dict) -> None:
+    """处理 dispatch:{target_id} 动态伪工具。始终返回 None（非终止）。"""
     target = str(args.get("target") or "").strip()
     instr = str(args.get("instruction") or "").strip()
     ctx_mode = str(args.get("context_mode") or "accumulate").strip()
@@ -275,72 +278,14 @@ async def _handle_pseudo_dispatch_node(ls: _LoopState, args: dict) -> None:
             _dispatch_result = json.dumps({"success": False, "error": f"dispatch API 返回 {_dispatch_resp.status_code}: {_dispatch_resp.text}"}, ensure_ascii=False)
     except Exception as e:
         _dispatch_result = json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
+    # [2026-05-04] Use the dynamic tool name in the result marker.
+    # Why: Responses-native history pairing is most reliable when a stored result
+    # carries the same function name as the preceding dispatch:{target_id} call.
+    # How: preserve the JSON payload shape and write dispatch:{target} in the
+    # textual marker. Purpose: keep child dispatch callbacks readable without
+    # reintroducing removed aggregate tool names.
     ls.messages.append({
         "role": "user",
-        "content": f"[dispatch_node result: {_dispatch_result}]",
-    })
-    return None
-
-
-async def _do_one_dispatch(
-    ls: _LoopState, _t_target: str, _t_instr: str, _t_ctx_mode: str, _t_ctx_key: str | None,
-    attachments: list | None = None,  # [2026-04-22] 新增：传递附件给子节点
-) -> dict:
-    """执行单个异步委派请求，供 dispatch_nodes 批量调用。"""
-    try:
-        payload: dict[str, Any] = {
-            "session_id": ls.rctx.session_id,
-            "session_generation": ls.rctx.session_generation,
-            "node_id": _t_target,
-            "instruction": _t_instr,
-            "context_mode": _t_ctx_mode,
-            "context_key": _t_ctx_key,
-            "caller_node_id": ls.node.id,
-        }
-        # [2026-04-22] 仅在有附件时附加
-        if attachments:
-            payload["attachments"] = attachments
-        _dispatch_resp = await ls.rctx.http.post(
-            f"{ls.rctx.supervisor_url}/v1/tasks/dispatch-async",
-            json=payload,
-            timeout=10.0,
-        )
-        if _dispatch_resp.status_code == 200:
-            _d_data = _dispatch_resp.json()
-            return {"target": _t_target, "success": True, "task_id": _d_data.get("task_id", "")}
-        else:
-            return {"target": _t_target, "success": False, "error": f"HTTP {_dispatch_resp.status_code}"}
-    except Exception as e:
-        return {"target": _t_target, "success": False, "error": str(e)}
-
-
-async def _handle_pseudo_dispatch_nodes(ls: _LoopState, args: dict) -> None:
-    """处理 dispatch_nodes 伪工具（批量异步委派）。始终返回 None（非终止）。"""
-    tasks_list = args.get("tasks")
-    if not isinstance(tasks_list, list) or not tasks_list:
-        _dispatch_result = json.dumps({"success": False, "error": "tasks 列表为空或格式错误"}, ensure_ascii=False)
-    else:
-        # [2026-04-22] 从每个 task_item 中提取 attachment_paths 并转换，传给 _do_one_dispatch
-        _coros = [
-            _do_one_dispatch(
-                ls,
-                str(_task_item.get("target") or "").strip(),
-                str(_task_item.get("instruction") or "").strip(),
-                str(_task_item.get("context_mode") or "accumulate").strip(),
-                str(_task_item.get("context_key") or "").strip() or None,
-                attachments=_paths_to_attachments(
-                    _task_item.get("attachment_paths") or [], ls.rctx.workspace_root,
-                ) or None,
-            )
-            for _task_item in tasks_list
-        ]
-        _batch_results = list(await asyncio.gather(*_coros, return_exceptions=True))
-        for i, r in enumerate(_batch_results):
-            if isinstance(r, BaseException):
-                _batch_results[i] = {"target": str(tasks_list[i].get("target", "?")), "success": False, "error": str(r)}
-        _dispatch_result = json.dumps({"success": True, "tasks": _batch_results}, ensure_ascii=False)
-    ls.messages.append({
-        "role": "user",
-        "content": f"[dispatch_nodes result: {_dispatch_result}]",
+        "content": f"[dispatch:{target} result: {_dispatch_result}]",
     })
     return None

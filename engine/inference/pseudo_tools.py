@@ -14,7 +14,42 @@ if TYPE_CHECKING:
 #  v3 伪工具名称
 # ---------------------------------------------------------------------------
 
-_PSEUDO_TOOL_NAMES = frozenset({"dispatch_node", "dispatch_nodes", "finish", "reply", "switch_node", "compact_context", "preempt_task"})
+_PSEUDO_TOOL_NAMES = frozenset({"finish", "reply", "switch_node", "compact_context", "preempt_task"})
+
+# [2026-05-04] Dynamic delegate dispatch tools use a stable prefix plus target id.
+# Why: the removed aggregate dispatch tools hid delegate choices behind one
+# schema. How: keep only static pseudo-tool names in _PSEUDO_TOOL_NAMES and
+# recognize dispatch:{target_id} through this prefix. Purpose: route dynamic tools
+# through the existing pseudo-tool execution path without hard-coding node ids or
+# reintroducing removed aggregate tools.
+DISPATCH_TOOL_PREFIX = "dispatch:"
+
+
+def _is_pseudo_tool_name(name: str) -> bool:
+    """Return whether ``name`` is handled by the engine pseudo-tool layer."""
+    tool_name = str(name or "").strip()
+    # [2026-05-04] The dynamic dispatch pattern requires a concrete target id.
+    # Why: dispatch: without a suffix cannot be executed by pseudo_handlers.
+    # How: keep exact static-name matching and accept only dispatch:{target_id}
+    # with a non-empty suffix. Purpose: avoid treating malformed dynamic names as
+    # pseudo tools while preserving all valid per-target dispatch tools.
+    return tool_name in _PSEUDO_TOOL_NAMES or (
+        tool_name.startswith(DISPATCH_TOOL_PREFIX)
+        and bool(tool_name[len(DISPATCH_TOOL_PREFIX):].strip())
+    )
+
+
+def _dispatch_tool_name(target_id: str) -> str:
+    """Build the public per-target dispatch tool name."""
+    return f"{DISPATCH_TOOL_PREFIX}{str(target_id or '').strip()}"
+
+
+def _dispatch_target_from_tool_name(tool_name: str) -> str:
+    """Extract the fixed target id from a dispatch:{target_id} tool name."""
+    name = str(tool_name or "").strip()
+    if not name.startswith(DISPATCH_TOOL_PREFIX):
+        return ""
+    return name[len(DISPATCH_TOOL_PREFIX):].strip()
 
 # [RFC 2026-04-20] finish 升级为真实 API 工具：tool_result 固定内容。
 # 仅用于满足 API 的 tool_use/tool_result 配对校验和下一轮对话历史格式合法性。
@@ -26,126 +61,80 @@ FINISH_TOOL_RESULT_CONTENT = "completed"
 #  v3 伪工具 spec 构建
 # ---------------------------------------------------------------------------
 
-def _dispatch_node_spec(targets: list[str], downstream_info: list[dict[str, str]] | None = None) -> dict:
-    """构建 dispatch_node 伪工具定义。downstream_info 包含各下游节点的 id/name/description。"""
+# [2026-05-04] Shared parameter schema for dynamic per-target dispatch tools.
+# Why: dispatch:{target_id} fixes the target in the tool name, so exposing a
+# target argument would let model output disagree with the registered tool.
+# How: reuse the legacy dispatch parameters except for target, and document the
+# default context behavior in schema. Purpose: keep execution compatible with the
+# existing supervisor dispatch API while making each delegate target visible as a
+# first-class tool.
+def _dispatch_delegate_parameters() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "instruction": {
+                "type": "string",
+                "description": "给目标节点的清晰、具体、可执行的指令。说明要做什么、为什么、你已经知道什么。",
+            },
+            "context_mode": {
+                "type": "string",
+                "enum": ["fresh", "fork", "accumulate"],
+                "default": "accumulate",
+                "description": "子节点上下文模式。fresh=每次从零无历史；fork=继承父节点对话历史；accumulate=首次从零后续恢复自己的上下文（默认 accumulate）。",
+            },
+            "context_key": {
+                "type": "string",
+                "description": "上下文继承标识（仅 accumulate 模式有效）。同一 context_key 的历次任务共享上下文链。不填则按目标节点 ID 查找。",
+            },
+            "attachment_paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "File paths (relative to workspace root) to attach to the child node's initial context. Images are injected as multimodal content; other files as references the child can read_file.",
+            },
+        },
+        "required": ["instruction"],
+    }
+
+
+def _dispatch_delegate_spec(target_id: str, info: dict[str, str] | None = None) -> dict:
+    """Build one dispatch:{target_id} pseudo-tool spec."""
+    target = str(target_id or "").strip()
+    node_name = str((info or {}).get("name") or target).strip() or target
+    node_description = str((info or {}).get("description") or node_name or target).strip()
     desc_parts = [
-        "将任务委派给另一个节点。目标节点会独立执行，完成后结果返回给你。",
+        f"将任务委派给固定目标节点 {node_name}（{target}）。",
+        node_description,
         "",
-        "使用方式：",
-        "- target：选择委派目标（见 enum）",
-        "- instruction：给出清晰、具体、可执行的指令",
+        "目标节点会独立执行，完成后结果返回给你。",
+        "参数中不再提供 target；该工具名已经固定了目标节点。",
+        "需要并行委派时，可以在同一轮并行调用多个 dispatch:{target_id} 工具。",
     ]
-    if downstream_info:
-        desc_parts.append("")
-        desc_parts.append("各目标节点：")
-        for info in downstream_info:
-            desc_parts.append(f"- {info.get('name', info['id'])}（{info['id']}）：{info.get('description', '')}")
-    desc_parts.extend([
-        "",
-        "何时使用：需要工具操作但你没有对应权限、需要多步执行、需要 shell 命令。",
-        "何时不用：能直接回答的问题、你自己有工具可以直接调用。",
-    ])
     return {
         "type": "function",
         "function": {
-            "name": "dispatch_node",
-            "description": "\n".join(desc_parts),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "target": {
-                        "type": "string",
-                        "enum": targets,
-                        "description": "委派目标节点 ID。",
-                    },
-                    "instruction": {
-                        "type": "string",
-                        "description": "给目标节点的清晰、具体、可执行的指令。像给一个刚进入房间的同事做简报——说明要做什么、为什么、你已经知道什么。",
-                    },
-                    "context_mode": {
-                        "type": "string",
-                        "enum": ["fresh", "fork", "accumulate"],
-                        "description": "子节点上下文模式。fresh=每次从零无历史；fork=继承父节点对话历史；accumulate=首次从零后续恢复自己的上下文（默认accumulate）",
-                    },
-                    "context_key": {
-                        "type": "string",
-                        "description": "上下文继承标识（仅 accumulate 模式有效）。用于精确指定继承哪个实例的上下文历史。同一 context_key 的历次任务共享上下文链。不填则按 target 节点 ID 查找（默认行为）。并发 dispatch 同一 target 多个实例时，应为每个实例指定不同的 context_key。",
-                    },
-                    # [2026-04-22] 新增 attachment_paths：允许父节点将文件附件传递给子节点。
-                    # 路径为 workspace-relative，图片注入为多模态内容，其他文件作为引用。
-                    "attachment_paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "File paths (relative to workspace root) to attach to the child node's initial context. Images are injected as multimodal content; other files as references the child can read_file.",
-                    },
-                },
-                "required": ["target", "instruction"],
-            },
+            "name": _dispatch_tool_name(target),
+            "description": "\n".join(part for part in desc_parts if part is not None),
+            "parameters": _dispatch_delegate_parameters(),
         },
     }
 
-def _dispatch_nodes_spec(targets: list[str], downstream_info: list[dict[str, str]] | None = None) -> dict:
-    """构建 dispatch_nodes 伪工具定义——并行委派多个节点实例。"""
-    desc_parts = [
-        "将任务并行委派给多个节点实例。所有子任务同时执行，全部完成后结果一起返回给你。",
-        "",
-        "使用场景：",
-        "- 需要对大量数据分段处理（每段交给一个独立实例）",
-        "- 需要多个独立子任务并行执行以提高效率",
-        "- 同一个 target 可以出现多次，每次创建该角色的一个新实例",
-    ]
-    if downstream_info:
-        desc_parts.append("")
-        desc_parts.append("可用目标节点：")
-        for info in downstream_info:
-            desc_parts.append(f"- {info.get('name', info['id'])}（{info['id']}）：{info.get('description', '')}")
-    return {
-        "type": "function",
-        "function": {
-            "name": "dispatch_nodes",
-            "description": "\n".join(desc_parts),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "tasks": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "target": {
-                                    "type": "string",
-                                    "enum": targets,
-                                    "description": "目标节点 ID。",
-                                },
-                                "instruction": {
-                                    "type": "string",
-                                    "description": "给该实例的清晰、具体、可执行的指令。",
-                                },
-                                "context_mode": {
-                                    "type": "string",
-                                    "enum": ["fresh", "fork", "accumulate"],
-                                    "description": "子节点上下文模式。fresh=每次从零；fork=继承父节点历史；accumulate=首次从零后续恢复（默认accumulate）",
-                                },
-                                "context_key": {
-                                    "type": "string",
-                                    "description": "上下文继承标识（仅 accumulate 模式有效）。同一 context_key 的历次任务共享上下文链。并发 dispatch 同一 target 多个实例时，应为每个实例指定不同的 context_key。",
-                                },
-                                # [2026-04-22] 新增 attachment_paths：与 dispatch_node 同理。
-                                "attachment_paths": {
-                                    "type": "array",
-                                    "items": {"type": "string"},
-                                    "description": "File paths (relative to workspace root) to attach to this child node instance.",
-                                },
-                            },
-                            "required": ["target", "instruction"],
-                        },
-                        "description": "并行子任务列表。同一 target 可多次出现，每次创建独立实例。",
-                    },
-                },
-                "required": ["tasks"],
-            },
-        },
+
+def _dispatch_delegate_specs(targets: list[str], downstream_info: list[dict[str, str]] | None = None) -> list[dict]:
+    """Build dynamic dispatch pseudo-tools for all delegate targets."""
+    info_by_id = {
+        str(info.get("id") or "").strip(): info
+        for info in (downstream_info or [])
+        if isinstance(info, dict) and str(info.get("id") or "").strip()
     }
+    result: list[dict] = []
+    seen: set[str] = set()
+    for raw_target in targets:
+        target = str(raw_target or "").strip()
+        if not target or target in seen:
+            continue
+        seen.add(target)
+        result.append(_dispatch_delegate_spec(target, info_by_id.get(target)))
+    return result
 
 def _finish_spec() -> dict:
     """Build the finish pseudo-tool spec.
@@ -165,7 +154,7 @@ def _finish_spec() -> dict:
                 "Submit the final result and terminate this node immediately.\n\n"
                 "CRITICAL: Once you call finish, the node exits. If you have other tools to call (like execute_command or save_memory), you MUST wait for them to complete (`ok`) before calling finish.\n\n"
                 "⚠️ finish MUST be called ALONE — never in the same turn as other tools (except reply). "
-                "If you call finish alongside execute_command, save_memory, dispatch_node, or any other tool, ALL calls will be REJECTED and you must retry. "
+                "If you call finish alongside execute_command, save_memory, a dispatch tool, or any other tool, ALL calls will be REJECTED and you must retry. "
                 "Always: execute tools first → wait for results → then call finish separately.\n\n"
                 "Do NOT send your final report via `reply` while waiting for tools. Just call the tools silently, wait for the next turn, and put your ENTIRE final report in the `finish` tool's text.\n\n"
                 "The `text` parameter is the ACTUAL DELIVERABLE — the content the caller "

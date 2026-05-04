@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import yaml
 
 from clonoth_runtime import (
     fetch_openai_secret,
@@ -119,18 +120,87 @@ def _create_provider_from_registry(
     return _instantiate_provider(provider_cls, init_kwargs)
 
 
+_NODE_INFO_CACHE: dict[str, tuple[int, dict[str, str]]] = {}
+
+
+def _fallback_node_info(node_id: str) -> dict[str, str]:
+    """Build fallback node metadata for absent or invalid node YAML."""
+    return {"id": node_id, "name": node_id, "description": node_id}
+
+
+def _node_info_path_and_mtime(workspace_root: Path, node_id: str) -> tuple[Path | None, int]:
+    """Resolve the node YAML path and return its mtime using os.stat."""
+    # [2026-05-04] Keep the same lookup order as load_node while avoiding a full
+    # load_node parse on every task. Why: delegate metadata is needed for tool
+    # descriptions, but parsing all target YAML files at task startup is wasteful.
+    # How: stat the system-node path first, then the user-node path, returning the
+    # first existing YAML file and its mtime. Purpose: unchanged YAML files can be
+    # served from the module cache, while hot edits still take effect immediately.
+    candidates = [
+        workspace_root / "engine" / "system_nodes" / f"{node_id}.yaml",
+        workspace_root / "config" / "nodes" / f"{node_id}.yaml",
+    ]
+    for path in candidates:
+        try:
+            stat_result = os.stat(path)
+        except OSError:
+            continue
+        # [2026-05-04] Store nanosecond mtime from os.stat. Why: YAML edits can
+        # happen close together during development. How: use st_mtime_ns instead
+        # of the rounded float mtime. Purpose: make hot edits invalidate the cache
+        # as soon as the filesystem reports a change.
+        return path, int(stat_result.st_mtime_ns)
+    return None, -1
+
+
+def _load_cached_node_info(workspace_root: Path, node_id: str) -> dict[str, str]:
+    """Load id/name/description for one node YAML with an mtime cache."""
+    path, mtime = _node_info_path_and_mtime(workspace_root, node_id)
+    if path is None:
+        # [2026-05-04] Missing delegate YAML must not prevent tool registration.
+        # Why: delegate_targets can contain absent nodes during partial config
+        # rollout. How: return a fallback info row with id/name/description equal
+        # to the target id. Purpose: ai_step can still register dispatch:target
+        # and the runtime will fail gracefully only if the supervisor cannot run it.
+        return _fallback_node_info(node_id)
+
+    cache_key = str(path.resolve())
+    cached = _NODE_INFO_CACHE.get(cache_key)
+    if cached is not None and cached[0] == mtime:
+        # [2026-05-04] Return the cached metadata dict directly when mtime is
+        # unchanged. Why: _collect_node_info is called on every task startup.
+        # How: the cache stores (mtime, info_dict) by resolved YAML path. Purpose:
+        # avoid yaml.safe_load and Node construction until the YAML file changes.
+        return cached[1]
+
+    info = _fallback_node_info(node_id)
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        data = None
+    if isinstance(data, dict):
+        kind = str(data.get("kind") or "node").strip()
+        node_type = str(data.get("type") or "ai").strip().lower()
+        if kind == "node" and node_type in {"ai", "tool"}:
+            name = str(data.get("name") or node_id).strip() or node_id
+            description = str(data.get("description") or "").strip() or name
+            info = {
+                "id": str(data.get("id") or node_id).strip() or node_id,
+                "name": name,
+                "description": description,
+            }
+    _NODE_INFO_CACHE[cache_key] = (mtime, info)
+    return info
+
+
 def _collect_node_info(workspace_root: Path, node_ids: list[str]) -> list[dict[str, str]]:
     """收集指定节点的基本信息（id/name/description）。"""
     result: list[dict[str, str]] = []
     for target_id in node_ids:
-        target = load_node(workspace_root, target_id)
-        if target is None:
+        tid = str(target_id or "").strip()
+        if not tid:
             continue
-        result.append({
-            "id": target.id,
-            "name": target.name,
-            "description": target.description or target.name,
-        })
+        result.append(_load_cached_node_info(workspace_root, tid))
     return result
 
 
@@ -165,7 +235,38 @@ def _discover_switchable_nodes(workspace_root: Path, current_node_id: str) -> li
     return [n for n in roots if n["id"] != current_node_id]
 
 
-_PSEUDO_TOOL_NAMES = {"finish", "dispatch_node", "dispatch_nodes", "reply", "switch_node"}
+# [2026-05-04] Only currently supported static pseudo tools are listed here.
+# Why: removed aggregate dispatch tools must not be treated as active static
+# pseudo tools. How: dynamic dispatch history records are still detected by
+# prefix below. Purpose: keep restored history cleanup aligned with the active
+# pseudo-tool surface.
+_PSEUDO_TOOL_NAMES = {"finish", "reply", "switch_node"}
+
+
+def _find_pseudo_history_marker(content: str) -> tuple[str, int]:
+    """Find a trailing pseudo-tool history marker, including dispatch:target."""
+    # [2026-05-04] Dynamic dispatch names cannot be enumerated in this helper.
+    # Why: restored fake-native history can contain records such as
+    # dispatch:ereuna_coder. How: first check the fixed static names, then parse
+    # the dispatch: prefix until the common "was executed" separator. Purpose:
+    # keep history restoration from leaking pseudo-tool call records.
+    for name in _PSEUDO_TOOL_NAMES:
+        tag = f"[Tool call history record: {name} was executed with args: "
+        pos = content.find(tag)
+        if pos >= 0:
+            return name, pos
+
+    dynamic_prefix = "[Tool call history record: dispatch:"
+    pos = content.find(dynamic_prefix)
+    if pos < 0:
+        return "", -1
+    name_start = pos + len("[Tool call history record: ")
+    tail = content[name_start:]
+    separator = " was executed with args: "
+    separator_pos = tail.find(separator)
+    if separator_pos < 0:
+        return "", -1
+    return tail[:separator_pos], pos
 
 
 def _message_to_history_dict(msg: Message) -> dict[str, Any]:
@@ -204,7 +305,7 @@ def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str,
     When restoring history from a context snapshot, the last assistant message
     may contain a pseudo-tool record like '[Tool call history record: finish was executed with args: {...}]'.
     For finish: extract the text param and replace with a normal assistant reply.
-    For dispatch_node/dispatch_nodes: drop or trim.
+    For other pseudo tools, including dispatch:{target_id}, drop or trim.
     """
     if not history:
         return history
@@ -219,15 +320,7 @@ def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str,
         return history
 
     # Look for pseudo-tool record marker
-    pseudo_name = ""
-    marker_pos = -1
-    for name in _PSEUDO_TOOL_NAMES:
-        tag = f"[Tool call history record: {name} was executed with args: "
-        pos = content.find(tag)
-        if pos >= 0:
-            pseudo_name = name
-            marker_pos = pos
-            break
+    pseudo_name, marker_pos = _find_pseudo_history_marker(content)
 
     if marker_pos < 0:
         return history
@@ -256,7 +349,7 @@ def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str,
                 except Exception:
                     pass
 
-    # ask/dispatch_node or parse failure: keep pre_text or drop the message
+    # Other pseudo tools or parse failure: keep pre_text or drop the message.
     if pre_text:
         result[-1] = {"role": role, "content": pre_text}
         return result
@@ -667,8 +760,7 @@ async def _run_node_task(
         snapshot = load_context_snapshot(ws_root, context_ref)
         if snapshot and isinstance(snapshot.get("messages"), list):
             history = [m for m in snapshot["messages"] if m.get("role") != "system"]
-            # 剥离尾部的伪工具调用（finish/ask/dispatch_node），
-            # 改为提取 finish/ask 的 text 作为正常 assistant 回复。
+            # 剥离尾部的伪工具调用，改为提取 finish 的 text 作为正常 assistant 回复。
             history = _strip_trailing_pseudo_call(history)
         elif use_context:
             # 快照加载失败，降级为 session_messages

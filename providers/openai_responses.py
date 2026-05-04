@@ -35,8 +35,13 @@ log = logging.getLogger(__name__)
 # provider recognizes both shapes so it can rebuild native input items without
 # changing other providers or the global formatter contract.
 _TOOL_RESULT_RE = re.compile(r'^Tool result for "(?P<name>[^"]+)":\r?\n(?P<output>.*)\Z', re.DOTALL)
+# [2026-05-04] Engine pseudo-result markers may now contain dynamic names such
+# as dispatch:target.id. Why: per-target dispatch stores the target in the tool
+# name. How: allow colon, dot, and hyphen after the initial function-name
+# character while preserving the older simple-name markers. Purpose: Responses
+# can pair dynamic dispatch results with the exact preceding function_call.
 _ENGINE_TOOL_RESULT_RE = re.compile(
-    r'^\[(?P<name>[A-Za-z_][A-Za-z0-9_]*) result: (?P<output>.*)\]\Z',
+    r'^\[(?P<name>[A-Za-z_][A-Za-z0-9_:\.-]*) result: (?P<output>.*)\]\Z',
     re.DOTALL,
 )
 _LEGACY_TOOL_RECORD_RE = re.compile(
@@ -622,9 +627,11 @@ def _parse_engine_tool_result(text: str) -> dict[str, str] | None:
     """Parse engine-generated pseudo-tool result text.
 
     [2026-05-01] Some pseudo tools currently append bracketed result text such
-    as ``[dispatch_node result: ...]`` instead of using format_tool_result().
-    The Responses provider still has to pair that text with the preceding
-    function_call, otherwise the next API request contains an unpaired tool call.
+    as ``[dispatch:target result: ...]`` instead of using format_tool_result().
+    [2026-05-04] Dynamic dispatch tools may have names like dispatch:target, and
+    the stored result marker now keeps that exact name. The Responses provider
+    still has to pair that text with the preceding function_call, otherwise the
+    next API request contains an unpaired tool call.
     """
     raw = text or ""
     match = _ENGINE_TOOL_RESULT_RE.match(raw)

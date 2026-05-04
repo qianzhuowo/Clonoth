@@ -196,6 +196,14 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
 
     data = _load_book(book_path)
     entries = data.get("entries", [])
+
+    # 禁止删除 constant 记忆
+    for e in entries:
+        if isinstance(e, dict) and str(e.get("id") or "").strip() == mid:
+            if bool(e.get("constant", False)):
+                return {"ok": False, "error": f"cannot delete constant memory: {mid}"}
+            break
+
     new_entries = [
         e for e in entries
         if not (isinstance(e, dict) and str(e.get("id") or "").strip() == mid)

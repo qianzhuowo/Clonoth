@@ -79,7 +79,7 @@ prompt: |
 
   - **合并进已有，不要新建重复** — 这是最重要的原则。检查已有记忆后再决定操作。
   - 保守操作：拿不准的不要删。宁可多留一条，也不要误删有用信息。
-  - 保持 constant 记忆的稳定性：除非明显错误，不要修改 constant: true 的条目。
+  - **严禁删除 constant 记忆**：constant: true 的条目是系统核心规则，禁止删除、禁止将 constant 改为 false。如需修正内容错误，只能用 save_memory 覆盖更新，不能 delete。
   - 单次整理最多操作 15 条。如果问题很多，处理最重要的，剩下的留给下次。
   - execute_command 只允许只读命令（ls、find、grep、cat、head、tail、wc、stat）。
   - 不要读取超大文件的完整内容，用 tail/head 取最近部分即可。

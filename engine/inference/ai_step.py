@@ -13,9 +13,8 @@ from toolbox.skills_runtime import build_skill_messages
 from ..memory import build_memory_messages
 
 from .pseudo_tools import (
-    _PSEUDO_TOOL_NAMES,
-    _dispatch_node_spec,
-    _dispatch_nodes_spec,
+    _dispatch_delegate_specs,
+    _is_pseudo_tool_name,
     _finish_spec,
     _reply_spec,
     _compact_context_spec,
@@ -456,14 +455,19 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     # 【方案 A 重构】伪工具改为列表按序执行，不再是 last-wins
     # 原本单标量 `pseudo_call = tc` 会导致同轮多伪工具只有最后一个生效，
     # 在 Fix 2（JSON 自由正文反向包装为 reply）后尤其危险——
-    # 例如 `dispatch_node + 自由正文` 会被吞掉 dispatch 只留 reply。
+    # 例如“委派工具 + 自由正文”会被吞掉委派，只留 reply。
     # 现改为按 LLM 输出顺序收集所有伪工具，后续按序处理，
     # 遇到返回 TaskAction 的（finish / switch_node / dispatch 等）立即退出循环，
     # 返回 None 的（reply / compact_context / preempt_task）继续执行下一个。
     pseudo_calls: list = []
     real_tool_calls: list[dict[str, Any]] = []
     for tc in resp.tool_calls:
-        if tc.name in _PSEUDO_TOOL_NAMES:
+        # [2026-05-04] Dynamic per-target dispatch tools are pseudo tools too.
+        # Why: names like dispatch:ereuna_coder are generated from delegate_targets
+        # and must bypass real-tool authorization. How: use the prefix-aware helper
+        # instead of a fixed name-only set. Purpose: route fixed-target dispatches
+        # to pseudo_handlers without accepting removed aggregate dispatch tools.
+        if _is_pseudo_tool_name(tc.name):
             pseudo_calls.append(tc)
         else:
             # 【Fix】真工具权限校验：工具必须在节点的授权列表内才能执行
@@ -599,7 +603,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
                 continue  # finish 延后执行
             action = await _handle_pseudo_tool(ls, _pc, step)
             if action is not None:
-                # 其他终止型伪工具（switch_node / dispatch_node 等）仍然立刻退出
+                # 其他终止型伪工具（如 switch_node）仍然立刻退出。
                 return action
             # 非终止型（reply / compact_context / preempt_task）继续
 
@@ -1262,8 +1266,12 @@ async def run_ai_node(
 
     delegate_targets = list(node.delegate_targets)
     if delegate_targets:
-        openai_tools.append(_dispatch_node_spec(delegate_targets, downstream_info))
-        openai_tools.append(_dispatch_nodes_spec(delegate_targets, downstream_info))
+        # [2026-05-04] Register one dynamic dispatch tool per delegate target.
+        # Why: target selection should happen through tool choice, not through an
+        # aggregate dispatch schema. How: expand node.delegate_targets into only
+        # dispatch:{target_id} specs. Purpose: keep dynamic dispatch intact while
+        # removing the old aggregate dispatch tools from the model-visible list.
+        openai_tools.extend(_dispatch_delegate_specs(delegate_targets, downstream_info))
 
     # switch_node 仅对非系统节点注入（系统节点如 memory_extractor 不应切换入口）
     _is_system_task = bool((rctx.task_context or {}).get("is_system_task"))

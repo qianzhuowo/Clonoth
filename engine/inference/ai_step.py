@@ -10,7 +10,6 @@ from typing import Any, TYPE_CHECKING
 
 from toolbox.registry import ToolRegistry
 from toolbox.skills_runtime import build_skill_messages
-from providers.openai import OpenAIProvider
 from ..memory import build_memory_messages
 
 from .pseudo_tools import (
@@ -57,10 +56,17 @@ from toolbox.context import ToolContext
 # 此处导入供外部通过 ai_step 模块访问（如测试、调试）。
 from .tool_format import ParsedToolCall, create_tool_formatter, build_llm_messages
 from .message_model import MessageMeta, set_message_meta
-from providers.base import ToolCall, ProviderResponse
+from providers.base import BaseProvider, ToolCall, ProviderResponse
 # Phase 2 Signal System: 导入信号总线，用于发射 tool.call 和 task.error 信号。
 # get_bus() 返回全局单例 SignalBus，Signal 是不可变事件数据类。
 from ..signals import Signal, get_bus
+# Phase 3 Hook System：引入 hook registry 与上下文对象。
+# 原因：before_tool_call 的业务检查要从 ai_step.py 的硬编码分支迁出。
+# 做法：ai_step 只负责构造 HookContext 并触发 registry；具体规则由 handler 实现。
+# 目的：后续内核逻辑可以插件化注册，同时保持当前推理循环行为不变。
+from ..hooks import HookContext, hook_registry
+from ..hooks.builtin import register_builtins
+from ..hooks.loader import load_external_plugins
 
 logger = logging.getLogger(__name__)
 
@@ -519,6 +525,71 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     # 用户可见的输出仅通过 finish / reply 伪工具产生。
     # 纯文本重试逻辑（_handle_plaintext_response）保留，仅覆盖「完全没有任何工具调用」的分支。
 
+    # ---- before_tool_call hook：本轮工具调用级检查 ----
+    # Phase 3 Hook System：先触发 round-level hook，再进入伪工具和真实工具处理。
+    # 原因：finish 并列检测这类业务规则不应继续硬编码在 ai_step.py。
+    # 做法：把本轮所有 tool_calls 以及 legacy 过滤后的 pseudo/real 列表放进 HookContext。
+    # 目的：handler 能复刻旧判断，同时后续可以继续迁移其他 before_tool_call 规则。
+    _before_ctx = HookContext(
+        messages=ls.messages,
+        tools=ls.openai_tools,
+        node=ls.node,
+        provider=ls.provider,
+        rctx=ls.rctx,
+        step=step,
+        response=resp,
+        tool_calls=list(resp.tool_calls or []),
+        extra={"pseudo_calls": pseudo_calls, "real_tool_calls": real_tool_calls},
+    )
+    _before_result = await hook_registry.fire("before_tool_call", _before_ctx)
+    if _before_result.action is not None:
+        return _before_result.action
+    if _before_result.block:
+        _reject_msg = (
+            _before_result.error_message
+            or _before_result.reason
+            or "Tool call blocked by before_tool_call hook."
+        )
+        for tc in resp.tool_calls:
+            _err = ls.formatter.format_tool_result(tc, _reject_msg)
+            set_message_meta(_err, MessageMeta(
+                tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+                message_type="tool_result",
+            ))
+            ls.messages.append(_err)
+            _shadow_write(ls, _err, message_type="tool_result")
+        return None  # 不执行任何工具，回到主循环让 AI 重试
+    if _before_result.skip_step:
+        return None
+
+    # LEGACY: replaced by hook FinishGuardHandler in engine.hooks.builtin.finish_guard.
+    # 原因：保留原始硬编码判断，便于下一轮清理前核对行为。
+    # 做法：只注释旧逻辑，不再执行；hook 使用 pseudo_calls/real_tool_calls 复刻同一判断。
+    # 目的：迁移期间可快速回溯，不破坏当前 finish 并列拒绝语义。
+    # _has_finish = any(_pc.name == "finish" for _pc in pseudo_calls)
+    # _has_non_reply_others = bool(real_tool_calls) or any(
+    #     _pc.name not in ("finish", "reply") for _pc in pseudo_calls
+    # )
+    # if _has_finish and _has_non_reply_others:
+    #     _reject_msg = (
+    #         "\u274c REJECTED: finish() cannot be called alongside other tools "
+    #         "(except reply). Execute your other tools first, wait for their "
+    #         "results, then call finish() alone in a separate turn."
+    #     )
+    #     logger.warning(
+    #         "Rejected finish + other tools in same turn (node=%s, step=%d, tools=%s)",
+    #         ls.node.id, step, [tc.name for tc in resp.tool_calls],
+    #     )
+    #     for tc in resp.tool_calls:
+    #         _err = ls.formatter.format_tool_result(tc, _reject_msg)
+    #         set_message_meta(_err, MessageMeta(
+    #             tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+    #             message_type="tool_result",
+    #         ))
+    #         ls.messages.append(_err)
+    #         _shadow_write(ls, _err, message_type="tool_result")
+    #     return None  # 不执行任何工具，回到主循环让 AI 重试
+
     # 处理伪工具（finish 延后到真实工具之后，确保同轮真实工具不被跳过）
     _finish_call = None
     if pseudo_calls:
@@ -738,12 +809,65 @@ async def _execute_real_tools(
 
     _tool_entries: list[dict[str, Any]] = []
     _tool_atts: list[dict[str, Any]] = []
+    # Phase 3 Hook System：预构造当前批次的真实工具调用对象。
+    # 原因：before_tool_call 的审批类 handler 需要看到“当前工具”和“本轮工具集合”。
+    # 做法：把 legacy dict 形状转换为 ParsedToolCall，避免 handler 直接依赖 ai_step 内部字典。
+    # 目的：在不改变工具执行结果格式的前提下，为真实工具执行前检查提供统一输入。
+    _hook_real_tool_calls = [
+        ParsedToolCall(
+            id=str(_call.get("id") or ""),
+            name=str(_call.get("name") or ""),
+            arguments=dict(_call.get("arguments") or {}),
+        )
+        for _call in real_tool_calls
+    ]
 
     for _rtc in real_tool_calls:
         if await ls.rctx.check_cancelled():
             break
         _t_name = _rtc["name"]
         _t_args = _rtc["arguments"]
+
+        # Phase 3 Hook System：触发单个真实工具的 before_tool_call hook。
+        # 原因：审批类 handler 以当前 tool_call 为粒度，不能只看整轮工具列表。
+        # 做法：在实际执行工具前构造 HookContext；block/skip 时写入一个 tool_result 保持
+        # native 工具调用配对完整。目的：新增 hook 不破坏后续 LLM 消息格式。
+        _current_tool_call = ParsedToolCall(
+            id=str(_rtc.get("id") or ""),
+            name=str(_t_name),
+            arguments=dict(_t_args or {}),
+        )
+        _tool_hook_ctx = HookContext(
+            messages=ls.messages,
+            tools=ls.openai_tools,
+            node=ls.node,
+            provider=ls.provider,
+            rctx=ls.rctx,
+            step=step,
+            tool_call=_current_tool_call,
+            tool_calls=_hook_real_tool_calls,
+            extra={"real_tool_calls": real_tool_calls},
+        )
+        _tool_hook_result = await hook_registry.fire("before_tool_call", _tool_hook_ctx)
+        if _tool_hook_result.action is not None:
+            return _tool_hook_result.action
+        if _tool_hook_result.block or _tool_hook_result.skip_step:
+            _blocked_msg = (
+                _tool_hook_result.error_message
+                or _tool_hook_result.reason
+                or "Tool call blocked by before_tool_call hook."
+            )
+            _tool_entries.append({
+                "id": _rtc.get("id", ""),
+                "name": _t_name,
+                "args": _t_args,
+                "format": "text",
+                "raw_inline": _blocked_msg,
+                "truncated": False,
+                "ref": "",
+                "summary": _blocked_msg[:200],
+            })
+            continue
 
         # [2026-04-23] 异步工具分流：查询 spec 判断该工具是否为 async_mode。
         # 若是，则在后台 asyncio.Task 中执行，不阻塞当前推理循环，
@@ -824,10 +948,33 @@ async def _execute_real_tools(
         if _t_cancelled:
             break
 
-        if isinstance(_t_result, dict) and isinstance(_t_result.get("attachments"), list):
-            _tool_atts.extend(_t_result["attachments"])
-            ls.collected_attachments.extend(_t_result["attachments"])
-            ls.tool_produced_attachments.extend(_t_result["attachments"])
+        # Phase 3 Hook System：工具附件收集交给 AttachmentCollector。
+        # 原因：附件收集是 after_tool_call 的副作用，不应散落在真实工具执行主体中。
+        # 做法：传入原始工具结果、局部附件列表和 loop state，由 handler 统一扩展。
+        # 目的：保持最终附件选择和多模态结果提示不变。
+        _attachment_ctx = HookContext(
+            messages=ls.messages,
+            tools=ls.openai_tools,
+            node=ls.node,
+            provider=ls.provider,
+            rctx=ls.rctx,
+            step=step,
+            tool_call=_current_tool_call,
+            extra={
+                "loop_state": ls,
+                "tool_result": _t_result,
+                "tool_attachments": _tool_atts,
+            },
+        )
+        _attachment_result = await hook_registry.fire("after_tool_call", _attachment_ctx)
+        if _attachment_result.action is not None:
+            return _attachment_result.action
+
+        # LEGACY: replaced by hook AttachmentCollector.
+        # if isinstance(_t_result, dict) and isinstance(_t_result.get("attachments"), list):
+        #     _tool_atts.extend(_t_result["attachments"])
+        #     ls.collected_attachments.extend(_t_result["attachments"])
+        #     ls.tool_produced_attachments.extend(_t_result["attachments"])
 
         await ls.rctx.emit_event("handoff_progress", {
             "message": f"[{ls.node.id}] {_t_name}: {_t_summary}",
@@ -946,11 +1093,48 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
 #  AI 节点主执行函数
 # ---------------------------------------------------------------------------
 
+async def _fire_task_end_hook_if_finish(ls: _LoopState, action: TaskAction, step_count: int) -> TaskAction:
+    """Fire on_task_end for successful finish actions and keep the action updated.
+
+    Why: most normal AI-node exits are produced inside finish or hybrid plaintext
+    branches before run_ai_node reaches its outer max_steps fallback. How: route
+    only ACTION_FINISH through the registered on_task_end handlers and copy the
+    snapshot context_ref back when the handler reports that persistence ran.
+    Purpose: connect ContextSnapshotSaver to the safe normal-end path without
+    changing dispatch, fail, cancel, or preempt terminal semantics yet.
+    """
+    if action.action != ACTION_FINISH:
+        return action
+
+    # Phase 3 Hook System：普通完成路径也触发 on_task_end。
+    # 原因：finish 可能从多个内部 helper 提前返回，外层没有统一的“成功结束”落点。
+    # 做法：只在 ACTION_FINISH 返回前构造 HookContext，并传入 loop_state 与正确步数。
+    # 目的：先覆盖低风险成功路径，后续再逐步迁移 fail/preempt/dispatch 的快照保存。
+    _end_ctx = HookContext(
+        messages=ls.messages,
+        tools=ls.openai_tools,
+        node=ls.node,
+        provider=ls.provider,
+        rctx=ls.rctx,
+        step=step_count,
+        extra={"loop_state": ls, "step_count": step_count, "task_action": action},
+    )
+    _end_result = await hook_registry.fire("on_task_end", _end_ctx)
+    if _end_result.action is not None:
+        return _end_result.action
+    if _end_ctx.extra.get("snapshot_saved"):
+        action.context_ref = str(_end_ctx.extra.get("context_ref") or "")
+    return action
+
+
 async def run_ai_node(
     *,
     rctx: "RunContext",
     streaming: bool = False,
-    provider: OpenAIProvider,
+    # [provider-registry 2026-05-03] 推理循环只依赖 BaseProvider 接口。
+    # 原因：provider 由 registry 创建后不一定是 OpenAI；做法：类型标注改为 BaseProvider；
+    # 目的：删除不必要的具体 OpenAI 类型引用。
+    provider: BaseProvider,
     registry: ToolRegistry,
     node: Node,
     instruction: str,
@@ -962,6 +1146,17 @@ async def run_ai_node(
     switch_info: list[dict[str, str]] | None = None,
     attachments: list[dict[str, Any]] | None = None,
 ) -> TaskAction:
+    # Phase 3 Hook System：每次进入 AI 节点都注册内置 handler。
+    # 原因：hook registry 是进程内单例，重启或测试环境都需要显式安装内置规则。
+    # 做法：调用幂等的 register_builtins；HookRegistry 会按名称替换旧实例。
+    # 目的：避免重复注册，同时保证 finish_guard 与 approval handler 始终可用。
+    register_builtins()
+    # Phase 3 External Hook Plugins：每次进入 AI 节点时扫描工作区 plugins/。
+    # 原因：用户需要在不修改 engine 源码的情况下添加自定义 handler。
+    # 做法：调用幂等的外部插件加载器；HookRegistry 会按 handler.name 替换旧实例。
+    # 目的：启动时自动发现插件，同时避免重复注册和单个插件失败影响引擎启动。
+    load_external_plugins(hook_registry, rctx.workspace_root / "plugins")
+
     runtime_cfg = load_runtime_config(rctx.workspace_root)
     max_steps = get_int(runtime_cfg, "engine.max_steps", 32, min_value=1, max_value=200)
 
@@ -984,6 +1179,14 @@ async def run_ai_node(
     step_count = 0
     _is_block_mode = False
     system_prompt: list[dict[str, Any]] = []
+    # Phase 3 Hook System：如果 before_prompt_build 中注册了 skill/memory handler，
+    # assemble_initial_messages 先跳过旧内联注入，随后由 hook 重建同一 prompt 布局。
+    # 原因：避免注册 hook 后重复注入；做法：按 handler 名称分别控制 skip；
+    # 目的：未注册 hook 的其他部署仍保持原有 assemble_initial_messages 行为。
+    _prompt_handler_names = set(hook_registry.list_hooks().get("before_prompt_build", []))
+    _skip_skill_inject = "skill_inject" in _prompt_handler_names
+    _skip_memory_inject = "memory_inject" in _prompt_handler_names
+    _assembled_fresh = False
     snapshot = load_context_snapshot(rctx.workspace_root, context_ref) if context_ref else None
     if snapshot and isinstance(snapshot.get("messages"), list):
         messages = list(snapshot.get("messages") or [])
@@ -1001,7 +1204,36 @@ async def run_ai_node(
             task_context=rctx.task_context,
             session_id=rctx.session_id,
             attachments=attachments,
+            skip_skill_inject=_skip_skill_inject,
+            skip_memory_inject=_skip_memory_inject,
         )
+        _assembled_fresh = True
+
+    if _assembled_fresh and _prompt_handler_names:
+        # Phase 3 Hook System：初始 messages 完成后触发 before_prompt_build。
+        # 原因：SkillInjector/MemoryInjector 需要复用已渲染的 system_prompt、history
+        # 和 instruction 布局信息。做法：handler 通过 shared layout helper 原地重建
+        # messages。目的：正式接入 prompt 注入 hook，同时避免重复注入。
+        _prompt_ctx = HookContext(
+            messages=messages,
+            tools=[],
+            node=node,
+            provider=provider,
+            rctx=rctx,
+            step=step_count,
+            extra={
+                "runtime_cfg": runtime_cfg,
+                "instruction_text": instruction,
+                "history": history,
+                "attachments": attachments,
+                "system_prompt": system_prompt,
+                "apply_injection": True,
+            },
+        )
+        _prompt_result = await hook_registry.fire("before_prompt_build", _prompt_ctx)
+        if _prompt_result.action is not None:
+            return _prompt_result.action
+        _is_block_mode = bool(_prompt_ctx.extra.get("is_block_mode", _is_block_mode))
 
     # ---- 追加恢复消息 ----
     if resume_data:
@@ -1093,64 +1325,40 @@ async def run_ai_node(
 
     # ---- 推理循环 ----
     for step in range(step_count, max_steps):
-        action = await _check_preempt_and_cancel(ls, step)
-        if action is not None:
-            return action
+        # Phase 3 Hook System：循环顶部统一触发 before_step。
+        # 原因：取消、preempt 注入、microcompact、proactive snip 和自动压缩都属于
+        # prompt 生成前的可插拔检查。做法：把完整 loop state 放入 HookContext.extra，
+        # 由 PreemptChecker 与 CompactChecker 按优先级执行。目的：减少 ai_step.py
+        # 中的硬编码控制流，同时保持旧行为顺序不变。
+        _step_ctx = HookContext(
+            messages=ls.messages,
+            tools=ls.openai_tools,
+            node=ls.node,
+            provider=ls.provider,
+            rctx=ls.rctx,
+            step=step,
+            extra={"loop_state": ls, "step_count": step_count},
+        )
+        _step_result = await hook_registry.fire("before_step", _step_ctx)
+        if _step_result.action is not None:
+            return _step_result.action
+        if _step_result.skip_step:
+            continue
 
-        await _inject_preempt_message(ls, step)
-
+        # LEGACY: replaced by hook PreemptChecker and CompactChecker.
+        # 原因：保留旧调用位置，方便对照迁移前的执行顺序。
+        # 做法：旧函数和原始逻辑仍保留在本文件中，但不再从循环直接调用。
+        # 目的：下一轮清理前可快速回退或核对行为。
+        # action = await _check_preempt_and_cancel(ls, step)
+        # if action is not None:
+        #     return action
+        # await _inject_preempt_message(ls, step)
         # P1 Microcompact + Proactive Snip: 闲置时主动减压
-        if step == step_count:  # 只在本轮第一步检查（避免循环内重复）
-            from engine.compact import microcompact_messages
-            _, _mc_cleared = microcompact_messages(ls.messages)
-            if _mc_cleared:
-                logger.info("microcompact: cleared %d tool_results", _mc_cleared)
-
-            # Proactive Snip: 按闲置时长渐进式替换旧 task 为摘要
-            # 每超过 1 小时替换 2 个，保留最近 3 个 task + 活跃 task
-            try:
-                from datetime import datetime as _dt, timezone as _tz
-                from engine.task_record import snip_history, snip_store, load_task_records
-                _last_ts = None
-                for _m in reversed(ls.messages):
-                    _mm = _m.get("_meta", {})
-                    if isinstance(_mm, dict) and (_mm.get("message_type") == "assistant" or _m.get("role") == "assistant"):
-                        _ts_str = _mm.get("timestamp", "")
-                        if _ts_str:
-                            try:
-                                _last_ts = _dt.fromisoformat(_ts_str)
-                                if _last_ts.tzinfo is None:
-                                    _last_ts = _last_ts.replace(tzinfo=_tz.utc)
-                            except Exception:
-                                pass
-                        break
-                if _last_ts is not None:
-                    _gap_hours = (_dt.now(_tz.utc) - _last_ts).total_seconds() / 3600.0
-                    if _gap_hours >= 1.0:
-                        _proactive_max = max(int(_gap_hours) * 2, 2)  # 2 per hour, no cap — keep_recent_tasks=3 is the floor
-                        _snip_sid = ls.rctx.child_session_id or ls.rctx.session_id
-                        _snip_records = load_task_records(ls.rctx.workspace_root, _snip_sid)
-                        if _snip_records:
-                            _snipped, _snip_count, _snipped_ids = snip_history(
-                                ls.messages, _snip_records,
-                                keep_recent_tasks=3, max_snip=_proactive_max,
-                            )
-                            if _snip_count > 0:
-                                ls.messages = _snipped
-                                _store = getattr(ls.rctx, 'conversation_store', None)
-                                if _store:
-                                    try:
-                                        _persisted = snip_store(_store.load(_snip_sid), _snip_records, _snipped_ids)
-                                        _store.replace_all(_snip_sid, _persisted)
-                                    except Exception as _pe:
-                                        logger.warning("proactive snip persist failed: %s", _pe)
-                                logger.info("proactive snip: replaced %d tasks (gap=%.1fh, max=%d)", _snip_count, _gap_hours, _proactive_max)
-            except Exception as _ps_err:
-                logger.warning("proactive snip failed: %s", _ps_err)
-
-        action = await _check_and_compact(ls, step)
-        if action is not None:
-            return action
+        # if step == step_count:
+        #     ...  # moved to CompactChecker._run_idle_cleanup
+        # action = await _check_and_compact(ls, step)
+        # if action is not None:
+        #     return action
 
         # _update_dynamic_vars(ls)  # Disabled to prevent intra-task prompt cache invalidation
 
@@ -1171,11 +1379,29 @@ async def run_ai_node(
         # P0 Task 内核化：记录实际完成的步数
         ls.rctx.completed_steps = step + 1
 
-        # P0 Task 内核化：累加 token 用量
-        if resp.usage and isinstance(resp.usage, dict):
-            for _uk in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                if _uk in resp.usage:
-                    ls.rctx.total_usage[_uk] = ls.rctx.total_usage.get(_uk, 0) + resp.usage[_uk]
+        # Phase 3 Hook System：LLM 调用后的 usage 统计交给 UsageTracker。
+        # 原因：token 累加是 after_llm_call 的典型横切逻辑。做法：传入响应和
+        # loop state，由 handler 更新 rctx.total_usage。目的：保持 TaskRecord
+        # 用量统计不变，同时从 ai_step.py 中抽出 bookkeeping。
+        _usage_ctx = HookContext(
+            messages=ls.messages,
+            tools=ls.openai_tools,
+            node=ls.node,
+            provider=ls.provider,
+            rctx=ls.rctx,
+            step=step,
+            response=resp,
+            extra={"loop_state": ls},
+        )
+        _usage_result = await hook_registry.fire("after_llm_call", _usage_ctx)
+        if _usage_result.action is not None:
+            return _usage_result.action
+
+        # LEGACY: replaced by hook UsageTracker.
+        # if resp.usage and isinstance(resp.usage, dict):
+        #     for _uk in ("prompt_tokens", "completion_tokens", "total_tokens"):
+        #         if _uk in resp.usage:
+        #             ls.rctx.total_usage[_uk] = ls.rctx.total_usage.get(_uk, 0) + resp.usage[_uk]
 
         if not resp.ok:
             return _build_failure_action(ls, resp, step)
@@ -1200,15 +1426,53 @@ async def run_ai_node(
         if resp.tool_calls:
             action = await _handle_tool_calls(ls, resp, step)
             if action is not None:
-                return action
+                return await _fire_task_end_hook_if_finish(ls, action, step + 1)
             continue
 
-        action = _handle_plaintext_response(ls, resp, step)
-        if action is not None:
-            return action
+        # Phase 3 Hook System：纯文本响应交给 PlaintextRetryHandler。
+        # 原因：hybrid 隐式 finish 与 tool_only 重试是 before_response 决策。
+        # 做法：handler 根据 output_mode 返回 TaskAction 或追加 retry hint。
+        # 目的：保留原行为，同时让响应策略可注册。
+        _plaintext_ctx = HookContext(
+            messages=ls.messages,
+            tools=ls.openai_tools,
+            node=ls.node,
+            provider=ls.provider,
+            rctx=ls.rctx,
+            step=step,
+            response=resp,
+            extra={"loop_state": ls},
+        )
+        _plaintext_result = await hook_registry.fire("before_response", _plaintext_ctx)
+        if _plaintext_result.action is not None:
+            return await _fire_task_end_hook_if_finish(ls, _plaintext_result.action, step + 1)
+
+        # LEGACY: replaced by hook PlaintextRetryHandler.
+        # action = _handle_plaintext_response(ls, resp, step)
+        # if action is not None:
+        #     return action
 
     # ---- 达到最大步数 ----
-    ctx_ref = _persist_ctx(ls, max_steps)
+    # Phase 3 Hook System：max_steps 是任务错误结束路径，先交给 on_task_error
+    # 保存上下文。原因：ContextSnapshotSaver 应成为后续终止路径的统一入口；
+    # 做法：传入正确 step_count=max_steps，并从 ctx.extra 读取 context_ref。
+    # 目的：先安全覆盖此处单一错误路径，其他复杂终止路径保留旧逻辑。
+    _error_ctx = HookContext(
+        messages=ls.messages,
+        tools=ls.openai_tools,
+        node=ls.node,
+        provider=ls.provider,
+        rctx=ls.rctx,
+        step=max_steps,
+        extra={"loop_state": ls, "step_count": max_steps},
+    )
+    _error_result = await hook_registry.fire("on_task_error", _error_ctx)
+    if _error_result.action is not None:
+        return _error_result.action
+    ctx_ref = str(_error_ctx.extra.get("context_ref") or "")
+    if not _error_ctx.extra.get("snapshot_saved"):
+        # LEGACY fallback: replaced by hook ContextSnapshotSaver for max_steps.
+        ctx_ref = _persist_ctx(ls, max_steps)
     return TaskAction(
         action=ACTION_FAIL, node_id=ls.node.id,
         error="达到最大步数限制。",

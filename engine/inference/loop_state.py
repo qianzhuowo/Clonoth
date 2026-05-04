@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 from toolbox.registry import ToolRegistry
-from providers.openai import OpenAIProvider
+from providers.base import BaseProvider
 from ..node import Node
 from ..context_store import save_context_snapshot, write_context_snapshot
 
@@ -75,7 +75,10 @@ class _LoopState:
     # ---- 核心引用 ----
     rctx: "RunContext"
     node: Node
-    provider: OpenAIProvider
+    # [provider-registry 2026-05-03] 推理状态只保存通用 provider 接口。
+    # 原因：registry 可返回任意 BaseProvider 子类；做法：把类型改为 BaseProvider；
+    # 目的：消除循环状态中的硬编码 provider 类型。
+    provider: BaseProvider
     registry: ToolRegistry
     run_id: str
     context_ref: str

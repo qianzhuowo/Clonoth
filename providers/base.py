@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 
 @dataclass
@@ -39,12 +39,30 @@ class ProviderResponse:
 
 
 class BaseProvider(ABC):
-    # [fix 2026-04-18] 新增 name 参数：让 engine 能动态获取 provider 名称，
-    # 不再硬编码 "openai"。各子类在 super().__init__ 时传入自身名称。
+    # [provider-registry 2026-05-03] provider_name 是自动注册使用的稳定 key。
+    # 原因：engine 不应再用 if-elif 认识每个 provider；做法：每个子类声明自己的 key；
+    # 目的：新增 provider 文件后可以被 registry 发现，而不用修改 engine 路由代码。
+    provider_name: str = ""
+
+    # [fix 2026-04-18] 新增 name 参数：让 engine 能动态获取 provider 名称。
+    # [provider-registry 2026-05-03] name 默认回落到 provider_name，避免实例名和注册 key 分叉。
     def __init__(self, *, model: str, name: str = ""):
         self.model = model
-        self.name = name
+        self.name = name or self.provider_name
 
     @abstractmethod
     async def chat(self, *, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None) -> ProviderResponse:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def chat_stream(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        on_text: Callable[[str], Awaitable[None]] | None = None,
+        on_thinking: Callable[[str], Awaitable[None]] | None = None,
+    ) -> ProviderResponse:
+        # [provider-registry 2026-05-03] 所有内置 provider 已实现流式接口。
+        # 在 ABC 中显式声明它，目的：插件作者能看到完整合约，抽象类也能阻止漏实现。
         raise NotImplementedError

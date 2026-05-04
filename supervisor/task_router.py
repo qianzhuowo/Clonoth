@@ -907,6 +907,17 @@ class TaskRouterMixin:
         if not _instruction.strip():
             return
 
+        # Strip tool call blocks to prevent summarizer from mimicking tool calls.
+        # The <<<TOOL_CALL>>>...<<<END_TOOL_CALL>>> markers cause flash models to
+        # hallucinate tool execution instead of summarizing.
+        import re
+        _instruction = re.sub(
+            r'<<<TOOL_CALL>>>.*?<<<END_TOOL_CALL>>>',
+            '[tool call omitted]',
+            _instruction,
+            flags=re.DOTALL,
+        )
+
         # 截断（保持在 ~30K chars，与原 turn_summary.py 一致）
         if len(_instruction) > 30000:
             _instruction = _instruction[:30000] + "\n...[truncated]"

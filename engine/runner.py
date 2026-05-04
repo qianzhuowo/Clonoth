@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import os
 import signal
 import uuid
 from pathlib import Path
@@ -18,7 +20,7 @@ from clonoth_runtime import (
     load_runtime_config,
     normalize_openai_secret,
 )
-from providers.openai import OpenAIProvider
+from providers import registry as provider_registry
 from toolbox.context import ToolContext
 from toolbox.registry import ToolRegistry
 
@@ -38,6 +40,83 @@ from .conversation_store import ConversationStore, Message, MessageType
 # 自动转发到 data/signals.jsonl 供监控使用。
 from engine.signals import get_bus
 from engine.signals.bridge import install_event_bridge
+
+
+def _provider_init_kwargs(
+    rp: Any,
+    *,
+    provider_name: str,
+    llm_http: httpx.AsyncClient,
+    api_key: str,
+    base_url: str,
+    provider_options: dict[str, Any],
+) -> dict[str, Any]:
+    """Build common constructor kwargs for provider classes."""
+    # [provider-registry 2026-05-03] 统一构造 provider 参数。
+    # 原因：runner 不应再按 provider 类型实例化不同类；做法：先组装一个超集 kwargs，
+    # 再由 _instantiate_provider 按构造签名过滤；目的：保留旧 provider 行为，同时支持新插件。
+    if provider_name in {"openai", "openai-responses"}:
+        resolved_api_key = rp.api_key or api_key
+        resolved_base_url = rp.base_url or base_url or None
+    else:
+        env_prefix = provider_name.upper().replace("-", "_")
+        resolved_api_key = rp.api_key or os.environ.get(f"{env_prefix}_API_KEY", "") or api_key
+        resolved_base_url = rp.base_url or os.environ.get(f"{env_prefix}_BASE_URL", "") or None
+    return {
+        "http": llm_http,
+        "api_key": resolved_api_key,
+        "base_url": resolved_base_url,
+        "model": rp.model,
+        "provider_options": provider_options,
+    }
+
+
+def _instantiate_provider(provider_cls: type, init_kwargs: dict[str, Any]) -> Any:
+    """Instantiate a provider, passing only kwargs its constructor accepts."""
+    # [provider-registry 2026-05-03] Provider 构造函数目前不完全一致。
+    # 原因：OpenAI 不接收 provider_options，而其他 provider 需要；做法：用签名过滤 kwargs，
+    # 若未来插件声明 **kwargs 则传入完整超集；目的：不强迫 Phase 1 改写所有 provider 构造函数。
+    signature = inspect.signature(provider_cls)
+    parameters = signature.parameters
+    if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+        return provider_cls(**init_kwargs)
+    allowed = {
+        name
+        for name, param in parameters.items()
+        if param.kind in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+    }
+    return provider_cls(**{key: value for key, value in init_kwargs.items() if key in allowed})
+
+
+def _create_provider_from_registry(
+    rp: Any,
+    *,
+    llm_http: httpx.AsyncClient,
+    api_key: str,
+    base_url: str,
+    provider_options: dict[str, Any],
+) -> Any:
+    """Resolve and instantiate the configured provider through ProviderRegistry."""
+    requested_name = (rp.provider_type or "openai").strip().lower()
+    provider_cls = provider_registry.get(requested_name)
+    provider_name = requested_name
+    if provider_cls is None:
+        # [provider-registry 2026-05-03] 未注册 provider 保持旧行为：回退到 OpenAI。
+        # 原因：过去未知 provider 会落入默认 OpenAI 分支；做法：registry miss 时取 openai；
+        # 目的：配置错误不改变历史降级语义。
+        provider_cls = provider_registry.get("openai")
+        provider_name = "openai"
+    if provider_cls is None:
+        raise RuntimeError("provider registry did not register the fallback 'openai' provider")
+    init_kwargs = _provider_init_kwargs(
+        rp,
+        provider_name=provider_name,
+        llm_http=llm_http,
+        api_key=api_key,
+        base_url=base_url,
+        provider_options=provider_options,
+    )
+    return _instantiate_provider(provider_cls, init_kwargs)
 
 
 def _collect_node_info(workspace_root: Path, node_ids: list[str]) -> list[dict[str, str]]:
@@ -606,46 +685,16 @@ async def _run_node_task(
 
     rp = resolve_provider(ws_root, node, default_model)
     _po = getattr(node, 'provider_options', {}) or {}
-    # Per-provider API key + base_url fallback from env vars
-    import os as _os
-    _gemini_key = rp.api_key or _os.environ.get("GEMINI_API_KEY", "") or api_key
-    _gemini_url = rp.base_url or _os.environ.get("GEMINI_BASE_URL", "") or None
-    _anthropic_key = rp.api_key or _os.environ.get("ANTHROPIC_API_KEY", "") or api_key
-    _anthropic_url = rp.base_url or _os.environ.get("ANTHROPIC_BASE_URL", "") or None
-    if rp.provider_type == "anthropic":
-        from providers.anthropic import AnthropicProvider
-        provider = AnthropicProvider(
-            http=llm_http,
-            api_key=_anthropic_key,
-            base_url=_anthropic_url or None,
-            model=rp.model,
-            provider_options=_po,
-        )
-    elif rp.provider_type == "openai-responses":
-        from providers.openai_responses import OpenAIResponsesProvider
-        provider = OpenAIResponsesProvider(
-            http=llm_http,
-            api_key=rp.api_key or api_key,
-            base_url=rp.base_url or base_url or None,
-            model=rp.model,
-            provider_options=_po,
-        )
-    elif rp.provider_type == "gemini":
-        from providers.gemini import GeminiProvider
-        provider = GeminiProvider(
-            http=llm_http,
-            api_key=_gemini_key,
-            base_url=_gemini_url or None,
-            model=rp.model,
-            provider_options=_po,
-        )
-    else:
-        provider = OpenAIProvider(
-            http=llm_http,
-            api_key=rp.api_key or api_key,
-            base_url=rp.base_url or base_url or None,
-            model=rp.model,
-        )
+    # [provider-registry 2026-05-03] Provider 创建改为 registry 查找。
+    # 原因：旧 if-elif 每新增 provider 都要改 runner；做法：按 rp.provider_type 找类并传统一 kwargs；
+    # 目的：保持现有四个 provider 行为不变，同时让 providers/*.py 插件可自动接入。
+    provider = _create_provider_from_registry(
+        rp,
+        llm_http=llm_http,
+        api_key=api_key,
+        base_url=base_url,
+        provider_options=_po,
+    )
 
     await rctx.emit_event("node_started", {
         "task_id": task_id, "node_id": node.id,

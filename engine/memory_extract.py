@@ -26,7 +26,7 @@ from typing import Any
 import yaml
 
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
-from providers.openai import OpenAIProvider
+from providers.base import BaseProvider
 
 logger = logging.getLogger(__name__)
 
@@ -296,7 +296,9 @@ _background_tasks: set[asyncio.Task] = set()
 async def maybe_extract_memories(
     *,
     workspace_root: Path,
-    provider: OpenAIProvider,
+    # [provider-registry 2026-05-03] 记忆提取只依赖 BaseProvider.chat。
+    # 原因：这里没有 OpenAI 专用逻辑；做法：类型改为 BaseProvider；目的：避免硬编码具体 provider。
+    provider: BaseProvider,
     messages: list[dict[str, Any]],
 ) -> None:
     """Fire-and-forget memory extraction after a successful main-agent turn.
@@ -343,7 +345,9 @@ async def maybe_extract_memories(
 
 async def _run_extraction(
     workspace_root: Path,
-    provider: OpenAIProvider,
+    # [provider-registry 2026-05-03] 后台提取调用只需要通用 chat 接口。
+    # 原因：provider 可能来自 registry 的任意实现；做法：类型改为 BaseProvider；目的：保留插件化兼容性。
+    provider: BaseProvider,
     transcript: str,
 ) -> None:
     """The actual extraction LLM call + disk write. Runs in background."""

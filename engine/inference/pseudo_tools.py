@@ -164,6 +164,9 @@ def _finish_spec() -> dict:
             "description": (
                 "Submit the final result and terminate this node immediately.\n\n"
                 "CRITICAL: Once you call finish, the node exits. If you have other tools to call (like execute_command or save_memory), you MUST wait for them to complete (`ok`) before calling finish.\n\n"
+                "⚠️ finish MUST be called ALONE — never in the same turn as other tools (except reply). "
+                "If you call finish alongside execute_command, save_memory, dispatch_node, or any other tool, ALL calls will be REJECTED and you must retry. "
+                "Always: execute tools first → wait for results → then call finish separately.\n\n"
                 "Do NOT send your final report via `reply` while waiting for tools. Just call the tools silently, wait for the next turn, and put your ENTIRE final report in the `finish` tool's text.\n\n"
                 "The `text` parameter is the ACTUAL DELIVERABLE — the content the caller "
                 "or user will receive. Put your real output here (full answer, full data, "

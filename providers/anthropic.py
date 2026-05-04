@@ -325,6 +325,11 @@ class AnthropicProvider(BaseProvider):
     streaming (chat_stream) modes, tool use, and thinking/reasoning blocks.
     """
 
+    # [provider-registry 2026-05-03] 这是自动发现注册使用的 key。
+    # 原因：engine 不再硬编码 AnthropicProvider 分支；做法：类声明 provider_name；
+    # 目的：registry 能把配置里的 "anthropic" 映射回这个类。
+    provider_name = "anthropic"
+
     def __init__(
         self,
         *,
@@ -334,7 +339,10 @@ class AnthropicProvider(BaseProvider):
         model: str,
         provider_options: dict[str, Any] | None = None,
     ):
-        super().__init__(model=model, name="anthropic")
+        # [provider-registry 2026-05-03] 实例 name 复用 provider_name。
+        # 原因：下游仍通过 provider.name 判断 provider 特性；做法：从类属性传入；
+        # 目的：注册 key、实例名和配置 provider 字段保持一致。
+        super().__init__(model=model, name=self.provider_name)
         self._http = http
         self._api_key = api_key
         # Default to official Anthropic API; strip trailing slash

@@ -237,16 +237,26 @@ class EventRouter:
     async def _init_seq(self) -> None:
         """启动时初始化事件流游标。
 
-        拉取当前事件流的最新 seq，使后续轮询只处理新事件。
-        失败时标记 _caught_up=False，由主循环首批快进补偿。
+        用 limit=5000 大步翻页追到事件流末尾，使后续轮询只处理新事件。
+        不对历史事件做任何 dispatch，仅记录最新 seq。
+        启动时连接可能暂不可用，最多重试 10 次（每次间隔 2 秒）。
         """
-        try:
-            events = await self._client.poll_events(after_seq=0)
-            if events:
-                self._after_seq = max(e.seq for e in events)
-            self._caught_up = True
-        except Exception as e:
-            logger.warning("Init failed (will fast-forward): %s", e)
+        for attempt in range(10):
+            try:
+                seq = 0
+                while True:
+                    events = await self._client.poll_events(after_seq=seq, limit=5000)
+                    if not events:
+                        break
+                    seq = max(e.seq for e in events)
+                self._after_seq = seq
+                self._caught_up = True
+                logger.info("_init_seq: caught up to seq=%d", self._after_seq)
+                return
+            except Exception as e:
+                logger.warning("_init_seq attempt %d failed: %s", attempt + 1, e)
+                await asyncio.sleep(2)
+        logger.warning("_init_seq: all attempts failed, will fast-forward from seq=0")
 
     async def _dispatch(self, event: Event) -> None:
         """将单个事件路由到 Layer 1 钩子，然后到协议处理器。"""

@@ -87,6 +87,11 @@ class OpenAIProvider(BaseProvider):
     It supports tool calling via the `tools` field.
     """
 
+    # [provider-registry 2026-05-03] 这是自动发现注册使用的 key。
+    # 原因：engine 不再硬编码 OpenAIProvider 分支；做法：类声明 provider_name；
+    # 目的：registry 能把配置里的 "openai" 映射回这个类。
+    provider_name = "openai"
+
     # ------------------------------------------------------------------
     #  L3 Provider 层：消息预处理
     # ------------------------------------------------------------------
@@ -121,8 +126,10 @@ class OpenAIProvider(BaseProvider):
         base_url: str | None,
         model: str,
     ) -> None:
-        # [fix 2026-04-18] 传入 name="openai"，供 engine 动态获取 provider 名称
-        super().__init__(model=model, name="openai")
+        # [provider-registry 2026-05-03] 实例 name 复用 provider_name。
+        # 原因：下游仍通过 provider.name 判断 provider 特性；做法：从类属性传入；
+        # 目的：注册 key、实例名和配置 provider 字段保持一致。
+        super().__init__(model=model, name=self.provider_name)
 
         k = (api_key or "").strip()
         if not k:

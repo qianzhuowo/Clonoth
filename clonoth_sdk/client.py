@@ -132,6 +132,7 @@ class ClonothClient:
         *,
         after_seq: int = 0,
         types: str | None = None,
+        limit: int | None = None,
     ) -> list[Event]:
         """从全局事件流拉取新事件。
 
@@ -149,6 +150,8 @@ class ClonothClient:
         params: dict[str, Any] = {"after_seq": after_seq}
         if types:
             params["types"] = types
+        if limit:
+            params["limit"] = limit
 
         resp = await self._http().get(f"{self._base_url}/v1/events", params=params)
         resp.raise_for_status()

@@ -256,7 +256,7 @@ def _find_pseudo_history_marker(content: str) -> tuple[str, int]:
         if pos >= 0:
             return name, pos
 
-    dynamic_prefix = "[Tool call history record: dispatch:"
+    dynamic_prefix = "[Tool call history record: dispatch_to_"
     pos = content.find(dynamic_prefix)
     if pos < 0:
         return "", -1

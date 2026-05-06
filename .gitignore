@@ -22,3 +22,4 @@ pip-wheel-metadata/
 
 # private skills
 secret_skills/
+tests/

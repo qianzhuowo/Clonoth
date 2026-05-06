@@ -22,7 +22,7 @@ _PSEUDO_TOOL_NAMES = frozenset({"finish", "reply", "switch_node", "compact_conte
 # recognize dispatch:{target_id} through this prefix. Purpose: route dynamic tools
 # through the existing pseudo-tool execution path without hard-coding node ids or
 # reintroducing removed aggregate tools.
-DISPATCH_TOOL_PREFIX = "dispatch:"
+DISPATCH_TOOL_PREFIX = "dispatch_to_"
 
 
 def _is_pseudo_tool_name(name: str) -> bool:
@@ -39,16 +39,35 @@ def _is_pseudo_tool_name(name: str) -> bool:
     )
 
 
+import re as _re
+
+_TOOL_NAME_SANITIZE_RE = _re.compile(r'[^a-zA-Z0-9_-]')
+# Reverse mapping: sanitized tool name suffix → original node id
+_DISPATCH_TOOL_REVERSE: dict[str, str] = {}
+
+
+def _sanitize_node_id_for_tool(node_id: str) -> str:
+    """Sanitize a node id to comply with OpenAI tool name pattern [a-zA-Z0-9_-]."""
+    return _TOOL_NAME_SANITIZE_RE.sub('_', str(node_id or '').strip())
+
+
 def _dispatch_tool_name(target_id: str) -> str:
     """Build the public per-target dispatch tool name."""
-    return f"{DISPATCH_TOOL_PREFIX}{str(target_id or '').strip()}"
+    raw = str(target_id or '').strip()
+    sanitized = _sanitize_node_id_for_tool(raw)
+    name = f"{DISPATCH_TOOL_PREFIX}{sanitized}"
+    _DISPATCH_TOOL_REVERSE[sanitized] = raw
+    return name
 
 
 def _dispatch_target_from_tool_name(tool_name: str) -> str:
-    """Extract the fixed target id from a dispatch:{target_id} tool name."""
+    """Extract the original target id from a dispatch-{sanitized_id} tool name."""
     name = str(tool_name or "").strip()
     if not name.startswith(DISPATCH_TOOL_PREFIX):
         return ""
+    sanitized_suffix = name[len(DISPATCH_TOOL_PREFIX):].strip()
+    # Reverse lookup: sanitized → original node id
+    return _DISPATCH_TOOL_REVERSE.get(sanitized_suffix, sanitized_suffix)
     return name[len(DISPATCH_TOOL_PREFIX):].strip()
 
 # [RFC 2026-04-20] finish 升级为真实 API 工具：tool_result 固定内容。
@@ -314,8 +333,13 @@ def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | No
         desc_parts.append("可切换到的节点：")
         for info in switch_info:
             desc_parts.append(f"- {info.get('name', info['id'])}（{info['id']}）：{info.get('description', '')}")
-    # target enum 允许空字符串（恢复默认）
-    enum_vals = targets + [""] if targets else [""]
+    # target enum: Gemini 不允许空字符串或空数组，仅在有 targets 时添加 enum
+    target_prop: dict = {
+        "type": "string",
+        "description": "目标节点 ID。传空字符串恢复为默认入口节点。",
+    }
+    if targets:
+        target_prop["enum"] = targets
     return {
         "type": "function",
         "function": {
@@ -324,11 +348,7 @@ def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | No
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "target": {
-                        "type": "string",
-                        "enum": enum_vals,
-                        "description": "目标节点 ID。传空字符串恢复为默认入口节点。",
-                    },
+                    "target": target_prop,
                     "text": {
                         "type": "string",
                         "description": "给用户的回复文本（如'已切换到编程节点'）。",

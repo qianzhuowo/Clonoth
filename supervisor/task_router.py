@@ -56,8 +56,14 @@ class TaskRouterMixin:
             self._route_fail_locked(task, action)
         # cancelled → 不做路由
 
-        # 后置触发：检查是否需要创建记忆提取任务
-        self._maybe_trigger_memory_extract_locked(task)
+        # Why: automatic memory extraction is now an engine.builtin supervisor
+        # hook handler and must not receive SupervisorState directly. How: build a
+        # callback-only context that includes the completed task. Purpose: keep
+        # TaskRouterMixin focused on routing while eliminating handler cycles.
+        self.hook_registry.fire(
+            "on_entry_task_complete",
+            self._build_supervisor_hook_ctx(task=task, session_id=task.session_id),
+        )
 
         # 后置触发：检查是否需要创建轮摘要任务
         self._maybe_trigger_turn_summary_locked(task)
@@ -939,136 +945,3 @@ class TaskRouterMixin:
             source_inbound_seq=None,
             caller_task_id=None,
         )
-
-    # ------------------------------------------------------------------ #
-    #  后置记忆提取
-    # ------------------------------------------------------------------ #
-
-    def _maybe_trigger_memory_extract_locked(self, task: Task) -> None:
-        """入口节点 finish 后，检查是否需要创建记忆提取后置任务。
-
-        P3 改进 (2026-04-25):
-          - 互斥：主节点已调 save_memory 时跳过（避免重复存储）
-          - 缩窄范围：只提取当前 task 的消息，不发全量 session 历史
-          - 门控保持消息增量计数（兼容旧逻辑）
-        """
-        # 仅对入口节点的 finish 动作触发
-        act = str((task.result or {}).get("action") or "").strip()
-        if act != "finish" or task.kind != TaskKind.node:
-            return
-        # 不对系统内部任务触发（避免提取节点自身完成后递归触发）
-        if task.input.get("_system_task"):
-            return
-
-        runtime_cfg = load_runtime_config(self.workspace_root)
-        entry_node_id = get_str(runtime_cfg, "shell.entry_node_id", "bootstrap.shell_orchestrator").strip()
-        if task.node_id != entry_node_id:
-            return
-        if not get_bool(runtime_cfg, "memory.auto_extract.enabled", False):
-            return
-
-        # P3 互斥：主节点这轮已调 save_memory → 跳过提取
-        _tool_names = (task.result or {}).get("_tool_names") or []
-        if "save_memory" in _tool_names:
-            return
-
-        # 门控：消息数量
-        msgs = self.session_messages(session_id=task.session_id, limit=0)  # limit=0 → 全量
-        non_system = [m for m in msgs if m.get("role") != "system"]
-        current_count = len(non_system)
-
-        min_messages = get_int(runtime_cfg, "memory.auto_extract.min_messages", 4, min_value=2, max_value=100)
-        if current_count < min_messages:
-            return
-
-        min_increment = get_int(runtime_cfg, "memory.auto_extract.min_increment", 10, min_value=1, max_value=100)
-        last_count = self._memory_extract_msg_counts.get(task.session_id, 0)
-        if current_count - last_count < min_increment:
-            return
-
-        # P3→修正：提取「上次游标到当前」之间所有 task 的消息
-        # 避免只取当前 task 导致中间 task 被永久跳过
-        _range_msgs = []
-        try:
-            from pathlib import Path
-            from engine.conversation_store import ConversationStore
-            _store = ConversationStore(Path(self.workspace_root) / "data" / "conversations")
-            _all_msgs = _store.load(task.session_id)
-            # 取非 system 消息，按存储顺序截取 last_count → current_count 区间
-            _non_sys = [m for m in _all_msgs if m.role != "system"]
-            _range_msgs = _non_sys[last_count:current_count]
-        except Exception:
-            pass
-
-        if _range_msgs:
-            _parts: list[str] = []
-            for _tm in _range_msgs:
-                _c = _tm.content or ""
-                if len(_c) > 2000:
-                    _c = _c[:2000] + "...<truncated>"
-                _parts.append(f"[{_tm.role}]\n{_c}")
-            transcript = "\n\n---\n\n".join(_parts)
-        else:
-            # fallback：旧方式全量格式化
-            transcript = self._format_transcript_for_extract(msgs)
-
-        if not transcript.strip():
-            return
-
-        # [2026-04-26] 删除 P4b 预注入逻辑：700+ 条记忆清单会污染主 session 历史并撑爆上下文。
-        # extractor 节点的 system prompt 已包含防重复指令，无需额外注入。
-
-        # 更新游标
-        self._memory_extract_msg_counts[task.session_id] = current_count
-
-        from uuid import uuid4
-        extractor_node = get_str(runtime_cfg, "memory.auto_extract.node_id", "system.memory_extractor").strip()
-        # [2026-04-26] 增加 child_session_id 隔离，防止系统任务的 instruction 写入主 session JSONL
-        _child_sid = f"child_{uuid4().hex[:12]}"
-        self._create_task_locked(
-            session_id=task.session_id,
-            session_generation=task.session_generation,
-            kind=TaskKind.node,
-            node_id=extractor_node,
-            input_data={
-                "instruction": transcript,
-                "child_session_id": _child_sid,
-                "_system_task": True,
-            },
-            continuation={},
-            source_inbound_seq=None,
-            caller_task_id=None,
-        )
-
-    @staticmethod
-    def _format_transcript_for_extract(
-        messages: list[dict[str, Any]],
-        *,
-        max_chars: int = 12000,
-    ) -> str:
-        """将会话消息格式化为对话记录文本，供记忆提取节点分析。"""
-        parts: list[str] = []
-        total = 0
-        for msg in reversed(messages):
-            role = msg.get("role", "")
-            if role == "system":
-                continue
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                texts = [
-                    p.get("text", "")
-                    for p in content
-                    if isinstance(p, dict) and isinstance(p.get("text"), str)
-                ]
-                content = "\n".join(texts)
-            if not isinstance(content, str):
-                content = str(content)
-            if len(content) > 2000:
-                content = content[:2000] + "...<truncated>"
-            line = f"[{role}]\n{content}"
-            total += len(line)
-            if total > max_chars:
-                break
-            parts.append(line)
-        parts.reverse()
-        return "\n\n---\n\n".join(parts)

@@ -9,7 +9,7 @@
 | `types.py` | 定义 `Handler`、`HookContext`、`HookResult`。 |
 | `registry.py` | 定义 `HookRegistry`，负责注册、排序、触发 handler。 |
 | `loader.py` | 扫描并加载工作区 `plugins/` 下的外部 hook 插件。 |
-| `builtin/` | 保存内置 handler，并由 `register_builtins()` 统一注册。 |
+| `../builtin/` | 保存内置 handler，并由 `auto_discover_and_register()` 根据 `PLUGIN_META` 自动注册。 |
 
 ## 当前 hook point
 

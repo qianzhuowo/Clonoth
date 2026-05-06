@@ -90,12 +90,16 @@ def _load_module_from_path(py_file: Path) -> ModuleType:
 def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path) -> int:
     """Load enabled external hook plugins from plugins_dir.
 
+    Supports two registration modes (checked in order):
+    1. PLUGIN_META auto-discovery — same mechanism as engine/builtin.
+    2. Legacy register() function — backward compatible with older plugins.
+
     Args:
         hook_registry: Registry that each plugin's register() function receives.
         plugins_dir: Directory containing drop-in plugin .py files.
 
     Returns:
-        Number of plugin files whose register() function completed successfully.
+        Number of plugin files loaded successfully.
     """
     count = 0
     plugins_dir = Path(plugins_dir)
@@ -108,32 +112,42 @@ def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path) -> int
         try:
             module = _load_module_from_path(py_file)
             meta = _normalize_plugin_meta(py_file, getattr(module, "PLUGIN_META", {}))
+
+            # Mode 1: PLUGIN_META with handler_class + hook_points
+            raw_meta = getattr(module, "PLUGIN_META", None)
+            if isinstance(raw_meta, dict) and raw_meta.get("handler_class") and raw_meta.get("hook_points"):
+                class_name = str(raw_meta["handler_class"]).strip()
+                cls = getattr(module, class_name)
+                instance = cls()
+                priority = raw_meta.get("priority", getattr(instance, "priority", None))
+                for item in raw_meta["hook_points"]:
+                    if isinstance(item, (tuple, list)) and len(item) == 2:
+                        hook_point, method_name = str(item[0]).strip(), str(item[1]).strip()
+                        method = getattr(instance, method_name)
+                        hook_registry.register(hook_point, method, priority=priority)
+                hook_registry.register_plugin_meta(meta)
+                count += 1
+                logger.info(
+                    "Loaded external plugin (PLUGIN_META): %s %s (%s)",
+                    meta["name"], meta["version"], py_file.name,
+                )
+                continue
+
+            # Mode 2: Legacy register() function
             register = getattr(module, "register", None)
             if not callable(register):
                 logger.warning(
-                    "Plugin %s %s (%s) has no register() function, skipped",
-                    meta["name"],
-                    meta["version"],
-                    py_file.name,
+                    "Plugin %s %s (%s) has no PLUGIN_META or register(), skipped",
+                    meta["name"], meta["version"], py_file.name,
                 )
                 continue
-            # Why: register_builtins() is already idempotent through handler-name
-            # replacement. How: external plugins use the same HookRegistry API and
-            # then publish normalized metadata through HookRegistry. Purpose:
-            # repeated task startup can call this loader safely while list_plugins()
-            # stays accurate.
             register(hook_registry)
             hook_registry.register_plugin_meta(meta)
             count += 1
             logger.info(
-                "Loaded external plugin: %s %s (%s)",
-                meta["name"],
-                meta["version"],
-                py_file.name,
+                "Loaded external plugin (legacy): %s %s (%s)",
+                meta["name"], meta["version"], py_file.name,
             )
         except Exception as exc:
-            # Why: user plugins are optional extensions and must not prevent the
-            # engine from starting. How: log the failure and continue scanning.
-            # Purpose: one bad plugin cannot disable all inference tasks.
             logger.error("Failed to load plugin %s: %s", py_file.name, exc, exc_info=True)
     return count

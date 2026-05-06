@@ -50,6 +50,46 @@ _LEGACY_TOOL_RECORD_RE = re.compile(
 _SYNTHETIC_TOOL_OUTPUT = "[No tool result was recorded by the engine.]"
 
 
+def _strip_encrypted_content(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Remove encrypted_content from reasoning items, keeping summary."""
+    cleaned: list[dict[str, Any]] = []
+    for item in items:
+        if isinstance(item, dict) and item.get("type") == "reasoning":
+            # [2026-05-06] Why: OpenAI can reject stale encrypted reasoning
+            # content when verifying prior turns. How: copy only reasoning items
+            # and drop encrypted_content while preserving summary. Purpose: keep
+            # useful visible reasoning summaries without resending unverifiable
+            # encrypted blobs.
+            new_item = {k: v for k, v in item.items() if k != "encrypted_content"}
+            if "summary" not in new_item:
+                new_item["summary"] = []
+            cleaned.append(new_item)
+        else:
+            cleaned.append(item)
+    return cleaned
+
+
+def _is_encrypted_content_error(error_msg: str) -> bool:
+    """Return True for OpenAI encrypted reasoning verification failures."""
+    lower = str(error_msg or "").lower()
+    # [2026-05-06] Why: generic verification/decryption errors may refer to
+    # unrelated inputs. How: require an encrypted-content marker plus the known
+    # OpenAI verification/decryption phrases. Purpose: retry only the safe
+    # fallback path requested for reasoning.encrypted_content failures.
+    has_encrypted_marker = "encrypted content" in lower or "encrypted_content" in lower
+    has_verification_failure = "could not be verified" in lower or "could not be decrypted" in lower
+    return has_encrypted_marker and has_verification_failure
+
+
+def _response_error_message(resp: httpx.Response) -> str:
+    """Extract an API error message from an HTTP response."""
+    try:
+        body = resp.json()
+        return body.get("error", {}).get("message", resp.text[:500])
+    except Exception:
+        return resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+
+
 class OpenAIResponsesProvider(BaseProvider):
     """Provider targeting the OpenAI Responses API (`POST /v1/responses`)."""
 
@@ -272,12 +312,29 @@ class OpenAIResponsesProvider(BaseProvider):
             return ProviderResponse(ok=False, error=str(exc))
 
         if resp.status_code >= 400:
-            try:
-                body = resp.json()
-                err_msg = body.get("error", {}).get("message", resp.text[:500])
-            except Exception:
-                err_msg = resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
-            return ProviderResponse(ok=False, error=err_msg, status_code=resp.status_code)
+            err_msg = _response_error_message(resp)
+            if resp.status_code == 400 and _is_encrypted_content_error(err_msg):
+                # [2026-05-06] Why: stale encrypted reasoning from saved
+                # Responses output can make OpenAI reject the request. How: strip
+                # encrypted_content from reasoning input items and resend this
+                # payload once. Purpose: recover the conversation while keeping
+                # the retry bounded and preserving summaries.
+                log.warning("Encrypted content verification failed, retrying without encrypted reasoning")
+                payload["input"] = _strip_encrypted_content(payload["input"])
+                try:
+                    resp = await self._http.post(
+                        self._endpoint(),
+                        headers=self._headers(),
+                        json=payload,
+                        timeout=600,
+                    )
+                except Exception as exc:
+                    return ProviderResponse(ok=False, error=str(exc))
+                if resp.status_code >= 400:
+                    err_msg = _response_error_message(resp)
+                    return ProviderResponse(ok=False, error=err_msg, status_code=resp.status_code)
+            else:
+                return ProviderResponse(ok=False, error=err_msg, status_code=resp.status_code)
 
         body = resp.json()
         result = self._parse_response(body)
@@ -307,128 +364,167 @@ class OpenAIResponsesProvider(BaseProvider):
             stream=True,
         )
 
-        # -- Accumulators for the full response --------------------------
-        text_parts: list[str] = []
-        thinking_parts: list[str] = []
-        # tool_calls keyed by output index so we can accumulate arguments
-        pending_calls: dict[int, dict[str, str]] = {}  # idx → {name, call_id, arguments}
-        usage: dict[str, int] = {}
-        raw_output_items: list[dict[str, Any]] = []  # captured from response.completed
-        # ----------------------------------------------------------------
+        # [2026-05-06] Why: stream retries must reopen the whole SSE request
+        # because a failed connection cannot be resumed. How: run at most two
+        # attempts and rebuild accumulators per attempt. Purpose: keep fallback
+        # bounded while avoiding polluted state from a failed first stream.
+        for attempt in range(2):
+            # -- Accumulators for the full response ----------------------
+            text_parts: list[str] = []
+            thinking_parts: list[str] = []
+            # tool_calls keyed by output index so we can accumulate arguments
+            pending_calls: dict[int, dict[str, str]] = {}  # idx → {name, call_id, arguments}
+            usage: dict[str, int] = {}
+            raw_output_items: list[dict[str, Any]] = []  # captured from response.completed
+            retry_without_encrypted = False
+            # ------------------------------------------------------------
 
-        try:
-          async with self._http.stream(
-            "POST",
-            self._endpoint(),
-            headers=self._headers(),
-            json=payload,
-            timeout=600,
-          ) as stream:
-            if stream.status_code >= 400:
-                body = await stream.aread()
-                try:
-                    data = json.loads(body)
-                    err_msg = data.get("error", {}).get("message", body.decode()[:500])
-                except Exception:
-                    err_msg = body.decode("utf-8", errors="replace")[:500]
-                return ProviderResponse(ok=False, error=err_msg, status_code=stream.status_code)
-            async for line in stream.aiter_lines():
-                if not line.startswith("data: "):
-                    continue
-                raw = line[6:]
-                if raw.strip() == "[DONE]":
-                    break
-                try:
-                    event = json.loads(raw)
-                except json.JSONDecodeError:
-                    continue
+            try:
+                async with self._http.stream(
+                    "POST",
+                    self._endpoint(),
+                    headers=self._headers(),
+                    json=payload,
+                    timeout=600,
+                ) as stream:
+                    if stream.status_code >= 400:
+                        body = await stream.aread()
+                        try:
+                            data = json.loads(body)
+                            err_msg = data.get("error", {}).get("message", body.decode()[:500])
+                        except Exception:
+                            err_msg = body.decode("utf-8", errors="replace")[:500]
+                        if (
+                            attempt == 0
+                            and stream.status_code == 400
+                            and _is_encrypted_content_error(err_msg)
+                        ):
+                            # [2026-05-06] Why: OpenAI can reject encrypted
+                            # reasoning before sending any SSE event. How: strip
+                            # encrypted_content and continue to the second and
+                            # final attempt. Purpose: recover once without an
+                            # unbounded retry loop.
+                            log.warning(
+                                "Encrypted content verification failed, retrying stream without encrypted reasoning"
+                            )
+                            payload["input"] = _strip_encrypted_content(payload["input"])
+                            continue
+                        return ProviderResponse(ok=False, error=err_msg, status_code=stream.status_code)
+                    async for line in stream.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        raw = line[6:]
+                        if raw.strip() == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
 
-                etype = event.get("type", "")
+                        etype = event.get("type", "")
 
-                # --- text deltas ---
-                if etype == "response.output_text.delta":
-                    delta = event.get("delta", "")
-                    if delta:
-                        text_parts.append(delta)
-                        if on_text:
-                            await on_text(delta)
+                        # --- text deltas ---
+                        if etype == "response.output_text.delta":
+                            delta = event.get("delta", "")
+                            if delta:
+                                text_parts.append(delta)
+                                if on_text:
+                                    await on_text(delta)
 
-                # --- reasoning / thinking deltas ---
-                elif etype in (
-                    "response.reasoning_text.delta",
-                    "response.reasoning_summary_text.delta",
-                ):
-                    delta = event.get("delta", "")
-                    if delta:
-                        thinking_parts.append(delta)
-                        if on_thinking:
-                            await on_thinking(delta)
+                        # --- reasoning / thinking deltas ---
+                        elif etype in (
+                            "response.reasoning_text.delta",
+                            "response.reasoning_summary_text.delta",
+                        ):
+                            delta = event.get("delta", "")
+                            if delta:
+                                thinking_parts.append(delta)
+                                if on_thinking:
+                                    await on_thinking(delta)
 
-                # --- new function_call item added ---
-                elif etype == "response.output_item.added":
-                    item = event.get("item", {})
-                    idx = event.get("output_index", 0)
-                    if item.get("type") == "function_call":
-                        pending_calls[idx] = {
-                            "name": item.get("name", ""),
-                            "call_id": item.get("call_id", ""),
-                            "arguments": "",
-                        }
+                        # --- new function_call item added ---
+                        elif etype == "response.output_item.added":
+                            item = event.get("item", {})
+                            idx = event.get("output_index", 0)
+                            if item.get("type") == "function_call":
+                                pending_calls[idx] = {
+                                    "name": item.get("name", ""),
+                                    "call_id": item.get("call_id", ""),
+                                    "arguments": "",
+                                }
 
-                # --- function_call arguments delta ---
-                elif etype == "response.function_call_arguments.delta":
-                    idx = event.get("output_index", 0)
-                    delta = event.get("delta", "")
-                    if idx in pending_calls:
-                        pending_calls[idx]["arguments"] += delta
+                        # --- function_call arguments delta ---
+                        elif etype == "response.function_call_arguments.delta":
+                            idx = event.get("output_index", 0)
+                            delta = event.get("delta", "")
+                            if idx in pending_calls:
+                                pending_calls[idx]["arguments"] += delta
 
-                # --- response completed: extract usage + raw output ---
-                elif etype in ("response.completed", "response.done"):
-                    resp_obj = event.get("response", {})
-                    u = resp_obj.get("usage", {})
-                    if u:
-                        usage = u
-                    # [2026-05-01] 流式完成时捕获原始 output（含 reasoning encrypted_content）
-                    _raw_out = resp_obj.get("output")
-                    if _raw_out and isinstance(_raw_out, list):
-                        raw_output_items = _raw_out
+                        # --- response completed: extract usage + raw output ---
+                        elif etype in ("response.completed", "response.done"):
+                            resp_obj = event.get("response", {})
+                            u = resp_obj.get("usage", {})
+                            if u:
+                                usage = u
+                            # [2026-05-01] 流式完成时捕获原始 output（含 reasoning encrypted_content）
+                            _raw_out = resp_obj.get("output")
+                            if _raw_out and isinstance(_raw_out, list):
+                                raw_output_items = _raw_out
 
-                # --- error / failure ---
-                elif etype == "response.failed":
-                    err = event.get("response", {}).get("error", {})
-                    err_msg = err.get("message", str(err))
-                    return ProviderResponse(ok=False, error=f"API failed: {err_msg}")
-                elif etype == "error":
-                    err_msg = event.get("message", str(event))
-                    return ProviderResponse(ok=False, error=f"Stream error: {err_msg}")
+                        # --- error / failure ---
+                        elif etype == "response.failed":
+                            err = event.get("response", {}).get("error", {})
+                            err_msg = err.get("message", str(err))
+                            if attempt == 0 and _is_encrypted_content_error(err_msg):
+                                # [2026-05-06] Why: OpenAI may report encrypted
+                                # reasoning failure as response.failed after the
+                                # SSE connection opens. How: close this stream,
+                                # strip encrypted_content, and retry exactly once.
+                                # Purpose: support both HTTP 400 and in-stream
+                                # failure shapes for the same fallback.
+                                log.warning(
+                                    "Encrypted content verification failed, retrying stream without encrypted reasoning"
+                                )
+                                payload["input"] = _strip_encrypted_content(payload["input"])
+                                retry_without_encrypted = True
+                                break
+                            return ProviderResponse(ok=False, error=f"API failed: {err_msg}")
+                        elif etype == "error":
+                            err_msg = event.get("message", str(event))
+                            return ProviderResponse(ok=False, error=f"Stream error: {err_msg}")
 
-        except Exception as exc:
-            return ProviderResponse(ok=False, error=str(exc))
+            except Exception as exc:
+                return ProviderResponse(ok=False, error=str(exc))
 
-        # -- Build final ProviderResponse --------------------------------
-        # raw_output_items 在 response.completed 事件中捕获
-        provider_meta: dict[str, Any] = {}
-        if raw_output_items:
-            provider_meta["raw_output"] = raw_output_items
+            if retry_without_encrypted:
+                continue
 
-        tool_calls: list[ToolCall] = []
-        for _idx, pc in sorted(pending_calls.items()):
-            tool_calls.append(ToolCall(
-                id=pc["call_id"],
-                name=pc["name"],
-                arguments=_safe_json_loads(pc["arguments"]),
-            ))
+            # -- Build final ProviderResponse ----------------------------
+            # raw_output_items 在 response.completed 事件中捕获
+            provider_meta: dict[str, Any] = {}
+            if raw_output_items:
+                provider_meta["raw_output"] = raw_output_items
 
-        inp = usage.get("input_tokens", 0)
-        out = usage.get("output_tokens", 0)
-        return ProviderResponse(
-            ok=True,
-            text="".join(text_parts) or None,
-            tool_calls=tool_calls,
-            reasoning="".join(thinking_parts) or None,
-            usage={"prompt_tokens": inp, "completion_tokens": out, "total_tokens": inp + out},
-            provider_meta=provider_meta,
-        )
+            tool_calls: list[ToolCall] = []
+            for _idx, pc in sorted(pending_calls.items()):
+                tool_calls.append(ToolCall(
+                    id=pc["call_id"],
+                    name=pc["name"],
+                    arguments=_safe_json_loads(pc["arguments"]),
+                ))
+
+            inp = usage.get("input_tokens", 0)
+            out = usage.get("output_tokens", 0)
+            return ProviderResponse(
+                ok=True,
+                text="".join(text_parts) or None,
+                tool_calls=tool_calls,
+                reasoning="".join(thinking_parts) or None,
+                usage={"prompt_tokens": inp, "completion_tokens": out, "total_tokens": inp + out},
+                provider_meta=provider_meta,
+            )
+
+        return ProviderResponse(ok=False, error="Encrypted content retry failed before receiving a response")
 
     # ------------------------------------------------------------------
     # Payload builder (shared between chat and chat_stream)

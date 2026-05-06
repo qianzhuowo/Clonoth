@@ -10,6 +10,7 @@ from .eventlog import SYSTEM_SESSION_ID
 from .types import ApprovalStatus, TaskStatus
 
 
+
 # ---------------------------------------------------------------------------
 #  多模态消息构建（内联版本，避免 supervisor → engine 依赖）
 # ---------------------------------------------------------------------------
@@ -119,6 +120,22 @@ class SessionMixin:
         if seq not in self._inbound_events:
             self._inbound_events[seq] = {"session_id": session_id, "payload": payload}
             self._inbound_order.append(seq)
+            # Why: inbound side effects now belong to supervisor hook handlers.
+            # How: fire only when this seq is first applied, so replayed or
+            # duplicate inbound events do not repeatedly disturb handler state.
+            # Purpose: let MemoryExtractHandler cancel idle extraction without
+            # keeping timer dictionaries on SupervisorState.
+            self.hook_registry.fire(
+                "on_inbound_message",
+                # Why: engine.builtin handlers cannot receive SupervisorState.
+                # How: pass a callback-only context plus inbound metadata.
+                # Purpose: preserve idle-timer cancellation without cyclic imports.
+                self._build_supervisor_hook_ctx(
+                    session_id=session_id,
+                    inbound_seq=seq,
+                    payload=payload,
+                ),
+            )
 
     def _apply_inbound_processed(self, payload: dict[str, Any]) -> None:
         try:

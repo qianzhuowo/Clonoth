@@ -49,6 +49,23 @@ def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
     return result
 
 
+def _emit_pseudo_tool_result(ls: _LoopState, pseudo_call, content: str) -> None:
+    """统一写入伪工具的 tool_result，确保 native 模式下 tool_use/tool_result 配对完整。"""
+    from .ai_step import _shadow_write
+    _parsed = ParsedToolCall(
+        id=getattr(pseudo_call, "id", "") or "",
+        name=pseudo_call.name,
+        arguments=dict(pseudo_call.arguments or {}),
+    )
+    tool_msg = ls.formatter.format_tool_result(_parsed, content)
+    set_message_meta(tool_msg, MessageMeta(
+        tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+        message_type="tool_result",
+    ))
+    ls.messages.append(tool_msg)
+    _shadow_write(ls, tool_msg, MessageType.TOOL_RESULT)
+
+
 async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAction | None:
     """处理伪工具调用。
 
@@ -66,26 +83,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 "task_id": ls.rctx.task_id,
                 "text": reply_text,
             })
-            # 【Fix 3】内核统一通过 formatter.format_tool_result 落 tool_result，
-            # 内容固定 "ok"——LLM 关心的是「reply 调用成功」这个事实，不需要回显原文。
-            # 让 native / JSON / fake-native 各自的 formatter 吸收模式差异，内核不写 if-else。
-            # 同时通过 set_message_meta 标 message_type=tool_result，并影子写入 ConversationStore，
-            # 与真实工具结果走同一路径，避免后续遍历时被误判。
-            from .ai_step import _shadow_write  # 延迟导入避免与 ai_step 之间的循环依赖
-            _parsed = ParsedToolCall(
-                id=getattr(pseudo_call, "id", "") or "",
-                name="reply",
-                arguments=dict(args),
-            )
-            tool_msg = ls.formatter.format_tool_result(_parsed, "ok")
-            # [2026-05-01] 工具结果记录当前 tool_mode。
-            # 目的：真 native 的 role=tool 结果在下一轮继续由 NativeToolFormatter 透传。
-            set_message_meta(tool_msg, MessageMeta(
-                tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
-                message_type="tool_result",
-            ))
-            ls.messages.append(tool_msg)
-            _shadow_write(ls, tool_msg, MessageType.TOOL_RESULT)
+            _emit_pseudo_tool_result(ls, pseudo_call, "ok")
         return None
 
     # compact_context: 非终止，手动压缩
@@ -94,7 +92,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
 
     # preempt_task: 非终止，软打断子任务
     if pseudo_call.name == "preempt_task":
-        return await _handle_pseudo_preempt_task(ls, args)
+        return await _handle_pseudo_preempt_task(ls, pseudo_call, args)
 
     # [2026-05-04] dispatch:{target_id}: 非终止，固定目标异步委派。
     # Why: dynamic per-target tools remove the target parameter from the schema.
@@ -103,30 +101,13 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     # selection happen at tool registration time.
     _fixed_dispatch_target = _dispatch_target_from_tool_name(pseudo_call.name)
     if _fixed_dispatch_target:
-        return await _handle_pseudo_dispatch(ls, {**args, "target": _fixed_dispatch_target})
+        return await _handle_pseudo_dispatch(ls, {**args, "target": _fixed_dispatch_target}, pseudo_call)
 
     # ---- 终止型伪工具：finish / switch_node ----
 
     if pseudo_call.name == "finish":
-        # [RFC 2026-04-20] finish 升级为真实 API 工具：在 _persist_ctx 之前构造
-        # tool_result("completed") 存入历史，确保 Native 模式下 tool_use/tool_result
-        # 配对完整。此内容不会被模型看到（循环即将终止），仅用于 API 配对校验
-        # 和下一轮对话历史格式合法性。与 reply 伪工具的 tool_result 写入路径对齐。
         from .pseudo_tools import FINISH_TOOL_RESULT_CONTENT
-        from .ai_step import _shadow_write  # 延迟导入避免循环依赖
-        _finish_parsed = ParsedToolCall(
-            id=getattr(pseudo_call, "id", "") or "",
-            name="finish",
-            arguments=dict(args),
-        )
-        _finish_result_msg = ls.formatter.format_tool_result(_finish_parsed, FINISH_TOOL_RESULT_CONTENT)
-        # [2026-05-01] finish 结果同样记录当前 tool_mode，保持 native 工具配对可恢复。
-        set_message_meta(_finish_result_msg, MessageMeta(
-            tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
-            message_type="tool_result",
-        ))
-        ls.messages.append(_finish_result_msg)
-        _shadow_write(ls, _finish_result_msg, MessageType.TOOL_RESULT)
+        _emit_pseudo_tool_result(ls, pseudo_call, FINISH_TOOL_RESULT_CONTENT)
 
         ctx_ref = _persist_ctx(ls, step + 1)
         summary_text = str(args.get("summary") or "").strip()
@@ -153,6 +134,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
 
     # switch_node 也需要 ctx_ref，单独计算
     if pseudo_call.name == "switch_node":
+        _emit_pseudo_tool_result(ls, pseudo_call, "ok")
         ctx_ref = _persist_ctx(ls, step + 1)
         switch_target = str(args.get("target") or "").strip()
         switch_text = str(args.get("text") or "").strip()
@@ -195,6 +177,8 @@ async def _handle_pseudo_compact(ls: _LoopState, pseudo_call, step: int) -> Task
             [m for m in ls.messages if m.get("role") != "system" and not m.get("_dynamic")]
         )
         if conversation_text.strip():
+            # Dispatch 路径：写 tool_result 后退出循环
+            _emit_pseudo_tool_result(ls, pseudo_call, "compacting...")
             ctx_ref = _persist_ctx(ls, step)
             return TaskAction(
                 action=ACTION_DISPATCH,
@@ -211,46 +195,39 @@ async def _handle_pseudo_compact(ls: _LoopState, pseudo_call, step: int) -> Task
                 },
             )
         else:
-            ls.messages.append({
-                "role": "user",
-                "content": "[Context compression skipped: no compressible content.]",
-            })
+            _emit_pseudo_tool_result(ls, pseudo_call, "skipped: no compressible content")
     except Exception as compact_err:
         await ls.rctx.emit_event("compact_failed", {"node_id": ls.node.id, "step": step, "error": str(compact_err)})
-        ls.messages.append({
-            "role": "user",
-            "content": f"[Context compression failed: {compact_err}]",
-        })
+        _emit_pseudo_tool_result(ls, pseudo_call, f"failed: {compact_err}")
     return None
 
 
-async def _handle_pseudo_preempt_task(ls: _LoopState, args: dict) -> None:
+async def _handle_pseudo_preempt_task(ls: _LoopState, pseudo_call, args: dict) -> None:
     """处理 preempt_task 伪工具。始终返回 None（非终止）。"""
     _pt_tid = str(args.get("task_id") or "").strip()
     if _pt_tid:
         try:
             _pt_resp = await ls.rctx.http.post(f"{ls.rctx.supervisor_url}/v1/tasks/{_pt_tid}/preempt")
             if _pt_resp.status_code == 200:
-                _pt_result = f"[preempt_task result: 已标记 task {_pt_tid[:8]} 为 preempt，等待优雅退出]"
+                _pt_result = f"已标记 task {_pt_tid[:8]} 为 preempt，等待优雅退出"
             elif _pt_resp.status_code == 404:
-                _pt_result = f"[preempt_task result: task {_pt_tid[:8]} 不存在或已结束]"
+                _pt_result = f"task {_pt_tid[:8]} 不存在或已结束"
             else:
-                _pt_result = f"[preempt_task result: API 返回 {_pt_resp.status_code}]"
+                _pt_result = f"API 返回 {_pt_resp.status_code}"
         except Exception as _pt_e:
-            _pt_result = f"[preempt_task result: 调用失败 {_pt_e}]"
+            _pt_result = f"调用失败 {_pt_e}"
     else:
-        _pt_result = "[preempt_task result: task_id 不能为空]"
-    ls.messages.append({"role": "user", "content": _pt_result})
+        _pt_result = "task_id 不能为空"
+    _emit_pseudo_tool_result(ls, pseudo_call, _pt_result)
     return None
 
 
-async def _handle_pseudo_dispatch(ls: _LoopState, args: dict) -> None:
+async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> None:
     """处理 dispatch:{target_id} 动态伪工具。始终返回 None（非终止）。"""
     target = str(args.get("target") or "").strip()
     instr = str(args.get("instruction") or "").strip()
     ctx_mode = str(args.get("context_mode") or "accumulate").strip()
     ctx_key = str(args.get("context_key") or "").strip() or None
-    # [2026-04-22] 从参数中提取 attachment_paths，转换为 attachment dicts 传给子节点
     attachment_paths = args.get("attachment_paths") or []
     attachments = _paths_to_attachments(attachment_paths, ls.rctx.workspace_root)
     try:
@@ -263,7 +240,6 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict) -> None:
             "context_key": ctx_key,
             "caller_node_id": ls.node.id,
         }
-        # [2026-04-22] 仅在有附件时附加，避免无谓的空列表
         if attachments:
             payload["attachments"] = attachments
         _dispatch_resp = await ls.rctx.http.post(
@@ -278,14 +254,5 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict) -> None:
             _dispatch_result = json.dumps({"success": False, "error": f"dispatch API 返回 {_dispatch_resp.status_code}: {_dispatch_resp.text}"}, ensure_ascii=False)
     except Exception as e:
         _dispatch_result = json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
-    # [2026-05-04] Use the dynamic tool name in the result marker.
-    # Why: Responses-native history pairing is most reliable when a stored result
-    # carries the same function name as the preceding dispatch:{target_id} call.
-    # How: preserve the JSON payload shape and write dispatch:{target} in the
-    # textual marker. Purpose: keep child dispatch callbacks readable without
-    # reintroducing removed aggregate tool names.
-    ls.messages.append({
-        "role": "user",
-        "content": f"[dispatch:{target} result: {_dispatch_result}]",
-    })
+    _emit_pseudo_tool_result(ls, pseudo_call, _dispatch_result)
     return None

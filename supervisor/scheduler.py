@@ -3,7 +3,7 @@
 每分钟醒一次，扫描 data/schedules.yaml，到时间的往 inbound 队列注入消息。
 调度线程挂了不影响 Supervisor 主进程。
 """
-# 同时负责系统级定时任务（如记忆整理 dream），配置在 runtime.yaml 中。
+# 系统级定时任务通过 supervisor hook handler 接入，调度器只负责发 tick。
 
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from typing import Any, TYPE_CHECKING
 import yaml
 
 from engine.context_store import cleanup_old_contexts
-from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
 
 
 if TYPE_CHECKING:
@@ -123,8 +122,6 @@ class SchedulerThread:
         self._state = state
         self._workspace_root = workspace_root
         self._last_fired: dict[str, str] = {}  # schedule_id -> "YYYY-MM-DD HH:MM"
-        self._last_dream_fired: str = ""       # 防同分钟重复
-        self._dream_last_session_count: int = 0  # 上次 dream 时的 session 数
         self._thread: threading.Thread | None = None
         self._running_scripts: set[str] = set()  # 防重入
 
@@ -183,8 +180,19 @@ class SchedulerThread:
             if once:
                 self._remove_schedule(sid)
 
-        # 系统级定时任务：记忆整理（dream）
-        self._tick_dream(now, now_key)
+        # Why: system-level scheduled features now live in engine.builtin
+        # supervisor hook handlers. How: emit a dream schedule tick with a
+        # callback-only context under the state's re-entrant lock. Purpose: keep
+        # SchedulerThread generic while avoiding direct handler access to state.
+        with self._state._lock:
+            self._state.hook_registry.fire(
+                "on_schedule_tick",
+                self._state._build_supervisor_hook_ctx(
+                    schedule_type="dream",
+                    now=now,
+                    now_key=now_key,
+                ),
+            )
 
     def _inject_inbound(self, sid: str, text: str, conv_key: str, entry_node_id: str = "", attachments: list | None = None) -> None:
         """共用的 inbound 注入逻辑。"""
@@ -288,66 +296,6 @@ class SchedulerThread:
             log.info(f"[scheduler] removed once-schedule: {sid}")
         except Exception as e:
             log.warning(f"[scheduler] failed to remove once-schedule {sid}: {e}")
-
-    def _tick_dream(self, now: datetime, now_key: str) -> None:
-        """系统级定时任务：记忆整理（dream）。配置在 runtime.yaml memory.dream 段。"""
-        runtime_cfg = load_runtime_config(self._workspace_root)
-        if not get_bool(runtime_cfg, "memory.dream.enabled", False):
-            return
-
-        cron_expr = get_str(runtime_cfg, "memory.dream.cron", "0 3 * * *").strip()
-        if not cron_expr:
-            return
-
-        # 防止同一分钟重复触发
-        if self._last_dream_fired == now_key:
-            return
-
-        if not cron_match(cron_expr, now):
-            return
-
-        # 可选门控：距上次 dream 后是否有足够的 session 活动
-        min_sessions = get_int(runtime_cfg, "memory.dream.min_sessions", 0, min_value=0, max_value=1000)
-        if min_sessions > 0:
-            with self._state._lock:
-                current_session_count = len(self._state.sessions)
-            new_sessions = current_session_count - self._dream_last_session_count
-            if new_sessions < min_sessions:
-                log.debug(f"[scheduler] dream skip: {new_sessions} new sessions, need {min_sessions}")
-                return
-
-        self._last_dream_fired = now_key
-
-        node_id = get_str(runtime_cfg, "memory.dream.node_id", "system.dream").strip()
-        conv_key = get_str(runtime_cfg, "memory.dream.conversation_key", "system:dream").strip()
-        channel = conv_key.split(":", 1)[0] if ":" in conv_key else "system"
-        text = f"[auto_dream] 定期记忆整理 ({now.strftime('%Y-%m-%d %H:%M UTC')})"
-        msg_id = f"dream:{uuid.uuid4()}"
-
-        try:
-            session_id = self._state.get_or_create_session(
-                channel=channel, conversation_key=conv_key,
-            )
-            evt = self._state.eventlog.append(
-                session_id=session_id,
-                component="scheduler",
-                type_="inbound_message",
-                payload={
-                    "channel": channel,
-                    "conversation_key": conv_key,
-                    "message_id": msg_id,
-                    "text": text,
-                    "entry_node_id": node_id,
-                    "_system_task": True,
-                },
-            )
-            self._state.record_inbound_message_event(evt)
-            # 更新 session 计数游标
-            with self._state._lock:
-                self._dream_last_session_count = len(self._state.sessions)
-            log.info(f"[scheduler] dream fired -> session={session_id}")
-        except Exception as e:
-            log.warning(f"[scheduler] dream inject failed: {e}")
 
     def _cleanup(self) -> None:
         """定期清理旧的上下文快照和已完成 task 的内存。"""

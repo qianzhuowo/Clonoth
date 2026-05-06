@@ -15,6 +15,8 @@ logger = logging.getLogger(__name__)
 
 from ._helpers import SessionInfo, _now
 from .eventlog import EventLog, SYSTEM_SESSION_ID
+from engine.builtin.loader import auto_discover_and_register
+from engine.hooks import HookRegistry
 from .policy import PolicyEngine
 from .session import SessionMixin
 from .session_store import SessionStore
@@ -70,12 +72,34 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._inbound_leases: dict[int, _InboundLease] = {}
 
         self._cancelled_sessions: set[str] = set()
-        self._memory_extract_msg_counts: dict[str, int] = {}
         self._tools_reload_seq: int = 0
         self.session_entry_overrides: dict[str, str] = {}  # session_id -> node_id (AI switch)
         self._session_context_usage: dict[str, dict[str, Any]] = {}  # session_id -> latest usage
         self._engine_generations: dict[str, str] = {}  # worker_id -> generation_id (Direction 2)
         self._pending_restart_notify: str | None = None  # session_id to notify after engine registers
+
+        # Why: supervisor feature side effects should be registered handlers rather
+        # than hard-coded router or scheduler branches. How: create one unified
+        # HookRegistry per SupervisorState and auto-discover built-ins before event
+        # replay. Purpose: inbound replay can notify handlers without storing their
+        # mutable state on SupervisorState or using a separate supervisor registry.
+        self.hook_registry = HookRegistry()
+        # Why: built-in supervisor handlers now live under engine.builtin, where
+        # they cannot import SupervisorState or other supervisor internals. How:
+        # register every PLUGIN_META declaration through the auto loader and retain
+        # the returned instances for diagnostics and existing tests. Purpose:
+        # preserve handler-owned timer/cursor state while removing cyclic imports
+        # and hard-coded registration.
+        _builtin_handlers = auto_discover_and_register(self.hook_registry)
+        self._memory_extract_handler = _builtin_handlers["memory_extract"]
+        self._dream_handler = _builtin_handlers["dream"]
+
+        # External plugins: same mechanism as engine, scan plugins/ directory
+        from engine.hooks.loader import load_external_plugins
+        _plugins_dir = workspace_root / "plugins"
+        _ext_count = load_external_plugins(self.hook_registry, _plugins_dir)
+        if _ext_count:
+            logger.info("Loaded %d external plugin(s) for supervisor hooks", _ext_count)
 
         # ---- Child Session 隔离（Phase A）：映射表 ----
         # (parent_session_id, node_id, context_key) → child_session_id
@@ -106,6 +130,107 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # 完成后未切回默认节点，重启后该覆盖从事件回放中恢复，导致用户
         # 在 discord 频道发消息时被错误地路由到 cmd_reviewer。
         self.session_entry_overrides.clear()
+
+    def _build_supervisor_hook_ctx(self, **extra: Any) -> dict[str, Any]:
+        """Build the callback-only context passed to built-in supervisor hooks."""
+        # Why: engine.builtin handlers must not import or keep a reference to
+        # SupervisorState. How: expose the small set of required supervisor
+        # operations as callbacks and plain values. Purpose: make hook handlers
+        # cycle-free while preserving the previous behavior at each fire point.
+        ctx: dict[str, Any] = {
+            "workspace_root": self.workspace_root,
+            "session_messages": lambda sid, limit=0: self.session_messages(session_id=sid, limit=limit),
+            "create_task": self._create_task_from_hook_locked,
+            "acquire_lock": self._lock,
+            "format_transcript": self._format_transcript_for_extract_callback,
+            "current_session_generation": lambda sid: self._current_session_generation_locked(sid),
+            "session_count": lambda: len(self.sessions),
+        }
+        ctx.update(extra)
+        return ctx
+
+    def _create_task_from_hook_locked(self, **kwargs: Any) -> Task:
+        """Create a task for a built-in hook using callback-friendly arguments."""
+        # Why: relocated supervisor handlers cannot import TaskKind or call session
+        # helpers directly. How: normalize string/enum kind values and optionally
+        # create a session from channel plus conversation_key before delegating to
+        # _create_task_locked. Purpose: keep handler code callback-only while still
+        # using the existing task creation path and event snapshot behavior.
+        data = dict(kwargs)
+        conversation_key = str(data.pop("conversation_key", "") or "").strip()
+        channel = str(data.pop("channel", "") or "").strip()
+        if not str(data.get("session_id") or "").strip():
+            if not conversation_key:
+                raise ValueError("session_id or conversation_key is required")
+            if not channel:
+                channel = conversation_key.split(":", 1)[0] if ":" in conversation_key else "system"
+            data["session_id"] = self.get_or_create_session(channel=channel, conversation_key=conversation_key)
+
+        sid = str(data.get("session_id") or "").strip()
+        generation = self._to_positive_int(data.get("session_generation"))
+        if generation is None:
+            generation = self._current_session_generation_locked(sid) or 1
+        data["session_generation"] = generation
+        if sid and not self.session_generations.get(sid):
+            self.session_generations[sid] = generation
+
+        kind = data.get("kind") or TaskKind.node
+        if not isinstance(kind, TaskKind):
+            value = getattr(kind, "value", kind)
+            try:
+                kind = TaskKind(str(value or "node"))
+            except Exception:
+                kind = TaskKind.node
+        data["kind"] = kind
+
+        input_data = data.get("input_data")
+        if isinstance(input_data, dict):
+            task_context = input_data.get("task_context")
+            if isinstance(task_context, dict):
+                # Why: hooks that create tasks directly bypass inbound processing,
+                # which used to add these identifiers. How: fill missing values in
+                # the provided task_context. Purpose: preserve system-task metadata
+                # for engine-side checks without requiring supervisor imports.
+                task_context.setdefault("session_id", sid)
+                task_context.setdefault("session_generation", generation)
+
+        data.setdefault("continuation", {})
+        data.setdefault("source_inbound_seq", None)
+        data.setdefault("caller_task_id", None)
+        return self._create_task_locked(**data)
+
+    @staticmethod
+    def _format_transcript_for_extract_callback(messages: list[dict[str, Any]], *, max_chars: int = 12000) -> str:
+        """Format conversation messages into transcript text for extraction hooks."""
+        # Why: MemoryExtractHandler now receives formatting as an injected callback
+        # rather than importing supervisor code. How: keep the previous pure
+        # formatter on SupervisorState and pass it through ctx. Purpose: retain the
+        # fallback transcript format while removing handler-side supervisor imports.
+        parts: list[str] = []
+        total = 0
+        for msg in reversed(messages):
+            role = msg.get("role", "")
+            if role == "system":
+                continue
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                texts = [
+                    p.get("text", "")
+                    for p in content
+                    if isinstance(p, dict) and isinstance(p.get("text"), str)
+                ]
+                content = "\n".join(texts)
+            if not isinstance(content, str):
+                content = str(content)
+            if len(content) > 2000:
+                content = content[:2000] + "...<truncated>"
+            line = f"[{role}]\n{content}"
+            total += len(line)
+            if total > max_chars:
+                break
+            parts.append(line)
+        parts.reverse()
+        return "\n\n---\n\n".join(parts)
 
     # ------------------------------------------------------------------ #
     #  事件回放

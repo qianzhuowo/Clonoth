@@ -64,7 +64,7 @@ from ..signals import Signal, get_bus
 # 做法：ai_step 只负责构造 HookContext 并触发 registry；具体规则由 handler 实现。
 # 目的：后续内核逻辑可以插件化注册，同时保持当前推理循环行为不变。
 from ..hooks import HookContext, hook_registry
-from ..hooks.builtin import register_builtins
+from ..builtin.loader import auto_discover_and_register
 from ..hooks.loader import load_external_plugins
 
 logger = logging.getLogger(__name__)
@@ -545,7 +545,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         tool_calls=list(resp.tool_calls or []),
         extra={"pseudo_calls": pseudo_calls, "real_tool_calls": real_tool_calls},
     )
-    _before_result = await hook_registry.fire("before_tool_call", _before_ctx)
+    _before_result = await hook_registry.afire("before_tool_call", _before_ctx)
     if _before_result.action is not None:
         return _before_result.action
     if _before_result.block:
@@ -566,7 +566,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     if _before_result.skip_step:
         return None
 
-    # LEGACY: replaced by hook FinishGuardHandler in engine.hooks.builtin.finish_guard.
+    # LEGACY: replaced by hook FinishGuardHandler in engine.builtin.finish_guard.
     # 原因：保留原始硬编码判断，便于下一轮清理前核对行为。
     # 做法：只注释旧逻辑，不再执行；hook 使用 pseudo_calls/real_tool_calls 复刻同一判断。
     # 目的：迁移期间可快速回溯，不破坏当前 finish 并列拒绝语义。
@@ -852,7 +852,7 @@ async def _execute_real_tools(
             tool_calls=_hook_real_tool_calls,
             extra={"real_tool_calls": real_tool_calls},
         )
-        _tool_hook_result = await hook_registry.fire("before_tool_call", _tool_hook_ctx)
+        _tool_hook_result = await hook_registry.afire("before_tool_call", _tool_hook_ctx)
         if _tool_hook_result.action is not None:
             return _tool_hook_result.action
         if _tool_hook_result.block or _tool_hook_result.skip_step:
@@ -970,7 +970,7 @@ async def _execute_real_tools(
                 "tool_attachments": _tool_atts,
             },
         )
-        _attachment_result = await hook_registry.fire("after_tool_call", _attachment_ctx)
+        _attachment_result = await hook_registry.afire("after_tool_call", _attachment_ctx)
         if _attachment_result.action is not None:
             return _attachment_result.action
 
@@ -1123,7 +1123,7 @@ async def _fire_task_end_hook_if_finish(ls: _LoopState, action: TaskAction, step
         step=step_count,
         extra={"loop_state": ls, "step_count": step_count, "task_action": action},
     )
-    _end_result = await hook_registry.fire("on_task_end", _end_ctx)
+    _end_result = await hook_registry.afire("on_task_end", _end_ctx)
     if _end_result.action is not None:
         return _end_result.action
     if _end_ctx.extra.get("snapshot_saved"):
@@ -1151,10 +1151,11 @@ async def run_ai_node(
     attachments: list[dict[str, Any]] | None = None,
 ) -> TaskAction:
     # Phase 3 Hook System：每次进入 AI 节点都注册内置 handler。
-    # 原因：hook registry 是进程内单例，重启或测试环境都需要显式安装内置规则。
-    # 做法：调用幂等的 register_builtins；HookRegistry 会按名称替换旧实例。
-    # 目的：避免重复注册，同时保证 finish_guard 与 approval handler 始终可用。
-    register_builtins()
+    # 原因：内置 handler 已统一迁入 engine.builtin，并通过 PLUGIN_META 声明
+    # 自己的 hook point。做法：自动扫描内置目录并注册到共享 hook_registry；
+    # HookRegistry 会按名称替换旧实例。目的：删除集中硬编码注册，同时保持
+    # finish_guard、approval、prompt 注入等内置规则始终可用。
+    auto_discover_and_register(hook_registry)
     # Phase 3 External Hook Plugins：每次进入 AI 节点时扫描工作区 plugins/。
     # 原因：用户需要在不修改 engine 源码的情况下添加自定义 handler。
     # 做法：调用幂等的外部插件加载器；HookRegistry 会按 handler.name 替换旧实例。
@@ -1234,7 +1235,7 @@ async def run_ai_node(
                 "apply_injection": True,
             },
         )
-        _prompt_result = await hook_registry.fire("before_prompt_build", _prompt_ctx)
+        _prompt_result = await hook_registry.afire("before_prompt_build", _prompt_ctx)
         if _prompt_result.action is not None:
             return _prompt_result.action
         _is_block_mode = bool(_prompt_ctx.extra.get("is_block_mode", _is_block_mode))
@@ -1347,7 +1348,7 @@ async def run_ai_node(
             step=step,
             extra={"loop_state": ls, "step_count": step_count},
         )
-        _step_result = await hook_registry.fire("before_step", _step_ctx)
+        _step_result = await hook_registry.afire("before_step", _step_ctx)
         if _step_result.action is not None:
             return _step_result.action
         if _step_result.skip_step:
@@ -1401,7 +1402,7 @@ async def run_ai_node(
             response=resp,
             extra={"loop_state": ls},
         )
-        _usage_result = await hook_registry.fire("after_llm_call", _usage_ctx)
+        _usage_result = await hook_registry.afire("after_llm_call", _usage_ctx)
         if _usage_result.action is not None:
             return _usage_result.action
 
@@ -1451,7 +1452,7 @@ async def run_ai_node(
             response=resp,
             extra={"loop_state": ls},
         )
-        _plaintext_result = await hook_registry.fire("before_response", _plaintext_ctx)
+        _plaintext_result = await hook_registry.afire("before_response", _plaintext_ctx)
         if _plaintext_result.action is not None:
             return await _fire_task_end_hook_if_finish(ls, _plaintext_result.action, step + 1)
 
@@ -1474,7 +1475,7 @@ async def run_ai_node(
         step=max_steps,
         extra={"loop_state": ls, "step_count": max_steps},
     )
-    _error_result = await hook_registry.fire("on_task_error", _error_ctx)
+    _error_result = await hook_registry.afire("on_task_error", _error_ctx)
     if _error_result.action is not None:
         return _error_result.action
     ctx_ref = str(_error_ctx.extra.get("context_ref") or "")

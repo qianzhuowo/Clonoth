@@ -46,7 +46,13 @@ def _persist_node_context(
     # 本函数仅在 child session 模式关闭时（主节点 + compact dispatch）使用。
     # _persist_ctx 已在 child session 模式下跳过调用。
     # 待 child session 稳定后可删除。
-    _persisted_msgs = [m for m in messages if not m.get("_dynamic") and not m.get("_ephemeral") and not m.get("_retry_hint")]
+    # [2026-05-07] 快照写入前清理控制流工具历史。
+    # 原因：旧 snapshot 路径仍可能保存 finish tool_call/tool_result，后续恢复会造成 native 配对错误。
+    # 做法：复用 L2 的控制流清洗，再过滤 dynamic/ephemeral/retry_hint。
+    # 目的：ConversationStore 与旧 snapshot 两条持久化路径保持同一语义。
+    from .tool_format import sanitize_control_tool_history
+    _clean_history = sanitize_control_tool_history(messages)
+    _persisted_msgs = [m for m in _clean_history if not m.get("_dynamic") and not m.get("_ephemeral") and not m.get("_retry_hint")]
     # Phase 3 (Session Conversation Store): snapshot version 升至 2，
     # 新增 last_message_id 字段指向 ConversationStore 中最后一条影子写入的消息。
     # messages 数组暂时保留（向后兼容），后续 Phase 可移除。

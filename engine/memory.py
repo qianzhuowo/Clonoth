@@ -17,101 +17,28 @@ Injection order in prompt:
 """
 from __future__ import annotations
 
-import re
 import threading
 import time
 from pathlib import Path
 from typing import Any
 
+# Why: memory activation must use the same matcher as skill activation.
+# How: import shared helpers instead of maintaining a second local copy.
+# Purpose: preserve behavior while removing duplicated keyword code.
+from engine.knowledge_match import build_scan_text, compile_keyword, match_keywords
+
 import yaml
-
-
-# ---------------------------------------------------------------------------
-#  Keyword compilation (same logic as skills_runtime.py, duplicated to
-#  avoid cross-layer import)
-# ---------------------------------------------------------------------------
-
-def _compile_keyword(kw: str) -> re.Pattern[str] | str:
-    """Compile a keyword entry.
-
-    If *kw* matches ``/pattern/flags``, compile as regex.
-    Otherwise return lowercased string for substring matching.
-    """
-    kw = (kw or "").strip()
-    if not kw:
-        return ""
-    if kw.startswith("/"):
-        last_slash = kw.rfind("/")
-        if last_slash > 0:
-            pattern = kw[1:last_slash]
-            flags_str = kw[last_slash + 1:]
-            flags = 0
-            if "i" in flags_str:
-                flags |= re.IGNORECASE
-            if "s" in flags_str:
-                flags |= re.DOTALL
-            if "m" in flags_str:
-                flags |= re.MULTILINE
-            try:
-                return re.compile(pattern, flags)
-            except re.error:
-                pass
-    return kw.lower()
-
-
-def _match_keywords(compiled: list[re.Pattern[str] | str], text: str) -> bool:
-    """Return True if any compiled keyword matches *text*."""
-    if not compiled or not text:
-        return False
-    text_lower = text.lower()
-    for kw in compiled:
-        if not kw:
-            continue
-        if isinstance(kw, re.Pattern):
-            if kw.search(text):
-                return True
-        elif kw in text_lower:
-            return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-#  Scan text building (same logic as skills_runtime)
-# ---------------------------------------------------------------------------
-
-def _build_scan_text(
-    instruction_text: str,
-    history: list[dict[str, Any]] | None,
-    scan_depth: int,
-) -> str:
-    """Build text to scan for keyword matching.
-
-    *instruction_text* is always included.  When *scan_depth* > 0,
-    the last *scan_depth* rounds from *history* are appended.
-    """
-    parts: list[str] = [instruction_text or ""]
-    if history and scan_depth > 0:
-        round_starts: list[int] = []
-        for i in range(len(history) - 1, -1, -1):
-            role = history[i].get("role", "")
-            if role != "user":
-                continue
-            if i == 0 or history[i - 1].get("role", "") != "user":
-                round_starts.append(i)
-                if len(round_starts) >= scan_depth:
-                    break
-        if round_starts:
-            start_idx = round_starts[-1]
-            for msg in history[start_idx:]:
-                content = msg.get("content")
-                if isinstance(content, str) and msg.get("role") in ("user", "assistant"):
-                    parts.append(content)
-    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
 #  Cache
 # ---------------------------------------------------------------------------
+
+# Why: _update_last_hit_bg runs in a daemon thread and may fire concurrently
+# for the same book file. How: serialize all YAML writes through one lock.
+# Purpose: prevent partial-write corruption without adding heavyweight flock.
+_yaml_write_lock = threading.Lock()
+
 
 class _MemoryCache:
     """Per-workspace memory catalog cache keyed on time."""
@@ -219,22 +146,80 @@ def load_memory_catalog(
                 elif isinstance(raw_node_ids, str) and raw_node_ids.strip():
                     node_ids = [n.strip() for n in raw_node_ids.split(",") if n.strip()]
 
+                source = str(entry.get("source", "")).strip()
+                created_at = str(entry.get("created_at", "")).strip()
+                last_hit_at = str(entry.get("last_hit_at", "")).strip()
+
                 items.append({
                     "book": book,
                     "id": eid,
                     "keywords": keywords,
-                    "compiled_keywords": [_compile_keyword(k) for k in keywords],
+                    "compiled_keywords": [compile_keyword(k) for k in keywords],
                     "content": content,
                     "constant": constant,
                     "priority": priority,
                     "scan_depth": scan_depth,
                     "node_ids": node_ids,
+                    "source": source,
+                    "created_at": created_at,
+                    "last_hit_at": last_hit_at,
                 })
         except Exception:
             continue
 
     _MemoryCache.put(workspace_root, items)
     return items
+
+
+# ---------------------------------------------------------------------------
+#  Hit-count tracking
+# ---------------------------------------------------------------------------
+
+def _update_last_hit_bg(workspace_root: Path, entries: list[dict[str, Any]]) -> None:
+    """Update last_hit_at for matched entries. Debounced: skip if <24h old."""
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    threshold = 86400  # 24h debounce
+
+    by_book: dict[str, list[str]] = {}
+    for e in entries:
+        b, eid = e.get("book", ""), e.get("id", "")
+        if b and eid:
+            by_book.setdefault(b, []).append(eid)
+    mem_dir = memory_dir(workspace_root)
+    for book, eids in by_book.items():
+        bp = mem_dir / f"{book}.yaml"
+        if not bp.exists():
+            continue
+        try:
+            data = yaml.safe_load(bp.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            eid_set = set(eids)
+            changed = False
+            for entry in data.get("entries", []):
+                if not isinstance(entry, dict) or entry.get("id") not in eid_set:
+                    continue
+                old = entry.get("last_hit_at", "")
+                if old:
+                    try:
+                        old_dt = datetime.fromisoformat(old)
+                        if (now - old_dt).total_seconds() < threshold:
+                            continue  # debounce: skip if <24h
+                    except Exception:
+                        pass
+                entry["last_hit_at"] = now_iso
+                changed = True
+            if changed:
+                with _yaml_write_lock:
+                    bp.write_text(
+                        yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False),
+                        encoding="utf-8",
+                    )
+        except Exception:
+            continue
+    _MemoryCache.invalidate(workspace_root)
 
 
 # ---------------------------------------------------------------------------
@@ -251,101 +236,26 @@ def build_memory_messages(
     memory_mode: str = "all",
     memory_allow: list[str] | None = None,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """Build system messages for memory injection.
+    """Build system messages for memory injection through the unified pipeline."""
+    # Why: memory filtering, matching, budgeting, rendering, and last_hit_at
+    # tracking now share the same engine-level path used by skills. How:
+    # normalize only memory catalog entries and disable skills in the shared
+    # helper. Purpose: keep this legacy public function compatible without
+    # retaining a separate memory injection implementation.
+    from engine.builtin.knowledge_inject import build_knowledge_messages, normalize_memory_entries
 
-    Returns ``(static_msgs, dynamic_msgs)`` tuple for prompt-cache
-    optimisation.  The caller should place *static_msgs* in the stable
-    prefix (before history) and *dynamic_msgs* after history.
-
-    * *static_msgs*  — constant memories (stable across turns)
-    * *dynamic_msgs* — active (keyword-matched) memories + discovery index
-    """
-    catalog = load_memory_catalog(workspace_root)
-    if not catalog:
-        return [], []
-
-    # 按 memory_mode allowlist 过滤 book
-    if memory_mode == "allowlist" and memory_allow:
-        catalog = [e for e in catalog if e.get("book") in memory_allow]
-        if not catalog:
-            return [], []
-
-    # 按 node_ids 过滤：空列表 = 全局可见
-    if node_id:
-        catalog = [e for e in catalog if not e.get("node_ids") or node_id in e["node_ids"]]
-
-    constant_entries: list[dict[str, Any]] = []
-    keyword_entries: list[dict[str, Any]] = []
-
-    for entry in catalog:
-        if entry["constant"]:
-            constant_entries.append(entry)
-        elif entry["keywords"]:
-            keyword_entries.append(entry)
-
-    # keyword matching
-    dynamic_entries: list[dict[str, Any]] = []
-    for entry in keyword_entries:
-        scan_text = _build_scan_text(
-            instruction_text, history, entry["scan_depth"],
-        )
-        if _match_keywords(entry["compiled_keywords"], scan_text):
-            dynamic_entries.append(entry)
-
-    # Deterministic ordering: sort by id within each group so identical
-    # match sets always produce byte-identical output (prompt cache friendly).
-    constant_entries.sort(key=lambda e: e.get("id", ""))
-    dynamic_entries.sort(key=lambda e: e.get("id", ""))
-
-    # budget enforcement
-    if max_budget_chars > 0:
-        all_injectable: list[tuple[str, dict[str, Any]]] = []
-        for e in constant_entries:
-            all_injectable.append(("constant", e))
-        for e in dynamic_entries:
-            all_injectable.append(("dynamic", e))
-        all_injectable.sort(key=lambda x: x[1]["priority"], reverse=True)
-
-        kept_constant: list[dict[str, Any]] = []
-        kept_dynamic: list[dict[str, Any]] = []
-        used = 0
-        for kind, e in all_injectable:
-            body_len = len(e.get("content") or "")
-            if used + body_len <= max_budget_chars:
-                used += body_len
-                if kind == "constant":
-                    kept_constant.append(e)
-                else:
-                    kept_dynamic.append(e)
-        # Re-sort by id after budget truncation for deterministic output
-        kept_constant.sort(key=lambda e: e.get("id", ""))
-        kept_dynamic.sort(key=lambda e: e.get("id", ""))
-        constant_entries = kept_constant
-        dynamic_entries = kept_dynamic
-
-    # ---- build messages ------------------------------------------------
-    static_msgs: list[dict[str, str]] = []
-    dynamic_msgs: list[dict[str, str]] = []
-
-    # constant block
-    if constant_entries:
-        parts: list[str] = ["[MEMORY:CONSTANT]"]
-        for e in constant_entries:
-            parts.append(f"\n## {e['id']}\n")
-            parts.append(e["content"])
-        parts.append("\n[/MEMORY:CONSTANT]")
-        static_msgs.append({"role": "system", "content": "\n".join(parts)})
-
-    # dynamic block (ACTIVE only, no INDEX)
-    dynamic_parts: list[str] = []
-    if dynamic_entries:
-        dynamic_parts.append("[MEMORY:ACTIVE]")
-        for e in dynamic_entries:
-            dynamic_parts.append(f"\n## {e['id']}\n")
-            dynamic_parts.append(e["content"])
-        dynamic_parts.append("\n[/MEMORY:ACTIVE]")
-
-    if dynamic_parts:
-        dynamic_msgs.append({"role": "system", "content": "\n".join(dynamic_parts)})
-
-    return static_msgs, dynamic_msgs
+    _skill_static, _skill_dynamic, memory_static, memory_dynamic = build_knowledge_messages(
+        workspace_root,
+        normalize_memory_entries(load_memory_catalog(workspace_root)),
+        node_id=node_id,
+        instruction_text=instruction_text,
+        history=history,
+        skill_mode="none",
+        skill_allow=None,
+        memory_mode=memory_mode,
+        memory_allow=memory_allow,
+        skill_max_budget_chars=0,
+        memory_max_budget_chars=max_budget_chars,
+        knowledge_max_budget_chars=0,
+    )
+    return memory_static, memory_dynamic

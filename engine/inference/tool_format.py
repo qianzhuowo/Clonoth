@@ -84,10 +84,10 @@ class ToolFormatter(ABC):
 
     @abstractmethod
     def format_tool_result(self, call: ParsedToolCall, result_text: str) -> dict[str, Any]:
-        """将工具执行结果格式化为消息 dict。
+        """将工具执行结果格式化为消息 dict（L1 存储层）。
 
-        native 模式:      返回 role=tool + tool_call_id 的真原生工具结果。
-        fake-native/json: 返回 user 文本消息，维持旧格式兼容。
+        [2026-05-08] 所有模式统一存储为 role=tool + tool_call_id 结构化格式。
+        L2 读取时由各 formatter 的 message_to_llm 按需转换为模型可消费格式。
         """
         ...
 
@@ -265,10 +265,20 @@ class FakeNativeToolFormatter(ToolFormatter):
         ]
 
     def format_tool_result(self, call: ParsedToolCall, result_text: str) -> dict[str, Any]:
-        """Fake Native 模式：维持旧的 user 文本工具结果格式。"""
+        """Fake Native 模式：L1 统一存储为结构化 role=tool 格式。
+
+        [2026-05-08] 与 NativeToolFormatter 保持一致的存储格式。
+        旧实现存 role=user 纯文本，导致 L1 存储层分裂：
+        assistant 消息有结构化 tool_calls，但 result 是纯文本，
+        跨模式读取时无法正确配对。
+        现在统一存 role=tool + tool_call_id，message_to_llm 读取时
+        再按 fake-native 模式转为 user 文本。
+        """
         return {
-            "role": "user",
-            "content": f'Tool result for "{call.name}":\n{result_text}',
+            "role": "tool",
+            "tool_call_id": call.id,
+            "name": call.name,
+            "content": result_text,
         }
 
     def message_to_llm(self, message_dict: dict) -> dict:
@@ -277,6 +287,20 @@ class FakeNativeToolFormatter(ToolFormatter):
         从同级 tool_calls 字段读取工具调用，拼接为 [Tool call history record] 文本。
         兼容旧消息：没有 tool_calls 字段时，回退到 _meta.raw_parts。
         """
+        # [2026-05-07] Convert native role=tool to fake-native user text.
+        # Why: native tool_result (role=tool + tool_call_id) becomes orphaned when
+        # its paired assistant.tool_calls is converted to [Tool call history record]
+        # text. Anthropic/Gemini require strict 1:1 tool_use/tool_result pairing.
+        # Fix: rewrite as role=user 'Tool result for "name":\n...' to match
+        # format_tool_result() output.
+        if message_dict.get('role') == 'tool':
+            tool_name = message_dict.get('name', '') or ''
+            content = message_dict.get('content', '') or ''
+            return {
+                'role': 'user',
+                'content': f'Tool result for "{tool_name}":\n{content}',
+            }
+
         clean = {k: v for k, v in message_dict.items()
                  if not k.startswith('_') and k != 'tool_calls'}
 
@@ -588,10 +612,16 @@ class JsonToolFormatter(ToolFormatter):
         return super().build_assistant_message(response, plain, tool_calls)
 
     def format_tool_result(self, call: ParsedToolCall, result_text: str) -> dict[str, Any]:
-        """格式化工具结果为 user 消息。与 FakeNativeToolFormatter 保持一致。"""
+        """JSON 模式：L1 统一存储为结构化 role=tool 格式。
+
+        [2026-05-08] 与 Native/FakeNative 保持一致的存储格式。
+        message_to_llm 读取时再转为 user 文本。
+        """
         return {
-            "role": "user",
-            "content": f'Tool result for "{call.name}":\n{result_text}',
+            "role": "tool",
+            "tool_call_id": call.id,
+            "name": call.name,
+            "content": result_text,
         }
 
     def message_to_llm(self, message_dict: dict) -> dict:
@@ -600,6 +630,16 @@ class JsonToolFormatter(ToolFormatter):
         从同级 tool_calls 字段读取工具调用。
         兼容旧消息：没有 tool_calls 字段时，回退到 _meta.raw_parts。
         """
+        # [2026-05-08] Convert native role=tool to user text.
+        # JSON 模式不走原生工具协议，tool result 以 user 文本形式呈现。
+        if message_dict.get('role') == 'tool':
+            tool_name = message_dict.get('name', '') or ''
+            content = message_dict.get('content', '') or ''
+            return {
+                'role': 'user',
+                'content': f'Tool result for "{tool_name}":\n{content}',
+            }
+
         clean = {k: v for k, v in message_dict.items()
                  if not k.startswith('_') and k != 'tool_calls'}
 
@@ -689,6 +729,404 @@ def create_tool_formatter(mode: str = "fake-native") -> ToolFormatter:
 
 
 # ---------------------------------------------------------------------------
+#  工具结果配对修复
+# ---------------------------------------------------------------------------
+
+_FINISH_TOOL_NAME = "finish"
+_FINISH_TOOL_RESULT_TEXT = "ok"
+
+
+def _tool_call_name(call: Any) -> str:
+    """Read a tool call name from either Clonoth storage or OpenAI API shape."""
+    if not isinstance(call, dict):
+        return ""
+    function = call.get("function") if isinstance(call.get("function"), dict) else {}
+    return str(call.get("name") or function.get("name") or "").strip()
+
+
+def _tool_call_id(call: Any) -> str:
+    """Read a tool call id defensively from a stored tool call dict."""
+    return str(call.get("id") or "").strip() if isinstance(call, dict) else ""
+
+
+def _tool_call_arguments(call: Any) -> dict[str, Any]:
+    """Read tool call arguments from simplified or OpenAI API format."""
+    if not isinstance(call, dict):
+        return {}
+    raw = call.get("arguments")
+    function = call.get("function") if isinstance(call.get("function"), dict) else {}
+    if raw is None:
+        raw = function.get("arguments")
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return dict(parsed) if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _is_finish_tool_name(name: str) -> bool:
+    """Return whether a tool name is the real finish API tool."""
+    return str(name or "").strip() == _FINISH_TOOL_NAME
+
+
+def _message_meta(message: dict[str, Any]) -> dict[str, Any]:
+    """Return message metadata from either runtime or persisted JSONL shape."""
+    # Why: runtime history uses _meta, while ConversationStore JSONL uses meta.
+    # How: read both keys without mutating the message. Purpose: let the same
+    # repair routine protect build_llm_messages, summaries, and migration tests.
+    meta = message.get("_meta") if isinstance(message.get("_meta"), dict) else message.get("meta")
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def _message_tool_mode(message: dict[str, Any]) -> str:
+    """Read and normalize the tool mode stored on a message."""
+    return _normalize_tool_mode(str(_message_meta(message).get("tool_mode") or "fake-native"))
+
+
+def _parse_text_tool_result(content: Any) -> tuple[str, str] | None:
+    """Parse fake-native text tool results into (name, output)."""
+    if not isinstance(content, str):
+        return None
+    prefix = 'Tool result for "'
+    if not content.startswith(prefix):
+        return None
+    end = content.find('":')
+    if end <= len(prefix):
+        return None
+    name = content[len(prefix):end]
+    output = content[end + 2:]
+    if output.startswith("\n"):
+        output = output[1:]
+    elif output.startswith(" "):
+        # [2026-05-07] 兼容旧单行 fake-native 结果。
+        # 原因：旧文本可能写成 `Tool result for "finish": completed`，冒号后有一个分隔空格。
+        # 做法：只去掉这个协议分隔空格，不对多行真实结果做 strip。
+        # 目的：修复旧 finish result 时保留原结果文本的语义。
+        output = output[1:]
+    return name, output
+
+
+def _is_tool_result_message(message: dict[str, Any]) -> bool:
+    """Return whether a stored message represents a tool result."""
+    if message.get("role") == "tool":
+        return True
+    if str(message.get("message_type") or "") == "tool_result":
+        return True
+    meta = _message_meta(message)
+    if str(meta.get("message_type") or "") == "tool_result":
+        return True
+    return _parse_text_tool_result(message.get("content")) is not None
+
+
+def _tool_result_name(message: dict[str, Any]) -> str:
+    """Return the tool name carried by a tool-result message, when known."""
+    explicit = str(message.get("name") or "").strip()
+    if explicit:
+        return explicit
+    meta_name = str(_message_meta(message).get("control_tool_name") or "").strip()
+    if meta_name:
+        # Why: old broken rows used control_tool_name to mark finish results.
+        # How: read it only as a legacy name hint. Purpose: migrate those rows
+        # without preserving the old non-persistent control semantics.
+        return meta_name
+    parsed = _parse_text_tool_result(message.get("content"))
+    return parsed[0] if parsed else ""
+
+
+def _tool_result_call_id(message: dict[str, Any]) -> str:
+    """Return the assistant tool_call id referenced by a tool result."""
+    return str(message.get("tool_call_id") or "").strip()
+
+
+def _assistant_tool_calls(message: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return normalized tool calls from one assistant message."""
+    if message.get("role") != "assistant" or not isinstance(message.get("tool_calls"), list):
+        return []
+    calls: list[dict[str, Any]] = []
+    for call in message.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        name = _tool_call_name(call)
+        if not name:
+            continue
+        calls.append({
+            "id": _tool_call_id(call),
+            "name": name,
+            "arguments": _tool_call_arguments(call),
+        })
+    return calls
+
+
+def _make_finish_tool_result(call: dict[str, Any], tool_mode: str) -> dict[str, Any]:
+    """Build a missing ordinary finish tool_result for old dangling histories."""
+    mode = _normalize_tool_mode(tool_mode)
+    call_id = str(call.get("id") or "")
+    if mode == "native":
+        # Why: true-native providers require role=tool with the original call id.
+        # How: synthesize the same ok result that the engine now writes at finish.
+        # Purpose: old assistant.finish calls can be repaired instead of deleted.
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": _FINISH_TOOL_NAME,
+            "content": _FINISH_TOOL_RESULT_TEXT,
+            "_meta": {"tool_mode": "native", "message_type": "tool_result"},
+        }
+    meta: dict[str, Any] = {"message_type": "tool_result"}
+    if mode != "fake-native":
+        meta["tool_mode"] = mode
+    return {
+        "role": "user",
+        "content": f'Tool result for "{_FINISH_TOOL_NAME}":\n{_FINISH_TOOL_RESULT_TEXT}',
+        "_meta": meta,
+    }
+
+
+def repair_tool_result_pairing_with_stats(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Remove orphan tool results while preserving valid tool-call pairs.
+
+    [2026-05-07] finish is no longer treated as an ephemeral control result.
+    Why: provider-native histories require every persisted assistant.tool_call to
+    keep its matching tool_result, including finish. How: track the pending tool
+    calls from the most recent assistant message, keep only matching result rows,
+    convert old paired fake-native finish result text into a native role=tool row,
+    and remove unpaired native result rows. Purpose: fix old orphan pollution
+    without deleting valid finish or business-tool history.
+    """
+    stats = {
+        "removed_orphan_finish_results": 0,
+        "removed_orphan_tool_results": 0,
+        "inserted_missing_finish_results": 0,
+        "kept_paired_finish_results": 0,
+        "fixed_orphan_tool_calls": 0,
+    }
+    result: list[dict[str, Any]] = []
+    pending_by_id: dict[str, dict[str, Any]] = {}
+    pending_order: list[dict[str, Any]] = []
+    pending_tool_mode = "fake-native"
+    pending_assistant_result_idx: int = -1  # index in result[] of the assistant that created pending
+
+    def _strip_unmatched_tool_calls() -> None:
+        """Strip unmatched tool_calls from the pending assistant in result.
+
+        [2026-05-09] When pending_order is non-empty (some tool_calls never got
+        a result), go back to the assistant message in result[] and convert the
+        unmatched tool_calls to text summaries. Keep matched ones intact.
+        """
+        nonlocal pending_assistant_result_idx
+        if not pending_order or pending_assistant_result_idx < 0:
+            return
+        if pending_assistant_result_idx >= len(result):
+            return
+        ast_msg = result[pending_assistant_result_idx]
+        if not ast_msg.get('tool_calls'):
+            return
+        unmatched_ids = {str(c.get('id', '')) for c in pending_order if c.get('id')}
+        if not unmatched_ids:
+            return
+        kept = []
+        text_parts: list[str] = []
+        for tc in ast_msg['tool_calls']:
+            tc_id = str(tc.get('id', ''))
+            if tc_id in unmatched_ids:
+                fn = tc.get('function', {}) if isinstance(tc.get('function'), dict) else {}
+                name = fn.get('name', '') or tc.get('name', '')
+                text_parts.append(f'[Tool call: {name}]')
+                stats['fixed_orphan_tool_calls'] += 1
+            else:
+                kept.append(tc)
+        if kept:
+            ast_msg['tool_calls'] = kept
+        else:
+            ast_msg.pop('tool_calls', None)
+        if text_parts:
+            existing = ast_msg.get('content', '') or ''
+            if isinstance(existing, list):
+                existing = ' '.join(
+                    c.get('text', '') for c in existing
+                    if isinstance(c, dict) and c.get('type') == 'text'
+                )
+            summary = ' '.join(text_parts)
+            ast_msg['content'] = (existing.strip() + '\n' + summary).strip() if existing.strip() else summary
+        pending_assistant_result_idx = -1
+
+    def _reset_pending() -> None:
+        nonlocal pending_assistant_result_idx
+        _strip_unmatched_tool_calls()
+        pending_by_id.clear()
+        pending_order.clear()
+        pending_assistant_result_idx = -1
+
+    def _set_pending_from_assistant(message: dict[str, Any]) -> None:
+        nonlocal pending_tool_mode, pending_assistant_result_idx
+        _reset_pending()
+        calls = _assistant_tool_calls(message)
+        if not calls:
+            return
+        pending_tool_mode = _message_tool_mode(message)
+        pending_order.extend(calls)
+        for call in calls:
+            cid = str(call.get("id") or "")
+            if cid:
+                pending_by_id[cid] = call
+        pending_assistant_result_idx = len(result) - 1  # the assistant just appended
+
+    def _consume_matching_result(message: dict[str, Any]) -> dict[str, Any] | None:
+        call_id = _tool_result_call_id(message)
+        name = _tool_result_name(message)
+        if call_id and call_id in pending_by_id:
+            call = pending_by_id.pop(call_id)
+            pending_order[:] = [item for item in pending_order if str(item.get("id") or "") != call_id]
+            return call
+        for idx, call in enumerate(list(pending_order)):
+            call_name = str(call.get("name") or "")
+            call_has_id = bool(str(call.get("id") or ""))
+            if message.get("role") == "tool":
+                # [2026-05-07] role=tool 结果不能只按 name 配对到有 id 的调用。
+                # 原因：原生 provider 校验 tool_call_id；缺 id 的结果即使同名也会成为坏历史。
+                # 做法：只有 assistant 调用本身也没有 id 时才允许 name fallback。
+                # 目的：避免普通业务工具结果被误判为已配对。
+                if call_has_id:
+                    continue
+            if name and call_name == name:
+                pending_order.pop(idx)
+                cid = str(call.get("id") or "")
+                if cid:
+                    pending_by_id.pop(cid, None)
+                return call
+        return None
+
+    def _repair_paired_result_message(message: dict[str, Any], call: dict[str, Any]) -> dict[str, Any]:
+        call_id = str(call.get("id") or "")
+        call_name = str(call.get("name") or "")
+        if message.get("role") == "tool":
+            repaired = dict(message)
+            # [2026-05-07] 已配对的原生结果补齐缺失字段。
+            # 原因：旧 JSONL 可能保存了 name 或 tool_call_id 不完整的 role=tool 行。
+            # 做法：从刚匹配到的 assistant.tool_call 回填缺失值。
+            # 目的：后续 provider 转换拿到完整的工具结果结构。
+            if call_id:
+                repaired.setdefault("tool_call_id", call_id)
+            if call_name:
+                repaired.setdefault("name", call_name)
+            return repaired
+
+        parsed = _parse_text_tool_result(message.get("content"))
+        if parsed is None:
+            return dict(message)
+        result_name, output = parsed
+        if _normalize_tool_mode(pending_tool_mode) != "native":
+            return dict(message)
+
+        # [2026-05-07] 修复旧 fake-native 文本结果与 native assistant.finish 的配对。
+        # 原因：早期存储会把 `Tool result for "finish": completed` 写成 user 文本，
+        # 但它紧跟 native assistant.finish 时本质上是该 tool_call 的结果。
+        # 做法：转换为 role=tool，并沿用原输出文本而不是强行改写为 ok。
+        # 目的：兼容旧历史，同时保持 provider 原生工具协议一致。
+        meta = _message_meta(message)
+        meta["tool_mode"] = "native"
+        meta["message_type"] = "tool_result"
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": result_name or call_name,
+            "content": output,
+            "_meta": meta,
+        }
+
+    for original in messages:
+        if not isinstance(original, dict):
+            continue
+        msg = dict(original)
+        if _is_tool_result_message(msg):
+            matched_call = _consume_matching_result(msg)
+            result_name = _tool_result_name(msg) or str((matched_call or {}).get("name") or "")
+            if matched_call is not None:
+                if _is_finish_tool_name(result_name):
+                    stats["kept_paired_finish_results"] += 1
+                result.append(_repair_paired_result_message(msg, matched_call))
+                continue
+
+            parsed = _parse_text_tool_result(msg.get("content"))
+            if msg.get("role") == "tool":
+                # [2026-05-07] 通用清洗所有原生孤儿 tool_result。
+                # 原因：Anthropic/Gemini 不只校验 finish，普通业务工具孤儿结果也会报错。
+                # 做法：role=tool 未匹配到当前 assistant.tool_call 时删除。
+                # 目的：保留完整配对，移除无法配对的半截结果。
+                if _is_finish_tool_name(result_name):
+                    stats["removed_orphan_finish_results"] += 1
+                else:
+                    stats["removed_orphan_tool_results"] += 1
+                continue
+            if parsed is not None and _is_finish_tool_name(parsed[0]):
+                # [2026-05-07] 只删除孤儿 finish 文本结果。
+                # 原因：旧 finish completed 文本没有配对时会污染摘要和 provider 历史。
+                # 做法：非 finish 的 fake-native 业务工具文本仍保留给摘要阅读。
+                # 目的：既清理控制工具旧污染，又不误删业务工具结果。
+                stats["removed_orphan_finish_results"] += 1
+                continue
+            result.append(msg)
+            continue
+
+        if pending_order:
+            # [2026-05-09] 遇到非工具结果消息时关闭当前 pending 窗口。
+            # _reset_pending() 内部调用 _strip_unmatched_tool_calls()，
+            # 自动将未配对的 tool_calls 转为文本摘要。
+            _reset_pending()
+        result.append(msg)
+        if msg.get("role") == "assistant":
+            _set_pending_from_assistant(msg)
+
+    if pending_order:
+        # [2026-05-09] _reset_pending() calls _strip_unmatched_tool_calls()
+        # which handles trailing orphans automatically.
+        _reset_pending()
+
+    return result, stats
+
+
+def repair_tool_result_pairing(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return history with old orphan finish results repaired or removed."""
+    repaired, _stats = repair_tool_result_pairing_with_stats(messages)
+    return repaired
+
+
+def sanitize_assistant_control_tools(
+    message: dict[str, Any],
+    *,
+    deliver_control_text: bool = True,
+    suppressed_control_call_ids: set[str] | None = None,
+    suppress_all_control_text: bool = False,
+    drop_if_only_control: bool = False,
+) -> dict[str, Any] | None:
+    """Legacy compatibility wrapper that no longer strips finish tool calls.
+
+    Why: external callers may still import this helper, but finish is now a real
+    persistent API tool. How: return the assistant message unchanged and ignore the
+    old control-flow arguments. Purpose: avoid reintroducing finish filtering while
+    keeping the public helper import-safe during the transition.
+    """
+    return dict(message)
+
+
+def sanitize_control_tool_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Legacy name for repair_tool_result_pairing.
+
+    Why: existing runner, compactor, and provider-bypass call sites still use the
+    old sanitizer name. How: delegate to the new pairing repair routine, which
+    preserves valid finish tool_use/tool_result pairs. Purpose: make the semantic
+    correction without a noisy cross-file rename in this urgent patch.
+    """
+    return repair_tool_result_pairing(messages)
+
+
+# ---------------------------------------------------------------------------
 #  反序列化辅助：将存储消息列表转换为 LLM 可消费格式
 # ---------------------------------------------------------------------------
 
@@ -709,8 +1147,14 @@ def build_llm_messages(
 
     跳过 _ephemeral 消息（retry hint 等），保留 _dynamic 消息（动态上下文）。
     """
+    # [2026-05-07] 先执行工具结果配对清洗。
+    # 原因：build_llm_messages 是所有非旁路 provider 的 L2 入口，旧存储中可能已有孤儿 tool_result。
+    # 做法：在模式路由前只移除无法配对的结果，完整工具轮包括 finish 都保留。
+    # 目的：普通工具和 finish 都按各自 formatter 回放，避免 provider 配对错误。
+    cleaned_messages = sanitize_control_tool_history(messages)
+
     result: list[dict] = []
-    for msg in messages:
+    for msg in cleaned_messages:
         # 跳过 ephemeral 消息（如 retry hint），它们不应进入 LLM 历史。
         # _dynamic 消息（动态上下文）保留——它们需要被 LLM 看到，
         # message_to_llm 会剥离 _dynamic 标记键但保留消息本身。

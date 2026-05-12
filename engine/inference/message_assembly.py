@@ -3,8 +3,6 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from toolbox.skills_runtime import build_skill_messages
-from ..memory import build_memory_messages
 from .dynamic_context import _load_dynamic_context_vars
 from ..attachments import build_multimodal_content
 from ..node import Node
@@ -53,9 +51,9 @@ def assemble_messages_with_injections(
 ) -> tuple[list[dict[str, Any]], bool]:
     """Lay out prompt messages using precomputed skill and memory injections.
 
-    Why: SkillInjector and MemoryInjector must be able to rebuild the same prompt
-    layout that assemble_initial_messages historically produced, without
-    duplicating injection in two places. How: keep the block-mode and string-mode
+    Why: KnowledgeInjector must be able to rebuild the same prompt layout that
+    assemble_initial_messages historically produced, without duplicating
+    injection in two places. How: keep the block-mode and string-mode
     placement rules in this shared helper and pass precomputed static/dynamic
     injection messages into it. Purpose: allow before_prompt_build hooks to own
     skill and memory construction while preserving byte-level prompt layout.
@@ -227,8 +225,6 @@ def assemble_initial_messages(
     task_context: dict[str, Any] | None = None,
     session_id: str = "",
     attachments: list[dict[str, Any]] | None = None,
-    skip_skill_inject: bool = False,
-    skip_memory_inject: bool = False,
 ) -> tuple[list[dict[str, Any]], bool, list[dict[str, Any]]]:
     """构建初始 messages 数组。
 
@@ -249,41 +245,12 @@ def assemble_initial_messages(
         compact_threshold=get_int(runtime_cfg, "engine.compact.threshold_tokens", 100_000, min_value=0),
     ))
     system_prompt = assemble_prompt(workspace_root, node, variables=prompt_vars)
-    skill_budget = get_int(runtime_cfg, "skills.max_budget_chars", 0, min_value=0)
-    _scan_history = _conversational_history(history)
-    # Phase 3 Hook System：允许 run_ai_node 在注册 before_prompt_build handler 时
-    # 跳过这里的旧内联 skill 注入。原因：SkillInjector 将在 hook 阶段调用同一
-    # build_skill_messages 并通过 assemble_messages_with_injections 重建同一布局。
-    # 做法：默认仍走旧行为；只有显式 skip_skill_inject=True 才交给 hook。
-    # 目的：当前仓库可解耦，未注册 hook 的部署仍保持原有行为。
-    if skip_skill_inject:
-        skill_static, skill_dynamic = [], []
-    else:
-        skill_static, skill_dynamic = build_skill_messages(
-            workspace_root,
-            node_id=node.id,
-            instruction_text=instruction,
-            history=_scan_history,
-            skill_mode=node.skill_access.mode,
-            skill_allow=node.skill_access.allow,
-            max_budget_chars=skill_budget,
-        )
-    # Phase 3 Hook System：memory 注入同样由显式 skip 控制。
-    # 原因、做法和目的与 skill 注入一致，避免 hook 注册后重复注入 memory。
-    if skip_memory_inject or node.memory_access.mode == "none":
-        memory_static, memory_dynamic = [], []
-    else:
-        memory_static, memory_dynamic = build_memory_messages(
-            workspace_root,
-            node_id=node.id,
-            instruction_text=instruction,
-            history=_scan_history,
-            max_budget_chars=get_int(
-                runtime_cfg, "memory.max_budget_chars", 0, min_value=0,
-            ),
-            memory_mode=node.memory_access.mode,
-            memory_allow=node.memory_access.allow,
-        )
+    # Why: this function now builds only the prompt skeleton, while knowledge
+    # content is added by before_prompt_build handlers. How: keep the existing
+    # layout code but pass empty skill and memory lists. Purpose: preserve message
+    # ordering without importing injection logic in the inference layer.
+    skill_static, skill_dynamic = [], []
+    memory_static, memory_dynamic = [], []
 
     # ---- Prompt cache friendly layout ----
     # Detect block list mode: assemble_prompt returns blocks with {role: history}

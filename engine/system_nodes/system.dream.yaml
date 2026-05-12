@@ -11,6 +11,8 @@ tool_access:
     - delete_memory
     - read_file
     - execute_command
+    - create_or_update_skill
+    - list_skills
 skills:
   mode: none
 prompt: |
@@ -24,8 +26,8 @@ prompt: |
   1. 用 `execute_command` 运行 `stat -c '%Y' data/memory/.dream-lock 2>/dev/null || echo 0`
      获取上次整理时间戳（秒）
   2. 用 `execute_command` 运行 `date +%s` 获取当前时间戳
-  3. 如果 (当前 - 上次) < 86400（24小时），直接 finish text="距上次整理不足24小时，跳过"
-  4. 如果 lock 文件不存在或超过24小时，继续 Phase 1
+  3. 如果 (当前 - 上次) < 79200（22小时），直接 finish text="距上次整理不足22小时，跳过"
+  4. 如果 lock 文件不存在或超过22小时，继续 Phase 1
 
   ## Phase 1 — Orient（定位）
 
@@ -60,12 +62,58 @@ prompt: |
 
   ## Phase 4 — Prune（修剪）
 
-  审查全量记忆，执行清理：
-  - 删除过时条目（临时信息、已过期安排）
+  ### 生命周期规则
+
+  每条记忆有以下元数据字段（可能缺失）：
+  - `source`: "auto" = 自动提取的，缺失/空 = 手动创建或世界书
+  - `created_at`: ISO 时间戳，创建时间
+  - `last_hit_at`: ISO 时间戳，最后一次被关键词命中的时间
+
+  **只有 `source: auto` 的条目参与过期清理。** 没有 source 字段的条目是手动创建或世界书，禁止自动删除/修改/合并。
+
+  ### 过期判断（仅对 source: auto）
+
+  用 `execute_command` 运行 `date +%s` 获取当前时间戳，然后对比：
+  - `last_hit_at` 超过 30 天未命中 + `created_at` 超过 30 天 → 候选过期
+  - `last_hit_at` 为空且 `created_at` 超过 30 天 → 候选过期
+  - 候选过期不等于直接删：审查内容，确认确实过时/无用后才删
+
+  ### 常规清理（所有 source: auto 条目）
+
   - 合并重复条目（两条表达同一信息 → 保留更完整的，删另一条）
   - 修正矛盾（两条互相冲突 → 根据最新对话判断哪条对，修正/删除）
   - 优化 keywords：太宽泛的收窄，太狭窄的扩展，加上 /regex/i 模式
   - 删除冗余（过于琐碎或模糊，不太可能被未来对话触发的条目）
+
+  ## Phase 5 — Promote（提升）
+
+  审查 `source: auto` 的记忆条目，将「老且活跃」的高质量知识提升为 skill。
+
+  ### 候选条件（必须全部满足）
+
+  1. `source: auto`（手动/世界书条目不参与）
+  2. `created_at` 距今超过 7 天（不是刚建的临时知识）
+  3. `last_hit_at` 在最近 7 天内（说明最近还在被频繁使用）
+  4. 内容长度 > 200 字（太短的保持 memory 即可，不值得提升）
+
+  ### 提升流程
+
+  1. 用 `list_skills` 查看现有 skill 列表
+  2. 对每个候选条目：
+     a. 检查是否已有同主题的 skill → 有则用 `create_or_update_skill` **合并内容到现有 skill**，不新建
+     b. 没有同主题 skill → 用 `create_or_update_skill` 创建新 skill
+        - name：简洁的英文标识（如 `deploy-guide`、`api-behavior`）
+        - 内容重写为结构化格式：标题、要点、步骤、注意事项
+        - 设置合适的 keywords（从原 memory 的 keywords 继承并优化）
+        - 设置 `strategy: normal`（关键词触发，不是 constant）
+     c. 提升完成后用 `delete_memory` 删除原 memory 条目
+  3. 在 finish 报告中注明提升了哪些条目
+
+  ### 约束
+
+  - 单次最多提升 3 条，优先提升内容最丰富、命中最活跃的
+  - 提升是重写压缩，不是简单复制——skill 内容应比原 memory 更结构化
+  - 如果没有符合条件的候选，跳过本阶段
 
   ## 完成
 
@@ -80,8 +128,9 @@ prompt: |
   - **合并进已有，不要新建重复** — 这是最重要的原则。检查已有记忆后再决定操作。
   - 保守操作：拿不准的不要删。宁可多留一条，也不要误删有用信息。
   - **严禁删除 constant 记忆**：constant: true 的条目是系统核心规则，禁止删除、禁止将 constant 改为 false。如需修正内容错误，只能用 save_memory 覆盖更新，不能 delete。
+  - **严禁碰无 source 标记的条目**：没有 `source` 字段的条目 = 手动创建/世界书，不要删、不要改、不要合并。只有 `source: auto` 的才归你管。
   - 单次整理最多操作 15 条。如果问题很多，处理最重要的，剩下的留给下次。
-  - execute_command 只允许只读命令（ls、find、grep、cat、head、tail、wc、stat）。
+  - execute_command 只允许只读命令（ls、find、grep、cat、head、tail、wc、stat、date）。
   - 不要读取超大文件的完整内容，用 tail/head 取最近部分即可。
 
   以下是本次整理的触发信息：

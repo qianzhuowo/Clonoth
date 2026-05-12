@@ -70,10 +70,16 @@ def _dispatch_target_from_tool_name(tool_name: str) -> str:
     return _DISPATCH_TOOL_REVERSE.get(sanitized_suffix, sanitized_suffix)
     return name[len(DISPATCH_TOOL_PREFIX):].strip()
 
-# [RFC 2026-04-20] finish 升级为真实 API 工具：tool_result 固定内容。
-# 仅用于满足 API 的 tool_use/tool_result 配对校验和下一轮对话历史格式合法性。
-# finish 调用后循环即终止，模型不会看到此内容。
-FINISH_TOOL_RESULT_CONTENT = "completed"
+# [2026-05-07] 控制流伪工具集合。
+# 原因：finish 只表示“结束当前任务并提交结果”，不是可长期回放的业务工具。
+# 做法：把控制流工具名集中声明，供运行期、存储层和 L2 历史构造层共用。
+# 目的：普通工具仍保留 provider 所需配对，finish 不再污染长期历史。
+CONTROL_TOOL_NAMES = frozenset({"finish"})
+
+
+def _is_control_tool_name(name: str) -> bool:
+    """Return whether ``name`` is an engine control-flow tool."""
+    return str(name or "").strip() in CONTROL_TOOL_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -333,13 +339,22 @@ def _switch_node_spec(targets: list[str], switch_info: list[dict[str, str]] | No
         desc_parts.append("可切换到的节点：")
         for info in switch_info:
             desc_parts.append(f"- {info.get('name', info['id'])}（{info['id']}）：{info.get('description', '')}")
-    # target enum: Gemini 不允许空字符串或空数组，仅在有 targets 时添加 enum
+    # [2026-05-06] switch_node 的枚举必须与 Gemini 的 schema 规则兼容。
+    # Why: target="" 是运行时恢复默认入口节点的约定，但 Gemini 会拒绝 enum
+    # 中的空字符串成员。How: 只把非空目标节点 ID 去重后写入 enum，没有可选
+    # 目标时直接省略 enum。Purpose: 保留 handler 对空 target 的兼容，同时避免
+    # 模型请求因工具声明无效而在进入推理前失败。
+    enum_targets: list[str] = []
+    for raw_target in targets:
+        target = str(raw_target or "").strip()
+        if target and target not in enum_targets:
+            enum_targets.append(target)
     target_prop: dict = {
         "type": "string",
         "description": "目标节点 ID。传空字符串恢复为默认入口节点。",
     }
-    if targets:
-        target_prop["enum"] = targets
+    if enum_targets:
+        target_prop["enum"] = enum_targets
     return {
         "type": "function",
         "function": {

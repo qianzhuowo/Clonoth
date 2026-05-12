@@ -20,6 +20,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -249,6 +250,9 @@ def _apply_memories(
             "enabled": True,
             "priority": 0,
             "scan_depth": 0,
+            "source": "auto",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "last_hit_at": "",
         }
 
         # Upsert

@@ -477,6 +477,25 @@ def _clean_schema(schema: dict[str, Any]) -> dict[str, Any]:
             cleaned[k] = _clean_schema(v)
         elif k in ("anyOf", "oneOf", "allOf") and isinstance(v, list):
             cleaned[k] = [_clean_schema(item) if isinstance(item, dict) else item for item in v]
+        elif k == "enum" and isinstance(v, list):
+            # [2026-05-06] Gemini rejects empty enum members in function schemas.
+            # Why: stale or dynamically generated tools can contain target enum values
+            # such as "" for internal runtime semantics, which causes Gemini to reject
+            # the whole GenerateContentRequest before the model runs. How: remove None
+            # and blank-string members, de-duplicate the remaining values while keeping
+            # their order, and omit enum entirely if nothing valid remains. Purpose: keep
+            # Gemini requests valid without changing the runtime handlers that may still
+            # accept an omitted or empty argument value.
+            enum_values: list[Any] = []
+            for item in v:
+                if item is None:
+                    continue
+                if isinstance(item, str) and not item.strip():
+                    continue
+                if item not in enum_values:
+                    enum_values.append(item)
+            if enum_values:
+                cleaned[k] = enum_values
         else:
             cleaned[k] = v
     return cleaned

@@ -13,7 +13,7 @@ from ..attachments import prepare_messages_for_llm
 from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
 from .loop_state import _LoopState, _persist_ctx, _short
 # message_to_llm 反序列化：在发送 LLM 前做格式转换（role 修正 + 内部字段剥离）
-from .tool_format import build_llm_messages
+from .tool_format import build_llm_messages, sanitize_control_tool_history
 # Phase 1: Signal System — 引入信号总线，用于 LLM 调用的可观测性
 # 在 while True 循环前发射 llm.call.start，在 return resp 前发射 llm.call.end，
 # 在重试路径发射 llm.retry，在不可重试失败时发射 llm.error。
@@ -27,13 +27,57 @@ from engine.signals.types import make_span_id
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
+# [fix 2026-05-07] Why: some OpenAI-compatible proxy layers return upstream
+# key-pool exhaustion as HTTP 400/402/403 instead of 429, and some provider
+# adapters use status_code=0 for transport exceptions. How: keep the strict HTTP
+# status whitelist, but add a separate combined semantic check for proxy resource
+# exhaustion. Purpose: retry recoverable upstream/key-pool failures without
+# retrying ordinary invalid-request 4xx responses that share the proxy prefix.
+_RESOURCE_LIMIT_CLIENT_STATUS_CODES = frozenset({400, 402, 403})
+_PROVIDER_FAILURE_MARKERS = (
+    "provider response failed",
+)
+_RESOURCE_LIMIT_ERROR_MARKERS = (
+    "quota exhausted",
+    "credits exhausted",
+    # [fix 2026-05-07] Why: bare "insufficient" or "credits" can also appear in
+    # schema/field/permission errors. How: only match explicit resource-limit
+    # phrases. Purpose: retry real quota/credit exhaustion without retrying
+    # malformed 400 requests.
+    "insufficient quota",
+    "insufficient_quota",
+    "insufficient credits",
+    "insufficient credit",
+    "insufficient balance",
+    "too many requests",
+    "rate limit",
+    "rate_limit",
+)
+
+
+def _has_resource_limit_marker(error: str | None) -> bool:
+    """Return whether an error is an upstream resource-limit failure."""
+    # [fix 2026-05-07] Why: resource-limit 4xx may be returned directly by a
+    # provider or wrapped by a proxy. How: match explicit quota/rate-limit phrases
+    # without requiring a generic provider-failure prefix. Purpose: keep quota
+    # exhaustion retryable while preventing schema/permission errors from retrying.
+    err = (error or "").lower()
+    return any(marker in err for marker in _RESOURCE_LIMIT_ERROR_MARKERS)
+
 
 def _is_retryable_error(resp) -> bool:
     """判定 ProviderResponse 是否属于可重试的临时性错误。"""
     if resp.ok:
         return False
-    if resp.status_code is not None:
-        return resp.status_code in _RETRYABLE_STATUS_CODES
+    status_code = resp.status_code
+    if status_code is not None:
+        if status_code <= 0:
+            return True
+        if status_code in _RETRYABLE_STATUS_CODES:
+            return True
+        if status_code in _RESOURCE_LIMIT_CLIENT_STATUS_CODES:
+            return _has_resource_limit_marker(getattr(resp, "error", None))
+        return False
     return True
 
 
@@ -61,7 +105,11 @@ def _build_messages_for_provider(
     if provider_name in {"openai-responses", "gemini"} and formatter_mode in {"native", "fake-native"}:
         # Keep storage-level tool_calls/_meta for the provider, but match
         # build_llm_messages by dropping ephemeral retry/control messages.
-        return [dict(msg) for msg in messages if not msg.get("_ephemeral")]
+        # [2026-05-07] 旁路 provider 也必须执行控制流历史清洗。
+        # 原因：Gemini/Responses 为保留 provider meta 绕过 L2，若不在这里清理会继续回放 finish。
+        # 做法：先用 L1 形态清洗 finish tool_call/tool_result，再保留 _meta 交给 provider。
+        # 目的：不破坏普通工具配对，同时防止控制流伪工具进入原生 provider 历史。
+        return [dict(msg) for msg in sanitize_control_tool_history(messages) if not msg.get("_ephemeral")]
     return build_llm_messages(messages, formatter) if formatter else messages
 
 

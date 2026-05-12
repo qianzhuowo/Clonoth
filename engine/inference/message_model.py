@@ -46,6 +46,13 @@ class MessageMeta:
     tool_call_ids: list[str] = field(default_factory=list)
     # 原始 tool_call id 列表
 
+    # [2026-05-07] 控制流工具标记。
+    # 原因：finish 这类伪工具只驱动引擎控制流，不能像普通业务工具一样长期回放。
+    # 做法：在 tool_result 等运行期消息的 meta 中记录控制工具名和状态。
+    # 目的：存储层、快照层、L2 历史构造层可以一致跳过这类临时协议配对消息。
+    control_tool_name: str = ""
+    control_tool_status: str = ""
+
     # ── 提取层（bot/前端可读）──
     # [refactor 2026-04-18] thinking_text → reasoning, has_thinking → has_reasoning
     reasoning: str = ""             # 思维链正文（给 debug/展示用）
@@ -77,6 +84,10 @@ class MessageMeta:
             d["metadata"] = self.metadata
         if self.tool_call_ids:
             d["tool_call_ids"] = list(self.tool_call_ids)
+        if self.control_tool_name:
+            d["control_tool_name"] = self.control_tool_name
+        if self.control_tool_status:
+            d["control_tool_status"] = self.control_tool_status
         if self.reasoning:
             d["reasoning"] = self.reasoning
         if self.has_reasoning:
@@ -120,6 +131,8 @@ class MessageMeta:
             timestamp=str(data.get("timestamp") or ""),
             metadata=dict(metadata),
             tool_call_ids=list(data.get("tool_call_ids") or []),
+            control_tool_name=str(data.get("control_tool_name") or ""),
+            control_tool_status=str(data.get("control_tool_status") or ""),
             reasoning=reasoning,
             has_reasoning=has_reasoning,
             inline_data=list(data.get("inline_data") or []),

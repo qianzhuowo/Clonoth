@@ -9,8 +9,6 @@ from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
 from toolbox.registry import ToolRegistry
-from toolbox.skills_runtime import build_skill_messages
-from ..memory import build_memory_messages
 
 from .pseudo_tools import (
     _dispatch_delegate_specs,
@@ -53,7 +51,11 @@ from clonoth_runtime import get_int, get_float, load_runtime_config
 from toolbox.context import ToolContext
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
 # 此处导入供外部通过 ai_step 模块访问（如测试、调试）。
-from .tool_format import ParsedToolCall, create_tool_formatter, build_llm_messages
+from .tool_format import (
+    ParsedToolCall,
+    create_tool_formatter,
+    build_llm_messages,
+)
 from .message_model import MessageMeta, set_message_meta
 from providers.base import BaseProvider, ToolCall, ProviderResponse
 # Phase 2 Signal System: 导入信号总线，用于发射 tool.call 和 task.error 信号。
@@ -141,6 +143,10 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
         # 跳过 dynamic context 和 ephemeral 消息（如 retry hint）
         if msg_dict.get('_dynamic') or msg_dict.get('_ephemeral'):
             return
+        # [2026-05-07] 不再按 control_tool_name 跳过 finish。
+        # 原因：finish 已恢复为真实 API 工具，正常结果必须像普通工具一样进入 ConversationStore。
+        # 做法：这里只保留 dynamic/ephemeral 两类运行期消息过滤，普通 tool_result 全部写入。
+        # 目的：长期历史能够保存 assistant.tool_call 与 tool_result 的完整配对。
         from uuid import uuid4
         from datetime import datetime, timezone
         msg_id = str(uuid4())
@@ -196,84 +202,6 @@ async def _check_preempt_and_cancel(ls: _LoopState, step: int) -> TaskAction | N
                     "node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step,
                 })
     return None
-
-
-async def _inject_preempt_message(ls: _LoopState, step: int) -> None:
-    """Preempt V2：如果有待注入的 preempt 消息，原地注入并重置状态。"""
-    if ls.preempt_inject_info is None:
-        return
-
-    _new_instruction = ls.preempt_inject_info.get("message", "")
-    _new_atts = ls.preempt_inject_info.get("attachments", [])
-
-    # 1. 剥离旧 dynamic context 消息
-    ls.messages = [m for m in ls.messages if not m.get("_dynamic")]
-
-    # 2. 重建 dynamic context（skill + memory 的 dynamic 部分）
-    from .message_assembly import _conversational_history
-    _scan_history = _conversational_history(ls.history)
-    _inj_skill_s, _inj_skill_d = build_skill_messages(
-        ls.rctx.workspace_root,
-        node_id=ls.node.id,
-        instruction_text=_new_instruction,
-        history=_scan_history,
-        skill_mode=ls.node.skill_access.mode,
-        skill_allow=ls.node.skill_access.allow,
-        max_budget_chars=get_int(ls.runtime_cfg, "skills.max_budget_chars", 0, min_value=0),
-    )
-    if ls.node.memory_access.mode == "none":
-        _inj_mem_d = []
-    else:
-        _inj_mem_s, _inj_mem_d = build_memory_messages(
-            ls.rctx.workspace_root,
-            node_id=ls.node.id,
-            instruction_text=_new_instruction,
-            history=_scan_history,
-            max_budget_chars=get_int(ls.runtime_cfg, "memory.max_budget_chars", 0, min_value=0),
-            memory_mode=ls.node.memory_access.mode,
-            memory_allow=ls.node.memory_access.allow,
-        )
-
-    _inj_parts: list[str] = []
-    if not ls.is_block_mode and len(ls.system_prompt) >= 2 and ls.system_prompt[1].get("content"):
-        _inj_parts.append(ls.system_prompt[1]["content"])
-    for _dm in _inj_skill_d:
-        if _dm.get("content"):
-            _inj_parts.append(_dm["content"])
-    for _dm in _inj_mem_d:
-        if _dm.get("content"):
-            _inj_parts.append(_dm["content"])
-
-    if _inj_parts:
-        _dyn_prefix = (
-            "以下是本轮动态上下文，每轮可能变化。\n\n"
-            if ls.is_block_mode
-            else "以下是本轮动态上下文信息，每轮可能变化。如与当前任务无关可忽略，继续之前的工作即可。\n\n"
-        )
-        ls.messages.append({
-            "role": "user",
-            "content": _dyn_prefix + "\n\n".join(_inj_parts),
-            "_dynamic": True,
-        })
-
-    # 3. 注入新 user message
-    if _new_atts:
-        ls.messages.append({"role": "user", "content": build_multimodal_content(
-            _new_instruction, _new_atts, workspace_root=ls.rctx.workspace_root,
-        )})
-    else:
-        ls.messages.append({"role": "user", "content": _new_instruction})
-
-    # 4. 通知 supervisor 已消费
-    await ls.rctx.consume_preempt()
-    await ls.rctx.emit_event("preempt_injected", {
-        "node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step,
-    })
-
-    # 5. 重置状态
-    ls.preempt_inject_info = None
-    ls.plaintext_retry_count = 0
-    ls.compacted = False
 
 
 async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
@@ -518,8 +446,17 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         usage=dict(ls.last_usage) if ls.last_usage else {},
     )
     set_message_meta(_assistant_msg, _tc_meta)
+    # [2026-05-07] Store reasoning_content at top level for API round-trip.
+    # DeepSeek V4 and similar models require this field in the message dict.
+    # _meta.reasoning is kept for internal use but top-level survives L2 stripping.
+    if resp.reasoning:
+        _assistant_msg["reasoning_content"] = resp.reasoning
     ls.messages.append(_assistant_msg)
     # Phase 1: 影子写入 assistant 消息到 ConversationStore
+    # [2026-05-07] 含 finish 的 assistant 消息也直接持久化。
+    # 原因：finish 是真实 API tool_call，删除或拆分它会使后续 tool_result 失去配对来源。
+    # 做法：不再调用 sanitize_assistant_control_tools，而是保存原始 assistant.tool_calls。
+    # 目的：ConversationStore、snapshot 与 provider replay 的工具轮结构一致。
     _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
 
     # 正文处理策略（JSON / Fake Native / Native 模式统一）：
@@ -556,11 +493,20 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         )
         for tc in resp.tool_calls:
             _err = ls.formatter.format_tool_result(tc, _reject_msg)
+            # [2026-05-07] 拒绝路径也按普通工具结果持久化。
+            # 原因：finish_guard 产生的是对模型可见的错误 tool_result，若标记为 ephemeral，
+            # 下一轮 provider 会看到 assistant.tool_call 缺少对应结果。
+            # 做法：不再给 finish 错误结果设置 control_tool_name 或 _ephemeral。
+            # 目的：被拒绝的 finish 与同轮其他工具一样保持完整配对历史。
             set_message_meta(_err, MessageMeta(
                 tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
                 message_type="tool_result",
             ))
             ls.messages.append(_err)
+            # [2026-05-07] before_tool_call 拒绝结果也要写入 ConversationStore。
+            # 原因：这些结果是 assistant.tool_call 的真实回复，不是运行期占位消息。
+            # 做法：与普通工具错误结果共用 _shadow_write。
+            # 目的：模型重试时能看到完整的拒绝原因和工具配对。
             _shadow_write(ls, _err, message_type="tool_result")
         return None  # 不执行任何工具，回到主循环让 AI 重试
     if _before_result.skip_step:
@@ -629,7 +575,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         # 消息（用户在 LLM 推理/工具执行期间发了新消息），拦截 finish：
         # 不产生 TaskAction(FINISH)，改为塞一个假 tool_result 维持 native
         # 模式下 tool_use/tool_result 的配对完整性（Claude API 强校验），
-        # 然后让主循环继续——下一轮 _inject_preempt_message 注入新用户消息。
+        # 然后让主循环继续，下一轮由 PreemptChecker 注入新用户消息。
         #
         # 同时补全 V2 遗漏：preempt_after_step（无消息 preempt）在只有 finish
         # 没有真工具的场景下也需要被检查，此前会跳过导致 finish 照常执行。
@@ -655,12 +601,25 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
                 "\u26a0\ufe0f Preempted: new user input received. Task continues.",
             )
             # [2026-05-01] 写入当前 tool_mode，避免真 native 的拦截结果被当作旧 fake-native。
+            # [2026-05-07] preempt 拦截 ACK 只服务当前运行期配对。
+            # 原因：该 finish 未交付，不能让 fake-native/json 的文本结果在恢复后压制未来正常 finish。
+            # 做法：补齐 ephemeral、tool_call_id 和 name，让清洗函数按调用 ID 精确移除。
+            # 目的：任务继续时不会向下一轮 provider 回放被拦截的 finish。
+            _intercept_msg["_ephemeral"] = True
+            if _finish_parsed.id:
+                _intercept_msg.setdefault("tool_call_id", _finish_parsed.id)
+            _intercept_msg.setdefault("name", "finish")
             set_message_meta(_intercept_msg, MessageMeta(
                 tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
                 message_type="tool_result",
+                control_tool_name="finish",
+                control_tool_status="preempt_intercepted",
             ))
             ls.messages.append(_intercept_msg)
-            _shadow_write(ls, _intercept_msg, MessageType.TOOL_RESULT)
+            # [2026-05-07] 被新用户输入拦截的 finish 未交付，不能写入长期历史。
+            # 原因：该 finish 没有产生最终交付，持久化会把未完成控制流带入下一轮。
+            # 做法：只保留运行期消息，且不调用 _shadow_write。
+            # 目的：下一轮提示由真实用户新输入驱动，而不是回放被拦截的 finish。
             await ls.rctx.emit_event("preempt_finish_intercepted", {
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
@@ -681,12 +640,25 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
             _preempt_result = ls.formatter.format_tool_result(
                 _finish_parsed2, "preempted",
             )
+            # [2026-05-07] 无消息 preempt 的 finish ACK 同样只保留在运行期。
+            # 原因：保存上下文后恢复时不应看到 finish tool_call/tool_result；但本轮内存仍需满足 provider 配对。
+            # 做法：设置 ephemeral，并补齐 tool_call_id/name 供 snapshot 清洗精确匹配。
+            # 目的：preempt 快照只恢复真实对话，不恢复控制流占位结果。
+            _preempt_result["_ephemeral"] = True
+            if _finish_parsed2.id:
+                _preempt_result.setdefault("tool_call_id", _finish_parsed2.id)
+            _preempt_result.setdefault("name", "finish")
             set_message_meta(_preempt_result, MessageMeta(
                 tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
                 message_type="tool_result",
+                control_tool_name="finish",
+                control_tool_status="preempted",
             ))
             ls.messages.append(_preempt_result)
-            _shadow_write(ls, _preempt_result, MessageType.TOOL_RESULT)
+            # [2026-05-07] 无消息 preempt 也不能持久化未交付的 finish 结果。
+            # 原因：任务会带上下文退出，恢复后不应看到已经终止的工具轮。
+            # 做法：只把结果留在运行期消息中，并依赖 ephemeral 过滤快照。
+            # 目的：恢复后的历史保持待继续执行的状态。
             ctx_ref = _persist_ctx(ls, step + 1)
             return TaskAction(
                 action=ACTION_PREEMPTED, node_id=ls.node.id,
@@ -1184,13 +1156,11 @@ async def run_ai_node(
     step_count = 0
     _is_block_mode = False
     system_prompt: list[dict[str, Any]] = []
-    # Phase 3 Hook System：如果 before_prompt_build 中注册了 skill/memory handler，
-    # assemble_initial_messages 先跳过旧内联注入，随后由 hook 重建同一 prompt 布局。
-    # 原因：避免注册 hook 后重复注入；做法：按 handler 名称分别控制 skip；
-    # 目的：未注册 hook 的其他部署仍保持原有 assemble_initial_messages 行为。
-    _prompt_handler_names = set(hook_registry.list_hooks().get("before_prompt_build", []))
-    _skip_skill_inject = "skill_inject" in _prompt_handler_names
-    _skip_memory_inject = "memory_inject" in _prompt_handler_names
+    # Phase 3 Hook System：初始组装只生成不含知识注入的 prompt 骨架。
+    # Why: inference core should know only the hook point, not concrete knowledge
+    # injection handlers. How: always fire before_prompt_build after fresh assembly
+    # and let registered handlers rebuild messages in place. Purpose: keep prompt
+    # ownership behind hooks while preserving the final prompt layout.
     _assembled_fresh = False
     snapshot = load_context_snapshot(rctx.workspace_root, context_ref) if context_ref else None
     if snapshot and isinstance(snapshot.get("messages"), list):
@@ -1209,16 +1179,16 @@ async def run_ai_node(
             task_context=rctx.task_context,
             session_id=rctx.session_id,
             attachments=attachments,
-            skip_skill_inject=_skip_skill_inject,
-            skip_memory_inject=_skip_memory_inject,
         )
         _assembled_fresh = True
 
-    if _assembled_fresh and _prompt_handler_names:
-        # Phase 3 Hook System：初始 messages 完成后触发 before_prompt_build。
-        # 原因：SkillInjector/MemoryInjector 需要复用已渲染的 system_prompt、history
-        # 和 instruction 布局信息。做法：handler 通过 shared layout helper 原地重建
-        # messages。目的：正式接入 prompt 注入 hook，同时避免重复注入。
+    if _assembled_fresh:
+        # Phase 3 Hook System：初始 messages 完成后始终触发 before_prompt_build。
+        # Why: the skeleton returned above intentionally contains no skill or
+        # memory blocks, so the hook is the single place that may add them. How:
+        # pass the rendered system prompt, history, instruction, and attachments
+        # through HookContext.extra and request an in-place rebuild. Purpose: keep
+        # zero behavior drift while removing knowledge injection from inference.
         _prompt_ctx = HookContext(
             messages=messages,
             tools=[],
@@ -1232,6 +1202,10 @@ async def run_ai_node(
                 "history": history,
                 "attachments": attachments,
                 "system_prompt": system_prompt,
+                # Why: the initial message list is now only a prompt skeleton.
+                # How: always request hook-side rebuild when before_prompt_build
+                # runs. Purpose: ensure knowledge injection is handled solely by
+                # hook handlers, not by the inference loop.
                 "apply_injection": True,
             },
         )
@@ -1355,19 +1329,11 @@ async def run_ai_node(
             continue
 
         # LEGACY: replaced by hook PreemptChecker and CompactChecker.
-        # 原因：保留旧调用位置，方便对照迁移前的执行顺序。
-        # 做法：旧函数和原始逻辑仍保留在本文件中，但不再从循环直接调用。
-        # 目的：下一轮清理前可快速回退或核对行为。
-        # action = await _check_preempt_and_cancel(ls, step)
-        # if action is not None:
-        #     return action
-        # await _inject_preempt_message(ls, step)
-        # P1 Microcompact + Proactive Snip: 闲置时主动减压
-        # if step == step_count:
-        #     ...  # moved to CompactChecker._run_idle_cleanup
-        # action = await _check_and_compact(ls, step)
-        # if action is not None:
-        #     return action
+        # Why: inference core should only keep the before_step trigger point for
+        # preempt and compact behavior. How: the old direct preempt injection path
+        # was removed, while compact fallback helpers remain unused for comparison.
+        # Purpose: avoid knowledge injection imports in this loop while keeping the
+        # migrated execution order visible.
 
         # _update_dynamic_vars(ls)  # Disabled to prevent intra-task prompt cache invalidation
 
@@ -1378,7 +1344,7 @@ async def run_ai_node(
         # Preempt V3 需求1: _call_llm_with_retry 返回 None 表示流式输出
         # 在思考阶段被 preempt 截断。partial assistant message 已丢弃（不存
         # 历史），preempt 消息已存储在 ls.preempt_inject_info 中。
-        # 跳到下一轮循环顶部，由 _inject_preempt_message 注入新用户消息后
+        # 跳到下一轮循环顶部，由 PreemptChecker 注入新用户消息后
         # 重新推理。与 cancel 的区别：不终止 task，继续循环。
         # ---------------------------------------------------------------
         if result is None:

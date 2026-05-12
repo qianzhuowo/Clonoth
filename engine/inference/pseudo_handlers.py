@@ -49,8 +49,22 @@ def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
     return result
 
 
-def _emit_pseudo_tool_result(ls: _LoopState, pseudo_call, content: str) -> None:
-    """统一写入伪工具的 tool_result，确保 native 模式下 tool_use/tool_result 配对完整。"""
+def _emit_pseudo_tool_result(
+    ls: _LoopState,
+    pseudo_call,
+    content: str,
+    *,
+    persist: bool = True,
+    control_tool_name: str = "",
+    control_tool_status: str = "",
+) -> None:
+    """统一写入伪工具的 tool_result，确保 native 模式下 tool_use/tool_result 配对完整。
+
+    [2026-05-07] 正常 finish 也通过本函数写普通工具结果。
+    原因：finish 现在是完整落盘的真实 API 工具，不能再被改写为普通 assistant 文本。
+    做法：默认 persist=True 且不设置 control 标记；只有未交付的拦截类结果才使用 control 参数。
+    目的：保留 provider 配对，同时让长期历史保存 assistant.tool_call + tool_result。
+    """
     from .ai_step import _shadow_write
     _parsed = ParsedToolCall(
         id=getattr(pseudo_call, "id", "") or "",
@@ -58,12 +72,24 @@ def _emit_pseudo_tool_result(ls: _LoopState, pseudo_call, content: str) -> None:
         arguments=dict(pseudo_call.arguments or {}),
     )
     tool_msg = ls.formatter.format_tool_result(_parsed, content)
+    if control_tool_name:
+        # [2026-05-07] 控制流工具结果必须保留运行期配对字段，但不能成为长期历史。
+        # 原因：finish 是真实 provider tool_use，需要 ACK；同时 fake-native/json 结果默认没有 call_id，旧清洗只能按全局兜底处理。
+        # 做法：给控制 ACK 标记 _ephemeral，并补齐 tool_call_id/name，供当轮内存配对和清洗函数精确识别。
+        # 目的：满足 provider 配对要求，同时避免 finish 结果进入 ConversationStore、快照、压缩和摘要。
+        tool_msg["_ephemeral"] = True
+        if _parsed.id:
+            tool_msg.setdefault("tool_call_id", _parsed.id)
+        tool_msg.setdefault("name", control_tool_name)
     set_message_meta(tool_msg, MessageMeta(
         tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
         message_type="tool_result",
+        control_tool_name=control_tool_name,
+        control_tool_status=control_tool_status,
     ))
     ls.messages.append(tool_msg)
-    _shadow_write(ls, tool_msg, MessageType.TOOL_RESULT)
+    if persist:
+        _shadow_write(ls, tool_msg, MessageType.TOOL_RESULT)
 
 
 async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAction | None:
@@ -106,8 +132,12 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     # ---- 终止型伪工具：finish / switch_node ----
 
     if pseudo_call.name == "finish":
-        from .pseudo_tools import FINISH_TOOL_RESULT_CONTENT
-        _emit_pseudo_tool_result(ls, pseudo_call, FINISH_TOOL_RESULT_CONTENT)
+        # [2026-05-07] 正常 finish 重新按真实 API 工具处理。
+        # 原因：provider 原生工具协议要求 assistant.tool_call 后面保留普通 tool_result，
+        # 若把 finish 改写成普通 assistant 文本，会破坏下一轮历史配对。
+        # 做法：与 reply、真实业务工具一样写入 content="ok" 的 tool_result，并允许影子持久化。
+        # 目的：ConversationStore、snapshot、provider replay 都能看到完整 finish 工具轮。
+        _emit_pseudo_tool_result(ls, pseudo_call, "ok")
 
         ctx_ref = _persist_ctx(ls, step + 1)
         summary_text = str(args.get("summary") or "").strip()

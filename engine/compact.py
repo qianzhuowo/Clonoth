@@ -11,6 +11,7 @@ system.compactor node, dispatched via supervisor task queue.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any
@@ -331,6 +332,15 @@ def _format_messages_for_summary(
     Inserts ``=== TASK [task_id] ===`` markers when source_task_id changes,
     so the compactor LLM can see task boundaries.
     """
+    from engine.inference.tool_format import sanitize_control_tool_history
+
+    # [2026-05-07] 摘要输入也要先清洗 finish 控制流历史。
+    # 原因：system.compactor 可能读取旧 child session 中已经持久化的 finish tool_call/tool_result；
+    # 若直接拼接，污染文本会被写进压缩摘要并回流父会话。
+    # 做法：复用 L2 的控制流清洗，只移除 finish 伪工具配对，普通业务工具结果保持原样。
+    # 目的：压缩摘要记录真实交付内容，不记录运行期协议占位结果。
+    messages = sanitize_control_tool_history(messages)
+
     parts: list[str] = []
     _prev_tid: str = ""
     for m in messages:
@@ -356,6 +366,24 @@ def _format_messages_for_summary(
             text = "\n".join(text_parts)
         else:
             text = str(content)
+        tool_calls = m.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            call_lines: list[str] = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                name = str(call.get("name") or function.get("name") or "").strip()
+                raw_args = call.get("arguments") if "arguments" in call else function.get("arguments", {})
+                args_text = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False, default=str)
+                call_lines.append(f"[tool_call] {name} {args_text}".strip())
+            if call_lines:
+                # [2026-05-07] 摘要输入显式渲染 assistant.tool_calls。
+                # 原因：finish 现在保留为真实工具轮，assistant.content 可能为空；若不渲染 tool_calls，
+                # compactor 看不到 finish 名称和 text 参数。
+                # 做法：把每个工具调用追加为可读文本行，普通 content 保持原样。
+                # 目的：摘要保留最终交付内容，同时不破坏 provider 工具配对历史。
+                text = "\n".join(part for part in [text, *call_lines] if part)
         if len(text) > 20_000:
             text = text[:20_000] + "\n...[truncated]"
         parts.append(f"[{role}]\n{text}")

@@ -2,15 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from clonoth_runtime import get_int
 from engine.attachments import build_multimodal_content
 # Why: engine.builtin handlers must not depend on the hook package after relocation.
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
 # cycles while keeping the existing hook registry duck-typed.
 from .result import hook_result
+from .knowledge_inject import build_knowledge_context
 from engine.protocol import ACTION_CANCELLED, TaskAction
-from engine.memory import build_memory_messages
-from toolbox.skills_runtime import build_skill_messages
 
 
 # Why: the built-in loader discovers handlers from per-file metadata.
@@ -95,37 +93,19 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     from engine.inference.message_assembly import _conversational_history
 
     scan_history = _conversational_history(ls.history)
-    skill_static, skill_dynamic = build_skill_messages(
+    # Why: built-in preempt handling must use the same knowledge boundary as
+    # initial prompt assembly. How: call build_knowledge_context, then discard
+    # static blocks because this reinjection path historically used only dynamic
+    # skill and memory blocks. Purpose: preserve preempt prompt placement while
+    # removing direct builder imports from this handler.
+    skill_static, skill_dynamic, memory_static, memory_dynamic = build_knowledge_context(
         ls.rctx.workspace_root,
-        node_id=ls.node.id,
-        instruction_text=new_instruction,
-        history=scan_history,
-        skill_mode=ls.node.skill_access.mode,
-        skill_allow=ls.node.skill_access.allow,
-        max_budget_chars=get_int(ls.runtime_cfg, "skills.max_budget_chars", 0, min_value=0),
+        ls.node,
+        new_instruction,
+        scan_history,
+        ls.runtime_cfg,
     )
-    # Why: build_skill_messages returns both static and dynamic blocks, but the
-    # preempt path historically reinjected only dynamic blocks. How: keep the
-    # static value assigned for parity with the old call shape while using only
-    # dynamic messages below. Purpose: avoid changing prompt-cache layout.
-    _ = skill_static
-
-    if ls.node.memory_access.mode == "none":
-        memory_dynamic = []
-    else:
-        memory_static, memory_dynamic = build_memory_messages(
-            ls.rctx.workspace_root,
-            node_id=ls.node.id,
-            instruction_text=new_instruction,
-            history=scan_history,
-            max_budget_chars=get_int(ls.runtime_cfg, "memory.max_budget_chars", 0, min_value=0),
-            memory_mode=ls.node.memory_access.mode,
-            memory_allow=ls.node.memory_access.allow,
-        )
-        # Why: same as skills, preempt reinjection only used dynamic memory.
-        # How: discard the static return explicitly. Purpose: preserve legacy
-        # message placement during this extraction.
-        _ = memory_static
+    _ = (skill_static, memory_static)
 
     dynamic_parts: list[str] = []
     if not ls.is_block_mode and len(ls.system_prompt) >= 2 and ls.system_prompt[1].get("content"):

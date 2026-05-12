@@ -29,6 +29,7 @@ from .inference import run_ai_node
 from .context import RunContext
 from .model import resolve_provider
 from .context_store import load_context_snapshot
+from .inference.tool_format import sanitize_control_tool_history
 
 from .node import Node, load_node
 # [2026-04-17] write_artifact 移除：截断机制已废弃
@@ -650,6 +651,20 @@ async def _handle_task(
             print(f"[engine] task {task_id} ORPHANED - shutdown interrupted complete POST", flush=True)
 
 
+def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
+    """Build task_context from input_data, bridging supervisor flags.
+
+    [2026-05-09] Supervisor sets '_system_task' in input_data top-level,
+    but engine checks 'is_system_task' inside task_context. This function
+    bridges that gap so system nodes (turn_summarizer, compactor, etc.)
+    correctly suppress switch_node injection.
+    """
+    ctx = input_data.get("task_context") if isinstance(input_data.get("task_context"), dict) else {}
+    if input_data.get("_system_task"):
+        ctx["is_system_task"] = True
+    return ctx
+
+
 async def _run_node_task(
     *,
     http: httpx.AsyncClient,
@@ -684,7 +699,7 @@ async def _run_node_task(
         user_text=str(input_data.get("instruction") or "").strip(),
         task_id=task_id, session_generation=session_generation,
         source_inbound_seq=int(source_inbound_seq) if source_inbound_seq is not None else None,
-        task_context=input_data.get("task_context") if isinstance(input_data.get("task_context"), dict) else {},
+        task_context=_build_task_context(input_data),
     )
     # Phase 1 (Session Conversation Store): 创建 ConversationStore 实例并挂载到 rctx。
     # ai_step 中的 _shadow_write 通过 getattr(ls.rctx, 'conversation_store', None) 访问。
@@ -727,6 +742,11 @@ async def _run_node_task(
             # 从子 session 的 JSONL 加载历史，过滤 system 消息（子节点重建自己的 system prompt）
             stored = _conv_store.load(child_session_id)
             history = [_message_to_history_dict(m) for m in stored if m.role != "system"]
+            # [2026-05-07] 子会话恢复时先清理 finish 控制流历史。
+            # 原因：system.compactor 等 child session 可能已有旧 finish tool_call/tool_result 污染。
+            # 做法：在进入提示组装前去掉控制流配对，再保留旧 fake-native 尾部兼容清理。
+            # 目的：父会话不会回放子任务 finish 伪工具。
+            history = sanitize_control_tool_history(history)
             history = _strip_trailing_pseudo_call(history)
         # child session 模式不使用 context_ref（让 ai_step 重建 system prompt）
         context_ref = ""
@@ -742,6 +762,11 @@ async def _run_node_task(
             stored = _conv_store.load(session_id)
             history = [_message_to_history_dict(m) for m in stored if m.role != "system"]
             # 剥离尾部伪工具（finish/dispatch 等），同 child session 路径处理
+            # [2026-05-07] 先执行结构化控制流清理，覆盖 true native 中非文本化的 finish 记录。
+            # 原因：旧 _strip_trailing_pseudo_call 只能处理 fake-native 文本 marker。
+            # 做法：sanitize_control_tool_history 处理 tool_calls/role=tool，再调用旧兼容函数。
+            # 目的：主会话与子会话的历史恢复语义一致。
+            history = sanitize_control_tool_history(history)
             history = _strip_trailing_pseudo_call(history)
             # 仅新 inbound（非 resume）需要 pop 尾部重复 instruction：
             # shadow_write 会在本轮再次写入 user 消息，若 JSONL 里上一条就是本轮 instruction，
@@ -761,6 +786,11 @@ async def _run_node_task(
         if snapshot and isinstance(snapshot.get("messages"), list):
             history = [m for m in snapshot["messages"] if m.get("role") != "system"]
             # 剥离尾部的伪工具调用，改为提取 finish 的 text 作为正常 assistant 回复。
+            # [2026-05-07] snapshot 兼容路径也清理结构化 finish 控制流记录。
+            # 原因：旧快照可能保存 true native role=tool finish result。
+            # 做法：先清理结构化控制工具，再执行旧文本 marker 清理。
+            # 目的：所有历史来源都不向 LLM 回放 finish 伪工具。
+            history = sanitize_control_tool_history(history)
             history = _strip_trailing_pseudo_call(history)
         elif use_context:
             # 快照加载失败，降级为 session_messages

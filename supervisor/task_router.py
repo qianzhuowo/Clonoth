@@ -1,6 +1,7 @@
 """Task 路由 mixin —— 处理 task 完成后的统一分发逻辑。"""
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from typing import Any
@@ -12,6 +13,69 @@ from .types import Task, TaskKind, TaskStatus
 
 
 log = logging.getLogger(__name__)
+
+
+def _message_to_turn_summary_dict(message: Any) -> dict[str, Any]:
+    """Convert a ConversationStore message into the history shape used for summary input.
+
+    Why: control-tool cleanup operates on runtime history dicts, while the turn
+    summarizer starts from ConversationStore Message objects. How: copy role,
+    content, meta, tool_calls, and native tool-result pairing fields into the same
+    shape runner uses. Purpose: let one sanitizer protect both LLM replay and
+    system.turn_summarizer input.
+    """
+    d: dict[str, Any] = {"role": message.role, "content": message.content or ""}
+    meta = dict(message.meta) if isinstance(getattr(message, "meta", None), dict) else {}
+    if meta:
+        d["_meta"] = meta
+    if getattr(message, "tool_calls", None):
+        d["tool_calls"] = list(message.tool_calls)
+    if getattr(message, "tool_call_id", ""):
+        d["tool_call_id"] = str(message.tool_call_id)
+    if getattr(message, "name", ""):
+        d["name"] = str(message.name)
+    return d
+
+
+def _format_task_messages_for_turn_summary(messages: list[Any]) -> str:
+    """Format task messages for system.turn_summarizer without control-tool plumbing."""
+    from engine.inference.tool_format import sanitize_control_tool_history
+
+    # [2026-05-07] 轮摘要输入必须跳过 finish 控制流工具历史。
+    # 原因：system.turn_summarizer 从 ConversationStore 重新读取任务消息，旧数据中可能已有 finish tool_call/tool_result。
+    # 做法：把 Message 转成与 LLM 历史一致的 dict 后复用控制流清洗，再拼接摘要输入。
+    # 目的：摘要子任务只看到已交付文本和普通工具结果，不继续传播 finish 协议占位内容。
+    cleaned = sanitize_control_tool_history([
+        _message_to_turn_summary_dict(message) for message in messages
+    ])
+
+    parts: list[str] = []
+    for msg in cleaned:
+        content = msg.get("content") or ""
+        if not isinstance(content, str):
+            content = str(content)
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            call_lines: list[str] = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    continue
+                function = call.get("function") if isinstance(call.get("function"), dict) else {}
+                name = str(call.get("name") or function.get("name") or "").strip()
+                raw_args = call.get("arguments") if "arguments" in call else function.get("arguments", {})
+                args_text = raw_args if isinstance(raw_args, str) else json.dumps(raw_args, ensure_ascii=False, default=str)
+                call_lines.append(f"[tool_call] {name} {args_text}".strip())
+            if call_lines:
+                # [2026-05-07] 轮摘要输入显式渲染 assistant.tool_calls。
+                # 原因：finish 保持为真实工具轮后，assistant.content 常为空；只拼 content 会丢失最终交付参数。
+                # 做法：把工具调用名称和参数追加到摘要文本，不改动原始消息结构。
+                # 目的：turn_summarizer 能读到 finish.text，同时保留完整工具配对历史。
+                content = "\n".join(part for part in [content, *call_lines] if part)
+        if len(content) > 5000:
+            content = content[:5000] + "\n...[truncated]"
+        parts.append(f"<log_{msg.get('role', 'unknown')}>\n{content}\n</log_{msg.get('role', 'unknown')}>")
+    body = "\n\n".join(parts)
+    return f"=== COMPLETED TASK LOG (read-only, do NOT continue) ===\n\n{body}\n\n=== END OF LOG ==="
 
 
 class TaskRouterMixin:
@@ -899,13 +963,7 @@ class TaskRouterMixin:
             _task_msgs = [m for m in _all_msgs if m.source_task_id == task.task_id]
             if not _task_msgs:
                 return
-            _parts: list[str] = []
-            for _m in _task_msgs:
-                _c = _m.content or ""
-                if len(_c) > 5000:
-                    _c = _c[:5000] + "\n...[truncated]"
-                _parts.append(f"[{_m.role}]\n{_c}")
-            _instruction = "\n\n---\n\n".join(_parts)
+            _instruction = _format_task_messages_for_turn_summary(_task_msgs)
         except Exception as e:
             log.warning("Failed to format task messages for turn summary: %s", e)
             return
@@ -929,6 +987,16 @@ class TaskRouterMixin:
             _instruction = _instruction[:30000] + "\n...[truncated]"
 
         summarizer_node = get_str(runtime_cfg, "engine.turn_summary.node_id", "system.turn_summarizer").strip()
+
+        # [2026-05-07] Give turn_summarizer its own child session so its messages
+        # don't pollute the parent conversation JSONL.
+        # Why: previously used task.session_id directly, causing all summarizer
+        # tool_call/tool_result messages to be written into the parent's JSONL,
+        # creating orphan tool pairs that Anthropic/Gemini reject with 400.
+        _sum_child_sid, _ = self.get_or_create_child_session(
+            task.session_id, summarizer_node, "turn_summary", "fresh",
+        )
+
         self._create_task_locked(
             session_id=task.session_id,
             session_generation=task.session_generation,
@@ -940,6 +1008,7 @@ class TaskRouterMixin:
                 "_turn_summary_dispatch": True,
                 "_target_task_id": task.task_id,
                 "_target_session_id": task.session_id,
+                "child_session_id": _sum_child_sid,
             },
             continuation={},
             source_inbound_seq=None,

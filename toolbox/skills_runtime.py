@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-import re
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+# Why: skill and memory keyword matching now share one engine-level matcher.
+# How: import the shared helpers instead of keeping local duplicate functions.
+# Purpose: keep activation behavior identical across both injection paths.
+from engine.knowledge_match import build_scan_text, compile_keyword, match_keywords
 
 import yaml
 
@@ -40,54 +44,6 @@ def _short_text(s: str, max_chars: int = 240) -> str:
     if len(s) <= max_chars:
         return s
     return s[:max_chars] + "…"
-
-
-# ---------------------------------------------------------------------------
-#  Keyword compilation & matching
-# ---------------------------------------------------------------------------
-
-def _compile_keyword(kw: str) -> re.Pattern[str] | str:
-    """Compile a keyword entry.
-
-    If *kw* matches ``/pattern/flags``, compile as a regular expression.
-    Otherwise return the lowercased string for substring matching.
-    """
-    kw = (kw or "").strip()
-    if not kw:
-        return ""
-    if kw.startswith("/"):
-        last_slash = kw.rfind("/")
-        if last_slash > 0:
-            pattern = kw[1:last_slash]
-            flags_str = kw[last_slash + 1:]
-            flags = 0
-            if "i" in flags_str:
-                flags |= re.IGNORECASE
-            if "s" in flags_str:
-                flags |= re.DOTALL
-            if "m" in flags_str:
-                flags |= re.MULTILINE
-            try:
-                return re.compile(pattern, flags)
-            except re.error:
-                pass
-    return kw.lower()
-
-
-def _match_keywords(compiled: list[re.Pattern[str] | str], text: str) -> bool:
-    """Return ``True`` if any compiled keyword matches *text*."""
-    if not compiled or not text:
-        return False
-    text_lower = text.lower()
-    for kw in compiled:
-        if not kw:
-            continue
-        if isinstance(kw, re.Pattern):
-            if kw.search(text):
-                return True
-        elif kw in text_lower:
-            return True
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +137,7 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
                 "path": skill_md.relative_to(workspace_root).as_posix(),
                 "strategy": strategy,
                 "keywords": keywords,
-                "compiled_keywords": [_compile_keyword(k) for k in keywords],
+                "compiled_keywords": [compile_keyword(k) for k in keywords],
                 "order": order,
                 "priority": priority,
                 "scan_depth": scan_depth,
@@ -192,54 +148,6 @@ def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list
             continue
     _SkillCache.put(workspace_root, items)
     return items
-
-
-# ---------------------------------------------------------------------------
-#  Scan text building
-# ---------------------------------------------------------------------------
-
-def _build_scan_text(
-    instruction_text: str,
-    history: list[dict[str, Any]] | None,
-    scan_depth: int,
-) -> str:
-    """Build text to scan for keyword matching.
-
-    *instruction_text* is always included.  When *scan_depth* > 0,
-    the content of the last *scan_depth* **rounds** (each round is a
-    user message followed by an optional assistant reply) from
-    *history* is appended.  A round boundary is defined as the start
-    of a user message that is preceded by a non-user message (or is
-    the first message).
-    """
-    parts: list[str] = [instruction_text or ""]
-    if history and scan_depth > 0:
-        # Walk backwards to find round boundaries.
-        # A "round" starts at a user message that is either the first
-        # message or follows a non-user message.
-        round_starts: list[int] = []
-        for i in range(len(history) - 1, -1, -1):
-            role = history[i].get("role", "")
-            if role != "user":
-                continue
-            # This user message starts a new round if:
-            #   - it is the first message, OR
-            #   - the previous message is not a user message
-            if i == 0 or history[i - 1].get("role", "") != "user":
-                round_starts.append(i)
-                if len(round_starts) >= scan_depth:
-                    break
-
-        if round_starts:
-            start_idx = round_starts[-1]  # earliest round start
-            for msg in history[start_idx:]:
-                role = msg.get("role", "")
-                if role not in ("user", "assistant"):
-                    continue
-                content = msg.get("content")
-                if isinstance(content, str):
-                    parts.append(content)
-    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -256,125 +164,26 @@ def build_skill_messages(
     skill_allow: list[str] | None = None,
     max_budget_chars: int = 0,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
-    """Build system messages for skill injection.
+    """Build system messages for skill injection through the unified pipeline."""
+    # Why: skill filtering, matching, budgeting, and rendering now live in the
+    # engine-level knowledge injector so skills can share a global budget with
+    # memories. How: normalize only skill catalog entries and disable memory in
+    # the shared helper. Purpose: keep this legacy public function working while
+    # preventing a second copy of the injection algorithm from drifting.
+    from engine.builtin.knowledge_inject import build_knowledge_messages, normalize_skill_entries
 
-    Returns ``(static_msgs, dynamic_msgs)`` tuple for prompt-cache
-    optimisation.  The caller should place *static_msgs* in the stable
-    prefix (before history) and *dynamic_msgs* after history so that
-    the prefix remains identical across turns.
-
-    * *static_msgs*  — constant skills block (stable across turns)
-    * *dynamic_msgs* — active (keyword-matched) skills + discovery index
-    """
-    catalog = load_skill_catalog(workspace_root)
-
-    # --- filter by enabled + node-level access --------------------------
-    skills = [s for s in catalog if s.get("enabled", True)]
-    # --- filter by skill-level node_ids (skill declares which nodes can see it)
-    if node_id:
-        skills = [s for s in skills if not s.get("node_ids") or node_id in s["node_ids"]]
-
-    if skill_mode == "none":
-        return [], []
-    if skill_mode == "allowlist" and skill_allow is not None:
-        allow_set = set(skill_allow)
-        skills = [s for s in skills if s.get("name") in allow_set]
-    if not skills:
-        return [], []
-
-    # --- classify -------------------------------------------------------
-    constant_skills: list[dict[str, Any]] = []
-    keyword_skills: list[dict[str, Any]] = []
-    index_only_skills: list[dict[str, Any]] = []
-
-    for s in skills:
-        if s["strategy"] == "constant":
-            constant_skills.append(s)
-        elif s["keywords"]:
-            keyword_skills.append(s)
-        else:
-            index_only_skills.append(s)
-
-    # --- keyword matching for dynamic skills ----------------------------
-    dynamic_skills: list[dict[str, Any]] = []
-    for s in keyword_skills:
-        scan_text = _build_scan_text(instruction_text, history, s["scan_depth"])
-        if _match_keywords(s["compiled_keywords"], scan_text):
-            dynamic_skills.append(s)
-        else:
-            index_only_skills.append(s)
-
-    # --- sort by order (secondary: name for deterministic byte output) ---
-    constant_skills.sort(key=lambda x: (x["order"], x.get("name", "")))
-    dynamic_skills.sort(key=lambda x: (x["order"], x.get("name", "")))
-    index_only_skills.sort(key=lambda x: (x["order"], x.get("name", "")))
-
-    # --- budget enforcement ---------------------------------------------
-    if max_budget_chars > 0:
-        all_injectable: list[tuple[str, dict[str, Any]]] = []
-        for s in constant_skills:
-            all_injectable.append(("constant", s))
-        for s in dynamic_skills:
-            all_injectable.append(("dynamic", s))
-
-        # Higher priority → keep first
-        all_injectable.sort(key=lambda x: x[1]["priority"], reverse=True)
-
-        kept_constant: list[dict[str, Any]] = []
-        kept_dynamic: list[dict[str, Any]] = []
-        used = 0
-        for kind, s in all_injectable:
-            body_len = len(s.get("body") or "")
-            if used + body_len <= max_budget_chars:
-                used += body_len
-                if kind == "constant":
-                    kept_constant.append(s)
-                else:
-                    kept_dynamic.append(s)
-            else:
-                index_only_skills.append(s)
-
-        kept_constant.sort(key=lambda x: (x["order"], x.get("name", "")))
-        kept_dynamic.sort(key=lambda x: (x["order"], x.get("name", "")))
-        constant_skills = kept_constant
-        dynamic_skills = kept_dynamic
-
-    # --- build messages -------------------------------------------------
-    static_msgs: list[dict[str, str]] = []
-    dynamic_msgs: list[dict[str, str]] = []
-
-    # constant block
-    if constant_skills:
-        parts: list[str] = ["[SKILLS:CONSTANT]"]
-        for s in constant_skills:
-            parts.append(f"\n## Skill: {s['name']}\n")
-            parts.append(s.get("body") or "")
-        parts.append("\n[/SKILLS:CONSTANT]")
-        static_msgs.append({"role": "system", "content": "\n".join(parts)})
-
-    # dynamic + index block
-    dynamic_parts: list[str] = []
-    if dynamic_skills:
-        dynamic_parts.append("[SKILLS:ACTIVE]")
-        for s in dynamic_skills:
-            dynamic_parts.append(f"\n## Skill: {s['name']}\n")
-            dynamic_parts.append(s.get("body") or "")
-        dynamic_parts.append("\n[/SKILLS:ACTIVE]")
-
-    if index_only_skills:
-        if dynamic_parts:
-            dynamic_parts.append("")
-        dynamic_parts.append("[SKILLS:INDEX]")
-        dynamic_parts.append(
-            "以下 skill 未被激活。如果当前任务需要，可通过 read_file 读取对应 path 的全文。"
-        )
-        for s in index_only_skills:
-            dynamic_parts.append(f"- name: {s['name']}")
-            dynamic_parts.append(f"  description: {_short_text(s.get('description') or '')}")
-            dynamic_parts.append(f"  path: {s['path']}")
-        dynamic_parts.append("[/SKILLS:INDEX]")
-
-    if dynamic_parts:
-        dynamic_msgs.append({"role": "system", "content": "\n".join(dynamic_parts)})
-
-    return static_msgs, dynamic_msgs
+    skill_static, skill_dynamic, _memory_static, _memory_dynamic = build_knowledge_messages(
+        workspace_root,
+        normalize_skill_entries(load_skill_catalog(workspace_root)),
+        node_id=node_id,
+        instruction_text=instruction_text,
+        history=history,
+        skill_mode=skill_mode,
+        skill_allow=skill_allow,
+        memory_mode="none",
+        memory_allow=None,
+        skill_max_budget_chars=max_budget_chars,
+        memory_max_budget_chars=0,
+        knowledge_max_budget_chars=0,
+    )
+    return skill_static, skill_dynamic

@@ -76,6 +76,12 @@ memory:
     min_sessions: 0           # 距上次 dream 后至少有 N 个不同 session 活动过才触发（0 = 不检查）
     conversation_key: "system:dream"  # dream 会话标识
 
+knowledge:
+  # Why: Phase 2+3 can budget skills and memories from one pool. How: keep 0
+  # as the backward-compatible default that falls back to separate budgets.
+  # Purpose: existing deployments keep old behavior until this is set > 0.
+  max_budget_chars: 0       # 0 = use skills/memory budgets; >0 = shared knowledge budget
+
 shell:
   default_conversation_key: "cli:default"
   mode: tui   # tui | cli

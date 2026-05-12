@@ -166,7 +166,7 @@ config/nodes/*.yaml
 一个典型节点如下：
 
 ```yaml
-id: ereuna_main
+id: bot_adapter
 type: ai
 name: EreunaMain
 description: 通用节点

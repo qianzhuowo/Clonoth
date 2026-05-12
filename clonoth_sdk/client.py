@@ -1,6 +1,6 @@
 """ClonothClient — 封装与 Clonoth Supervisor 的全部 HTTP 交互。
 
-Phase 1 (2026-04-17): 初始创建，从 ereuna_main.py 中提取所有直接 HTTP 调用。
+Phase 1 (2026-04-17): 初始创建，从 bot_adapter.py 中提取所有直接 HTTP 调用。
 使用 httpx.AsyncClient 作为底层 HTTP 库。
 SDK 是纯协议层，不包含任何平台（Discord / Telegram 等）相关逻辑。
 
@@ -84,7 +84,7 @@ class ClonothClient:
         """提交用户消息到 Supervisor。
 
         对应 POST /v1/inbound。
-        提取自 ereuna_main.py _submit_inbound() 中的 HTTP 调用逻辑。
+        提取自 bot_adapter.py _submit_inbound() 中的 HTTP 调用逻辑。
 
         Args:
             channel: 频道类型标识，如 "discord_guild"、"discord_dm"、"cli"
@@ -137,7 +137,7 @@ class ClonothClient:
         """从全局事件流拉取新事件。
 
         对应 GET /v1/events。
-        提取自 ereuna_main.py _outbound_poller() 中的事件轮询逻辑。
+        提取自 bot_adapter.py _outbound_poller() 中的事件轮询逻辑。
 
         Args:
             after_seq: 只返回 seq 大于此值的事件
@@ -171,7 +171,7 @@ class ClonothClient:
         """提交审批决策。
 
         对应 POST /v1/approvals/{approval_id}。
-        提取自 ereuna_main.py _auto_approve() 和 ApprovalView 按钮回调。
+        提取自 bot_adapter.py _auto_approve() 和 ApprovalView 按钮回调。
 
         Args:
             approval_id: 审批请求 ID
@@ -197,7 +197,7 @@ class ClonothClient:
         """取消单个任务及其子任务链。
 
         对应 POST /v1/tasks/{task_id}/cancel。
-        提取自 ereuna_main.py CancelView.cancel_task 精准取消逻辑。
+        提取自 bot_adapter.py CancelView.cancel_task 精准取消逻辑。
 
         Returns:
             True 表示取消成功，False 表示任务已不存在或已完成
@@ -211,7 +211,7 @@ class ClonothClient:
         """取消指定 session 中所有活跃任务。
 
         对应 POST /v1/sessions/{session_id}/cancel_active_tasks。
-        提取自 ereuna_main.py CancelView fallback 逻辑（task_id 未回填时）。
+        提取自 bot_adapter.py CancelView fallback 逻辑（task_id 未回填时）。
 
         Returns:
             True 表示请求成功
@@ -235,7 +235,7 @@ class ClonothClient:
         """向正在运行的任务注入 preempt 请求。
 
         对应 POST /v1/tasks/{task_id}/preempt。
-        提取自 ereuna_main.py _handle_agent_inner() 中的 Preempt V2 逻辑。
+        提取自 bot_adapter.py _handle_agent_inner() 中的 Preempt V2 逻辑。
         被打断的任务会在当前原子操作完成后保存上下文快照并退出，
         新消息通过 message 参数注入到任务中继续处理。
 
@@ -265,7 +265,7 @@ class ClonothClient:
         """查询指定 session 的活跃任务列表。
 
         对应 GET /v1/sessions/{session_id}/running_tasks。
-        提取自 ereuna_main.py _handle_agent_inner() 中的 preempt 目标查找逻辑。
+        提取自 bot_adapter.py _handle_agent_inner() 中的 preempt 目标查找逻辑。
         Supervisor 端会自动收割 lease 过期的僵尸任务。
 
         Returns:
@@ -294,7 +294,7 @@ class ClonothClient:
         """查询 Supervisor 健康状态。
 
         对应 GET /v1/health。
-        提取自 ereuna_main.py on_ready() 中获取 workspace_root 的逻辑。
+        提取自 bot_adapter.py on_ready() 中获取 workspace_root 的逻辑。
         启动时可通过此方法动态获取工作区路径。
 
         Raises:
@@ -315,7 +315,7 @@ class ClonothClient:
         """查询当前 OpenAI 兼容 API 配置（公开信息）。
 
         对应 GET /v1/config/openai。
-        提取自 ereuna_main.py !model show 命令。
+        提取自 bot_adapter.py !model show 命令。
 
         Raises:
             httpx.HTTPStatusError: 请求失败时抛出
@@ -336,7 +336,7 @@ class ClonothClient:
         """更新 OpenAI 兼容 API 配置。
 
         对应 POST /v1/config/openai。
-        提取自 ereuna_main.py !model set/key/url 命令。
+        提取自 bot_adapter.py !model set/key/url 命令。
 
         Args:
             **kwargs: 要更新的字段，可选 model, base_url, api_key

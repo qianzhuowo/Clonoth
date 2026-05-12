@@ -1,8 +1,8 @@
 """Session 状态管理 — 集中管理会话运行时状态。
 
-Phase 2 (2026-04-17): 初始创建，将 ereuna_main.py 中散落的全局 dict 收纳为结构化类。
+Phase 2 (2026-04-17): 初始创建，将 bot_adapter.py 中散落的全局 dict 收纳为结构化类。
 
-替代的全局变量（来自 ereuna_main.py）：
+替代的全局变量（来自 bot_adapter.py）：
   _trigger_messages        → SessionState.triggers (dict[int, TriggerInfo])
   _session_dm_channels     → SessionState.session_dm_channels
   _main_task_state         → SessionState.main_task_states (dict[int, MainTaskState])
@@ -43,7 +43,7 @@ from typing import Any
 class TriggerInfo:
     """触发消息信息 — 跟踪 inbound 请求与平台消息的映射。
 
-    替代 ereuna_main.py _trigger_messages[seq] 中的内联 dict（L131-132）：
+    替代 bot_adapter.py _trigger_messages[seq] 中的内联 dict（L131-132）：
       {"message": discord.Message, "channel_id": int, "conversation_key": str,
        "is_dm": bool, "status_msg": discord.Message|None, "session_id": str,
        "created_at": float, "cancel_view": CancelView, "last_typing_time": float}
@@ -70,14 +70,14 @@ class TriggerInfo:
     def refresh(self) -> None:
         """刷新 created_at，防止被超时清理。
 
-        对应 ereuna_main.py 中多处 trigger["created_at"] = time.time()。
+        对应 bot_adapter.py 中多处 trigger["created_at"] = time.time()。
         """
         self.created_at = time.time()
 
     def is_stale(self, timeout: float = 600.0) -> bool:
         """判断 trigger 是否已超时（默认 600 秒 = 10 分钟）。
 
-        对应 ereuna_main.py L1252：
+        对应 bot_adapter.py L1252：
           _now - info["created_at"] > 600
         """
         return time.time() - self.created_at > timeout
@@ -87,7 +87,7 @@ class TriggerInfo:
 class MainTaskState:
     """主节点（入口节点）任务运行状态。
 
-    替代 ereuna_main.py _main_task_state[seq] 中的内联 dict：
+    替代 bot_adapter.py _main_task_state[seq] 中的内联 dict：
       {"progress_records": list, "log_msg": Message|None,
        "stream_parts": [], "handled_approvals": set}
 
@@ -109,7 +109,7 @@ class MainTaskState:
 class ChildTaskState:
     """子节点任务运行状态。
 
-    替代 ereuna_main.py _child_task_logs[task_key] 中的内联 dict：
+    替代 bot_adapter.py _child_task_logs[task_key] 中的内联 dict：
       {"msg": Message, "lines": list, "prefix": str}
 
     platform_data 典型用法（Discord 适配器）：
@@ -129,7 +129,7 @@ class ChildTaskState:
 class SessionState:
     """集中管理所有会话运行时状态。
 
-    替代 ereuna_main.py 中散落在模块级的多个全局 dict，
+    替代 bot_adapter.py 中散落在模块级的多个全局 dict，
     提供结构化方法操作 trigger 注册/消费、session 映射、watermark 推进等。
 
     asyncio 单线程模型下运行，不加线程锁。
@@ -159,7 +159,7 @@ class SessionState:
 
     def __init__(self) -> None:
         # ---- conversation_key ↔ session_id 双向映射 ----
-        # 对应 ereuna_main.py:
+        # 对应 bot_adapter.py:
         #   _conversation_sessions: dict[str, str]  (conv_key → session_id, L136)
         #   session_conv_map: dict[str, str]        (session_id → conv_key, L140)
         self.conversation_sessions: dict[str, str] = {}
@@ -193,7 +193,7 @@ class SessionState:
     def register_session(self, conversation_key: str, session_id: str) -> None:
         """注册 conversation_key ↔ session_id 双向映射。
 
-        对应 ereuna_main.py 两处赋值：
+        对应 bot_adapter.py 两处赋值：
           _conversation_sessions[conversation_key] = session_id  (L880)
           session_conv_map[session_id] = conv_key                (L1282)
         合并为单次调用，保证双向一致性。
@@ -212,7 +212,7 @@ class SessionState:
     def unregister_session(self, conversation_key: str) -> None:
         """删除 conversation_key 的双向映射。
 
-        对应 ereuna_main.py context_reset(clear) L1976：
+        对应 bot_adapter.py context_reset(clear) L1976：
           _conversation_sessions.pop(_cr_conv, None)
         此处同时清理反向映射，避免残留。
         """
@@ -227,7 +227,7 @@ class SessionState:
     def register_trigger(self, trigger: TriggerInfo) -> None:
         """注册触发消息。在 submit_inbound 成功后、任何后续 await 之前调用。
 
-        对应 ereuna_main.py L888-902：
+        对应 bot_adapter.py L888-902：
           _trigger_messages[my_inbound_seq] = trigger_info
           if is_dm: _session_dm_channels[session_id] = channel_id
 
@@ -248,7 +248,7 @@ class SessionState:
     def consume_trigger(self, inbound_seq: int) -> TriggerInfo | None:
         """消费（pop）指定 inbound_seq 的 trigger 并返回。不存在时返回 None。
 
-        对应 ereuna_main.py L1302：
+        对应 bot_adapter.py L1302：
           trigger = _trigger_messages.pop(_out_src_seq)
         """
         return self.triggers.pop(inbound_seq, None)
@@ -260,7 +260,7 @@ class SessionState:
     def find_trigger_by_session(self, session_id: str) -> tuple[int, TriggerInfo] | None:
         """按 session_id 查找 trigger（fallback 策略）。
 
-        对应 ereuna_main.py 中多处 for-loop fallback 模式（如 L1534-1537）：
+        对应 bot_adapter.py 中多处 for-loop fallback 模式（如 L1534-1537）：
           for _t_seq, _t_info in _trigger_messages.items():
               if _t_info.get("session_id") == session_id:
                   return ...
@@ -278,7 +278,7 @@ class SessionState:
     ) -> tuple[int, TriggerInfo] | None:
         """先按 source_inbound_seq 精确查找，再按 session_id fallback。
 
-        合并了 ereuna_main.py 中反复出现的两步查找模式：
+        合并了 bot_adapter.py 中反复出现的两步查找模式：
           1. if _src_seq and _src_seq in _trigger_messages: 精确命中
           2. else: for _t_seq, _t_info in _trigger_messages.items(): session fallback
 
@@ -296,7 +296,7 @@ class SessionState:
     def cleanup_stale_triggers(self, timeout: float = 600.0) -> list[TriggerInfo]:
         """清理超时的 trigger，返回被清理的列表。
 
-        对应 ereuna_main.py L1250-1266 的超时清理循环：
+        对应 bot_adapter.py L1250-1266 的超时清理循环：
           _stale_triggers = [seq for seq, info in _trigger_messages.items()
                              if _now - info["created_at"] > 600]
           for seq in _stale_triggers: ...
@@ -327,7 +327,7 @@ class SessionState:
     ) -> TriggerInfo | None:
         """更新 trigger 的 platform_data 字段。
 
-        对应 ereuna_main.py L918-919：
+        对应 bot_adapter.py L918-919：
           _trigger_messages[my_inbound_seq]["status_msg"] = status_msg
         以及 preempt V2 中更新 trigger 的 message/status_msg（L833-836）。
 
@@ -350,7 +350,7 @@ class SessionState:
     def get_or_create_main_state(self, inbound_seq: int) -> MainTaskState:
         """获取或创建主任务状态。
 
-        对应 ereuna_main.py 中的 setdefault 模式（如 L1542, L1598, L1769）：
+        对应 bot_adapter.py 中的 setdefault 模式（如 L1542, L1598, L1769）：
           state = _main_task_state.setdefault(seq,
               {"progress_records": [], "log_msg": None, "stream_parts": [],
                "handled_approvals": set()})
@@ -366,7 +366,7 @@ class SessionState:
     def remove_main_state(self, inbound_seq: int) -> MainTaskState | None:
         """移除并返回主任务状态。
 
-        对应 ereuna_main.py L1303：
+        对应 bot_adapter.py L1303：
           state = _main_task_state.pop(_out_src_seq, None)
         """
         return self.main_task_states.pop(inbound_seq, None)
@@ -380,7 +380,7 @@ class SessionState:
     ) -> tuple[ChildTaskState, bool]:
         """获取或创建子任务状态。
 
-        对应 ereuna_main.py L1672-1685 的子节点日志首次创建逻辑。
+        对应 bot_adapter.py L1672-1685 的子节点日志首次创建逻辑。
 
         Returns:
             (state, is_new)。is_new=True 表示新创建，
@@ -401,7 +401,7 @@ class SessionState:
     def remove_child_state(self, task_key: str) -> ChildTaskState | None:
         """移除并返回子任务状态。
 
-        对应 ereuna_main.py L1831：
+        对应 bot_adapter.py L1831：
           del _child_task_logs[task_key]
         """
         return self.child_task_states.pop(task_key, None)
@@ -409,7 +409,7 @@ class SessionState:
     def trim_child_states(self, max_count: int = 50) -> None:
         """当子任务状态过多时，删除最旧的一半。
 
-        对应 ereuna_main.py L1688-1691 的大小限制清理：
+        对应 bot_adapter.py L1688-1691 的大小限制清理：
           if len(_child_task_logs) > 50:
               _to_remove = list(_child_task_logs.keys())[:25]
               for _k in _to_remove: del _child_task_logs[_k]
@@ -424,10 +424,10 @@ class SessionState:
     ) -> list[tuple[str, ChildTaskState]]:
         """查找属于指定 session 的所有子任务状态。
 
-        通过 task_key 后缀 ":{session_id}" 匹配（与 ereuna_main.py 的
+        通过 task_key 后缀 ":{session_id}" 匹配（与 bot_adapter.py 的
         task_key 生成规则一致：task_id 或 "{node_id}:{session_id}"）。
 
-        对应 ereuna_main.py task_preempted 事件处理 L1876 中的子节点清理。
+        对应 bot_adapter.py task_preempted 事件处理 L1876 中的子节点清理。
         """
         suffix = f":{session_id}"
         return [
@@ -445,7 +445,7 @@ class SessionState:
     ) -> None:
         """注册待确认的水位标记。
 
-        对应 ereuna_main.py L882-883：
+        对应 bot_adapter.py L882-883：
           _pending_watermarks[my_inbound_seq] = (channel_id, _new_wm)
 
         水位在 inbound_accepted 事件到达后才正式推进，防止 engine 未接受
@@ -456,7 +456,7 @@ class SessionState:
     def accept_watermark(self, inbound_seq: int) -> tuple[int, int] | None:
         """确认水位标记并推进 last_ctx_seq 高水位。
 
-        对应 ereuna_main.py L1984-1989 inbound_accepted 事件处理：
+        对应 bot_adapter.py L1984-1989 inbound_accepted 事件处理：
           _ia_ch_id, _ia_wm = _pending_watermarks.pop(_ia_seq)
           _last_ctx_seq[_ia_ch_id] = max(_last_ctx_seq.get(..., -1), _ia_wm)
 
@@ -475,7 +475,7 @@ class SessionState:
     def reset_channel_watermark(self, channel_id: int) -> None:
         """重置频道的高水位（context_reset 时调用）。
 
-        对应 ereuna_main.py L1956：
+        对应 bot_adapter.py L1956：
           _last_ctx_seq.pop(_cr_ch_id, None)
         重置后下一轮 inbound 会带完整频道历史。
         """
@@ -492,7 +492,7 @@ class SessionState:
     def register_dm_channel(self, session_id: str, channel_id: int) -> None:
         """注册 DM 频道映射。
 
-        对应 ereuna_main.py L901-902：
+        对应 bot_adapter.py L901-902：
           if is_dm: _session_dm_channels[session_id] = channel_id
 
         通常由 register_trigger 内部自动调用。
@@ -504,14 +504,14 @@ class SessionState:
         """查找 session 对应的 DM 频道 ID。
 
         trigger 被消费后，子节点仍可通过此方法找到 DM 发送目标。
-        对应 ereuna_main.py L1654-1661。
+        对应 bot_adapter.py L1654-1661。
         """
         return self.session_dm_channels.get(session_id)
 
     def cleanup_dm_channels_for(self, channel_id: int) -> None:
         """清理指定频道的所有 DM 映射。
 
-        对应 ereuna_main.py L1978-1980 context_reset(clear)：
+        对应 bot_adapter.py L1978-1980 context_reset(clear)：
           _cr_stale_sdc = [sid for sid, ch in _session_dm_channels.items() if ch == _cr_ch_id]
           for sid in _cr_stale_sdc: _session_dm_channels.pop(sid, None)
         """
@@ -533,7 +533,7 @@ class SessionState:
     ) -> list[TriggerInfo]:
         """context_reset(clear) 时清理指定会话的所有关联状态。
 
-        对应 ereuna_main.py L1964-1982 context_reset 非 compact 分支的完整清理。
+        对应 bot_adapter.py L1964-1982 context_reset 非 compact 分支的完整清理。
 
         操作内容：
           1. 清理 conversation_key 匹配的所有 trigger 及关联状态
@@ -581,7 +581,7 @@ class SessionState:
     ) -> tuple[TriggerInfo | None, list[tuple[str, ChildTaskState]]]:
         """task_preempted 事件时清理被打断任务的所有关联状态。
 
-        对应 ereuna_main.py L1852-1887 task_preempted 事件处理。
+        对应 bot_adapter.py L1852-1887 task_preempted 事件处理。
 
         操作内容：
           1. 查找并消费 trigger（精确 + session fallback）

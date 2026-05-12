@@ -2,7 +2,7 @@
 
 Phase 3 step 2 (2026-04-17): 初始创建。
 
-替代 ereuna_main.py _outbound_poller() (L1206-2040)，将 834 行协议逻辑
+替代 bot_adapter.py _outbound_poller() (L1206-2040)，将 834 行协议逻辑
 提取到 SDK。EventRouter 轮询 Supervisor 事件流，执行协议状态管理，
 然后通过 AdapterCallbacks 通知适配器执行平台操作。
 
@@ -53,7 +53,7 @@ _TOOL_TRACE_RE = re.compile(
 def strip_protocol_markers(text: str) -> str:
     """移除 SDK 协议标记。Bot 自定义标记（[SPLIT]、[REACT] 等）不受影响。
 
-    提取自 ereuna_main.py 中散落的 TOOL_TRACE 清理逻辑，
+    提取自 bot_adapter.py 中散落的 TOOL_TRACE 清理逻辑，
     整合为单一入口，由 EventRouter 在所有文本输出点统一调用。
     """
     if not text:
@@ -69,7 +69,7 @@ def strip_protocol_markers(text: str) -> str:
 class EventRouter:
     """事件轮询主循环 + 协议状态管理 + 适配器分发。
 
-    替代 ereuna_main.py _outbound_poller()。
+    替代 bot_adapter.py _outbound_poller()。
     轮询 Supervisor 事件流，处理协议状态（trigger 匹配、session 映射、
     watermark 推进、审批去重），然后通过 AdapterCallbacks 通知适配器
     执行平台操作（发送消息、刷新 typing、编辑进度日志等）。
@@ -90,7 +90,7 @@ class EventRouter:
     """
 
     # 事件类型过滤列表，传给 Supervisor GET /v1/events 的 types 参数。
-    # 与 ereuna_main.py _outbound_poller() 中的过滤列表一致。
+    # 与 bot_adapter.py _outbound_poller() 中的过滤列表一致。
     # 2026-04-17: 追加 compact_start/compact_done/compact_failed，
     # 使 _handle_compact 处理器能接收到这些事件。
     _EVENT_TYPES = (
@@ -291,7 +291,7 @@ class EventRouter:
     async def _handle_inbound_message(self, event: Event) -> None:
         """处理 inbound_message 事件：维护会话双向映射。
 
-        对应 ereuna_main.py L1280-1283 中 inbound_message 事件的
+        对应 bot_adapter.py L1280-1283 中 inbound_message 事件的
         session 映射注册。
         """
         conv_key = event.payload.get("conversation_key", "")
@@ -307,7 +307,7 @@ class EventRouter:
 
         仅处理根任务（无 caller_task_id）且有 source_inbound_seq 匹配的情况。
         回填后适配器可通过 trigger.task_id 精准取消单个任务。
-        对应 ereuna_main.py L1284-1295。
+        对应 bot_adapter.py L1284-1295。
         """
         p = event.payload
         src_seq = int(p.get("source_inbound_seq") or 0)
@@ -333,10 +333,10 @@ class EventRouter:
         两条路径：
           Path 1（主节点回复）：src_seq 命中 trigger → 消费 trigger，
               移除 MainTaskState，清理协议标记，调用 send_reply。
-              对应 ereuna_main.py L1297-1373。
+              对应 bot_adapter.py L1297-1373。
           Path 2（Fallback）：无 trigger 匹配 → 过滤 system.* 节点，
               通过 session_conv_map 解析 conv_key，调用 send_to_channel。
-              对应 ereuna_main.py L1375-1434。
+              对应 bot_adapter.py L1375-1434。
         """
         p = event.payload
         src_seq = int(p.get("source_inbound_seq") or 0)
@@ -385,10 +385,10 @@ class EventRouter:
         两条路径：
           Path 1（入口节点中间回复）：src_seq 命中 trigger 且为入口节点 →
               刷新 trigger、清空 stream buffer、调用 send_intermediate_reply。
-              对应 ereuna_main.py L1435-1465。
+              对应 bot_adapter.py L1435-1465。
           Path 2（子节点/Fallback）：非入口节点 → 更新子任务日志，
               通过 session_conv_map fallback 调用 send_to_channel。
-              对应 ereuna_main.py L1467-1520。
+              对应 bot_adapter.py L1467-1520。
         """
         p = event.payload
         src_seq = int(p.get("source_inbound_seq") or 0)
@@ -450,7 +450,7 @@ class EventRouter:
 
         入口节点 → 更新 MainTaskState 进度记录 + 通知适配器。
         非入口节点 → 更新 ChildTaskState 日志行 + 通知适配器。
-        对应 ereuna_main.py L1539-1587。
+        对应 bot_adapter.py L1539-1587。
         """
         p = event.payload
         node_id = p.get("node_id", "")
@@ -516,7 +516,7 @@ class EventRouter:
         入口节点 → 追加到 MainTaskState.progress_records + 通知更新。
         非入口节点 → 创建或更新 ChildTaskState + 通知适配器。
         子节点首次出现时调用 create_child_progress 让适配器创建显示消息。
-        对应 ereuna_main.py L1595-1707。
+        对应 bot_adapter.py L1595-1707。
         """
         p = event.payload
         node_id = p.get("node_id", "")
@@ -587,7 +587,7 @@ class EventRouter:
 
         SDK 仅做 buffer 累积。dot_state / thinking_preview / 动画等
         展示层逻辑由适配器通过 on_raw_event hook 自行管理。
-        对应 ereuna_main.py L1716-1760 的流式处理。
+        对应 bot_adapter.py L1716-1760 的流式处理。
         """
         p = event.payload
         src_seq = int(p.get("source_inbound_seq") or 0)
@@ -615,7 +615,7 @@ class EventRouter:
           3. 分类：外部操作 → 通知适配器展示审批 UI；
                    内部操作 → 自动放行
           4. 向 progress_records 追加审批状态记录
-        对应 ereuna_main.py L993-1006 _process_approval_event。
+        对应 bot_adapter.py L993-1006 _process_approval_event。
         """
         p = event.payload
         appr_id = p.get("approval_id", "")
@@ -692,7 +692,7 @@ class EventRouter:
 
         入口节点 task_cancelled → 清理 trigger + 编辑状态消息。
         非入口节点 → 移除子任务状态 + 通知适配器做最终更新。
-        对应 ereuna_main.py L1790-1831。
+        对应 bot_adapter.py L1790-1831。
         """
         p = event.payload
         node_id = p.get("node_id", "")
@@ -745,7 +745,7 @@ class EventRouter:
     async def _handle_cancel_requested(self, event: Event) -> None:
         """处理 cancel_requested 事件：清理 trigger 并编辑状态消息。
 
-        对应 ereuna_main.py L1838-1850。
+        对应 bot_adapter.py L1838-1850。
         """
         p = event.payload
         cancel_sid = p.get("session_id") or event.session_id
@@ -771,7 +771,7 @@ class EventRouter:
         通过 SessionState.cleanup_for_task_preempted 一次性完成
         trigger 消费、MainTaskState 移除、子任务状态移除。
         然后通知适配器编辑状态消息和最终化子任务进度。
-        对应 ereuna_main.py L1852-1887。
+        对应 bot_adapter.py L1852-1887。
         """
         p = event.payload
         src_seq = int(p.get("source_inbound_seq") or 0)
@@ -806,7 +806,7 @@ class EventRouter:
 
         将压缩状态消息追加到 MainTaskState.progress_records，
         然后通知适配器刷新进度显示。
-        对应 ereuna_main.py L1889-1948。
+        对应 bot_adapter.py L1889-1948。
         """
         p = event.payload
         src_seq = int(p.get("source_inbound_seq") or 0)
@@ -856,7 +856,7 @@ class EventRouter:
           reason='compact' → 仅重置水位标记，不清理 trigger/session 状态。
           其他 reason → 通过 cleanup_for_context_reset 完整清理。
         然后通知适配器执行平台侧清理。
-        对应 ereuna_main.py L1950-1982。
+        对应 bot_adapter.py L1950-1982。
         """
         p = event.payload
         conv_key = p.get("conversation_key", "")
@@ -902,7 +902,7 @@ class EventRouter:
 
         inbound 消息被 Supervisor 正式接受后，才将 pending_watermark
         推进为 last_ctx_seq，防止未接受的消息错误地认为历史已发送。
-        对应 ereuna_main.py L1984-1989。
+        对应 bot_adapter.py L1984-1989。
         """
         p = event.payload
         ia_seq = int(p.get("inbound_seq") or 0)

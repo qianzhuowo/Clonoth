@@ -1,6 +1,6 @@
 """Clonoth SDK 数据类型定义。
 
-Phase 1 (2026-04-17): 初始创建，从 ereuna_main.py 协议交互中提取。
+Phase 1 (2026-04-17): 初始创建，从 bot_adapter.py 协议交互中提取。
 包含所有与 Supervisor HTTP API 交互所需的数据结构。
 使用 dataclass 而非 pydantic，减少外部依赖。
 """
@@ -14,7 +14,7 @@ from typing import Any
 class InboundResult:
     """POST /v1/inbound 的返回结果。
 
-    提取自 ereuna_main.py _submit_inbound() 返回的 (session_id, inbound_seq) 元组，
+    提取自 bot_adapter.py _submit_inbound() 返回的 (session_id, inbound_seq) 元组，
     增加 accepted 字段与 Supervisor 响应保持一致。
     """
     session_id: str

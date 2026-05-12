@@ -1,15 +1,15 @@
 """审批策略逻辑 — 去重与自动放行分类。
 
-Phase 1 (2026-04-17): 初始创建，从 ereuna_main.py 审批处理逻辑中提取。
+Phase 1 (2026-04-17): 初始创建，从 bot_adapter.py 审批处理逻辑中提取。
 
 核心职责：
 1. 审批 ID 去重（ApprovalTracker）：防止同一审批被多次处理
-   提取自 ereuna_main.py 全局 _handled_approval_ids 集合
+   提取自 bot_adapter.py 全局 _handled_approval_ids 集合
 2. 路径分类（classify_path / is_external_operation）：
    判断审批操作目标是否在工作区外部
-   提取自 ereuna_main.py 内联的 clonoth_runtime.classify_path
+   提取自 bot_adapter.py 内联的 clonoth_runtime.classify_path
 3. 自动审批（auto_approve）：对内部操作自动放行，带重试
-   提取自 ereuna_main.py _auto_approve()
+   提取自 bot_adapter.py _auto_approve()
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ class ApprovalTracker:
     """审批去重追踪器。
 
     维护已处理的审批 ID 集合，防止同一审批被 outbound_poller 多次处理。
-    提取自 ereuna_main.py 的全局 _handled_approval_ids 集合。
+    提取自 bot_adapter.py 的全局 _handled_approval_ids 集合。
     当集合超过 max_size 时自动清空，与原始行为一致（L1290 清理逻辑）。
     """
 
@@ -57,7 +57,7 @@ def classify_path(
 ) -> tuple[Path | None, str, bool]:
     """解析并分类文件系统路径。
 
-    提取自 ereuna_main.py 内联的 clonoth_runtime.classify_path (L58-82)。
+    提取自 bot_adapter.py 内联的 clonoth_runtime.classify_path (L58-82)。
     判断给定路径是在工作区/信任路径内（内部），还是在外部。
 
     Args:
@@ -106,7 +106,7 @@ def is_external_operation(
 ) -> bool:
     """判断审批操作是否指向工作区外部路径。
 
-    提取自 ereuna_main.py _is_external_operation() (L605-612)。
+    提取自 bot_adapter.py _is_external_operation() (L605-612)。
     外部路径的操作（如写入 /etc 下的文件）需要人工审批，
     工作区内部路径可自动放行。
 
@@ -134,7 +134,7 @@ async def auto_approve(
 ) -> bool:
     """自动放行审批，失败重试。
 
-    提取自 ereuna_main.py _auto_approve() (L928-942)。
+    提取自 bot_adapter.py _auto_approve() (L928-942)。
     对判定为内部操作的审批自动提交 allow 决策。
 
     Args:

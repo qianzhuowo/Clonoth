@@ -2,7 +2,7 @@
 
 > 日期: 2026-04-25
 > 状态: Accepted
-> 参与者: YazawaHY, EreunaMain
+> 参与者: Clonoth Contributors
 
 ## 背景
 

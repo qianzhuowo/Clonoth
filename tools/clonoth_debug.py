@@ -54,7 +54,7 @@ SPEC = {
                 'type': 'string',
             },
             'node_id': {
-                'description': "node_status / recent_events 过滤用：节点 ID（如 'ereuna_coder'）",
+                'description': "node_status / recent_events 过滤用：节点 ID（如 'child_coder'）",
                 'type': 'string',
             },
             'limit': {

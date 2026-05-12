@@ -36,7 +36,7 @@ if __name__ == "__main__":
     # 1. 清 Bot 端 _channel_history
     try:
         resp = httpx.post(
-            "http://127.0.0.1:8768/discord",
+            f"http://127.0.0.1:{args.get('port', 8768)}/discord",
             json={"code": f"_channel_history[{channel_id}] = []\nreturn {{'cleared': True}}"},
             timeout=10.0,
         )

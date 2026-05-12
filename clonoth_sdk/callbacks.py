@@ -2,7 +2,7 @@
 
 Phase 3 step 1 (2026-04-17): 初始创建。
 
-从 ereuna_main.py _outbound_poller() (L1206-2040) 中提取所有
+从 bot_adapter.py _outbound_poller() (L1206-2040) 中提取所有
 「SDK 完成协议处理后需要适配器执行平台操作」的点，为每个点定义一个回调方法。
 
 设计原则：
@@ -15,7 +15,7 @@ Phase 3 step 1 (2026-04-17): 初始创建。
 
 参考：
   - data/sdk_refactor_plan_final.md 第四节「双层钩子架构」
-  - ereuna_main.py _outbound_poller() 中所有平台操作点
+  - bot_adapter.py _outbound_poller() 中所有平台操作点
 """
 from __future__ import annotations
 
@@ -30,7 +30,7 @@ class AdapterCallbacks(Protocol):
     EventRouter 在处理每个事件的协议逻辑（trigger 匹配、状态更新、
     去重、节流）后，通过此接口通知适配器执行平台特定操作。
 
-    适配器（如 ereuna_main.py 的 Discord Bot）需要实现全部方法。
+    适配器（如 bot_adapter.py 的 Discord Bot）需要实现全部方法。
     SDK 保证只在协议处理完成后调用回调，适配器无需关心事件解析、
     trigger 匹配、状态管理等协议细节。
 
@@ -41,7 +41,7 @@ class AdapterCallbacks(Protocol):
 
     # ================================================================
     #  消息发送
-    #  对应 ereuna_main.py outbound_message / intermediate_reply 事件
+    #  对应 bot_adapter.py outbound_message / intermediate_reply 事件
     # ================================================================
 
     async def send_reply(
@@ -55,7 +55,7 @@ class AdapterCallbacks(Protocol):
         """主节点最终回复到达，发送到平台。
 
         触发时机：outbound_message 事件，source_inbound_seq 命中 trigger。
-        对应 ereuna_main.py L1297-1373 的主节点回复处理分支。
+        对应 bot_adapter.py L1297-1373 的主节点回复处理分支。
 
         SDK 已完成：
           - 通过 source_inbound_seq 精确匹配并消费 trigger（从 triggers 中移除）
@@ -92,7 +92,7 @@ class AdapterCallbacks(Protocol):
 
         触发时机：intermediate_reply 事件，source_inbound_seq 命中 trigger，
                   且 node_id 为入口节点。
-        对应 ereuna_main.py L1435-1465。
+        对应 bot_adapter.py L1435-1465。
 
         SDK 已完成：
           - 匹配 trigger（不消费，主节点仍在运行）
@@ -125,7 +125,7 @@ class AdapterCallbacks(Protocol):
           - outbound_message 事件，source_inbound_seq 不在 triggers 中
             （主节点 finish 后子节点或调度任务的输出）
           - intermediate_reply 事件，非入口节点的中间回复
-        对应 ereuna_main.py L1375-1434（outbound fallback）和 L1467-1520（intermediate fallback）。
+        对应 bot_adapter.py L1375-1434（outbound fallback）和 L1467-1520（intermediate fallback）。
 
         SDK 已完成：
           - 确认不是 system.* 内部节点（已过滤跳过）
@@ -159,7 +159,7 @@ class AdapterCallbacks(Protocol):
 
         触发时机：
           - trigger 超时清理后（SessionState.cleanup_stale_triggers）
-        对应 ereuna_main.py L1256-1260 的超时 status_msg 编辑，
+        对应 bot_adapter.py L1256-1260 的超时 status_msg 编辑，
         以及 L1261-1266 的超时 log_msg 删除。
 
         SDK 已完成：
@@ -186,11 +186,11 @@ class AdapterCallbacks(Protocol):
 
         触发时机（content 按场景不同）：
           - 任务取消（task_cancelled / cancel_requested）："⚠️ 任务已取消。"
-            对应 ereuna_main.py L1796 和 L1844。
+            对应 bot_adapter.py L1796 和 L1844。
           - 任务打断（task_preempted）："⚡ 已被新消息打断。"
-            对应 ereuna_main.py L1871。
+            对应 bot_adapter.py L1871。
           - 上下文重置（context_reset, clear）："🔄 上下文已重置。"
-            对应 ereuna_main.py L1972。
+            对应 bot_adapter.py L1972。
 
         SDK 已完成：
           - 相关的状态清理（trigger 消费/移除、MainTaskState 清理等）
@@ -220,11 +220,11 @@ class AdapterCallbacks(Protocol):
 
         触发时机：
           - node_started / node_completed 事件（入口节点）
-            对应 ereuna_main.py L1539-1571。
+            对应 bot_adapter.py L1539-1571。
           - handoff_progress 事件（入口节点）
-            对应 ereuna_main.py L1595-1632。
+            对应 bot_adapter.py L1595-1632。
           - compact_start / compact_done / compact_failed 事件
-            对应 ereuna_main.py L1889-1948。
+            对应 bot_adapter.py L1889-1948。
         SDK 已完成：
           - 向 state.progress_records 追加新记录
           - 刷新 trigger.created_at 防止超时
@@ -256,7 +256,7 @@ class AdapterCallbacks(Protocol):
 
         触发时机：handoff_progress 事件，task_key 为新创建
                   （SessionState.get_or_create_child_state 返回 is_new=True）。
-        对应 ereuna_main.py L1672-1691 子节点日志首次创建。
+        对应 bot_adapter.py L1672-1691 子节点日志首次创建。
 
         SDK 已完成：
           - 创建 ChildTaskState（含 prefix, lines=[首条消息]）
@@ -289,11 +289,11 @@ class AdapterCallbacks(Protocol):
 
         触发时机：
           - handoff_progress 事件追加新行后（非首次）
-            对应 ereuna_main.py L1692-1707。
+            对应 bot_adapter.py L1692-1707。
           - node_started / node_completed 事件（非入口节点）
-            对应 ereuna_main.py L1573-1587。
+            对应 bot_adapter.py L1573-1587。
           - intermediate_reply 事件在子节点日志中追加「↳ 已发送中间回复」后
-            对应 ereuna_main.py L1492-1500。
+            对应 bot_adapter.py L1492-1500。
 
         SDK 已完成：
           - 向 state.lines 追加新记录
@@ -322,11 +322,11 @@ class AdapterCallbacks(Protocol):
 
         触发时机：
           - task_completed 事件（非入口节点）：status = "✓ 任务完成"
-            对应 ereuna_main.py L1810-1831。
+            对应 bot_adapter.py L1810-1831。
           - task_cancelled 事件（非入口节点）：status = "✗ 任务已取消"
             对应同上。
           - task_preempted 事件清理子节点：status = "⚡ 被打断"
-            对应 ereuna_main.py L1875-1884。
+            对应 bot_adapter.py L1875-1884。
 
         SDK 已完成：
           - 从 child_task_states 中移除此 task_key
@@ -364,7 +364,7 @@ class AdapterCallbacks(Protocol):
 
         触发时机：approval_requested 事件，经 is_external_operation 判定为
                   外部操作（操作目标在工作区外部）。
-        对应 ereuna_main.py L993-1006 _process_approval_event 中的外部操作分支。
+        对应 bot_adapter.py L993-1006 _process_approval_event 中的外部操作分支。
 
         SDK 已完成：
           - 全局级去重（ApprovalTracker.mark_handled）
@@ -400,7 +400,7 @@ class AdapterCallbacks(Protocol):
 
         触发时机：每轮 poll 结束后的 sweep 阶段，对所有活跃 trigger
                   检查距上次 typing 是否超过阈值（约 8 秒）。
-        对应 ereuna_main.py L1993-2001 的 typing 刷新循环。
+        对应 bot_adapter.py L1993-2001 的 typing 刷新循环。
 
         适配器需要：
           - 在 trigger 关联的频道触发 typing 指示
@@ -454,7 +454,7 @@ class AdapterCallbacks(Protocol):
 
         触发时机：task_created 事件，且为根任务（无 caller_task_id），
                   source_inbound_seq 命中 trigger。
-        对应 ereuna_main.py L1284-1295 的 CancelView task_id 回填。
+        对应 bot_adapter.py L1284-1295 的 CancelView task_id 回填。
 
         SDK 已完成：
           - 将 task_id 回填到 trigger.task_id
@@ -498,7 +498,7 @@ class AdapterCallbacks(Protocol):
         """会话上下文被重置，通知适配器执行平台侧清理。
 
         触发时机：context_reset 事件。
-        对应 ereuna_main.py L1950-1982。
+        对应 bot_adapter.py L1950-1982。
 
         SDK 已根据 reason 区分处理（SessionState 方法）：
           - reason="compact" → 仅重置水位标记（reset_channel_watermark），

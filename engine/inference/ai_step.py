@@ -1267,18 +1267,18 @@ async def run_ai_node(
             # consistent with parent-first compact targeting.
             record_compact_success(rctx.parent_session_id or rctx.session_id)
             # Phase 2 Signal: compact.done 信号，通过 SignalBus 发射供监控使用
-            get_bus().emit(Signal(name="compact.done", payload={
+            _cd_payload = {
                 "node_id": node.id,
                 "success": resume_data.get("success", True),
                 "before": resume_data.get("before", 0),
                 "after": resume_data.get("after", 0),
-            }))
-            await rctx.emit_event("compact_done", {
-                "node_id": node.id,
-                "success": resume_data.get("success", True),
-                "before": resume_data.get("before", 0),
-                "after": resume_data.get("after", 0),
-            })
+            }
+            # task 粒度信息（ConvStore 路径产生）
+            for _k in ("total_segments", "kept_segments", "compressed_segments"):
+                if _k in resume_data:
+                    _cd_payload[_k] = resume_data[_k]
+            get_bus().emit(Signal(name="compact.done", payload=_cd_payload))
+            await rctx.emit_event("compact_done", _cd_payload)
 
     # ---- 构建工具列表 ----
     tool_specs = _filter_tool_specs(node, registry.list_specs())

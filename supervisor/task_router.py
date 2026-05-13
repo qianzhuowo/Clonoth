@@ -757,20 +757,20 @@ class TaskRouterMixin:
 
             if summary and target_sid_for_conv:
                 # ---- ConversationStore 路径 ----
-                before, after = self._apply_compact_via_conv_store_locked(
+                cr = self._apply_compact_via_conv_store_locked(
                     target_sid_for_conv, summary,
                     keep_recent=int(caller.input.get("_compact_keep_recent", 6)),
                 )
-                if after < before:
+                if cr["after"] < cr["before"]:
                     self._resume_compact_parent_locked(
                         caller, parent_ctx_ref,
-                        before=before, after=after, success=True,
+                        compact_result=cr, success=True,
                     )
                     return
                 # before == after：消息太少未压缩，静默恢复
                 self._resume_compact_parent_locked(
                     caller, parent_ctx_ref,
-                    before=before, after=after, success=False,
+                    compact_result=cr, success=False,
                 )
                 return
 
@@ -803,7 +803,7 @@ class TaskRouterMixin:
 
     def _apply_compact_via_conv_store_locked(
         self, target_session_id: str, summary: str, *, keep_recent: int,
-    ) -> tuple[int, int]:
+    ) -> dict[str, int]:
         """Step 2（2026-04-16）：在 ConversationStore 层面执行压缩。
 
         读取 target session 的 JSONL，用 summary 消息替换旧 task segment，保留
@@ -813,7 +813,7 @@ class TaskRouterMixin:
         注意 ConversationStore 里没有 system 消息（system prompt 每轮由 ai_step
         的 assemble_initial_messages 重建），所以无需处理 prefix/inner system。
 
-        Returns: (before_count, after_count)
+        Returns: dict with keys: before, after, total_segments, kept_segments, compressed_segments
         """
         from uuid import uuid4
         from datetime import datetime, timezone
@@ -848,7 +848,7 @@ class TaskRouterMixin:
         # the in-memory compaction path and keep the active task intact.
         keep_recent = max(keep_recent, 1)
         if len(segments) <= keep_recent:
-            return before, before
+            return {"before": before, "after": before, "total_segments": len(segments), "kept_segments": len(segments), "compressed_segments": 0}
 
         kept_segments = segments[-keep_recent:]
         to_remove_segments = segments[:-keep_recent]
@@ -894,6 +894,12 @@ class TaskRouterMixin:
         new_messages = [summary_msg] + to_keep
         store.replace_all(target_session_id, new_messages)
         after = len(new_messages)
+        result = {
+            "before": before, "after": after,
+            "total_segments": len(segments),
+            "kept_segments": len(kept_segments),
+            "compressed_segments": len(to_remove_segments),
+        }
         if after < before:
             # [AutoC 2026-05-13] Why: active branches forked before parent compact
             # keep their own old prefix and would otherwise resume or merge from an
@@ -901,7 +907,7 @@ class TaskRouterMixin:
             # simplified prefix compaction into active branch sessions. Purpose:
             # branch histories stay bounded while preserving branch-local tails.
             self._sync_compact_to_branches(target_session_id, summary_msg, to_keep)
-        return before, after
+        return result
 
     def _clone_compact_summary_message(self, summary_msg: Any) -> Any:
         """Clone a compact summary message for a branch session."""
@@ -1067,6 +1073,7 @@ class TaskRouterMixin:
 
     def _resume_compact_parent_locked(
         self, caller: Task, context_ref: str, *,
+        compact_result: dict[str, int] | None = None,
         before: int = 0, after: int = 0, success: bool = True,
     ) -> None:
         """恢复等待压缩的父 task。"""
@@ -1075,12 +1082,11 @@ class TaskRouterMixin:
         caller.worker_id = None
         caller.lease_expires_at = None
         caller.updated_at = _now()
-        caller.input["resume_data"] = {
-            "type": "compact_done",
-            "success": success,
-            "before": before,
-            "after": after,
-        }
+        if compact_result:
+            _rd = {"type": "compact_done", "success": success, **compact_result}
+        else:
+            _rd = {"type": "compact_done", "success": success, "before": before, "after": after}
+        caller.input["resume_data"] = _rd
         caller.input["context_ref"] = context_ref
         caller.input.pop("_compact_dispatch_pending", None)
         self._event_task_snapshot("task_resumed", caller)

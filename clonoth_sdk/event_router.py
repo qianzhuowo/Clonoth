@@ -853,7 +853,12 @@ class EventRouter:
             before = p.get("before", 0)
             after = p.get("after", 0)
             if p.get("success", True):
-                msg = f"✅ 上下文已压缩：{before} → {after} 条消息"
+                compressed_segs = p.get("compressed_segments")
+                kept_segs = p.get("kept_segments")
+                if compressed_segs is not None and kept_segs is not None:
+                    msg = f"✅ 上下文已压缩：压缩 {compressed_segs} 个旧 task，保留 {kept_segs} 个（{before} → {after} 条消息）"
+                else:
+                    msg = f"✅ 上下文已压缩：{before} → {after} 条消息"
             else:
                 msg = "⚠️ 上下文压缩失败（静默恢复）"
         else:  # compact_failed

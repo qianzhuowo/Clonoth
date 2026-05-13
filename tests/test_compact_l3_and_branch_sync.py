@@ -80,15 +80,18 @@ def test_conv_store_compact_keeps_recent_complete_task_segments(tmp_path: Path) 
     store.replace_all("parent", [old_a, old_b, recent_a, recent_b, latest])
 
     harness = _RouterHarness(tmp_path)
-    before, after = harness._apply_compact_via_conv_store_locked(
+    cr = harness._apply_compact_via_conv_store_locked(
         "parent",
         "compact summary",
         keep_recent=2,
     )
 
     reloaded = ConversationStore(tmp_path / "data" / "conversations").load("parent")
-    assert before == 5
-    assert after == 4
+    assert cr["before"] == 5
+    assert cr["after"] == 4
+    assert cr["total_segments"] == 3
+    assert cr["kept_segments"] == 2
+    assert cr["compressed_segments"] == 1
     assert reloaded[0].content.startswith("[以下是之前对话的结构化摘要")
     assert [m.id for m in reloaded[1:]] == ["recent-a", "recent-b", "latest"]
     assert set(reloaded[0].meta["compressed_task_ids"]) == {"task_old", "legacy_old"}

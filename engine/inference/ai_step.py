@@ -232,8 +232,6 @@ async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
     # ---------------------------------------------------------------
     try:
         from engine.task_record import (
-            compress_summaries,
-            compress_summary_store,
             load_task_records,
             snip_history,
             snip_store,
@@ -269,31 +267,8 @@ async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
                 ls.compacted = True
                 return None
 
-        # [AutoC 2026-05-13] L3 runs after L2 finds nothing to snip. Why: old L2
-        # summaries can accumulate into the new pressure source. How: merge the
-        # oldest summary blocks and mirror that mutation to ConversationStore.
-        # Purpose: avoid dispatching the LLM compactor just to fold summaries.
-        _l3_msgs, _l3_count = compress_summaries(ls.messages, _snip_records)
-        if _l3_count > 0:
-            ls.messages = _l3_msgs
-            _store = getattr(ls.rctx, 'conversation_store', None)
-            if _store:
-                try:
-                    _stored = _store.load(_snip_sid)
-                    _persisted, _persisted_count = compress_summary_store(_stored)
-                    if _persisted_count > 0:
-                        _store.replace_all(_snip_sid, _persisted)
-                except Exception as _pe:
-                    logger.warning("failed to persist L3 summary compact: %s", _pe)
-            await ls.rctx.emit_event("summary_compact", {
-                "node_id": ls.node.id, "step": step,
-                "merged_summaries": _l3_count,
-            })
-            logger.info("summary_compact: merged %d summaries, skipping LLM compact", _l3_count)
-            ls.compacted = True
-            return None
     except Exception as _snip_err:
-        logger.warning("snip/L3 compact failed, falling through to LLM compact: %s", _snip_err)
+        logger.warning("snip compact failed, falling through to LLM compact: %s", _snip_err)
 
     ls.compacted = True
     try:

@@ -4,85 +4,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-_TASK_SUMMARY_MARKER = "[Task summary — original messages snipped]"
-_AGGREGATED_MARKER = "[Aggregated task summaries — condensed]"
-
-
-def test_compress_summaries_merges_oldest_summaries_and_inherits_ids() -> None:
-    """L3 should merge the oldest snip summaries and retain their task ids."""
-    # Why: L2 snip summaries can themselves fill the context over a long session.
-    # How: build more than the default allowed summary count, then merge the
-    # oldest five into one aggregate block. Purpose: protect the new L3 behavior
-    # before wiring it into the automatic compact path.
-    from engine.task_record import compress_summaries
-
-    messages: list[dict] = [{"role": "user", "content": "prefix"}]
-    for i in range(11):
-        messages.append({
-            "role": "user",
-            "content": f"{_TASK_SUMMARY_MARKER}\nsummary {i}",
-            "_meta": {
-                "source_task_id": f"task_{i}",
-                "compressed_task_ids": [f"legacy_{i}"],
-            },
-        })
-
-    compacted, merged_count = compress_summaries(messages, [], max_summary_count=10, merge_count=5)
-
-    assert merged_count == 5
-    assert len(compacted) == len(messages) - 4
-    aggregate = compacted[1]
-    assert aggregate["content"].startswith(_AGGREGATED_MARKER)
-    assert "summary 0" in aggregate["content"]
-    assert "summary 4" in aggregate["content"]
-    assert "summary 5" not in aggregate["content"]
-    assert aggregate["_meta"]["source_task_id"] == "aggregated_task_summaries"
-    assert set(aggregate["_meta"]["compressed_task_ids"]) >= {
-        "task_0",
-        "task_1",
-        "task_2",
-        "task_3",
-        "task_4",
-        "legacy_0",
-        "legacy_4",
-    }
-    assert compacted[2]["content"].startswith(_TASK_SUMMARY_MARKER)
-    assert "summary 5" in compacted[2]["content"]
-
-
-def test_snip_history_treats_l3_aggregate_ids_as_already_compressed() -> None:
-    """L2 should not snip task ids already covered by an L3 aggregate summary."""
-    # Why: after L3 replaces individual snip messages, their source_task_id markers
-    # disappear from the visible message list. How: keep the inherited
-    # compressed_task_ids metadata on the aggregate and verify L2 honors it.
-    # Purpose: prevent repeated snipping attempts for task chains already covered
-    # by an aggregate summary.
-    from engine.task_record import TaskRecord, snip_history
-
-    records = [
-        TaskRecord(task_id=f"task_{i}", session_id="parent", node_id="node", summary=f"summary {i}")
-        for i in range(5)
-    ]
-    messages = [
-        {
-            "role": "user",
-            "content": f"{_AGGREGATED_MARKER}\nsummary 0",
-            "_meta": {"compressed_task_ids": ["task_0"]},
-        },
-        {"role": "assistant", "content": "leftover", "_meta": {"source_task_id": "task_0"}},
-    ]
-
-    compacted, snip_count, snipped_ids = snip_history(
-        messages,
-        records,
-        keep_recent_tasks=1,
-        max_snip=5,
-    )
-
-    assert compacted == messages
-    assert snip_count == 0
-    assert snipped_ids == set()
-
+# [AutoC 2026-05-13] Why: the L3 summary-concatenation tests covered a removed
+# path. How: keep this file focused on branch synchronization and the new
+# ConversationStore task-segment retention checks. Purpose: prevent obsolete
+# expectations from reintroducing pure summary concatenation.
 
 def _message(message_id: str, content: str, *, source_task_id: str = ""):
     # Why: branch-sync tests need real ConversationStore messages. How: create a
@@ -135,6 +60,38 @@ class _RouterHarness(TaskRouterMixin):
             type_=event_type,
             payload=task.model_dump(mode="json"),
         )
+
+
+def test_conv_store_compact_keeps_recent_complete_task_segments(tmp_path: Path) -> None:
+    """ConversationStore compaction should retain whole recent task segments."""
+    # Why: _apply_compact_via_conv_store_locked used to keep raw message count,
+    # which could preserve only the tail of a multi-message task. How: compact a
+    # store with three task segments and keep the last two segments. Purpose:
+    # align this path with engine.compact.apply_compact_summary.
+    from engine.conversation_store import ConversationStore
+
+    store = ConversationStore(tmp_path / "data" / "conversations")
+    old_a = _message("old-a", "old task first", source_task_id="task_old")
+    old_b = _message("old-b", "old task second", source_task_id="task_old")
+    recent_a = _message("recent-a", "recent task first", source_task_id="task_recent_a")
+    recent_b = _message("recent-b", "recent task second", source_task_id="task_recent_a")
+    latest = _message("latest", "latest task", source_task_id="task_recent_b")
+    old_a.meta = {"compressed_task_ids": ["legacy_old"]}
+    store.replace_all("parent", [old_a, old_b, recent_a, recent_b, latest])
+
+    harness = _RouterHarness(tmp_path)
+    before, after = harness._apply_compact_via_conv_store_locked(
+        "parent",
+        "compact summary",
+        keep_recent=2,
+    )
+
+    reloaded = ConversationStore(tmp_path / "data" / "conversations").load("parent")
+    assert before == 5
+    assert after == 4
+    assert reloaded[0].content.startswith("[以下是之前对话的结构化摘要")
+    assert [m.id for m in reloaded[1:]] == ["recent-a", "recent-b", "latest"]
+    assert set(reloaded[0].meta["compressed_task_ids"]) == {"task_old", "legacy_old"}
 
 
 def test_compact_result_targets_parent_session_and_syncs_active_branch(tmp_path: Path) -> None:

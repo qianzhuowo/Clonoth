@@ -806,9 +806,9 @@ class TaskRouterMixin:
     ) -> tuple[int, int]:
         """Step 2（2026-04-16）：在 ConversationStore 层面执行压缩。
 
-        读取 target session 的 JSONL，用 summary 消息替换中间部分，保留最后
-        keep_recent 条消息。与 engine.compact.apply_compact_summary 的策略一致，
-        但直接操作 Message 对象而非 dict。
+        读取 target session 的 JSONL，用 summary 消息替换旧 task segment，保留
+        最近 keep_recent 个完整 task segment。与 engine.compact.apply_compact_summary
+        的策略一致，但直接操作 Message 对象而非 dict。
 
         注意 ConversationStore 里没有 system 消息（system prompt 每轮由 ai_step
         的 assemble_initial_messages 重建），所以无需处理 prefix/inner system。
@@ -823,23 +823,58 @@ class TaskRouterMixin:
         msgs = store.load(target_session_id)
         before = len(msgs)
 
-        # 消息太少（加上 summary 和保留的也不会变短）→ 不压缩
-        if before <= keep_recent + 1:
+        # [AutoC 2026-05-13] Why: ConversationStore stores Message objects, while
+        # engine.compact.apply_compact_summary works on dict history. How: read
+        # task ids through Message attributes and meta, then split only when the
+        # consecutive source_task_id changes. Purpose: keep recent task segments
+        # complete instead of slicing by raw message count.
+        segments: list[list[Any]] = []
+        cur_seg: list[Any] = []
+        cur_tid: str = ""
+        for msg in msgs:
+            meta = msg.meta if isinstance(getattr(msg, "meta", None), dict) else {}
+            tid = str(meta.get("source_task_id", "") or getattr(msg, "source_task_id", "") or "")
+            if tid != cur_tid and cur_seg:
+                segments.append(cur_seg)
+                cur_seg = []
+            cur_tid = tid
+            cur_seg.append(msg)
+        if cur_seg:
+            segments.append(cur_seg)
+
+        # [AutoC 2026-05-13] Why: keep_recent now means recent task segments, not
+        # recent messages. How: require at least one retained segment and skip the
+        # rewrite when the store has no older segments to summarize. Purpose: match
+        # the in-memory compaction path and keep the active task intact.
+        keep_recent = max(keep_recent, 1)
+        if len(segments) <= keep_recent:
             return before, before
 
-        to_keep = msgs[-keep_recent:] if keep_recent > 0 else []
+        kept_segments = segments[-keep_recent:]
+        to_remove_segments = segments[:-keep_recent]
+
+        to_keep: list[Any] = []
+        for seg in kept_segments:
+            to_keep.extend(seg)
+
+        to_remove: list[Any] = []
+        for seg in to_remove_segments:
+            to_remove.extend(seg)
 
         # P6.5 Metadata Preservation: 收集被压缩掉的消息所属的 source_task_id，
         # 存入 summary 消息的 meta 中。L2 snip_history 据此判断哪些 task 已被
         # LLM 压缩过，避免因 ID 丢失而反复 fall through 到 LLM compact。
         # [2026-04-26] 累积继承：旧 compact_summary 被再次压缩时，
         # 继承其 meta.compressed_task_ids，防止历史 ID 丢失。
-        to_remove = msgs[:-keep_recent] if keep_recent > 0 else list(msgs)
+        # [AutoC 2026-05-13] Why: metadata must describe removed task segments,
+        # not an arbitrary message prefix. How: iterate over to_remove from the
+        # segment split above and access Message fields by attribute. Purpose:
+        # keep compressed_task_ids accurate after task-granular retention.
         _ctid_set: set[str] = set()
         for _rm in to_remove:
-            if _rm.source_task_id:
-                _ctid_set.add(_rm.source_task_id)
-            _rm_meta = _rm.meta if isinstance(_rm.meta, dict) else {}
+            if getattr(_rm, "source_task_id", ""):
+                _ctid_set.add(str(_rm.source_task_id))
+            _rm_meta = _rm.meta if isinstance(getattr(_rm, "meta", None), dict) else {}
             _old_ctids = _rm_meta.get("compressed_task_ids")
             if isinstance(_old_ctids, list):
                 for _ctid in _old_ctids:

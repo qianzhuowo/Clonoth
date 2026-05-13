@@ -153,7 +153,7 @@ class SessionState:
         # 消费触发
         t = state.consume_trigger(42)
 
-        # 按 session_id fallback 查找
+        # Legacy helper remains available for adapters, but EventRouter does not use it.
         result = state.find_trigger_by_session("sid-abc")
     """
 
@@ -258,12 +258,13 @@ class SessionState:
         return self.triggers.get(inbound_seq)
 
     def find_trigger_by_session(self, session_id: str) -> tuple[int, TriggerInfo] | None:
-        """按 session_id 查找 trigger（fallback 策略）。
+        """按 session_id 查找 trigger（仅保留给旧适配器直接调用）。
 
-        对应 bot_adapter.py 中多处 for-loop fallback 模式（如 L1534-1537）：
-          for _t_seq, _t_info in _trigger_messages.items():
-              if _t_info.get("session_id") == session_id:
-                  return ...
+        [Fork/Merge 2026-05-12] EventRouter must not use this fallback anymore.
+        Why: several concurrent branch tasks can share one parent session, so session-only
+        lookup can attach an event to the wrong inbound. How: keep the helper for external
+        compatibility but route SDK events through source_inbound_seq. Purpose: avoid breaking
+        adapters that may call this method manually while making core routing exact.
 
         Returns:
             (inbound_seq, TriggerInfo) 元组，未找到则返回 None。
@@ -276,22 +277,26 @@ class SessionState:
     def resolve_trigger(
         self, source_inbound_seq: int, session_id: str,
     ) -> tuple[int, TriggerInfo] | None:
-        """先按 source_inbound_seq 精确查找，再按 session_id fallback。
+        """只按 source_inbound_seq 精确查找 trigger。
 
-        合并了 bot_adapter.py 中反复出现的两步查找模式：
-          1. if _src_seq and _src_seq in _trigger_messages: 精确命中
-          2. else: for _t_seq, _t_info in _trigger_messages.items(): session fallback
-
-        此方法不消费 trigger，仅查找。
+        [Fork/Merge 2026-05-12] session_id is intentionally ignored by SDK event routing.
+        Why: concurrent forked inbounds can share the same parent session, so a session fallback
+        can update or consume the wrong trigger. How: keep the parameter for API compatibility,
+        but return a match only when source_inbound_seq exists in triggers. Purpose: make event
+        routing deterministic while preserving old callers' function signature.
 
         Returns:
             (inbound_seq, TriggerInfo) 元组，未找到则返回 None。
         """
+        # [Fork/Merge 2026-05-12] Keep session_id only for signature compatibility.
+        # Why: using it as a fallback would be ambiguous under concurrent branch tasks.
+        # How: bind it to '_' and perform no lookup with it. Purpose: exact trigger routing.
+        _ = session_id
         if source_inbound_seq:
             trigger = self.triggers.get(source_inbound_seq)
             if trigger is not None:
                 return source_inbound_seq, trigger
-        return self.find_trigger_by_session(session_id)
+        return None
 
     def cleanup_stale_triggers(self, timeout: float = 600.0) -> list[TriggerInfo]:
         """清理超时的 trigger，返回被清理的列表。
@@ -578,43 +583,45 @@ class SessionState:
         self,
         source_inbound_seq: int,
         session_id: str,
+        task_id: str = "",
     ) -> tuple[TriggerInfo | None, list[tuple[str, ChildTaskState]]]:
-        """task_preempted 事件时清理被打断任务的所有关联状态。
+        """task_preempted 事件时按精确键清理被打断任务的关联状态。
 
-        对应 bot_adapter.py L1852-1887 task_preempted 事件处理。
-
-        操作内容：
-          1. 查找并消费 trigger（精确 + session fallback）
-          2. 移除关联的 MainTaskState
-          3. 查找并移除属于该 session 的所有子任务状态
+        [Fork/Merge 2026-05-12] This cleanup no longer falls back to session_id.
+        Why: several active triggers can share one parent session, so session fallback can clear
+        an unrelated inbound. How: consume a trigger only by source_inbound_seq and remove child
+        progress only by exact task_id when available. Purpose: keep preempt cleanup scoped to
+        the task that actually emitted the event.
 
         Returns:
             (trigger_or_none, child_states_list)。
             trigger 可能为 None（无匹配 trigger 时）。
             child_states_list 是 (task_key, ChildTaskState) 的列表。
         """
-        # 查找 trigger
+        # [Fork/Merge 2026-05-12] Keep session_id only for old call sites.
+        # Why: task_preempted cleanup must not use session fallback. How: ignore this value and
+        # rely on source_inbound_seq/task_id. Purpose: prevent sibling branch state from being removed.
+        _ = session_id
         trigger: TriggerInfo | None = None
         trigger_seq: int = 0
 
         if source_inbound_seq and source_inbound_seq in self.triggers:
             trigger = self.triggers.get(source_inbound_seq)
             trigger_seq = source_inbound_seq
-        else:
-            result = self.find_trigger_by_session(session_id)
-            if result:
-                trigger_seq, trigger = result
 
-        # 消费 trigger 及关联状态
-        # fix: 原条件 `trigger and trigger_seq` 在 trigger_seq=0 时 falsy 会跳过清理。
-        # 虽然实际 inbound_seq 永远 >0，但语义应正确：只要 trigger 存在就执行清理。
+        # 消费 trigger 及关联状态。
+        # [Fork/Merge 2026-05-12] The source sequence is the only trigger key accepted here.
+        # Why: using session_id would be ambiguous under concurrent entry branches. How: pop only
+        # the exact trigger found above. Purpose: avoid clearing another inbound's status message.
         if trigger is not None:
             self.triggers.pop(trigger_seq, None)
             self.main_task_states.pop(trigger_seq, None)
 
-        # 查找并移除子任务状态
-        child_states = self.find_child_states_by_session(session_id)
-        for key, _ in child_states:
-            self.child_task_states.pop(key, None)
+        child_states: list[tuple[str, ChildTaskState]] = []
+        exact_task_key = str(task_id or "").strip()
+        if exact_task_key:
+            child_state = self.child_task_states.pop(exact_task_key, None)
+            if child_state is not None:
+                child_states.append((exact_task_key, child_state))
 
         return trigger, child_states

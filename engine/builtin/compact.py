@@ -70,6 +70,15 @@ class CompactChecker:
         return None
 
 
+def _compact_target_session_id(ls: Any) -> str:
+    """Return the durable session that automatic compact should rewrite."""
+    # [AutoC 2026-05-13] Why: entry tasks can run on forked branch sessions whose
+    # JSONL files are temporary. How: prefer rctx.parent_session_id when present
+    # and fall back to the runtime session for non-branch tasks. Purpose: L2, L3,
+    # and LLM compact all reduce the parent ConversationStore instead of a fork.
+    return str(getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id or "").strip()
+
+
 async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
     """Run first-step microcompact and proactive snip cleanup.
 
@@ -103,7 +112,12 @@ async def _run_idle_cleanup(ctx: Any, ls: Any) -> bool:
             gap_hours = (datetime.now(timezone.utc) - last_ts).total_seconds() / 3600.0
             if gap_hours >= 1.0:
                 proactive_max = max(int(gap_hours) * 2, 2)
-                snip_sid = ls.rctx.child_session_id or ls.rctx.session_id
+                # [AutoC 2026-05-13] Why: proactive L2 cleanup used to snip the
+                # branch copy when child_session_id/session_id pointed at a fork.
+                # How: use the same parent-first compact target helper as the
+                # threshold path. Purpose: all persisted snips affect the durable
+                # parent session.
+                snip_sid = _compact_target_session_id(ls)
                 snip_records = load_task_records(ls.rctx.workspace_root, snip_sid)
                 if snip_records:
                     snipped, snip_count, snipped_ids = snip_history(
@@ -139,15 +153,26 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
     """Return a compactor dispatch action when the legacy threshold says so."""
     if ls.compacted or ls.compact_threshold <= 0:
         return None
-    if is_compact_circuit_open(ls.rctx.session_id):
+    compact_sid = _compact_target_session_id(ls)
+    if is_compact_circuit_open(compact_sid):
         return None
     if not should_compact(ls.messages, ls.compact_threshold, ls.last_prompt_tokens):
         return None
 
     try:
-        from engine.task_record import load_task_records, snip_history, snip_store
+        from engine.task_record import (
+            compress_summaries,
+            compress_summary_store,
+            load_task_records,
+            snip_history,
+            snip_store,
+        )
 
-        snip_sid = ls.rctx.child_session_id or ls.rctx.session_id
+        # [AutoC 2026-05-13] Why: L2 persisted snips must affect the parent
+        # ConversationStore, not an entry branch fork. How: reuse compact_sid for
+        # transcripts and store replacement. Purpose: the next fork starts from
+        # already-snipped durable history.
+        snip_sid = compact_sid
         snip_records = load_task_records(ls.rctx.workspace_root, snip_sid)
         if snip_records:
             snipped, snip_count, snipped_ids = snip_history(ls.messages, snip_records)
@@ -171,8 +196,36 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
                 ls.compacted = True
                 ctx.extra["compact_modified"] = True
                 return None
+
+        # [AutoC 2026-05-13] L3 runs only after L2 finds no task chain to snip.
+        # Why: many old L2 summaries can become the new context pressure source.
+        # How: merge the oldest summary blocks in memory and mirror the operation
+        # to ConversationStore. Purpose: avoid invoking the LLM compactor merely
+        # to reduce already-summarized task summaries.
+        summary_compacted, summary_count = compress_summaries(ls.messages, snip_records)
+        if summary_count > 0:
+            ls.messages = summary_compacted
+            ctx.messages = ls.messages
+            store = getattr(ls.rctx, "conversation_store", None)
+            if store:
+                try:
+                    stored = store.load(snip_sid)
+                    persisted, persisted_count = compress_summary_store(stored)
+                    if persisted_count > 0:
+                        store.replace_all(snip_sid, persisted)
+                except Exception as persist_error:
+                    logger.warning("failed to persist L3 summary compact: %s", persist_error)
+            await ls.rctx.emit_event("summary_compact", {
+                "node_id": ls.node.id,
+                "step": ctx.step,
+                "merged_summaries": summary_count,
+            })
+            logger.info("summary_compact: merged %d summaries, skipping LLM compact", summary_count)
+            ls.compacted = True
+            ctx.extra["compact_modified"] = True
+            return None
     except Exception as snip_error:
-        logger.warning("snip_compact failed, falling through to LLM compact: %s", snip_error)
+        logger.warning("snip/L3 compact failed, falling through to LLM compact: %s", snip_error)
 
     ls.compacted = True
     try:
@@ -204,12 +257,22 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
                     "_compact_dispatch": True,
                     "context_mode": "fresh",
                     "_compact_keep_recent": ls.compact_keep_recent,
+                    # [AutoC 2026-05-13] Why: supervisor applies the compactor
+                    # result after this task is suspended, so it needs an explicit
+                    # durable target. How: pass the parent-first compact session id
+                    # through dispatch_input. Purpose: LLM compact cannot fall back
+                    # to rewriting a branch session.
+                    "target_session_id": compact_sid,
                     "_system_task": True,
                     "use_context": False,
                 },
             )
     except Exception as compact_error:
-        record_compact_failure(ls.rctx.session_id)
+        # [AutoC 2026-05-13] Why: failures should trip the breaker for the session
+        # we attempted to compact, not a temporary branch. How: record against
+        # compact_sid. Purpose: retry behavior matches the parent ConversationStore
+        # target used by L2/L3/LLM compact.
+        record_compact_failure(compact_sid)
         await ls.rctx.emit_event("compact_failed", {
             "node_id": ls.node.id,
             "step": ctx.step,

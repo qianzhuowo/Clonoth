@@ -135,6 +135,17 @@ class TaskStoreMixin:
                 task.status = TaskStatus.cancelled
                 task.updated_at = now
                 task.lease_expires_at = None
+                # [Fork/Merge 2026-05-12] pending 入口分支被 session cancel 直接终结时也要清理。
+                # 原因：此路径不会经过 complete_task/task_router。做法：调用幂等 finalize。
+                # 目的：避免未启动分支在主 session 取消后遗留 JSONL 与映射。
+                self._finalize_branch_task_locked(task, merge=True)
+                self._event_task_snapshot("task_cancelled", task)
+            elif task.status == TaskStatus.suspended:
+                task.cancel_requested = True
+                task.status = TaskStatus.cancelled
+                task.waiting_for_task_id = None
+                task.updated_at = now
+                self._finalize_branch_task_locked(task, merge=True)
                 self._event_task_snapshot("task_cancelled", task)
             elif task.status == TaskStatus.running and not task.cancel_requested:
                 task.cancel_requested = True
@@ -183,6 +194,13 @@ class TaskStoreMixin:
         if not self.session_generations.get(session_id):
             self.session_generations[session_id] = generation
         self._cancelled_sessions.discard(session_id)
+        # [Fork/Merge 2026-05-12] 每条 inbound 都创建独立入口分支。
+        # 原因：同一主 session 的新消息不再抢占旧入口 task，而是并发运行在各自
+        # branch session 上。做法：在 supervisor 持锁期间 fork ConversationStore，
+        # 并把 fork 基准写入 task.input。目的：task 结束时能按 base_count merge 回主 session。
+        branch_session_id, fork_meta = self._create_entry_branch_locked(session_id, inbound_seq)
+        branch_base_count = int(fork_meta.get("base_count") or 0)
+        self._cancelled_sessions.discard(branch_session_id)
         # 收集当前活跃 task 摘要，注入给入口节点 AI 判断
         active_tasks_summary = self._active_tasks_summary_locked(session_id)
         attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else None
@@ -200,7 +218,7 @@ class TaskStoreMixin:
             # 查找入口节点上一轮的 context_ref，使对话上下文（含工具调用）跨轮次连续
             last_ctx_ref = self._find_last_context_ref_locked(session_id, entry_node)
         task = self._create_task_locked(
-            session_id=session_id,
+            session_id=branch_session_id,
             session_generation=generation,
             kind=TaskKind.node,
             node_id=entry_node,
@@ -213,12 +231,24 @@ class TaskStoreMixin:
                 "_system_task": bool(payload.get("_system_task", False)),
                 "active_tasks_summary": active_tasks_summary,
                 "attachments": attachments or [],
+                # [Fork/Merge 2026-05-12] 入口分支元数据随 task 持久化。
+                # 原因：完成路由只拿到 Task 快照，不能依赖易失内存索引判断 merge 目标。
+                # 做法：记录 parent、branch 与 fork base_count/base_last_id。目的：finish、fail、
+                # cancel 终态都能独立完成 merge，并保持没有这些字段的旧 task 正常工作。
+                "parent_session_id": session_id,
+                "branch_session_id": branch_session_id,
+                "base_count": branch_base_count,
+                "base_last_id": str(fork_meta.get("base_last_id") or ""),
+                "fork_copied": int(fork_meta.get("copied") or 0),
                 "task_context": {
                     "conversation_key": str(payload.get("conversation_key") or ""),
                     "channel": str(payload.get("channel") or ""),
                     "message_id": str(payload.get("message_id") or ""),
                     "entry_node_id": entry_node,
-                    "session_id": session_id,
+                    "session_id": branch_session_id,
+                    "parent_session_id": session_id,
+                    "branch_session_id": branch_session_id,
+                    "base_count": branch_base_count,
                     "session_generation": generation,
                     "is_system_task": bool(payload.get("_system_task", False)),
                     "switched_from": default_node if session_override else "",
@@ -238,6 +268,7 @@ class TaskStoreMixin:
                 "inbound_seq": inbound_seq,
                 "task_id": task.task_id,
                 "session_id": session_id,
+                "branch_session_id": branch_session_id,
                 "conversation_key": str(payload.get("conversation_key") or ""),
             },
             transient=True,
@@ -247,8 +278,9 @@ class TaskStoreMixin:
     def _active_tasks_summary_locked(self, session_id: str) -> list[dict[str, Any]]:
         """返回当前 session 中活跃（pending/running）task 的摘要列表。"""
         result: list[dict[str, Any]] = []
+        session_ids = {session_id, *self._entry_branch_ids_for_parent_locked(session_id)}
         for task in self.tasks.values():
-            if task.session_id != session_id:
+            if task.session_id not in session_ids:
                 continue
             if self._task_terminal(task):
                 continue
@@ -260,6 +292,13 @@ class TaskStoreMixin:
                 "status": task.status.value,
                 "instruction": str(task.input.get("instruction") or "")[:200],
                 "created_at": task.created_at.isoformat() if task.created_at else "",
+                # [Fork/Merge 2026-05-12] 摘要暴露分支来源。
+                # 原因：主 session 可能同时有多个 branch 任务，入口节点需要区分它们。
+                # 做法：优先读取 task.input.branch_session_id，否则用 task.session_id。
+                # 目的：保留旧摘要字段的同时支持并发分支可观测性。
+                "branch_session_id": str(task.input.get("branch_session_id") or (task.session_id if task.session_id != session_id else "")),
+                "parent_session_id": str(task.input.get("parent_session_id") or session_id),
+                "source_inbound_seq": task.source_inbound_seq,
             })
         return result
 
@@ -279,14 +318,19 @@ class TaskStoreMixin:
 
             now = _now()
             count = 0
+            session_ids = {sid, *self._entry_branch_ids_for_parent_locked(sid)}
             for task in self.tasks.values():
-                if task.session_id != sid or self._task_terminal(task) or task.task_id in keep_ids:
+                if task.session_id not in session_ids or self._task_terminal(task) or task.task_id in keep_ids:
                     continue
                 if task.status == TaskStatus.pending:
                     task.cancel_requested = True
                     task.status = TaskStatus.cancelled
                     task.updated_at = now
                     task.lease_expires_at = None
+                    # [Fork/Merge 2026-05-12] 本地取消直接置终态时同步收束入口分支。
+                    # 原因：pending 任务不会再由 engine 上报完成。做法：调用幂等 finalize。
+                    # 目的：让 cancel_active_tasks 与 finish/fail 路径一样清理分支。
+                    self._finalize_branch_task_locked(task, merge=True)
                     self._event_task_snapshot("task_cancelled", task)
                     count += 1
                 elif task.status == TaskStatus.suspended:
@@ -294,6 +338,7 @@ class TaskStoreMixin:
                     task.status = TaskStatus.cancelled
                     task.waiting_for_task_id = None
                     task.updated_at = now
+                    self._finalize_branch_task_locked(task, merge=True)
                     self._event_task_snapshot("task_cancelled", task)
                     count += 1
                 elif task.status == TaskStatus.running:
@@ -303,6 +348,7 @@ class TaskStoreMixin:
                             task.status = TaskStatus.cancelled
                             task.lease_expires_at = None
                             task.updated_at = now
+                            self._finalize_branch_task_locked(task, merge=True)
                             self._event_task_snapshot("task_cancelled", task)
                             count += 1
                     else:
@@ -312,6 +358,7 @@ class TaskStoreMixin:
                         if task.lease_expires_at and task.lease_expires_at < now:
                             task.status = TaskStatus.cancelled
                             task.lease_expires_at = None
+                            self._finalize_branch_task_locked(task, merge=True)
                             self._event_task_snapshot("task_cancelled", task)
                         else:
                             self._event_task_snapshot("task_cancel_requested", task)
@@ -351,6 +398,10 @@ class TaskStoreMixin:
                     t.status = TaskStatus.cancelled
                     t.updated_at = now
                     t.lease_expires_at = None
+                    # [Fork/Merge 2026-05-12] 单任务取消可能直接终结入口分支。
+                    # 原因：pending 分支不会再进入完成路由。做法：在记录取消事件前 finalize。
+                    # 目的：保证显式 task cancel 与自然完成一样回收 branch。
+                    self._finalize_branch_task_locked(t, merge=True)
                     self._event_task_snapshot("task_cancelled", t)
                     count += 1
                 elif t.status == TaskStatus.suspended:
@@ -358,6 +409,7 @@ class TaskStoreMixin:
                     t.status = TaskStatus.cancelled
                     t.waiting_for_task_id = None
                     t.updated_at = now
+                    self._finalize_branch_task_locked(t, merge=True)
                     self._event_task_snapshot("task_cancelled", t)
                     count += 1
                 elif t.status == TaskStatus.running:
@@ -368,6 +420,7 @@ class TaskStoreMixin:
                             t.status = TaskStatus.cancelled
                             t.lease_expires_at = None
                             t.updated_at = now
+                            self._finalize_branch_task_locked(t, merge=True)
                             self._event_task_snapshot("task_cancelled", t)
                             count += 1
                     else:
@@ -378,6 +431,7 @@ class TaskStoreMixin:
                         if not t.lease_expires_at or t.lease_expires_at < now:
                             t.status = TaskStatus.cancelled
                             t.lease_expires_at = None
+                            self._finalize_branch_task_locked(t, merge=True)
                             self._event_task_snapshot("task_cancelled", t)
                         else:
                             self._event_task_snapshot("task_cancel_requested", t)
@@ -535,6 +589,11 @@ class TaskStoreMixin:
                 task.updated_at = _now()
                 task.lease_expires_at = None
                 task.result = dict(result or {})
+                # [Fork/Merge 2026-05-12] 运行中的入口分支被取消时仍需收束分支。
+                # 原因：cancel_requested 分支原先直接 return，不会进入 task_router 的终态路由。
+                # 做法：在写 task_cancelled 事件前调用分支 finalize，执行 merge 与 cleanup。
+                # 目的：finish/fail/cancel 三类终态都能把分支历史回写主 session。
+                self._finalize_branch_task_locked(task, merge=True)
                 self._event_task_snapshot("task_cancelled", task, component="engine")
                 return task
 

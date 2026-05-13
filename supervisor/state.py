@@ -106,6 +106,13 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self.child_session_map: dict[tuple[str, str, str], str] = {}
         # 反向索引：parent_session_id → set of child_session_ids，用于 clear 时快速查找
         self.parent_children: dict[str, set[str]] = {}
+        # [Fork/Merge 2026-05-12] 记录入口分支与主 session 的关系。
+        # 原因：入口 task 现在运行在 branch session 上，主 session 的取消、重置和
+        # running_tasks 查询仍需要找到这些分支。做法：维护 parent→branches 与
+        # branch→parent 两张轻量内存索引，持久清理仍复用 parent_children/session_store。
+        # 目的：允许同一主 session 下多个入口分支并发执行，同时保持旧 session 映射不变。
+        self.parent_entry_branches: dict[str, set[str]] = {}
+        self.entry_branch_parents: dict[str, str] = {}
 
         # ---- 方案 A: 独立 session 持久化 ----
         self._session_store = SessionStore(workspace_root / "data" / "sessions.json")

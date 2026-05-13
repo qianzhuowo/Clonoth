@@ -462,8 +462,10 @@ class EventRouter:
         # 隔离系统任务：system.* 节点严禁回退到主触发，必须作为独立子任务日志处理
         is_system = (node_id or "").startswith("system.")
 
-        # 查找关联 trigger（精确 + session fallback）
-        # 系统任务不参与 fallback，防止日志串台到主频道
+        # [Fork/Merge 2026-05-12] 查找关联 trigger 时只使用 source_inbound_seq。
+        # Why: entry branches share the parent session, and session fallback can attach a node event
+        # to another active inbound. How: resolve_trigger now ignores session_id while preserving the
+        # call signature. Purpose: keep progress records scoped to the exact triggering message.
         result = None
         if not is_system:
             result = self._state.resolve_trigger(src_seq, event.session_id)
@@ -557,7 +559,10 @@ class EventRouter:
         if is_new:
             # 新子任务：追加首条消息 → 通知适配器创建显示消息
             child_state.lines.append(hp_msg)
-            # 查找 trigger 以便适配器定位展示频道
+            # [Fork/Merge 2026-05-12] Use only source_inbound_seq for trigger attachment.
+            # Why: session fallback is ambiguous when several branch tasks share one parent session.
+            # How: resolve_trigger keeps the old signature but ignores event.session_id. Purpose:
+            # child progress is attached only to the inbound that created this task.
             result = self._state.resolve_trigger(src_seq, event.session_id)
             trigger = result[1] if result else None
             conv_key = self._state.get_conversation_key(event.session_id) or ""
@@ -627,9 +632,14 @@ class EventRouter:
             return
         self._approval.mark_handled(appr_id)
 
-        # per-trigger 去重 + 进度记录
+        # [Fork/Merge 2026-05-12] per-trigger 去重只能按 source_inbound_seq 精确挂载。
+        # Why: approval events may be routed through a shared parent session while multiple branch
+        # tasks are active. How: do not call find_trigger_by_session; if the payload has no source
+        # sequence, still show the approval UI by session mapping but skip main-progress attachment.
+        # Purpose: approval handling remains visible without corrupting another trigger's progress.
         ap_session = str(p.get("session_id") or event.session_id)
-        result = self._state.find_trigger_by_session(ap_session)
+        src_seq = int(p.get("source_inbound_seq") or 0)
+        result = self._state.resolve_trigger(src_seq, ap_session)
         if result:
             trigger_seq, trigger = result
             trigger.refresh()
@@ -698,7 +708,10 @@ class EventRouter:
         node_id = p.get("node_id", "")
         src_seq = int(p.get("source_inbound_seq") or 0)
 
-        # 入口节点 cancelled → 清理 trigger 并通知适配器
+        # [Fork/Merge 2026-05-12] 入口节点取消只按 source_inbound_seq 清理 trigger。
+        # Why: cancelling one branch must not consume another trigger on the same parent session.
+        # How: resolve_trigger performs exact source lookup only. Purpose: lifecycle cleanup follows
+        # the task that actually ended.
         if node_id == self._entry_node_id and event.type == "task_cancelled":
             result = self._state.resolve_trigger(src_seq, event.session_id)
             if result:
@@ -724,13 +737,12 @@ class EventRouter:
                 if event.type == "task_completed"
                 else "✗ 任务已取消"
             )
-            # 判断是否 DM 场景（影响适配器的清理策略）
+            # [Fork/Merge 2026-05-12] DM 判断也只从精确 trigger 取得。
+            # Why: session_dm_channels is session-scoped and can be ambiguous with concurrent
+            # branches. How: if source_inbound_seq no longer maps to a trigger, use False instead
+            # of a session fallback. Purpose: avoid applying another inbound's DM cleanup policy.
             result = self._state.resolve_trigger(src_seq, event.session_id)
-            if result:
-                is_dm = result[1].is_dm
-            else:
-                # system 任务或孤儿任务无关联 trigger，回退到 session_dm_channels 判断
-                is_dm = self._state.get_dm_channel(event.session_id) is not None
+            is_dm = result[1].is_dm if result else False
             try:
                 await self._cb.finalize_child_progress(
                     task_key, child_state, status, is_dm=is_dm,
@@ -748,8 +760,12 @@ class EventRouter:
         对应 bot_adapter.py L1838-1850。
         """
         p = event.payload
-        cancel_sid = p.get("session_id") or event.session_id
-        result = self._state.find_trigger_by_session(cancel_sid)
+        # [Fork/Merge 2026-05-12] Do not clear triggers by session-level cancel events.
+        # Why: a parent session can own several running branch triggers. How: only clear when a
+        # source_inbound_seq is present and still maps to a trigger; otherwise task_cancelled events
+        # will perform exact cleanup. Purpose: session cancel no longer deletes unrelated status UI.
+        src_seq = int(p.get("source_inbound_seq") or 0)
+        result = self._state.resolve_trigger(src_seq, event.session_id)
         if result:
             trigger_seq, trigger = result
             self._state.consume_trigger(trigger_seq)
@@ -775,9 +791,14 @@ class EventRouter:
         """
         p = event.payload
         src_seq = int(p.get("source_inbound_seq") or 0)
+        task_id = str(p.get("task_id") or "")
 
+        # [Fork/Merge 2026-05-12] Preempt cleanup is exact by source_inbound_seq and task_id.
+        # Why: session fallback can clear a different branch's trigger or child progress. How:
+        # cleanup_for_task_preempted consumes only the matching source trigger and removes only the
+        # exact child task key when present. Purpose: a preempt event cannot affect sibling branches.
         trigger, child_states = self._state.cleanup_for_task_preempted(
-            src_seq, event.session_id,
+            src_seq, event.session_id, task_id=task_id,
         )
 
         if trigger:
@@ -787,15 +808,15 @@ class EventRouter:
                 )
             except Exception:
                 pass
-            # 最终化所有关联的子任务状态
-            is_dm = trigger.is_dm
-            for task_key, child_state in child_states:
-                try:
-                    await self._cb.finalize_child_progress(
-                        task_key, child_state, "⚡ 被打断", is_dm=is_dm,
-                    )
-                except Exception:
-                    pass
+        # 最终化所有精确关联的子任务状态。无 trigger 时按非 DM 处理，避免 session fallback。
+        is_dm = trigger.is_dm if trigger else False
+        for task_key, child_state in child_states:
+            try:
+                await self._cb.finalize_child_progress(
+                    task_key, child_state, "⚡ 被打断", is_dm=is_dm,
+                )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     #  compact_start / compact_done / compact_failed — 上下文压缩
@@ -811,6 +832,10 @@ class EventRouter:
         p = event.payload
         src_seq = int(p.get("source_inbound_seq") or 0)
 
+        # [Fork/Merge 2026-05-12] Compact progress attaches only to the exact inbound sequence.
+        # Why: compact events from branch tasks may share a parent session. How: resolve_trigger
+        # ignores session fallback and returns None when source_inbound_seq is missing. Purpose:
+        # compression progress cannot appear on another active request.
         result = self._state.resolve_trigger(src_seq, event.session_id)
         if not result:
             return

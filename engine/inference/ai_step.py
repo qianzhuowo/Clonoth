@@ -165,8 +165,10 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
             tool_call_id=str(msg_dict.get('tool_call_id') or ''),
             name=str(msg_dict.get('name') or ''),
         )
-        # Child Session 隔离（Phase B）：子节点写入自己的 child session JSONL，
-        # 不再写入父 session。无 child_session_id 时仍写入 parent session（主节点路径）。
+        # [Fork/Merge 2026-05-12] Child sessions still win, otherwise write to the runtime session.
+        # Why: rctx.session_id may now be an entry branch, not the user-facing parent session. How:
+        # keep child_session_id for delegated nodes and use rctx.session_id for main branch tasks.
+        # Purpose: ConversationStore writes stay isolated until supervisor merges the branch.
         target_session = getattr(ls.rctx, 'child_session_id', '') or ls.rctx.session_id
         store.append(target_session, msg)
         # Phase 3: 记录最后一次影子写入的 message id，供 snapshot 持久化使用
@@ -204,12 +206,22 @@ async def _check_preempt_and_cancel(ls: _LoopState, step: int) -> TaskAction | N
     return None
 
 
+def _compact_target_session_id(ls: _LoopState) -> str:
+    """Return the durable session that automatic compact should rewrite."""
+    # [AutoC 2026-05-13] Why: this legacy helper may still be called by tests or
+    # fallback paths while entry tasks run on branch sessions. How: prefer
+    # parent_session_id and fall back to session_id. Purpose: keep legacy L2/L3/LLM
+    # compact target selection aligned with the active hook implementation.
+    return str(getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id or "").strip()
+
+
 async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
     """上下文压缩检查。如需压缩则返回 DISPATCH action。"""
     if ls.compacted or ls.compact_threshold <= 0:
         return None
+    compact_sid = _compact_target_session_id(ls)
     # [2026-04-24] P1.5 熔断器：连续压缩失败达到阈值时跳过自动压缩
-    if is_compact_circuit_open(ls.rctx.session_id):
+    if is_compact_circuit_open(compact_sid):
         return None
     if not should_compact(ls.messages, ls.compact_threshold, ls.last_prompt_tokens):
         return None
@@ -219,8 +231,18 @@ async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
     # 在 dispatch LLM compactor 前先尝试，可能免去 LLM 调用
     # ---------------------------------------------------------------
     try:
-        from engine.task_record import snip_history, snip_store, load_task_records
-        _snip_sid = ls.rctx.child_session_id or ls.rctx.session_id
+        from engine.task_record import (
+            compress_summaries,
+            compress_summary_store,
+            load_task_records,
+            snip_history,
+            snip_store,
+        )
+        # [AutoC 2026-05-13] Why: branch sessions are forked copies, so snipping
+        # them does not reduce the durable parent history. How: use the same
+        # parent-first target as LLM compact. Purpose: L2 and L3 compaction both
+        # persist to the session future branches will fork from.
+        _snip_sid = compact_sid
         _snip_records = load_task_records(ls.rctx.workspace_root, _snip_sid)
         if _snip_records:
             # Incremental: snip a few oldest tasks per trigger
@@ -246,9 +268,32 @@ async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
                 logger.info("snip_compact: replaced %d tasks, skipping LLM compact", _snip_count)
                 ls.compacted = True
                 return None
-            # snip_count == 0 → all eligible already snipped, fall through to LLM
+
+        # [AutoC 2026-05-13] L3 runs after L2 finds nothing to snip. Why: old L2
+        # summaries can accumulate into the new pressure source. How: merge the
+        # oldest summary blocks and mirror that mutation to ConversationStore.
+        # Purpose: avoid dispatching the LLM compactor just to fold summaries.
+        _l3_msgs, _l3_count = compress_summaries(ls.messages, _snip_records)
+        if _l3_count > 0:
+            ls.messages = _l3_msgs
+            _store = getattr(ls.rctx, 'conversation_store', None)
+            if _store:
+                try:
+                    _stored = _store.load(_snip_sid)
+                    _persisted, _persisted_count = compress_summary_store(_stored)
+                    if _persisted_count > 0:
+                        _store.replace_all(_snip_sid, _persisted)
+                except Exception as _pe:
+                    logger.warning("failed to persist L3 summary compact: %s", _pe)
+            await ls.rctx.emit_event("summary_compact", {
+                "node_id": ls.node.id, "step": step,
+                "merged_summaries": _l3_count,
+            })
+            logger.info("summary_compact: merged %d summaries, skipping LLM compact", _l3_count)
+            ls.compacted = True
+            return None
     except Exception as _snip_err:
-        logger.warning("snip_compact failed, falling through to LLM compact: %s", _snip_err)
+        logger.warning("snip/L3 compact failed, falling through to LLM compact: %s", _snip_err)
 
     ls.compacted = True
     try:
@@ -288,13 +333,23 @@ async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
                     "_compact_dispatch": True,
                     "context_mode": "fresh",
                     "_compact_keep_recent": ls.compact_keep_recent,
+                    # [AutoC 2026-05-13] Why: supervisor applies the compactor
+                    # result after dispatch returns, and branch session ids are
+                    # temporary. How: carry the parent-first target session in the
+                    # dispatch input. Purpose: LLM compact rewrites the durable
+                    # parent ConversationStore.
+                    "target_session_id": compact_sid,
                     "_system_task": True,
                     "use_context": False,
                 },
             )
     except Exception as compact_err:
         # [2026-04-24] P1.5 熔断器：记录压缩失败，累计达阈值后自动跳过
-        record_compact_failure(ls.rctx.session_id)
+        # [AutoC 2026-05-13] Why: the circuit breaker should follow the session
+        # we tried to compact, not the branch currently executing. How: record the
+        # failure against compact_sid. Purpose: retry suppression matches the
+        # parent ConversationStore target.
+        record_compact_failure(compact_sid)
         await ls.rctx.emit_event("compact_failed", {
             "node_id": ls.node.id, "step": step, "error": str(compact_err),
         })
@@ -693,7 +748,12 @@ async def _run_async_tool(
     tool_ctx: ToolContext,
     async_tool_id: str,
 ) -> None:
-    """后台执行异步工具，完成后通过 session 级 API 注入结果。"""
+    """后台执行异步工具，完成后通过路由 session 的 API 注入结果。"""
+    # [Fork/Merge 2026-05-12] session_id here is the event/user-facing route session.
+    # Why: async tool results create a new inbound and must attach to the parent session when
+    # the original task is running on a branch. How: callers pass parent_session_id when present.
+    # Purpose: branch-local ConversationStore writes remain isolated while async callbacks still
+    # reach the SDK conversation_key mapping.
     _started = time.monotonic()
     try:
         _args_summary = _short(json.dumps(tool_args, ensure_ascii=False, default=str), 200)
@@ -730,7 +790,10 @@ async def _run_async_tool(
         if attachments:
             payload["attachment_paths"] = attachments
 
-        # 使用 session 级 API，复用三级回退逻辑
+        # [Fork/Merge 2026-05-12] Use the route session, not necessarily the runtime session.
+        # Why: branch sessions are internal and may not have SDK channel mappings. How: the caller
+        # passes parent_session_id when available. Purpose: async results become normal inbound
+        # messages on the user-facing parent session.
         await http.post(
             f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
             json=payload,
@@ -866,7 +929,11 @@ async def _execute_real_tools(
                     http=ls.rctx.http,
                     supervisor_url=ls.rctx.supervisor_url,
                     task_id=ls.rctx.task_id,
-                    session_id=ls.rctx.session_id,
+                    # [Fork/Merge 2026-05-12] Route async callbacks through the parent session.
+                    # Why: ls.rctx.session_id may be an entry branch used only for runtime history.
+                    # How: prefer parent_session_id and fall back to session_id for old tasks.
+                    # Purpose: async tool results create follow-up inbound messages in the SDK-visible session.
+                    session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
                     tool_name=_t_name,
                     tool_args=_t_args,
                     tool_ctx=_tool_ctx,
@@ -1219,7 +1286,11 @@ async def run_ai_node(
         messages.extend(_build_resume_messages(resume_data))
         if str(resume_data.get("type") or "") == "compact_done":
             # [2026-04-24] P1.5 熔断器：压缩成功时重置失败计数
-            record_compact_success(rctx.session_id)
+            # [AutoC 2026-05-13] Why: compaction may have targeted the parent
+            # session while the task resumed on a branch. How: reset the breaker
+            # on parent_session_id when present. Purpose: success accounting stays
+            # consistent with parent-first compact targeting.
+            record_compact_success(rctx.parent_session_id or rctx.session_id)
             # Phase 2 Signal: compact.done 信号，通过 SignalBus 发射供监控使用
             get_bus().emit(Signal(name="compact.done", payload={
                 "node_id": node.id,

@@ -141,6 +141,37 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     else:
         ls.messages.append({"role": "user", "content": new_instruction})
 
+    # [Fork/Merge 2026-05-12] Persist the injected preempt user message to ConversationStore.
+    # Why: before this hook was extracted, preempt injection only mutated the in-memory prompt,
+    # so a branch task could lose the new user message when it resumed or later merged. How:
+    # append a USER_INPUT record to the active runtime session, preferring child_session_id for
+    # delegated child nodes and otherwise using rctx.session_id, which may be an entry branch.
+    # Purpose: preempted branch histories remain complete and merge back with the injected input.
+    try:
+        store = getattr(ls.rctx, "conversation_store", None)
+        if store is not None and (new_instruction or new_attachments):
+            from datetime import datetime, timezone
+            from uuid import uuid4
+
+            from engine.conversation_store import Message, MessageType
+
+            target_session = getattr(ls.rctx, "child_session_id", "") or ls.rctx.session_id
+            store.append(
+                target_session,
+                Message(
+                    id=str(uuid4()),
+                    role="user",
+                    content=new_instruction,
+                    message_type=MessageType.USER_INPUT,
+                    created_at=datetime.now(timezone.utc).isoformat(),
+                    meta={"attachments": list(new_attachments)} if new_attachments else {},
+                    source_node_id=getattr(ls.node, "id", ""),
+                    source_task_id=getattr(ls.rctx, "task_id", ""),
+                ),
+            )
+    except Exception:
+        pass
+
     await ls.rctx.consume_preempt()
     await ls.rctx.emit_event("preempt_injected", {
         "node_id": ls.node.id,

@@ -20,6 +20,40 @@ from pathlib import Path
 log = logging.getLogger(__name__)
 
 
+# [AutoC 2026-05-13] L3 summary aggregation uses explicit markers shared by
+# history-dict and ConversationStore paths. Why: the automatic compact pipeline
+# must recognize L2 snip summaries after individual task messages have already
+# been removed. How: keep stable marker constants and helper functions in this
+# module next to snip_history. Purpose: avoid duplicated string literals and keep
+# L2/L3 compatibility rules in one place.
+_SNIP_MARKER = "[Task summary — original messages snipped]"
+_AGGREGATED_SUMMARY_MARKER = "[Aggregated task summaries — condensed]"
+_SUMMARY_MERGE_SEPARATOR = "\n\n---\n\n"
+
+
+def _summary_body(content: str) -> str:
+    """Return the text portion of a snip summary without its marker."""
+    # [AutoC 2026-05-13] Why: L3 aggregation should not repeat the L2 marker five
+    # times inside the new block. How: strip only the known leading marker and one
+    # following newline. Purpose: preserve the actual summary text unchanged while
+    # reducing structural overhead.
+    if content.startswith(_SNIP_MARKER):
+        return content[len(_SNIP_MARKER):].lstrip("\n")
+    return content
+
+
+def _add_unique_task_id(target: list[str], seen: set[str], task_id: str) -> None:
+    """Append one task id while preserving first-seen order."""
+    # [AutoC 2026-05-13] Why: compressed_task_ids metadata is consumed later by
+    # snip_history, and deterministic order makes tests and JSONL diffs stable.
+    # How: maintain an auxiliary set while appending to a list. Purpose: retain
+    # all inherited ids without noisy reordering.
+    tid = str(task_id or "").strip()
+    if tid and tid not in seen:
+        seen.add(tid)
+        target.append(tid)
+
+
 @dataclass
 class TaskRecord:
     """Lightweight index for a single task execution.
@@ -141,7 +175,6 @@ def snip_history(
 
     # Collect eligible task_ids in order of appearance (oldest first)
     # Also exclude tasks that have already been snipped (content starts with marker)
-    _SNIP_MARKER = "[Task summary \u2014 original messages snipped]"
     already_snipped: set[str] = set()
     for msg in messages:
         content = msg.get("content", "")
@@ -155,12 +188,14 @@ def snip_history(
             if tid:
                 already_snipped.add(tid)
 
-        # 场景2：LLM 全量压缩摘要块，提取其包含的所有任务 ID
-        if "[以下是之前对话的结构化摘要" in str(content):
-            c_tids = meta.get("compressed_task_ids")
-            if isinstance(c_tids, list):
-                for _ctid in c_tids:
-                    already_snipped.add(str(_ctid))
+        # [AutoC 2026-05-13] 场景2：任意压缩摘要块继承的 task id。
+        # 原因：L3 会把多条 L2 snip summary 合成一个 aggregate，单条消息上的
+        # source_task_id 会消失。做法：不再只识别 LLM 中文摘要标记，而是统一读取
+        # meta.compressed_task_ids。目的：L2 后续扫描不会重复处理已被 L3 覆盖的 task。
+        c_tids = meta.get("compressed_task_ids")
+        if isinstance(c_tids, list):
+            for _ctid in c_tids:
+                already_snipped.add(str(_ctid))
 
     # Collect task_ids that actually have messages in this message list.
     # Child tasks (ereuna_coder, system.compactor, etc.) write their messages
@@ -218,6 +253,147 @@ def snip_history(
                  snip_count, len(eligible_ordered), len(messages), len(result))
 
     return result, snip_count, seen_snipped
+
+
+def compress_summaries(
+    messages: list[dict],
+    records: list["TaskRecord"],
+    *,
+    max_summary_count: int = 10,
+    merge_count: int = 5,
+) -> tuple[list[dict], int]:
+    """L3: merge old accumulated L2 snip summaries into one aggregate block.
+
+    Returns:
+        (new_messages, merged_count)
+    """
+    # [AutoC 2026-05-13] Why: records are accepted to mirror snip_history and keep
+    # the public API ready for future task-boundary logic. How: current L3 relies
+    # on explicit summary markers already present in messages, so records are not
+    # needed for selection. Purpose: keep this pass deterministic and independent
+    # from transcript availability.
+    _ = records
+    if not messages:
+        return messages, 0
+
+    summary_indices = [
+        idx for idx, msg in enumerate(messages)
+        if isinstance(msg.get("content", ""), str)
+        and str(msg.get("content", "")).startswith(_SNIP_MARKER)
+    ]
+    if len(summary_indices) <= max_summary_count:
+        return messages, 0
+
+    selected_indices = set(summary_indices[:max(1, merge_count)])
+    selected_messages = [messages[idx] for idx in summary_indices[:max(1, merge_count)]]
+
+    parts: list[str] = []
+    compressed_task_ids: list[str] = []
+    seen_task_ids: set[str] = set()
+    for msg in selected_messages:
+        content = str(msg.get("content", ""))
+        parts.append(_summary_body(content).strip())
+        meta = msg.get("_meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        _add_unique_task_id(compressed_task_ids, seen_task_ids, str(meta.get("source_task_id") or ""))
+        old_ids = meta.get("compressed_task_ids")
+        if isinstance(old_ids, list):
+            for old_id in old_ids:
+                _add_unique_task_id(compressed_task_ids, seen_task_ids, str(old_id or ""))
+
+    aggregate_msg = {
+        "role": "user",
+        "content": f"{_AGGREGATED_SUMMARY_MARKER}\n{_SUMMARY_MERGE_SEPARATOR.join(parts)}",
+        "_meta": {
+            "source_task_id": "aggregated_task_summaries",
+            "compressed_task_ids": compressed_task_ids,
+        },
+    }
+
+    result: list[dict] = []
+    inserted = False
+    for idx, msg in enumerate(messages):
+        if idx in selected_indices:
+            if not inserted:
+                result.append(aggregate_msg)
+                inserted = True
+            continue
+        result.append(msg)
+
+    merged_count = len(selected_indices)
+    log.info(
+        "compress_summaries: merged %d old snip summaries, %d → %d messages",
+        merged_count,
+        len(messages),
+        len(result),
+    )
+    return result, merged_count
+
+
+def compress_summary_store(
+    store_messages: list,
+    *,
+    max_summary_count: int = 10,
+    merge_count: int = 5,
+) -> tuple[list, int]:
+    """Apply L3 summary aggregation to ConversationStore Message objects."""
+    # [AutoC 2026-05-13] Why: automatic L3 compaction mutates the in-memory prompt
+    # and must persist the same shape to ConversationStore. How: mirror
+    # compress_summaries while preserving Message objects and writing one summary
+    # Message. Purpose: the next task load sees the same aggregated history.
+    if not store_messages:
+        return store_messages, 0
+
+    summary_indices = [
+        idx for idx, msg in enumerate(store_messages)
+        if isinstance(getattr(msg, "content", ""), str)
+        and str(getattr(msg, "content", "")).startswith(_SNIP_MARKER)
+    ]
+    if len(summary_indices) <= max_summary_count:
+        return store_messages, 0
+
+    from datetime import datetime, timezone
+    from uuid import uuid4
+    from engine.conversation_store import Message, MessageType
+
+    selected_indices = set(summary_indices[:max(1, merge_count)])
+    selected_messages = [store_messages[idx] for idx in summary_indices[:max(1, merge_count)]]
+    parts: list[str] = []
+    compressed_task_ids: list[str] = []
+    seen_task_ids: set[str] = set()
+    for msg in selected_messages:
+        parts.append(_summary_body(str(getattr(msg, "content", ""))).strip())
+        _add_unique_task_id(compressed_task_ids, seen_task_ids, str(getattr(msg, "source_task_id", "") or ""))
+        meta = getattr(msg, "meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        old_ids = meta.get("compressed_task_ids")
+        if isinstance(old_ids, list):
+            for old_id in old_ids:
+                _add_unique_task_id(compressed_task_ids, seen_task_ids, str(old_id or ""))
+
+    aggregate_msg = Message(
+        id=str(uuid4()),
+        role="user",
+        content=f"{_AGGREGATED_SUMMARY_MARKER}\n{_SUMMARY_MERGE_SEPARATOR.join(parts)}",
+        message_type=MessageType.SUMMARY,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        source_task_id="aggregated_task_summaries",
+        meta={"compressed_task_ids": compressed_task_ids},
+    )
+
+    result = []
+    inserted = False
+    for idx, msg in enumerate(store_messages):
+        if idx in selected_indices:
+            if not inserted:
+                result.append(aggregate_msg)
+                inserted = True
+            continue
+        result.append(msg)
+
+    return result, len(selected_indices)
 
 
 def snip_store(

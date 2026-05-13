@@ -89,6 +89,46 @@ class TaskRouterMixin:
     #  统一路由入口
     # ------------------------------------------------------------------ #
 
+    def _route_session_id_for_task_locked(self, task: Task) -> str:
+        """Return the session that user-visible routing should use for a task."""
+        # [Fork/Merge 2026-05-12] branch task 的运行 session 与用户会话 session 分离。
+        # 原因：entry task 在 branch 上运行，但 outbound、hook 和 adapter 查询仍应落到主 session。
+        # 做法：优先读取 finalize 写入的 _route_session_id，其次读取 parent_session_id。
+        # 目的：没有 branch_session_id 的旧 task 保持原 session_id 行为。
+        return str(
+            task.input.get("_route_session_id")
+            or task.input.get("parent_session_id")
+            or task.session_id
+            or ""
+        )
+
+    def _finalize_branch_task_locked(self, task: Task, *, merge: bool) -> str:
+        """Merge and clean an entry branch task once; return the routing session id."""
+        parent_session_id = str(task.input.get("parent_session_id") or "").strip()
+        branch_session_id = str(task.input.get("branch_session_id") or "").strip()
+        if not parent_session_id or not branch_session_id:
+            return task.session_id
+        task.input["_route_session_id"] = parent_session_id
+        if task.input.get("_branch_finalized"):
+            return parent_session_id
+
+        merged_count = 0
+        if merge:
+            try:
+                base_count = int(task.input.get("base_count") or 0)
+            except Exception:
+                base_count = 0
+            merged_count = self._merge_branch_locked(parent_session_id, branch_session_id, base_count)
+        # [Fork/Merge 2026-05-12] finalize 标记写入 task.input。
+        # 原因：完成、取消、僵尸回收等路径都可能尝试收束同一个入口分支。
+        # 做法：用 _branch_finalized 做进程内幂等保护，并记录 merged_count 供调试。
+        # 目的：避免重复 merge 或重复删除 branch session。
+        task.input["_branch_finalized"] = True
+        task.input["_branch_merged_count"] = merged_count
+        if merge:
+            self._cleanup_branch_locked(branch_session_id)
+        return parent_session_id
+
     def _route_completed_task_locked(self, task: Task) -> None:
         """统一路由入口。根据 result.action 分发。"""
         # ---- 批量 task：优先走统一批量收集 ----
@@ -109,16 +149,30 @@ class TaskRouterMixin:
 
         action = task.result or {}
         act = str(action.get("action") or "").strip()
+        route_session_id = task.session_id
         if act == "preempted":
             self._route_preempted_locked(task, action)
-            return  # preempted 不触发记忆提取
+            return  # preempted 不触发记忆提取，也不 merge branch
         elif act == "dispatch":
             self._route_dispatch_locked(task, action)
         elif act in ("finish", "ask"):
+            # [Fork/Merge 2026-05-12] finish/ask 是入口分支的用户可见终态。
+            # 原因：outbound 必须在主 session 产生，且应先把 branch JSONL 合并回主历史。
+            # 做法：路由 finish 前执行幂等 finalize。目的：SDK 按主 conversation_key 收到回复。
+            route_session_id = self._finalize_branch_task_locked(task, merge=True)
             self._route_finish_locked(task, action)
         elif act == "fail":
+            # [Fork/Merge 2026-05-12] fail 也会结束入口分支。
+            # 原因：错误回复应进入主 session，同时保留分支中已产生的上下文。
+            # 做法：先 merge/cleanup，再走原 fail 输出。目的：失败路径与成功路径一致。
+            route_session_id = self._finalize_branch_task_locked(task, merge=True)
             self._route_fail_locked(task, action)
-        # cancelled → 不做路由
+        elif act == "cancelled":
+            # [Fork/Merge 2026-05-12] engine 主动返回 cancelled 时不输出，但仍收束分支。
+            # 原因：cancel 是终态，不应遗留 branch session。做法：只 finalize，不调用输出路由。
+            # 目的：符合 finish/cancel 时 merge 回主 session 的架构约束。
+            route_session_id = self._finalize_branch_task_locked(task, merge=True)
+        # cancelled → 不做用户输出
 
         # Why: automatic memory extraction is now an engine.builtin supervisor
         # hook handler and must not receive SupervisorState directly. How: build a
@@ -126,7 +180,7 @@ class TaskRouterMixin:
         # TaskRouterMixin focused on routing while eliminating handler cycles.
         self.hook_registry.fire(
             "on_entry_task_complete",
-            self._build_supervisor_hook_ctx(task=task, session_id=task.session_id),
+            self._build_supervisor_hook_ctx(task=task, session_id=route_session_id),
         )
 
         # 后置触发：检查是否需要创建轮摘要任务
@@ -142,11 +196,25 @@ class TaskRouterMixin:
         dispatch_batch = action.get("dispatch_batch")
 
         # 标记父 task 正在等待压缩 dispatch
+        compact_target_session_id = ""
         if dispatch_input.get("_compact_dispatch"):
             task.input["_compact_dispatch_pending"] = True
             task.input["_compact_keep_recent"] = int(
                 dispatch_input.get("_compact_keep_recent", 6)
             )
+            # [AutoC 2026-05-13] Why: compactor results are applied after the
+            # caller task is suspended, and caller.session_id may be an entry
+            # branch. How: store the explicit parent-first target from engine,
+            # falling back to caller parent/session for older actions. Purpose:
+            # _apply_compact_result_locked always rewrites the durable session.
+            compact_target_session_id = str(
+                dispatch_input.get("target_session_id")
+                or task.input.get("parent_session_id")
+                or task.session_id
+                or ""
+            ).strip()
+            if compact_target_session_id:
+                task.input["_compact_target_session_id"] = compact_target_session_id
 
         created_child_ids: list[str] = []
 
@@ -223,22 +291,28 @@ class TaskRouterMixin:
                 _single_input["_context_key"] = _ctx_key
 
             # Child Session 隔离（Phase B）：用 child session 替代 context_ref
+            # [AutoC 2026-05-13] Why: system.compactor is a child node, but its
+            # output must target the parent session when the caller is a branch.
+            # How: for compact dispatch only, key the child session and child task
+            # under compact_target_session_id. Purpose: compactor bookkeeping and
+            # result application stay attached to the durable parent session.
+            _dispatch_session_id = compact_target_session_id or task.session_id
             _child_sid, _is_new = self.get_or_create_child_session(
-                task.session_id, target, _ctx_key or "", _ctx_mode,
+                _dispatch_session_id, target, _ctx_key or "", _ctx_mode,
             )
             _single_input["child_session_id"] = _child_sid
             _single_input["context_mode"] = _ctx_mode
             _single_input["use_context"] = False  # child session 模式不走 _fetch_history
             if _ctx_mode == "fork":
                 # fork 模式需要告诉 engine 从哪个 session 复制历史
-                _single_input["fork_from_session_id"] = task.session_id
+                _single_input["fork_from_session_id"] = _dispatch_session_id
 
             # 审计报告 Step 1（2026-04-16）：删除此处单节点 dispatch 的 accumulate/fresh
             # 兼容期 fallback。engine/runner.py:514 在 child_session_id 非空时会无条件
             # 清空 context_ref，accumulate/fresh 两个分支写的值永远不会被消费。
 
             child = self._create_task_locked(
-                session_id=task.session_id,
+                session_id=_dispatch_session_id,
                 session_generation=task.session_generation,
                 kind=TaskKind.node,
                 node_id=target,
@@ -447,7 +521,7 @@ class TaskRouterMixin:
         # Bot 侧 trigger 和 status_msg（含 stream_delta 累积的原始标记预览）永远无法清理。
         # 去掉守卫后，Bot 侧 send_reply 会跳过 Discord 发送但正常执行清理收尾。
         self.append_outbound_message(
-            session_id=task.session_id, text=text,
+            session_id=self._route_session_id_for_task_locked(task), text=text,
             attachments=atts, source_inbound_seq=task.source_inbound_seq,
             node_id=task.node_id,
         )
@@ -460,12 +534,11 @@ class TaskRouterMixin:
     def _inject_async_dispatch_result_locked(
         self, task: Task, fallback_result: dict[str, Any],
     ) -> None:
-        """异步 dispatch 子任务完成后，将结果注入 session。
+        """异步 dispatch 子任务完成后，将结果作为新 inbound 注入 session。
 
-        优先尝试 preempt 当前 running 的入口 task（V2 preempt：engine
-        在 checkpoint 检测到信号后注入消息并继续执行，无需新建 task）。
-        若 session 中没有 running 的入口 task，则走传统 inbound 路径
-        创建新 task。
+        [Fork/Merge 2026-05-12] 不再自动 preempt running/suspended 入口 task。
+        原因：preempt 只能由 adapter 显式 API 触发；内部结果注入应 fork 新分支并发处理。
+        做法：始终走 inbound 创建路径。目的：避免内部事件破坏正在运行的入口分支。
 
         此方法在 self._lock 内调用，不可调用会再次获取 _lock 的公开方法。
         """
@@ -501,52 +574,12 @@ class TaskRouterMixin:
         if task.session_id in self._cancelled_sessions:
             return
 
-        # ---- 优先路径：preempt running 的入口 task ----
-        running_entry = self._find_running_entry_task_locked(task.session_id)
-        if running_entry is not None and not running_entry.preempt_requested:
-            running_entry.preempt_requested = True
-            running_entry.preempt_message = notify_text
-            running_entry.preempt_attachments = list(result_atts or [])
-            self.eventlog.append(
-                session_id=task.session_id,
-                component="supervisor",
-                type_="preempt_requested",
-                payload={
-                    "task_id": running_entry.task_id,
-                    "session_id": task.session_id,
-                    "has_message": True,
-                    "reason": "async_dispatch_result",
-                    "source_task_id": task.task_id,
-                },
-                transient=True,
-            )
-            return
+        # [Fork/Merge 2026-05-12] 异步 dispatch 结果不再自动 preempt 入口 task。
+        # 原因：新架构规定 preempt 只能由 adapter 显式调用 preempt API 触发，普通 inbound
+        # 或内部注入都应通过 fork 分支并发处理。做法：移除 running/suspended 入口任务的
+        # 自动 preempt 分支，直接创建 inbound。目的：同一 session 下多个入口分支可并行运行。
 
-        # ---- 次优路径：标记 suspended 的入口 task ----
-        # 入口 task 可能暂时挂起（如等待 compactor），此时无法立即 preempt。
-        # 预设 preempt 标记后，task 恢复为 running 时 engine 会在首次推理
-        # 循环中检测到并注入结果，避免结果丢失。
-        suspended_entry = self._find_suspended_entry_task_locked(task.session_id)
-        if suspended_entry is not None and not suspended_entry.preempt_requested:
-            suspended_entry.preempt_requested = True
-            suspended_entry.preempt_message = notify_text
-            suspended_entry.preempt_attachments = list(result_atts or [])
-            self.eventlog.append(
-                session_id=task.session_id,
-                component="supervisor",
-                type_="preempt_requested",
-                payload={
-                    "task_id": suspended_entry.task_id,
-                    "session_id": task.session_id,
-                    "has_message": True,
-                    "reason": "async_dispatch_result_deferred",
-                    "source_task_id": task.task_id,
-                },
-                transient=True,
-            )
-            return
-
-        # ---- 回退路径：创建 inbound → 新 task ----
+        # ---- 创建 inbound → 新 branch task ----
         conv_key = session_info.conversation_key
         channel = session_info.channel
         msg_id = f"async_dispatch:{task.task_id}"
@@ -575,11 +608,11 @@ class TaskRouterMixin:
         )
 
     def inject_async_result(self, session_id: str, text: str, attachments: list | None = None) -> dict[str, Any]:
-        """注入异步工具结果到 session，复用三级回退逻辑。
+        """注入异步工具结果到 session，并创建新的 inbound 分支。
 
-        1. preempt running 入口 task
-        2. 标记 suspended 入口 task
-        3. 创建 inbound → 新 task
+        [Fork/Merge 2026-05-12] 旧的 running/suspended 自动 preempt 回退被移除。
+        原因：新架构要求只有 adapter 显式 preempt API 才能抢占任务。
+        做法：异步工具结果统一创建 inbound。目的：保持入口分支并发运行。
         """
         with self._lock:
             session_info = self.sessions.get(session_id)
@@ -588,47 +621,12 @@ class TaskRouterMixin:
 
             result_atts = list(attachments or [])
 
-            # ---- 优先路径：preempt running 的入口 task ----
-            running_entry = self._find_running_entry_task_locked(session_id)
-            if running_entry is not None and not running_entry.preempt_requested:
-                running_entry.preempt_requested = True
-                running_entry.preempt_message = text
-                running_entry.preempt_attachments = result_atts
-                self.eventlog.append(
-                    session_id=session_id,
-                    component="supervisor",
-                    type_="preempt_requested",
-                    payload={
-                        "task_id": running_entry.task_id,
-                        "session_id": session_id,
-                        "has_message": True,
-                        "reason": "async_tool_result",
-                    },
-                    transient=True,
-                )
-                return {"ok": True, "strategy": "preempt_running", "task_id": running_entry.task_id}
+            # [Fork/Merge 2026-05-12] 外部异步结果注入不再自动 preempt。
+            # 原因：preempt 语义收窄为 adapter 显式请求；内部注入应像普通 inbound 一样
+            # fork 新分支。做法：删除 running/suspended 自动抢占路径。目的：避免新 inbound
+            # 破坏正在运行的入口分支。
 
-            # ---- 次优路径：标记 suspended 的入口 task ----
-            suspended_entry = self._find_suspended_entry_task_locked(session_id)
-            if suspended_entry is not None and not suspended_entry.preempt_requested:
-                suspended_entry.preempt_requested = True
-                suspended_entry.preempt_message = text
-                suspended_entry.preempt_attachments = result_atts
-                self.eventlog.append(
-                    session_id=session_id,
-                    component="supervisor",
-                    type_="preempt_requested",
-                    payload={
-                        "task_id": suspended_entry.task_id,
-                        "session_id": session_id,
-                        "has_message": True,
-                        "reason": "async_tool_result_deferred",
-                    },
-                    transient=True,
-                )
-                return {"ok": True, "strategy": "preempt_suspended", "task_id": suspended_entry.task_id}
-
-            # ---- 回退路径：创建 inbound → 新 task ----
+            # ---- 创建 inbound → 新 branch task ----
             conv_key = session_info.conversation_key
             channel = session_info.channel
             msg_id = f"async_tool_result:{session_id}"
@@ -727,19 +725,26 @@ class TaskRouterMixin:
         ).strip()
 
         # ---- 选择压缩路径 ----
-        # 1. caller 带 child_session_id → ConversationStore（child session）
-        # 2. caller 无 context_ref + main_session_enabled → ConversationStore（主 session）
+        # 1. caller 提供 _compact_target_session_id / parent_session_id → ConversationStore（父 session）
+        # 2. caller 无 parent 但 main_session_enabled → ConversationStore（当前 session）
         # 3. 否则 → 旧 snapshot 路径
         from clonoth_runtime import load_runtime_config
         _rc = load_runtime_config(self.workspace_root)
         _main_conv_enabled = bool(
             _rc.get("engine", {}).get("child_session", {}).get("main_session_enabled", True)
         )
-        child_sid = str(caller.input.get("child_session_id") or "").strip()
-        target_sid_for_conv = ""
-        if child_sid:
-            target_sid_for_conv = child_sid
-        elif _main_conv_enabled:
+        # [AutoC 2026-05-13] Why: child_session_id and branch session ids are
+        # temporary copies, so compacting them does not shrink the parent history.
+        # How: prefer the explicit target saved during dispatch, then the caller's
+        # parent_session_id, and only then the caller session. Purpose: supervisor
+        # result application matches engine-side parent-first target selection.
+        target_sid_for_conv = str(
+            caller.input.get("_compact_target_session_id")
+            or caller.input.get("target_session_id")
+            or caller.input.get("parent_session_id")
+            or ""
+        ).strip()
+        if not target_sid_for_conv and _main_conv_enabled:
             # Step 2 修复：main_session_enabled=true 时无条件走 ConvStore 路径。
             # 原条件 `and not parent_ctx_ref` 会被 _persist_ctx 写入的 context_ref 拦住，
             # 导致 compact 走旧 snapshot 路径，而 runner.py 已改为从 JSONL 读取——读写不一致。
@@ -853,7 +858,177 @@ class TaskRouterMixin:
         )
         new_messages = [summary_msg] + to_keep
         store.replace_all(target_session_id, new_messages)
-        return before, len(new_messages)
+        after = len(new_messages)
+        if after < before:
+            # [AutoC 2026-05-13] Why: active branches forked before parent compact
+            # keep their own old prefix and would otherwise resume or merge from an
+            # uncompressed copy. How: after the parent rewrite succeeds, mirror a
+            # simplified prefix compaction into active branch sessions. Purpose:
+            # branch histories stay bounded while preserving branch-local tails.
+            self._sync_compact_to_branches(target_session_id, summary_msg, to_keep)
+        return before, after
+
+    def _clone_compact_summary_message(self, summary_msg: Any) -> Any:
+        """Clone a compact summary message for a branch session."""
+        # [AutoC 2026-05-13] Why: parent and branch JSONL files should not share
+        # the same Message id even when they carry the same summary content. How:
+        # create a new Message with copied content and metadata. Purpose: future
+        # message-id based matching can distinguish parent and branch records.
+        from uuid import uuid4
+        from datetime import datetime, timezone
+        from engine.conversation_store import Message, MessageType
+
+        return Message(
+            id=str(uuid4()),
+            role=getattr(summary_msg, "role", "user") or "user",
+            content=str(getattr(summary_msg, "content", "") or ""),
+            message_type=getattr(summary_msg, "message_type", "") or MessageType.SUMMARY,
+            created_at=datetime.now(timezone.utc).isoformat(),
+            meta=dict(getattr(summary_msg, "meta", {}) or {}),
+            source_node_id=getattr(summary_msg, "source_node_id", "") or "",
+            source_task_id=getattr(summary_msg, "source_task_id", "") or "compact_summary",
+        )
+
+    def _sync_compact_to_branches(
+        self, target_session_id: str, summary_msg: Any, to_keep: list[Any],
+    ) -> None:
+        """Synchronize a successful parent compact into active branch sessions."""
+        # [AutoC 2026-05-13] Why: already-forked branch sessions keep the old
+        # uncompressed parent prefix after the parent JSONL is compacted. How:
+        # find active entry branches for the parent and compact only their forked
+        # prefix, while separately compacting ordinary active child sessions under
+        # the same parent. Purpose: keep branch stores small without dropping
+        # branch-local messages that still need to merge back.
+        from engine.conversation_store import ConversationStore
+
+        target = str(target_session_id or "").strip()
+        if not target:
+            return
+        keep_recent = len(to_keep)
+        store = ConversationStore(self.workspace_root / "data" / "conversations")
+
+        entry_branches: dict[str, dict[str, Any]] = {}
+        child_sessions: set[str] = set()
+        for task in list(self.tasks.values()):
+            if self._task_terminal(task):
+                continue
+            parent_sid = str(task.input.get("parent_session_id") or "").strip()
+            branch_sid = str(task.input.get("branch_session_id") or "").strip()
+            if parent_sid == target and branch_sid:
+                info = entry_branches.setdefault(branch_sid, {"tasks": [], "base_count": 0})
+                info["tasks"].append(task)
+                try:
+                    base_count = int(task.input.get("base_count") or 0)
+                except Exception:
+                    base_count = 0
+                if base_count > int(info.get("base_count") or 0):
+                    info["base_count"] = base_count
+
+            child_sid = str(task.input.get("child_session_id") or "").strip()
+            if task.session_id == target and child_sid:
+                child_sessions.add(child_sid)
+
+        for branch_sid, info in entry_branches.items():
+            self._sync_entry_branch_compact_locked(
+                store,
+                branch_sid,
+                summary_msg,
+                keep_recent=keep_recent,
+                base_count=int(info.get("base_count") or 0),
+                tasks=list(info.get("tasks") or []),
+            )
+
+        for child_sid in child_sessions:
+            self._sync_child_session_compact_locked(
+                store,
+                child_sid,
+                summary_msg,
+                keep_recent=keep_recent,
+            )
+
+    def _sync_entry_branch_compact_locked(
+        self,
+        store: Any,
+        branch_session_id: str,
+        summary_msg: Any,
+        *,
+        keep_recent: int,
+        base_count: int,
+        tasks: list[Task],
+    ) -> None:
+        """Compact the forked parent prefix of one active entry branch."""
+        # [AutoC 2026-05-13] Why: entry branch merge uses base_count to append only
+        # branch-local tail messages back to the parent. How: replace only the
+        # forked prefix with summary + recent prefix messages, then update base_count
+        # on active tasks. Purpose: branch sync cannot lose or duplicate the branch
+        # tail during final merge.
+        branch = str(branch_session_id or "").strip()
+        if not branch or base_count <= 0:
+            return
+        try:
+            branch_msgs = list(store.load(branch))
+            if len(branch_msgs) < base_count:
+                log.warning(
+                    "compact branch sync skipped for %s: base_count=%d exceeds len=%d",
+                    branch,
+                    base_count,
+                    len(branch_msgs),
+                )
+                return
+            if base_count <= keep_recent + 1:
+                return
+            branch_prefix = branch_msgs[:base_count]
+            branch_tail = branch_msgs[base_count:]
+            prefix_keep = branch_prefix[-keep_recent:] if keep_recent > 0 else []
+            branch_summary = self._clone_compact_summary_message(summary_msg)
+            new_base = [branch_summary] + prefix_keep
+            store.replace_all(branch, new_base + branch_tail)
+            for task in tasks:
+                task.input["base_count"] = len(new_base)
+                task.input["base_last_id"] = getattr(prefix_keep[-1], "id", "") if prefix_keep else branch_summary.id
+                task.updated_at = _now()
+            log.info(
+                "compact branch sync: %s base %d → %d, preserved tail=%d",
+                branch,
+                base_count,
+                len(new_base),
+                len(branch_tail),
+            )
+        except Exception as exc:
+            log.warning("compact branch sync failed for %s: %s", branch, exc)
+
+    def _sync_child_session_compact_locked(
+        self,
+        store: Any,
+        child_session_id: str,
+        summary_msg: Any,
+        *,
+        keep_recent: int,
+    ) -> None:
+        """Apply simplified compact sync to one active ordinary child session."""
+        # [AutoC 2026-05-13] Why: ordinary child sessions are not merged by
+        # base_count, so they can use the same simple summary + recent messages
+        # shape as the parent. How: replace the whole child JSONL when doing so
+        # shortens it. Purpose: long-lived active child sessions do not keep an
+        # outdated uncompressed parent fork.
+        child = str(child_session_id or "").strip()
+        if not child:
+            return
+        try:
+            child_msgs = list(store.load(child))
+            before = len(child_msgs)
+            if before <= keep_recent + 1:
+                return
+            child_keep = child_msgs[-keep_recent:] if keep_recent > 0 else []
+            store.replace_all(child, [self._clone_compact_summary_message(summary_msg)] + child_keep)
+            log.info(
+                "compact child sync: %s %d → %d",
+                child,
+                before,
+                1 + len(child_keep),
+            )
+        except Exception as exc:
+            log.warning("compact child sync failed for %s: %s", child, exc)
 
     def _resume_compact_parent_locked(
         self, caller: Task, context_ref: str, *,
@@ -953,12 +1128,17 @@ class TaskRouterMixin:
 
         # 格式化 task 消息，作为 summarizer 的输入
         _instruction = ""
+        # [Fork/Merge 2026-05-12] 入口分支完成后，摘要任务必须回到主 session。
+        # 原因：branch JSONL 已经在 finalize 中 merge 并 cleanup，继续读取 task.session_id
+        # 会访问已删除的分支。做法：无 child_session_id 时读取 route_session_id。
+        # 目的：轮摘要仍能基于合并后的主 ConversationStore 生成。
+        _route_sid = self._route_session_id_for_task_locked(task)
         try:
             from pathlib import Path
             from engine.conversation_store import ConversationStore
             _store = ConversationStore(Path(self.workspace_root) / "data" / "conversations")
             _child_sid = task.input.get("child_session_id") or ""
-            _load_sid = _child_sid if _child_sid else task.session_id
+            _load_sid = _child_sid if _child_sid else _route_sid
             _all_msgs = _store.load(_load_sid)
             _task_msgs = [m for m in _all_msgs if m.source_task_id == task.task_id]
             if not _task_msgs:
@@ -994,12 +1174,13 @@ class TaskRouterMixin:
         # tool_call/tool_result messages to be written into the parent's JSONL,
         # creating orphan tool pairs that Anthropic/Gemini reject with 400.
         _sum_child_sid, _ = self.get_or_create_child_session(
-            task.session_id, summarizer_node, "turn_summary", "fresh",
+            _route_sid, summarizer_node, "turn_summary", "fresh",
         )
+        _summary_generation = self._current_session_generation_locked(_route_sid) or task.session_generation
 
         self._create_task_locked(
-            session_id=task.session_id,
-            session_generation=task.session_generation,
+            session_id=_route_sid,
+            session_generation=_summary_generation,
             kind=TaskKind.node,
             node_id=summarizer_node,
             input_data={
@@ -1007,7 +1188,7 @@ class TaskRouterMixin:
                 "_system_task": True,
                 "_turn_summary_dispatch": True,
                 "_target_task_id": task.task_id,
-                "_target_session_id": task.session_id,
+                "_target_session_id": _route_sid,
                 "child_session_id": _sum_child_sid,
             },
             continuation={},

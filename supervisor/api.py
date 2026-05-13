@@ -243,46 +243,61 @@ def create_app(
             raise HTTPException(status_code=404, detail="session not found")
         now = _now()
         _GRACE = timedelta(seconds=180)
-        # 检查该 session 是否有 pending approval
-        _has_pending_approval = any(
-            a.status == ApprovalStatus.pending and a.session_id == session_id
-            for a in st.approvals.values()
-        )
         tasks: list[dict[str, Any]] = []
-        for task in st.tasks.values():
-            if task.session_id != session_id:
-                continue
-            if task.status not in (TaskStatus.running, TaskStatus.pending):
-                continue
-            # 收割僵尸：running + lease 过期超过 grace period
-            # 但如果 session 有 pending approval，跳过回收（等审批是合法阻塞）
-            # fix: lease_expires_at 为 None 时也视为僵尸，避免无 lease 的 running 任务永远无法被收割
-            if (task.status == TaskStatus.running
-                    and (not task.lease_expires_at or task.lease_expires_at + _GRACE < now)
-                    and not _has_pending_approval):
-                task.status = TaskStatus.failed
-                task.updated_at = now
-                task.lease_expires_at = None
-                task.result = {"action": "fail", "error": "lease expired (zombie reaped)"}
-                # 写事件，使 events.jsonl 与内存状态一致
-                st.eventlog.append(
-                    session_id=task.session_id,
-                    component="supervisor",
-                    type_="task_completed",
-                    payload=task.model_dump(mode="json"),
-                )
-                continue
-            _is_async = bool(task.input.get("_async_dispatch"))
-            _is_system = bool(task.input.get("_system_task"))
-            tasks.append({
-                "task_id": task.task_id,
-                "node_id": task.node_id or "",
-                "status": task.status.value,
-                "created_at": task.created_at.isoformat() if task.created_at else "",
-                "caller_task_id": task.caller_task_id or "",
-                "is_user_entry": bool(not task.caller_task_id and not _is_async and not _is_system),
-                "source_inbound_seq": task.source_inbound_seq,
-            })
+        with st._lock:
+            # [Fork/Merge 2026-05-12] running_tasks 查询主 session 时也返回入口分支任务。
+            # 原因：adapter 以后需要在多个并发 branch 中选择显式 preempt 目标。
+            # 做法：把主 session 与 parent→branches 索引合并为查询集合。
+            # 目的：端点仍以主 session_id 调用，但能观察所有活跃分支。
+            session_ids = {session_id, *st._entry_branch_ids_for_parent_locked(session_id)}
+            # 检查该 session 或任一分支是否有 pending approval
+            _has_pending_approval = any(
+                a.status == ApprovalStatus.pending and a.session_id in session_ids
+                for a in st.approvals.values()
+            )
+            for task in st.tasks.values():
+                if task.session_id not in session_ids:
+                    continue
+                if task.status not in (TaskStatus.running, TaskStatus.pending):
+                    continue
+                # 收割僵尸：running + lease 过期超过 grace period
+                # 但如果 session 有 pending approval，跳过回收（等审批是合法阻塞）
+                # fix: lease_expires_at 为 None 时也视为僵尸，避免无 lease 的 running 任务永远无法被收割
+                if (task.status == TaskStatus.running
+                        and (not task.lease_expires_at or task.lease_expires_at + _GRACE < now)
+                        and not _has_pending_approval):
+                    task.status = TaskStatus.failed
+                    task.updated_at = now
+                    task.lease_expires_at = None
+                    task.result = {"action": "fail", "error": "lease expired (zombie reaped)"}
+                    # 写事件，使 events.jsonl 与内存状态一致
+                    st.eventlog.append(
+                        session_id=task.session_id,
+                        component="supervisor",
+                        type_="task_completed",
+                        payload=task.model_dump(mode="json"),
+                    )
+                    # [Fork/Merge 2026-05-12] 僵尸回收是 fail 终态，也必须走统一路由。
+                    # 原因：入口分支被回收时需要 merge 回主 session，并输出错误事件。
+                    # 做法：复用 task_router 的 fail 路由。目的：避免 reaped branch 永久悬挂。
+                    st._route_completed_task_locked(task)
+                    continue
+                _is_async = bool(task.input.get("_async_dispatch"))
+                _is_system = bool(task.input.get("_system_task"))
+                branch_session_id = str(task.input.get("branch_session_id") or "")
+                if not branch_session_id and task.session_id != session_id:
+                    branch_session_id = task.session_id
+                tasks.append({
+                    "task_id": task.task_id,
+                    "node_id": task.node_id or "",
+                    "status": task.status.value,
+                    "created_at": task.created_at.isoformat() if task.created_at else "",
+                    "caller_task_id": task.caller_task_id or "",
+                    "is_user_entry": bool(not task.caller_task_id and not _is_async and not _is_system),
+                    "source_inbound_seq": task.source_inbound_seq,
+                    "branch_session_id": branch_session_id,
+                    "parent_session_id": str(task.input.get("parent_session_id") or (session_id if branch_session_id else "")),
+                })
         return {"tasks": tasks}
 
     @app.post("/v1/tasks/{task_id}/renew_lease")

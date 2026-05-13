@@ -64,6 +64,290 @@ class SessionMixin:
     def _current_session_generation_locked(self, session_id: str) -> int:
         return int(self.session_generations.get(session_id, 0) or 0)
 
+    # ---- Fork/Merge 入口分支管理 ----
+
+    def _ensure_entry_branch_indexes_locked(self) -> None:
+        """Ensure fork/merge branch indexes exist on older reconstructed states."""
+        # [Fork/Merge 2026-05-12] 兼容旧 SupervisorState 实例或测试桩。
+        # 原因：分支索引是新增内存字段，部分单元测试可能直接构造 mixin 所需属性。
+        # 做法：在每个分支管理入口惰性补齐两张索引。目的：让新逻辑不依赖
+        # __init__ 一定已经按最新代码运行，保持 supervisor 层向后兼容。
+        if not hasattr(self, "parent_entry_branches"):
+            self.parent_entry_branches = {}
+        if not hasattr(self, "entry_branch_parents"):
+            self.entry_branch_parents = {}
+
+    def _is_entry_branch_session_locked(self, branch_session_id: str, *, parent_session_id: str | None = None) -> bool:
+        """Return whether a session id is an entry fork branch."""
+        self._ensure_entry_branch_indexes_locked()
+        bid = str(branch_session_id or "").strip()
+        if not bid:
+            return False
+        parent = self.entry_branch_parents.get(bid)
+        if parent_session_id is not None and parent and parent != parent_session_id:
+            return False
+        if parent:
+            return True
+        entry = getattr(self, "_session_store", None)
+        registry = getattr(entry, "_registry", {}) if entry is not None else {}
+        raw = registry.get(bid) if isinstance(registry, dict) else None
+        if isinstance(raw, dict) and raw.get("node_id") == "__entry_branch__":
+            if parent_session_id is None:
+                return True
+            return str(raw.get("parent_session_id") or "") == parent_session_id
+        return bid.startswith("branch_")
+
+    def _entry_branch_ids_for_parent_locked(self, parent_session_id: str) -> set[str]:
+        """Collect active entry branch session ids for a parent session."""
+        self._ensure_entry_branch_indexes_locked()
+        parent = str(parent_session_id or "").strip()
+        if not parent:
+            return set()
+        branch_ids: set[str] = set(self.parent_entry_branches.get(parent, set()))
+        for child_sid in self.parent_children.get(parent, set()):
+            if self._is_entry_branch_session_locked(child_sid, parent_session_id=parent):
+                branch_ids.add(child_sid)
+        return branch_ids
+
+    def _remove_child_mapping_for_session_locked(self, child_session_id: str) -> None:
+        """Remove child_session_map entries that point at one session id."""
+        # [Fork/Merge 2026-05-12] 分支清理需要删除 branch 自身及其派生 child。
+        # 原因：分支运行时可能通过 dispatch 创建普通 child session；只删 JSONL 会留下
+        # child_session_map 的悬挂条目。做法：按 value 反查并删除映射，同时更新
+        # parent_children。目的：reset 与后续 context_mode=accumulate 不会复用已清理分支。
+        keys_to_remove = [key for key, cid in self.child_session_map.items() if cid == child_session_id]
+        for key in keys_to_remove:
+            self.child_session_map.pop(key, None)
+            parent_sid = key[0]
+            children = self.parent_children.get(parent_sid)
+            if children is not None:
+                children.discard(child_session_id)
+                if not children:
+                    self.parent_children.pop(parent_sid, None)
+
+    def _delete_conversation_session_locked(self, session_id: str) -> None:
+        """Delete a ConversationStore JSONL file and invalidate its cache."""
+        from engine.conversation_store import ConversationStore
+
+        # [Fork/Merge 2026-05-12] 分支生命周期由 supervisor 管理。
+        # 原因：入口分支只是一次 inbound 的执行副本，merge 后继续保留会污染后续查询。
+        # 做法：通过 ConversationStore.delete 删除 JSONL 和缓存。目的：确保已合并分支
+        # 不再作为可恢复会话被误用。
+        store = ConversationStore(self.workspace_root / "data" / "conversations")
+        store.delete(session_id)
+
+    def _create_entry_branch_locked(self, parent_session_id: str, inbound_seq: int) -> tuple[str, dict[str, Any]]:
+        """Create a branch session for one inbound and fork parent history into it."""
+        from engine.conversation_store import ConversationStore
+
+        self._ensure_entry_branch_indexes_locked()
+        parent = str(parent_session_id or "").strip()
+        seq = int(inbound_seq or 0)
+        branch_session_id = f"branch_{seq}" if seq > 0 else f"branch_{uuid.uuid4().hex[:12]}"
+        parent_info = self.sessions.get(parent)
+        now = _now()
+        self.sessions[branch_session_id] = SessionInfo(
+            session_id=branch_session_id,
+            channel=parent_info.channel if parent_info else "internal",
+            # [Fork/Merge 2026-05-12] branch 保留父 conversation_key 作为元数据，
+            # 但不写 conversation_map。目的：内部事件可追溯到同一平台会话，
+            # 同时 get_or_create_session 仍稳定返回主 session。
+            conversation_key=parent_info.conversation_key if parent_info else "",
+            created_at=now,
+            updated_at=now,
+        )
+        parent_generation = self._current_session_generation_locked(parent) or 1
+        self.session_generations[branch_session_id] = parent_generation
+        self.entry_branch_parents[branch_session_id] = parent
+        self.parent_entry_branches.setdefault(parent, set()).add(branch_session_id)
+        self.parent_children.setdefault(parent, set()).add(branch_session_id)
+
+        # [Fork/Merge 2026-05-12] 持久登记入口分支为内部 child。
+        # 原因：reset_conversation 可能在重启后执行，单纯内存索引会丢失未合并分支。
+        # 做法：复用 sessions.json 的 child session 记录，并用专用 node_id 区分入口分支。
+        # 目的：重置主会话时能找到并删除遗留 branch JSONL。
+        self._session_store.on_child_session_created(
+            child_session_id=branch_session_id,
+            parent_session_id=parent,
+            node_id="__entry_branch__",
+            context_key=str(seq),
+        )
+
+        store = ConversationStore(self.workspace_root / "data" / "conversations")
+        fork_meta: dict[str, Any] = {"copied": 0, "base_count": 0, "base_last_id": ""}
+        try:
+            try:
+                fork_result = store.fork(parent, branch_session_id, include_system=True)
+            except TypeError:
+                # [Fork/Merge 2026-05-12] 兼容旧 ConversationStore.fork 签名。
+                # 原因：supervisor 层必须能在 engine store 还未完全升级时通过 py_compile
+                # 和本地运行。做法：手动复制父 session 的全部消息，等价实现 include_system=True。
+                # 目的：不修改 engine 层文件，也能得到 merge 所需的 branch 基准长度。
+                source_messages = list(store.load(parent))
+                if store.message_count(branch_session_id) == 0 and source_messages:
+                    store.append_batch(branch_session_id, source_messages)
+                    fork_result = {
+                        "copied": len(source_messages),
+                        "base_count": len(source_messages),
+                        "base_last_id": getattr(source_messages[-1], "id", "") if source_messages else "",
+                    }
+                else:
+                    branch_count = store.message_count(branch_session_id)
+                    fork_result = {"copied": 0, "base_count": branch_count, "base_last_id": ""}
+            if isinstance(fork_result, dict):
+                fork_meta.update({
+                    "copied": int(fork_result.get("copied") or 0),
+                    "base_count": int(fork_result.get("base_count") or 0),
+                    "base_last_id": str(fork_result.get("base_last_id") or ""),
+                })
+            else:
+                copied = int(fork_result or 0)
+                fork_meta.update({"copied": copied, "base_count": copied})
+        except Exception as exc:
+            fork_meta["error"] = str(exc)
+
+        self.eventlog.append(
+            session_id=parent,
+            component="supervisor",
+            type_="branch_created",
+            payload={
+                "parent_session_id": parent,
+                "branch_session_id": branch_session_id,
+                "inbound_seq": seq,
+                **fork_meta,
+            },
+            transient=True,
+        )
+        return branch_session_id, fork_meta
+
+    def _merge_branch_locked(self, parent_session_id: str, branch_session_id: str, base_count: int) -> int:
+        """Merge a completed entry branch back into its parent ConversationStore."""
+        from engine.conversation_store import ConversationStore
+
+        parent = str(parent_session_id or "").strip()
+        branch = str(branch_session_id or "").strip()
+        if not parent or not branch:
+            return 0
+        store = ConversationStore(self.workspace_root / "data" / "conversations")
+        count = 0
+        try:
+            merge_fn = getattr(store, "merge", None)
+            if callable(merge_fn):
+                count = int(merge_fn(parent, branch, base_count=int(base_count or 0)) or 0)
+            else:
+                # [Fork/Merge 2026-05-12] 兼容旧 ConversationStore 无 merge 方法的情况。
+                # 原因：本次任务只允许改 supervisor 层，目标树里的 engine store 可能仍是旧版。
+                # 做法：读取 branch 中 fork 基准之后的消息并批量追加到 parent。
+                # 目的：保持新 supervisor 在旧 store 上也能完成分支回写。
+                branch_messages = list(store.load(branch))
+                tail = branch_messages[int(base_count or 0):]
+                if tail:
+                    store.append_batch(parent, tail)
+                count = len(tail)
+        except Exception as exc:
+            self.eventlog.append(
+                session_id=parent,
+                component="supervisor",
+                type_="branch_merge_failed",
+                payload={
+                    "parent_session_id": parent,
+                    "branch_session_id": branch,
+                    "base_count": int(base_count or 0),
+                    "error": str(exc),
+                },
+                transient=True,
+            )
+            return 0
+
+        self.eventlog.append(
+            session_id=parent,
+            component="supervisor",
+            type_="branch_merged",
+            payload={
+                "parent_session_id": parent,
+                "branch_session_id": branch,
+                "base_count": int(base_count or 0),
+                "merged_count": count,
+            },
+            transient=True,
+        )
+        return count
+
+    def _cleanup_branch_locked(self, branch_session_id: str) -> None:
+        """Delete one entry branch session and its derived child sessions."""
+        self._ensure_entry_branch_indexes_locked()
+        branch = str(branch_session_id or "").strip()
+        if not branch:
+            return
+        parent = self.entry_branch_parents.pop(branch, "")
+        entry = self._session_store._registry.get(branch)
+        if not parent and isinstance(entry, dict):
+            parent = str(entry.get("parent_session_id") or "")
+
+        # [Fork/Merge 2026-05-12] 先清理分支派生的普通 child session。
+        # 原因：入口分支运行过程中仍可 dispatch 子节点，这些子节点的 parent_session_id
+        # 是 branch。做法：删除 parent_children[branch] 下的所有 JSONL、映射和 registry 标记。
+        # 目的：merge 后不会留下只能由已删除 branch 访问的悬挂上下文。
+        derived_children = list(self.parent_children.pop(branch, set()))
+        for child_sid in derived_children:
+            if self._is_entry_branch_session_locked(child_sid, parent_session_id=branch):
+                self._cleanup_branch_locked(child_sid)
+                continue
+            self._delete_conversation_session_locked(child_sid)
+            self._remove_child_mapping_for_session_locked(child_sid)
+            self.sessions.pop(child_sid, None)
+            self.session_generations.pop(child_sid, None)
+            self._cancelled_sessions.discard(child_sid)
+            self._session_context_usage.pop(child_sid, None)
+            self._session_store.on_session_reset(child_sid)
+
+        # [Fork/Merge 2026-05-12] 删除 branch 前取消仍挂在该运行 session 下的派生任务。
+        # 原因：异步 dispatch 可能让 root entry 已结束但 branch 下仍有 pending/running 子任务。
+        # 做法：把这些任务标记为 cancelled 并写快照，不递归 finalize。目的：避免任务继续
+        # 写入已清理的 branch session。
+        now = _now()
+        for task in self.tasks.values():
+            if task.session_id != branch or self._task_terminal(task):
+                continue
+            task.cancel_requested = True
+            task.status = TaskStatus.cancelled
+            task.updated_at = now
+            task.lease_expires_at = None
+            if task.waiting_for_task_id:
+                task.waiting_for_task_id = None
+            self._event_task_snapshot("task_cancelled", task)
+
+        self._delete_conversation_session_locked(branch)
+        self.sessions.pop(branch, None)
+        self.session_generations.pop(branch, None)
+        self._cancelled_sessions.discard(branch)
+        self._session_context_usage.pop(branch, None)
+        self._remove_child_mapping_for_session_locked(branch)
+        if parent:
+            branches = self.parent_entry_branches.get(parent)
+            if branches is not None:
+                branches.discard(branch)
+                if not branches:
+                    self.parent_entry_branches.pop(parent, None)
+            children = self.parent_children.get(parent)
+            if children is not None:
+                children.discard(branch)
+                if not children:
+                    self.parent_children.pop(parent, None)
+        else:
+            for branches in self.parent_entry_branches.values():
+                branches.discard(branch)
+            for children in self.parent_children.values():
+                children.discard(branch)
+        self._session_store.on_session_reset(branch)
+        self.eventlog.append(
+            session_id=parent or branch,
+            component="supervisor",
+            type_="branch_cleaned",
+            payload={"parent_session_id": parent, "branch_session_id": branch},
+            transient=True,
+        )
+
     # ---- 引擎心跳 ----
 
     def mark_engine_seen(self, *, worker_id: str) -> None:
@@ -172,6 +456,13 @@ class SessionMixin:
             generation = self._next_session_generation_locked(sid)
             self._cancelled_sessions.add(sid)
             self._cancel_session_tasks_locked(sid)
+            # [Fork/Merge 2026-05-12] 主 session 取消必须覆盖所有入口分支。
+            # 原因：入口 task 已经运行在 branch session 上，只取消主 session 会遗漏正在
+            # pending/running 的分支任务。做法：遍历 parent→branches 索引并逐个调用
+            # 现有 task 取消逻辑。目的：保持 /sessions/{id}/cancel 的语义仍是取消整段对话。
+            for branch_sid in self._entry_branch_ids_for_parent_locked(sid):
+                self._cancelled_sessions.add(branch_sid)
+                self._cancel_session_tasks_locked(branch_sid)
             self.eventlog.append(
                 session_id=sid,
                 component="supervisor",
@@ -430,15 +721,28 @@ class SessionMixin:
                 except Exception:
                     pass
 
-            # 删除所有关联 child session 的 JSONL 并标记 reset
-            child_ids = self.parent_children.pop(old_session_id, set())
-            for child_sid in child_ids:
+            # [Fork/Merge 2026-05-12] reset 时必须先收集未合并入口分支。
+            # 原因：branch session 可能已从内存索引丢失，但仍存在于 parent_children 或
+            # sessions.json。做法：把 parent_children 和 entry_branch 索引合并后逐个判断。
+            # 目的：清理对话时不会留下未 merge 的 branch JSONL 和派生 child session。
+            child_ids = set(self.parent_children.pop(old_session_id, set()))
+            child_ids.update(self._entry_branch_ids_for_parent_locked(old_session_id))
+            for child_sid in list(child_ids):
+                if self._is_entry_branch_session_locked(child_sid, parent_session_id=old_session_id):
+                    self._cleanup_branch_locked(child_sid)
+                    cleared_children += 1
+                    continue
                 child_jsonl = conv_dir / f"{child_sid}.jsonl"
                 if child_jsonl.exists():
                     try:
                         child_jsonl.unlink()
                     except Exception:
                         pass
+                self._remove_child_mapping_for_session_locked(child_sid)
+                self.sessions.pop(child_sid, None)
+                self.session_generations.pop(child_sid, None)
+                self._cancelled_sessions.discard(child_sid)
+                self._session_context_usage.pop(child_sid, None)
                 self._session_store.on_session_reset(child_sid)
                 cleared_children += 1
 

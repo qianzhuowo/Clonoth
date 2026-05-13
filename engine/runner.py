@@ -684,6 +684,12 @@ async def _run_node_task(
     node_id = str(task.get("node_id") or "").strip()
     source_inbound_seq = task.get("source_inbound_seq")
     input_data = task.get("input") if isinstance(task.get("input"), dict) else {}
+    # [Fork/Merge 2026-05-12] Read parent_session_id from task input before RunContext creation.
+    # Why: supervisor now runs entry tasks on a branch session while the SDK still maps channels
+    # through the parent session. How: keep session_id as the runtime ConversationStore session and
+    # carry parent_session_id separately for event routing. Purpose: preserve old tasks that do not
+    # have this field while allowing branch tasks to report events on the user-facing session.
+    parent_session_id = str(input_data.get("parent_session_id") or "").strip()
 
     node = load_node(ws_root, node_id)
     if node is None:
@@ -698,6 +704,7 @@ async def _run_node_task(
         api_key=api_key, base_url=base_url, default_model=default_model,
         user_text=str(input_data.get("instruction") or "").strip(),
         task_id=task_id, session_generation=session_generation,
+        parent_session_id=parent_session_id,
         source_inbound_seq=int(source_inbound_seq) if source_inbound_seq is not None else None,
         task_context=_build_task_context(input_data),
     )
@@ -844,7 +851,10 @@ async def _run_node_task(
     # Phase 1 补丁：将 user_input (instruction) 影子写入 ConversationStore。
     # 此前 _shadow_write 只写了 assistant 和 tool_result，用户指令完全缺失，
     # 导致子节点 accumulate 恢复时 JSONL 里缺少用户输入、上下文不完整。
-    # 写入目标 session：优先 child_session_id（子节点隔离），否则 session_id（主节点）。
+    # [Fork/Merge 2026-05-12] 写入目标 session：优先 child_session_id，否则 rctx 运行 session。
+    # Why: session_id may be an entry branch rather than the user-facing parent. How: keep the
+    # existing child-session priority and otherwise write to the branch/runtime session. Purpose:
+    # branch histories remain complete until supervisor merge.
     #
     # Step 2（2026-04-16）：resume 场景（compact_done / child_result / child_failed 等）
     # 下 caller task 被 supervisor 重新唤醒，input.instruction 仍是原先的用户指令，

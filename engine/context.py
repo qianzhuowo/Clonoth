@@ -20,6 +20,13 @@ class RunContext:
     worker_id: str
     http: httpx.AsyncClient
     llm_http: httpx.AsyncClient
+    # [Fork/Merge 2026-05-12] parent_session_id separates event routing from runtime storage.
+    # Why: entry tasks now run on a branch session, but SDK adapters know the
+    # user-facing conversation_key through the parent session. How: keep
+    # session_id as the ConversationStore/runtime session and use this optional
+    # parent for supervisor event POSTs. Purpose: branch history stays isolated
+    # while events still reach the channel-level SDK route.
+    parent_session_id: str = ""
     api_key: str = ""
     base_url: str = ""
     default_model: str = "gpt-4o-mini"
@@ -42,11 +49,22 @@ class RunContext:
     async def emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.source_inbound_seq is not None:
             payload.setdefault("source_inbound_seq", self.source_inbound_seq)
+        # [Fork/Merge 2026-05-12] Events are delivered through the parent session
+        # when this task is running on an entry branch. Why: SDK session maps are
+        # keyed by the user-facing parent session, while self.session_id remains
+        # the branch used for ConversationStore reads/writes. How: post to
+        # parent_session_id when present and annotate the payload with both IDs.
+        # Purpose: preserve exact SDK routing without writing branch events to an
+        # unmapped internal session.
+        route_session_id = self.parent_session_id or self.session_id
+        if self.parent_session_id and self.parent_session_id != self.session_id:
+            payload.setdefault("parent_session_id", self.parent_session_id)
+            payload.setdefault("branch_session_id", self.session_id)
         # Bridge emit_event → SignalBus，用 dict(payload) 复制避免后续修改影响信号订阅方
         get_bus().emit(Signal(name=event_type, payload=dict(payload)))
         try:
             await self.http.post(
-                f"{self.supervisor_url}/v1/sessions/{self.session_id}/events",
+                f"{self.supervisor_url}/v1/sessions/{route_session_id}/events",
                 json={"type": event_type, "payload": payload},
             )
         except Exception:

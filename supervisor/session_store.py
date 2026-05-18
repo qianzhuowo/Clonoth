@@ -176,10 +176,14 @@ class SessionStore:
         供 load() 时重建 child_session_map。
         """
         now_str = _now().isoformat()
+        # Inherit parent's conversation_key so child tasks can resolve
+        # the originating channel (e.g. for approval UI routing).
+        parent_info = self._registry.get(parent_session_id)
+        parent_conv_key = parent_info.get("conversation_key", "") if parent_info else ""
         self._registry[child_session_id] = {
             "session_id": child_session_id,
             "channel": "internal",
-            "conversation_key": "",
+            "conversation_key": parent_conv_key,
             "created_at": now_str,
             "reset": False,
             "is_child": True,

@@ -225,18 +225,31 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
         i += 1
 
     # Merge consecutive same-role messages (Anthropic requires strict user/assistant alternation)
+    # IMPORTANT: tool_result blocks and text blocks MUST NOT be mixed in the
+    # same user message — Anthropic rejects any user message containing both.
+    # When a user-role tool_result group is followed by a user-role text message
+    # (or vice versa), we insert a synthetic assistant separator instead of merging.
     merged: list[dict] = []
     for msg in converted:
         if merged and merged[-1]["role"] == msg["role"]:
-            # Merge content blocks
             prev_content = merged[-1]["content"]
             curr_content = msg["content"]
-            if isinstance(prev_content, list) and isinstance(curr_content, list):
-                prev_content.extend(curr_content)
-            elif isinstance(prev_content, list):
-                prev_content.extend(_content_to_blocks(curr_content))
+            prev_blocks = prev_content if isinstance(prev_content, list) else _content_to_blocks(prev_content)
+            curr_blocks = curr_content if isinstance(curr_content, list) else _content_to_blocks(curr_content)
+            prev_has_tr = any(b.get("type") == "tool_result" for b in prev_blocks)
+            curr_has_tr = any(b.get("type") == "tool_result" for b in curr_blocks)
+            # Both have tool_result, or neither has — safe to merge
+            if prev_has_tr == curr_has_tr:
+                if isinstance(prev_content, list) and isinstance(curr_content, list):
+                    prev_content.extend(curr_content)
+                elif isinstance(prev_content, list):
+                    prev_content.extend(_content_to_blocks(curr_content))
+                else:
+                    merged[-1]["content"] = _content_to_blocks(prev_content) + _content_to_blocks(curr_content)
             else:
-                merged[-1]["content"] = _content_to_blocks(prev_content) + _content_to_blocks(curr_content)
+                # Mixing tool_result with text — insert assistant separator
+                merged.append({"role": "assistant", "content": [{"type": "text", "text": "(continued)"}]})
+                merged.append(msg)
         else:
             merged.append(msg)
 
@@ -402,6 +415,7 @@ class AnthropicProvider(BaseProvider):
         _thinking = self._options.get("thinking")
         if _thinking and isinstance(_thinking, dict):
             payload["thinking"] = _thinking
+        self._last_payload = payload
         return payload
 
     # ===================================================================
@@ -674,6 +688,7 @@ class AnthropicProvider(BaseProvider):
         except Exception:
             msg = resp.text[:500]
         log.error("Anthropic API error %d: %s", resp.status_code, msg)
+        self._dump_error_payload(resp.status_code, msg)
         return ProviderResponse(ok=False, error=msg, status_code=resp.status_code)
 
     def _error_from_body(self, status_code: int, body: bytes) -> ProviderResponse:
@@ -687,4 +702,38 @@ class AnthropicProvider(BaseProvider):
         except Exception:
             msg = body.decode("utf-8", errors="replace")[:500]
         log.error("Anthropic API error %d: %s", status_code, msg)
+        self._dump_error_payload(status_code, msg)
         return ProviderResponse(ok=False, error=msg, status_code=status_code)
+
+    def _dump_error_payload(self, status_code: int, error_msg: str) -> None:
+        """Dump the last request payload on error for forensic analysis."""
+        payload = getattr(self, '_last_payload', None)
+        if not payload:
+            return
+        try:
+            from pathlib import Path
+            from datetime import datetime, timezone
+            snap_dir = Path('data/llm_error_snapshots')
+            snap_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')
+            filename = f'{ts}_anthropic_actual_payload.json'
+            snap = {
+                'timestamp': datetime.now(timezone.utc).isoformat(),
+                'provider': 'AnthropicProvider',
+                'model': self.model,
+                'status_code': status_code,
+                'error': error_msg[:500],
+                'message_count': len(payload.get('messages', [])),
+                'messages': payload.get('messages', []),
+            }
+            with open(snap_dir / filename, 'w', encoding='utf-8') as f:
+                json.dump(snap, f, ensure_ascii=False, indent=2, default=str)
+            # Keep only newest 10 actual payload dumps
+            existing = sorted(snap_dir.glob('*_actual_payload.json'), key=lambda p: p.stat().st_mtime)
+            for old in existing[:-10]:
+                old.unlink(missing_ok=True)
+            log.info('dumped error payload: %s (%d messages)', filename, snap['message_count'])
+        except Exception as exc:
+            log.warning('failed to dump error payload: %s', exc)
+        finally:
+            self._last_payload = None

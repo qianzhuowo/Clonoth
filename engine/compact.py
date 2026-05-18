@@ -210,6 +210,42 @@ def should_compact(
     return total_chars // 3 > threshold_tokens
 
 
+def _source_task_id_from_message_like(message: Any) -> str:
+    """Return source_task_id from either a stored Message object or history dict."""
+    # [2026-05-17] Why: compact pre-checks run on ConversationStore Message
+    # objects, while legacy snapshot compaction still uses dict histories. How:
+    # read meta/_meta first and then fall back to the top-level field/attribute.
+    # Purpose: keep segment counting consistent across both engine compact paths.
+    if isinstance(message, dict):
+        meta = message.get("_meta") or message.get("meta") or {}
+        meta_tid = meta.get("source_task_id", "") if isinstance(meta, dict) else ""
+        return str(meta_tid or message.get("source_task_id", "") or "")
+    meta = getattr(message, "meta", None)
+    meta_tid = meta.get("source_task_id", "") if isinstance(meta, dict) else ""
+    return str(meta_tid or getattr(message, "source_task_id", "") or "")
+
+
+def count_real_task_segments(messages: list[Any]) -> int:
+    """Count consecutive task segments, excluding existing compact summaries."""
+    # [2026-05-17] Why: an old compact_summary is already summarized history and
+    # must be compressed together with older task messages, not retained as one
+    # keep_recent segment. How: skip source_task_id=compact_summary and count only
+    # transitions between consecutive real task ids. Purpose: prevent automatic
+    # compaction from dispatching forever when only the old summary can be removed.
+    count = 0
+    previous_tid: str | None = None
+    in_real_segment = False
+    for message in messages:
+        task_id = _source_task_id_from_message_like(message)
+        if task_id == "compact_summary":
+            continue
+        if not in_real_segment or task_id != previous_tid:
+            count += 1
+        previous_tid = task_id
+        in_real_segment = True
+    return count
+
+
 # ---------------------------------------------------------------------------
 #  Apply summary (pure function, no LLM)
 # ---------------------------------------------------------------------------
@@ -219,11 +255,17 @@ def apply_compact_summary(
     summary: str,
     *,
     keep_recent: int = 2,
+    threshold_tokens: int = 0,
 ) -> list[dict[str, Any]]:
     """Apply a pre-generated summary to compress messages.
 
     Same split logic as the old compact_messages, but takes
     the summary text directly instead of calling LLM.
+
+    If *threshold_tokens* > 0, the function will progressively reduce
+    *keep_recent* until the result fits within the budget or keep_recent
+    reaches 0.  This prevents infinite compact loops when the retained
+    segments alone exceed the threshold.
 
     Returns compressed message list.  If summary is empty or
     messages too short, returns original list unchanged.
@@ -313,9 +355,32 @@ def apply_compact_summary(
     result.extend(inner_systems)
     result.extend(to_keep)
 
+    # --- Progressive keep_recent reduction ---
+    # If the result still exceeds the token threshold, drop older kept
+    # segments one at a time until we fit or keep_recent reaches 0.
+    if threshold_tokens > 0 and keep_recent > 0:
+        while should_compact(result, threshold_tokens) and keep_recent > 0:
+            keep_recent -= 1
+            if keep_recent > 0:
+                kept_segments = segments[-keep_recent:]
+            else:
+                kept_segments = []
+            to_keep = []
+            for seg in kept_segments:
+                to_keep.extend(seg)
+            result = []
+            result.extend(prefix_systems)
+            result.append(summary_msg)
+            result.extend(inner_systems)
+            result.extend(to_keep)
+            logger.info(
+                "apply_compact_summary: still over threshold, reduced keep_recent to %d",
+                keep_recent,
+            )
+
     logger.info(
-        "apply_compact_summary: %d -> %d messages (compressed %d middle messages)",
-        len(messages), len(result), len(conversation) - keep_recent,
+        "apply_compact_summary: %d -> %d messages (keep_recent=%d)",
+        len(messages), len(result), keep_recent,
     )
     return result
 

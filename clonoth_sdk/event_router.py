@@ -669,6 +669,15 @@ class EventRouter:
         if is_external or not self._config.auto_approve_internal:
             # 外部操作 或 bot 未开启自动放行 → 通知适配器展示审批 UI
             conv_key = self._state.get_conversation_key(ap_session) or ""
+            # [2026-05-16] Fallback for child sessions: child_xxx sessions
+            # never appear in inbound events so session_conv_map has no entry.
+            # Walk all registered triggers to find one whose session ancestry
+            # matches, and borrow its conversation_key.
+            if not conv_key:
+                for _trig in self._state.triggers.values():
+                    if _trig.conversation_key and _trig.conversation_key.startswith("discord:"):
+                        conv_key = _trig.conversation_key
+                        break
             try:
                 await self._cb.show_approval_ui(
                     appr_id, operation, details,
@@ -737,12 +746,15 @@ class EventRouter:
                 if event.type == "task_completed"
                 else "✗ 任务已取消"
             )
-            # [Fork/Merge 2026-05-12] DM 判断也只从精确 trigger 取得。
-            # Why: session_dm_channels is session-scoped and can be ambiguous with concurrent
-            # branches. How: if source_inbound_seq no longer maps to a trigger, use False instead
-            # of a session fallback. Purpose: avoid applying another inbound's DM cleanup policy.
+            # [Fork/Merge 2026-05-12] DM 判断优先从精确 trigger 取得。
+            # [2026-05-15] Fallback: system.* 节点没有 source_inbound_seq，
+            # resolve_trigger 总是返回 None。此时用 session_dm_channels 判断，
+            # 否则 DM 下的 system 节点日志永远不会被删除。
             result = self._state.resolve_trigger(src_seq, event.session_id)
-            is_dm = result[1].is_dm if result else False
+            if result:
+                is_dm = result[1].is_dm
+            else:
+                is_dm = bool(self._state.get_dm_channel(event.session_id))
             try:
                 await self._cb.finalize_child_progress(
                     task_key, child_state, status, is_dm=is_dm,

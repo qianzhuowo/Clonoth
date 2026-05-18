@@ -168,9 +168,15 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         ctx_ref = _persist_ctx(ls, step + 1)
         switch_target = str(args.get("target") or "").strip()
         switch_text = str(args.get("text") or "").strip()
+        # [Fork/Merge 2026-05-17] Why: switch_node changes the entry node for
+        # future inbound messages, which are keyed by the parent conversation
+        # session, not the temporary branch runtime session. How: prefer
+        # rctx.parent_session_id for the supervisor endpoint. Purpose: node
+        # switching remains effective after the current branch is merged/cleaned.
+        route_session_id = getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id
         try:
             await ls.rctx.http.post(
-                f"{ls.rctx.supervisor_url}/v1/sessions/{ls.rctx.session_id}/switch_node",
+                f"{ls.rctx.supervisor_url}/v1/sessions/{route_session_id}/switch_node",
                 json={"target_node_id": switch_target},
             )
         except Exception:
@@ -270,6 +276,13 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
             "context_key": ctx_key,
             "caller_node_id": ls.node.id,
         }
+        # [Fork/Merge 2026-05-17] Why: async dispatch API may receive a branch
+        # session from older engine paths or after a supervisor index rebuild.
+        # How: include the parent route session when RunContext has it. Purpose:
+        # supervisor can anchor async child tasks to the durable conversation.
+        parent_session_id = getattr(ls.rctx, "parent_session_id", "") or ""
+        if parent_session_id:
+            payload["parent_session_id"] = parent_session_id
         if attachments:
             payload["attachments"] = attachments
         _dispatch_resp = await ls.rctx.http.post(

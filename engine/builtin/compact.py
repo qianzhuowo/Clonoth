@@ -6,6 +6,7 @@ from typing import Any
 
 from engine.compact import (
     _format_messages_for_summary,
+    count_real_task_segments,
     is_compact_circuit_open,
     microcompact_messages,
     record_compact_failure,
@@ -159,10 +160,34 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
     if not should_compact(ls.messages, ls.compact_threshold, ls.last_prompt_tokens):
         return None
 
+    # ---------------------------------------------------------------
+    # Pre-check: count task segments in ConversationStore. If there
+    # are not enough segments to compress (≤ keep_recent), skip the
+    # LLM compactor call entirely to avoid wasting API calls.
+    # ---------------------------------------------------------------
+    try:
+        _conv_store = getattr(ls.rctx, 'conversation_store', None)
+        if _conv_store:
+            _stored_msgs = _conv_store.load(compact_sid)
+            # [2026-05-17] Why: compact_summary is already compressed history,
+            # not a real task segment, so counting it can trigger an endless
+            # LLM compactor loop. How: use the shared counter that skips old
+            # compact summaries and only counts consecutive real task ids.
+            # Purpose: builtin compact and legacy ai_step compact make the same
+            # dispatch decision before asking the compactor LLM to summarize.
+            _seg_count = count_real_task_segments(_stored_msgs)
+            if _seg_count <= ls.compact_keep_recent:
+                logger.info(
+                    "skip compact: only %d task segments (keep_recent=%d), not enough to compress",
+                    _seg_count, ls.compact_keep_recent,
+                )
+                ls.compacted = True
+                return None
+    except Exception as _seg_err:
+        logger.warning("segment pre-check failed, proceeding with compact: %s", _seg_err)
+
     try:
         from engine.task_record import (
-            compress_summaries,
-            compress_summary_store,
             load_task_records,
             snip_history,
             snip_store,
@@ -196,36 +221,8 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
                 ls.compacted = True
                 ctx.extra["compact_modified"] = True
                 return None
-
-        # [AutoC 2026-05-13] L3 runs only after L2 finds no task chain to snip.
-        # Why: many old L2 summaries can become the new context pressure source.
-        # How: merge the oldest summary blocks in memory and mirror the operation
-        # to ConversationStore. Purpose: avoid invoking the LLM compactor merely
-        # to reduce already-summarized task summaries.
-        summary_compacted, summary_count = compress_summaries(ls.messages, snip_records)
-        if summary_count > 0:
-            ls.messages = summary_compacted
-            ctx.messages = ls.messages
-            store = getattr(ls.rctx, "conversation_store", None)
-            if store:
-                try:
-                    stored = store.load(snip_sid)
-                    persisted, persisted_count = compress_summary_store(stored)
-                    if persisted_count > 0:
-                        store.replace_all(snip_sid, persisted)
-                except Exception as persist_error:
-                    logger.warning("failed to persist L3 summary compact: %s", persist_error)
-            await ls.rctx.emit_event("summary_compact", {
-                "node_id": ls.node.id,
-                "step": ctx.step,
-                "merged_summaries": summary_count,
-            })
-            logger.info("summary_compact: merged %d summaries, skipping LLM compact", summary_count)
-            ls.compacted = True
-            ctx.extra["compact_modified"] = True
-            return None
     except Exception as snip_error:
-        logger.warning("snip/L3 compact failed, falling through to LLM compact: %s", snip_error)
+        logger.warning("snip compact failed, falling through to LLM compact: %s", snip_error)
 
     ls.compacted = True
     try:

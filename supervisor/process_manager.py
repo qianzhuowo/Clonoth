@@ -195,7 +195,10 @@ class ProcessManager:
             return
         runtime_cfg = load_runtime_config(self.workspace_root)
         shell_mode = (runtime_cfg.get("shell", {}).get("mode", "") or "tui").strip().lower()
-        module = "shell.tui" if shell_mode == "tui" else "shell.cli"
+        # 2026-05-14: shell moved under platform/shell, so spawned child
+        # processes must use platform-qualified module paths. Process names such
+        # as shell-tui and shell-cli intentionally stay unchanged for compatibility.
+        module = "platform.shell.tui" if shell_mode == "tui" else "platform.shell.cli"
         name = "shell-tui" if shell_mode == "tui" else "shell-cli"
 
         self.shell_cli = self._spawn(

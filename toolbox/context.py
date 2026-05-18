@@ -19,18 +19,36 @@ class ToolContext:
     registry: Any
     task_id: str = ""
     session_generation: int = 0
+    # [Fork/Merge 2026-05-17] Why: tools can execute inside an entry branch while
+    # user-visible supervisor APIs are keyed by the parent session. How: carry the
+    # parent separately and let route_session_id() choose it when present. Purpose:
+    # approvals, tool events, and session-scoped tools do not target a temporary branch.
+    parent_session_id: str = ""
     approval_poll_interval_sec: float = 0.5
 
+    def route_session_id(self) -> str:
+        """Return the user-visible session for supervisor API calls."""
+        # [Fork/Merge 2026-05-17] Why: session_id remains the runtime storage
+        # session and may be branch_xxx. How: prefer parent_session_id and fall
+        # back to session_id for old tasks and ordinary child tools. Purpose:
+        # route outward-facing tool side effects to the durable conversation.
+        return (self.parent_session_id or self.session_id or "").strip()
+
     async def emit_event(self, type_: str, payload: dict[str, Any]) -> None:
+        route_session_id = self.route_session_id()
+        if self.parent_session_id and self.parent_session_id != self.session_id:
+            payload.setdefault("parent_session_id", self.parent_session_id)
+            payload.setdefault("branch_session_id", self.session_id)
         await self.http.post(
-            f"{self.supervisor_url}/v1/sessions/{self.session_id}/events",
+            f"{self.supervisor_url}/v1/sessions/{route_session_id}/events",
             json={"type": type_, "payload": payload},
         )
 
     async def request_op(self, op: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        route_session_id = self.route_session_id()
         r = await self.http.post(
             f"{self.supervisor_url}/v1/ops/request",
-            json={"session_id": self.session_id, "op": op, "parameters": parameters},
+            json={"session_id": route_session_id, "op": op, "parameters": parameters},
         )
         r.raise_for_status()
         return r.json()
@@ -49,8 +67,11 @@ class ToolContext:
                 if r.status_code == 200:
                     return bool(r.json().get("cancelled", False))
             else:
+                # [Fork/Merge 2026-05-17] Why: session-level cancellation is a
+                # user-visible operation. How: query the parent route session when
+                # present. Purpose: tools without task_id still honor parent cancel.
                 r = await self.http.get(
-                    f"{self.supervisor_url}/v1/sessions/{self.session_id}/cancelled",
+                    f"{self.supervisor_url}/v1/sessions/{self.route_session_id()}/cancelled",
                     timeout=2.0,
                 )
                 if r.status_code == 200:

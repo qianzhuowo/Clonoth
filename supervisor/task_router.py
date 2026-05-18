@@ -217,6 +217,13 @@ class TaskRouterMixin:
                 task.input["_compact_target_session_id"] = compact_target_session_id
 
         created_child_ids: list[str] = []
+        # [Fork/Merge 2026-05-17] Why: descendants of an entry branch should keep
+        # branch-local storage but still route user-visible events through the
+        # parent session. How: compute the parent route once and propagate it in
+        # child task input while leaving task.session_id unchanged. Purpose: child
+        # nodes/tools do not call supervisor APIs with a soon-to-be-deleted branch.
+        route_parent_session_id = self._route_session_id_for_task_locked(task)
+        route_parent_for_child = route_parent_session_id if route_parent_session_id != task.session_id else ""
 
         # ---- 批量委派（node 或 tool 均可） ----
         if isinstance(dispatch_batch, list) and dispatch_batch:
@@ -228,15 +235,22 @@ class TaskRouterMixin:
                     continue
 
                 if item_kind == "tool":
+                    _tool_input = {
+                        "arguments": item.get("arguments", {}),
+                        "call_id": str(item.get("call_id") or ""),
+                    }
+                    if route_parent_for_child:
+                        # [Fork/Merge 2026-05-17] Why: batch tool tasks inherit
+                        # the caller branch as runtime session. How: carry the
+                        # parent route in input for engine.runner ToolContext.
+                        # Purpose: guarded tools and progress route to parent.
+                        _tool_input["parent_session_id"] = route_parent_for_child
                     child = self._create_task_locked(
                         session_id=task.session_id,
                         session_generation=task.session_generation,
                         kind=TaskKind.tool,
                         tool_name=item_target,
-                        input_data={
-                            "arguments": item.get("arguments", {}),
-                            "call_id": str(item.get("call_id") or ""),
-                        },
+                        input_data=_tool_input,
                         continuation={},
                         source_inbound_seq=task.source_inbound_seq,
                         caller_task_id=task.task_id,
@@ -249,6 +263,12 @@ class TaskRouterMixin:
                     _batch_input: dict[str, Any] = {
                         "instruction": str(item.get("instruction") or "").strip(),
                     }
+                    if route_parent_for_child:
+                        # [Fork/Merge 2026-05-17] Why: batch child nodes can run
+                        # under a branch session while emitting progress or tool
+                        # approvals. How: pass the durable parent as route metadata.
+                        # Purpose: RunContext.emit_event targets the user session.
+                        _batch_input["parent_session_id"] = route_parent_for_child
                     if _batch_ctx_key:
                         _batch_input["_context_key"] = _batch_ctx_key
 
@@ -287,6 +307,12 @@ class TaskRouterMixin:
             _single_input: dict[str, Any] = {
                 "instruction": str(dispatch_input.get("instruction") or "").strip(),
             }
+            if route_parent_for_child:
+                # [Fork/Merge 2026-05-17] Why: a synchronous child task should be
+                # branch-local for merge semantics but parent-routed for events and
+                # session tools. How: pass parent_session_id without changing the
+                # child task's runtime session. Purpose: avoid hidden branch events.
+                _single_input["parent_session_id"] = route_parent_for_child
             if _ctx_key:
                 _single_input["_context_key"] = _ctx_key
 
@@ -339,16 +365,21 @@ class TaskRouterMixin:
         context_ref = str(action.get("context_ref") or "")
         task.preempted_context_ref = context_ref
 
-        # 发射 task_preempted 事件给 Bot
+        # [Fork/Merge 2026-05-17] Why: preempt notifications are user-visible,
+        # while task.session_id can be a temporary branch. How: route the event to
+        # the parent session when task metadata provides one. Purpose: adapters
+        # polling the durable session can observe the preempted task.
+        route_session_id = self._route_session_id_for_task_locked(task)
         self.eventlog.append(
-            session_id=task.session_id,
+            session_id=route_session_id,
             component="supervisor",
             type_="task_preempted",
             payload={
                 "task_id": task.task_id,
                 "node_id": task.node_id,
                 "context_ref": context_ref,
-                "session_id": task.session_id,
+                "session_id": route_session_id,
+                "runtime_session_id": task.session_id,
             },
             transient=True,
         )
@@ -561,17 +592,22 @@ class TaskRouterMixin:
             else None
         )
 
-        session_info = self.sessions.get(task.session_id)
+        # [Fork/Merge 2026-05-17] Why: async dispatch tasks may originate from a
+        # branch, but their completion should inject a new inbound into the parent
+        # conversation. How: use the same route helper as outbound/hook paths.
+        # Purpose: async results do not target a deleted branch session.
+        route_session_id = self._route_session_id_for_task_locked(task)
+        session_info = self.sessions.get(route_session_id)
         if not session_info:
             return
 
         # 检查 session generation 是否过期
-        current_gen = self._current_session_generation_locked(task.session_id)
+        current_gen = self._current_session_generation_locked(route_session_id)
         if task.session_generation and current_gen and task.session_generation != current_gen:
             return
 
         # 检查 session 是否已被 cancel
-        if task.session_id in self._cancelled_sessions:
+        if route_session_id in self._cancelled_sessions:
             return
 
         # [Fork/Merge 2026-05-12] 异步 dispatch 结果不再自动 preempt 入口 task。
@@ -595,16 +631,16 @@ class TaskRouterMixin:
 
         # eventlog 有独立锁，不会与 self._lock 死锁
         evt = self.eventlog.append(
-            session_id=task.session_id,
+            session_id=route_session_id,
             component="supervisor",
             type_="inbound_message",
             payload=payload,
         )
         seq = int(evt.get("seq", 0))
-        self._apply_inbound_message(seq=seq, session_id=task.session_id, payload=payload)
+        self._apply_inbound_message(seq=seq, session_id=route_session_id, payload=payload)
         self._advance_inbound_cursor()
         self._create_entry_task_for_inbound_locked(
-            inbound_seq=seq, session_id=task.session_id, payload=payload,
+            inbound_seq=seq, session_id=route_session_id, payload=payload,
         )
 
     def inject_async_result(self, session_id: str, text: str, attachments: list | None = None) -> dict[str, Any]:
@@ -755,11 +791,46 @@ class TaskRouterMixin:
             raw_summary = str(result.get("text") or "").strip()
             summary = _format_compact_summary(raw_summary)
 
+            # --- Circuit breaker + emergency truncation ---
+            # If summary was rejected (empty), record failure for circuit breaker
+            # AND perform emergency segment truncation to break the loop.
+            if not summary and target_sid_for_conv:
+                from engine.compact import record_compact_failure
+                _cb_sid = target_sid_for_conv
+                record_compact_failure(_cb_sid)
+                # Emergency truncation: even without a valid summary, force-remove
+                # old segments to break the compact loop.
+                _keep = int(caller.input.get("_compact_keep_recent", 6))
+                _threshold = int(caller.input.get("_compact_threshold_tokens", 0) or 256000)
+                _emergency_summary = (
+                    "[上下文压缩摘要生成失败，旧消息已被裁剪以恢复服务]"
+                )
+                try:
+                    cr = self._apply_compact_via_conv_store_locked(
+                        target_sid_for_conv, _emergency_summary,
+                        keep_recent=_keep,
+                        threshold_tokens=_threshold,
+                    )
+                    if cr["after"] < cr["before"]:
+                        log.warning(
+                            "compact: emergency truncation applied (summary rejected), "
+                            "before=%d after=%d", cr["before"], cr["after"],
+                        )
+                        self._resume_compact_parent_locked(
+                            caller, parent_ctx_ref,
+                            compact_result=cr, success=True,
+                        )
+                        return
+                except Exception as _et:
+                    log.warning("compact: emergency truncation failed: %s", _et)
+                # If emergency truncation didn't help, fall through to failure path
+
             if summary and target_sid_for_conv:
                 # ---- ConversationStore 路径 ----
                 cr = self._apply_compact_via_conv_store_locked(
                     target_sid_for_conv, summary,
                     keep_recent=int(caller.input.get("_compact_keep_recent", 6)),
+                    threshold_tokens=int(caller.input.get("_compact_threshold_tokens", 0) or 256000),
                 )
                 if cr["after"] < cr["before"]:
                     self._resume_compact_parent_locked(
@@ -782,6 +853,7 @@ class TaskRouterMixin:
                     keep_recent = int(caller.input.get("_compact_keep_recent", 6))
                     compressed = apply_compact_summary(
                         old_messages, summary, keep_recent=keep_recent,
+                        threshold_tokens=int(caller.input.get("_compact_threshold_tokens", 0) or 256000),
                     )
                     if len(compressed) < len(old_messages):
                         snapshot["messages"] = compressed
@@ -803,6 +875,7 @@ class TaskRouterMixin:
 
     def _apply_compact_via_conv_store_locked(
         self, target_session_id: str, summary: str, *, keep_recent: int,
+        threshold_tokens: int = 256000,
     ) -> dict[str, int]:
         """Step 2（2026-04-16）：在 ConversationStore 层面执行压缩。
 
@@ -828,12 +901,25 @@ class TaskRouterMixin:
         # task ids through Message attributes and meta, then split only when the
         # consecutive source_task_id changes. Purpose: keep recent task segments
         # complete instead of slicing by raw message count.
+        # [2026-05-17] Split messages into task segments, but treat old
+        # compact_summary segments as "prefix" rather than a real task segment.
+        # Old summaries should be replaced alongside other old segments, not
+        # counted toward keep_recent (which would cause an infinite loop where
+        # the old summary is deleted and recreated each cycle with no net change).
+        prefix_msgs: list[Any] = []  # old compact_summary messages
         segments: list[list[Any]] = []
         cur_seg: list[Any] = []
         cur_tid: str = ""
         for msg in msgs:
             meta = msg.meta if isinstance(getattr(msg, "meta", None), dict) else {}
             tid = str(meta.get("source_task_id", "") or getattr(msg, "source_task_id", "") or "")
+            if tid == "compact_summary":
+                # [2026-05-17] Why: an old compact_summary is compressed prefix
+                # material, not a task boundary. How: collect it for replacement
+                # and keep the current real segment open. Purpose: the old summary
+                # is fed into the next summary and never consumes keep_recent.
+                prefix_msgs.append(msg)
+                continue
             if tid != cur_tid and cur_seg:
                 segments.append(cur_seg)
                 cur_seg = []
@@ -842,10 +928,7 @@ class TaskRouterMixin:
         if cur_seg:
             segments.append(cur_seg)
 
-        # [AutoC 2026-05-13] Why: keep_recent now means recent task segments, not
-        # recent messages. How: require at least one retained segment and skip the
-        # rewrite when the store has no older segments to summarize. Purpose: match
-        # the in-memory compaction path and keep the active task intact.
+        # keep_recent applies to real task segments only (prefix excluded)
         keep_recent = max(keep_recent, 1)
         if len(segments) <= keep_recent:
             return {"before": before, "after": before, "total_segments": len(segments), "kept_segments": len(segments), "compressed_segments": 0}
@@ -857,7 +940,7 @@ class TaskRouterMixin:
         for seg in kept_segments:
             to_keep.extend(seg)
 
-        to_remove: list[Any] = []
+        to_remove: list[Any] = list(prefix_msgs)  # old summaries are always replaced
         for seg in to_remove_segments:
             to_remove.extend(seg)
 
@@ -872,9 +955,14 @@ class TaskRouterMixin:
         # keep compressed_task_ids accurate after task-granular retention.
         _ctid_set: set[str] = set()
         for _rm in to_remove:
-            if getattr(_rm, "source_task_id", ""):
-                _ctid_set.add(str(_rm.source_task_id))
             _rm_meta = _rm.meta if isinstance(getattr(_rm, "meta", None), dict) else {}
+            # [2026-05-17] Why: compact_summary is not a real task id and should
+            # not be recorded as a compressed task. How: inherit its historical
+            # compressed_task_ids but skip the compact_summary source id itself.
+            # Purpose: L2 snip metadata remains about real tasks only.
+            _rm_tid = str(_rm_meta.get("source_task_id", "") or getattr(_rm, "source_task_id", "") or "")
+            if _rm_tid and _rm_tid != "compact_summary":
+                _ctid_set.add(_rm_tid)
             _old_ctids = _rm_meta.get("compressed_task_ids")
             if isinstance(_old_ctids, list):
                 for _ctid in _old_ctids:
@@ -892,21 +980,61 @@ class TaskRouterMixin:
             meta={"compressed_task_ids": compressed_task_ids},
         )
         new_messages = [summary_msg] + to_keep
-        store.replace_all(target_session_id, new_messages)
+
+        # --- Progressive keep_recent reduction ---
+        # If the compressed result still exceeds the token threshold,
+        # drop older kept segments one at a time until we fit or reach 0.
+        # Estimate tokens as total chars / 3 (mixed CJK/English).
+        _threshold = threshold_tokens
+        try:
+            # Build a rough char-based check: sum content lengths
+            _total_chars = sum(
+                len(getattr(m, 'content', '') or '')
+                for m in new_messages
+            )
+            while keep_recent > 0 and _total_chars // 3 > _threshold:
+                keep_recent -= 1
+                if keep_recent > 0:
+                    kept_segments = segments[-keep_recent:]
+                else:
+                    kept_segments = []
+                to_keep = []
+                for seg in kept_segments:
+                    to_keep.extend(seg)
+                new_messages = [summary_msg] + to_keep
+                _total_chars = sum(
+                    len(getattr(m, 'content', '') or '')
+                    for m in new_messages
+                )
+                log.info(
+                    "conv_store compact: still over threshold, reduced keep_recent to %d",
+                    keep_recent,
+                )
+        except Exception:
+            pass  # safety net: never break compact flow
+
         after = len(new_messages)
         result = {
             "before": before, "after": after,
             "total_segments": len(segments),
             "kept_segments": len(kept_segments),
-            "compressed_segments": len(to_remove_segments),
+            "compressed_segments": len(segments) - len(kept_segments),
         }
-        if after < before:
-            # [AutoC 2026-05-13] Why: active branches forked before parent compact
-            # keep their own old prefix and would otherwise resume or merge from an
-            # uncompressed copy. How: after the parent rewrite succeeds, mirror a
-            # simplified prefix compaction into active branch sessions. Purpose:
-            # branch histories stay bounded while preserving branch-local tails.
-            self._sync_compact_to_branches(target_session_id, summary_msg, to_keep)
+        if after >= before:
+            # [2026-05-17] Why: callers treat after==before as an unsuccessful
+            # compact, so persisting a same-length replacement can mutate durable
+            # history while the engine still believes compact failed. How: return
+            # counts without replace_all unless the new message list is shorter.
+            # Purpose: avoid no-op rewrites and prevent compact retry loops.
+            return result
+
+        store.replace_all(target_session_id, new_messages)
+        # [AutoC 2026-05-13] Why: active branches forked before parent compact
+        # keep their own old prefix and would otherwise resume or merge from an
+        # uncompressed copy. How: after the parent rewrite succeeds, mirror a
+        # simplified prefix compaction into active branch sessions. Purpose:
+        # branch histories stay bounded while preserving branch-local tails.
+        self._sync_compact_to_branches(target_session_id, summary_msg, to_keep)
         return result
 
     def _clone_compact_summary_message(self, summary_msg: Any) -> Any:

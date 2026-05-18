@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import uuid
@@ -38,6 +39,12 @@ class EventLog:
         self._lock = threading.Lock()
         self._events: list[dict[str, Any]] = []
         self._seq: int = 0
+        # [WS events 2026-05-17] Why: WebSocket clients need live updates while
+        # EventLog remains the durable source of truth. How: keep per-session
+        # asyncio.Queue subscribers beside the append-only memory buffer. Purpose:
+        # append() can fan out each new event without changing persistence or the
+        # existing polling API.
+        self._subscribers: dict[str, list[asyncio.Queue]] = {}
 
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._load_existing()
@@ -152,7 +159,50 @@ class EventLog:
             # Trim with hysteresis to prevent unbounded memory growth
             if len(self._events) > _MAX_MEMORY_EVENTS + 500:
                 self._events = self._events[-_MAX_MEMORY_EVENTS:]
-            return evt
+            # [WS events 2026-05-17] Why: broadcasting while holding the threading
+            # lock would make subscriber callbacks part of the critical section.
+            # How: copy the current session queues and fan out after leaving the
+            # lock. Purpose: keep append() fast and avoid awaiting under this lock.
+            subscribers = list(self._subscribers.get(session_id, []))
+
+        for queue in subscribers:
+            try:
+                queue.put_nowait(evt)
+            except asyncio.QueueFull:
+                # The current queues are unbounded, but this keeps future bounded
+                # queues from breaking event persistence if a client falls behind.
+                continue
+        return evt
+
+    def subscribe(self, session_id: str) -> asyncio.Queue:
+        """Subscribe to new events for one session.
+
+        [WS events 2026-05-17] Why: the WebSocket endpoint needs a live channel
+        but EventLog must remain the only event source. How: callers receive an
+        asyncio.Queue that append() fills with matching session events. Purpose:
+        consumers can combine catch-up reads with live delivery.
+        """
+        queue: asyncio.Queue = asyncio.Queue()
+        with self._lock:
+            self._subscribers.setdefault(session_id, []).append(queue)
+        return queue
+
+    def unsubscribe(self, session_id: str, queue: asyncio.Queue) -> None:
+        """Remove a queue previously returned by subscribe()."""
+        # [WS events 2026-05-17] Why: disconnected WebSocket clients must not
+        # keep receiving events or retain memory. How: remove the exact queue and
+        # drop the session list when it becomes empty. Purpose: make cleanup
+        # deterministic even when multiple clients watch the same session.
+        with self._lock:
+            queues = self._subscribers.get(session_id)
+            if not queues:
+                return
+            try:
+                queues.remove(queue)
+            except ValueError:
+                return
+            if not queues:
+                self._subscribers.pop(session_id, None)
 
     def list_events(self, *, session_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
         # 简单线性过滤（MVP）。后续可按 session 建索引或 snapshot。

@@ -1175,10 +1175,10 @@ def build_llm_messages(
         else:
             msg_mode = _normalize_tool_mode(msg_mode)
 
-        if msg_mode == current_formatter.mode:
-            msg_formatter = current_formatter
-        else:
-            msg_formatter = create_tool_formatter(msg_mode)
-
-        result.append(msg_formatter.message_to_llm(msg))
+        # [2026-05-14] 统一用 current_formatter 处理所有消息，不按消息自身 mode 路由。
+        # 原因：选了 json 模式就应该把所有历史消息（包括 native 存储的）都翻译为
+        # json 文本格式，而不是原样保留 role=tool + tool_calls 结构。
+        # 各 formatter 的 message_to_llm 已有跨模式兼容逻辑（如 json/fake-native
+        # 都能将 role=tool 转为 user 文本）。
+        result.append(current_formatter.message_to_llm(msg))
     return result

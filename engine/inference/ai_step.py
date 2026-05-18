@@ -46,7 +46,14 @@ from ..protocol import (
 from ..tool_step import result_to_raw, summarize_result
 # [2026-04-24] P1.5 熔断器：新增 record_compact_failure, record_compact_success, is_compact_circuit_open
 # 用于在连续压缩失败时跳过自动压缩，避免浪费 API 调用。
-from ..compact import should_compact, _format_messages_for_summary, record_compact_failure, record_compact_success, is_compact_circuit_open
+from ..compact import (
+    _format_messages_for_summary,
+    count_real_task_segments,
+    is_compact_circuit_open,
+    record_compact_failure,
+    record_compact_success,
+    should_compact,
+)
 from clonoth_runtime import get_int, get_float, load_runtime_config
 from toolbox.context import ToolContext
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
@@ -227,6 +234,31 @@ async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
         return None
 
     # ---------------------------------------------------------------
+    # Pre-check: count task segments in ConversationStore. If there
+    # are not enough segments to compress (≤ keep_recent), skip the
+    # LLM compactor call entirely to avoid wasting API calls.
+    # ---------------------------------------------------------------
+    try:
+        _conv_store = getattr(ls.rctx, 'conversation_store', None)
+        if _conv_store:
+            _stored_msgs = _conv_store.load(compact_sid)
+            # [2026-05-17] Why: compact_summary is the prior compressed prefix,
+            # not a real task segment. How: use the shared segment counter that
+            # skips compact_summary and counts only consecutive real task ids.
+            # Purpose: this legacy ai_step path stays aligned with builtin
+            # compact and stops dispatching when only keep_recent real tasks remain.
+            _seg_count = count_real_task_segments(_stored_msgs)
+            if _seg_count <= ls.compact_keep_recent:
+                logger.info(
+                    "skip compact: only %d task segments (keep_recent=%d), not enough to compress",
+                    _seg_count, ls.compact_keep_recent,
+                )
+                ls.compacted = True  # prevent retrigger this step
+                return None
+    except Exception as _seg_err:
+        logger.warning("segment pre-check failed, proceeding with compact: %s", _seg_err)
+
+    # ---------------------------------------------------------------
     # P6 Snip Compact (Level 2): 用已有轮摘要替换旧 task 消息链
     # 在 dispatch LLM compactor 前先尝试，可能免去 LLM 调用
     # ---------------------------------------------------------------
@@ -308,6 +340,7 @@ async def _check_and_compact(ls: _LoopState, step: int) -> TaskAction | None:
                     "_compact_dispatch": True,
                     "context_mode": "fresh",
                     "_compact_keep_recent": ls.compact_keep_recent,
+                    "_compact_threshold_tokens": ls.compact_threshold,
                     # [AutoC 2026-05-13] Why: supervisor applies the compactor
                     # result after dispatch returns, and branch session ids are
                     # temporary. How: carry the parent-first target session in the
@@ -819,6 +852,11 @@ async def _execute_real_tools(
         registry=ls.registry,
         task_id=ls.rctx.task_id,
         session_generation=ls.rctx.session_generation,
+        # [Fork/Merge 2026-05-17] Why: real tools may call supervisor APIs while
+        # their node is running on a branch session. How: pass RunContext's parent
+        # route session into ToolContext. Purpose: tool events, approvals, and
+        # session-scoped built-ins stay attached to the durable user session.
+        parent_session_id=getattr(ls.rctx, "parent_session_id", "") or "",
     )
 
     _tool_entries: list[dict[str, Any]] = []
@@ -890,6 +928,18 @@ async def _execute_real_tools(
         _is_async = _spec.get("async_mode", False) if _spec else False
 
         if _is_async:
+            # [WS tool events 2026-05-17] Why: WebSocket clients need structured
+            # tool lifecycle events in the durable EventLog, not only localized
+            # handoff_progress text. How: emit a non-transient start event before
+            # the async tool is scheduled. Purpose: reconnecting clients can replay
+            # the tool start through the existing EventLog catch-up path.
+            await ls.rctx.emit_event("tool_call_start", {
+                "node_id": ls.node.id,
+                "task_id": ls.rctx.task_id,
+                "tool_call_id": _rtc.get("id", ""),
+                "tool_name": _t_name,
+                "arguments": _t_args,
+            })
             _cleanup_async_tracker()
             _async_id = uuid.uuid4().hex[:8]
             _async_tool_tasks[_async_id] = {
@@ -916,6 +966,7 @@ async def _execute_real_tools(
                 ),
                 name=f"async_tool_{_t_name}_{_async_id}",
             )
+            _async_summary = f"异步执行已启动 (id: {_async_id})，结果将通过 preempt 自动回传"
             _tool_entries.append({
                 "id": _rtc.get("id", ""),
                 "name": _t_name,
@@ -924,7 +975,20 @@ async def _execute_real_tools(
                 "raw_inline": f'\u23f3 Async tool "{_t_name}" started (id: {_async_id}). Result will be delivered via preempt when ready.',
                 "truncated": False,
                 "ref": "",
-                "summary": f"异步执行已启动 (id: {_async_id})，结果将通过 preempt 自动回传",
+                "summary": _async_summary,
+            })
+            # [WS tool events 2026-05-17] Why: async tools return control before
+            # the real result exists, so clients still need a lifecycle closure for
+            # this immediate call. How: emit tool_call_end with async_started rather
+            # than success or error. Purpose: UIs can show that the background task
+            # was accepted while waiting for the later preempt-delivered result.
+            await ls.rctx.emit_event("tool_call_end", {
+                "node_id": ls.node.id,
+                "task_id": ls.rctx.task_id,
+                "tool_call_id": _rtc.get("id", ""),
+                "tool_name": _t_name,
+                "status": "async_started",
+                "summary": _async_summary,
             })
             await ls.rctx.emit_event("handoff_progress", {
                 "message": f"[{ls.node.id}] {_t_name}: 异步执行已启动",
@@ -934,6 +998,17 @@ async def _execute_real_tools(
             continue
 
         # ---- 同步工具：阻塞等待执行完成（原有逻辑）----
+        # [WS tool events 2026-05-17] Why: handoff_progress remains for legacy
+        # consumers, but the web UI needs structured lifecycle data. How: emit a
+        # durable tool_call_start immediately before the SignalBus span. Purpose:
+        # the EventLog can replay the exact tool name, call id, and arguments.
+        await ls.rctx.emit_event("tool_call_start", {
+            "node_id": ls.node.id,
+            "task_id": ls.rctx.task_id,
+            "tool_call_id": _rtc.get("id", ""),
+            "tool_name": _t_name,
+            "arguments": _t_args,
+        })
         # Phase 2 Signal: tool.call span 包裹每个工具的执行过程。
         # 自动发射 tool.call.start（含工具名和参数摘要）和 tool.call.end（含 elapsed_ms 和 error）。
         # span 是同步 contextmanager，在 async 函数中直接 with 即可。
@@ -958,6 +1033,20 @@ async def _execute_real_tools(
             "raw_inline": _t_raw_inline,
             "truncated": False,  # [2026-04-17] 截断机制已移除，保留字段兼容 format_tool_trace
             "ref": "",
+            "summary": _t_summary,
+        })
+
+        # [WS tool events 2026-05-17] Why: clients should receive a structured
+        # completion event even when a tool reports an error dict or cancellation
+        # stops later progress messages. How: derive status from the tool result's
+        # error field and emit before any legacy handoff_progress path. Purpose:
+        # reconnecting clients can reconstruct completed tool calls from EventLog.
+        await ls.rctx.emit_event("tool_call_end", {
+            "node_id": ls.node.id,
+            "task_id": ls.rctx.task_id,
+            "tool_call_id": _rtc.get("id", ""),
+            "tool_name": _t_name,
+            "status": "cancelled" if _t_cancelled else ("error" if (isinstance(_t_result, dict) and _t_result.get("error")) else "success"),
             "summary": _t_summary,
         })
 

@@ -74,6 +74,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._cancelled_sessions: set[str] = set()
         self._tools_reload_seq: int = 0
         self.session_entry_overrides: dict[str, str] = {}  # session_id -> node_id (AI switch)
+        self.session_last_entry_node: dict[str, str] = {}  # session_id -> last used entry node
         self._session_context_usage: dict[str, dict[str, Any]] = {}  # session_id -> latest usage
         self._engine_generations: dict[str, str] = {}  # worker_id -> generation_id (Direction 2)
         self._pending_restart_notify: str | None = None  # session_id to notify after engine registers
@@ -126,6 +127,17 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         if loaded_parent_children:
             for psid, children in loaded_parent_children.items():
                 self.parent_children.setdefault(psid, set()).update(children)
+        # [Fork/Merge 2026-05-17] Why: sessions.json stores entry branches as
+        # child sessions with node_id="__entry_branch__", but the fast branch→parent
+        # indexes are in-memory only. How: rebuild those indexes from the loaded
+        # child registry before event replay. Purpose: public APIs and async
+        # dispatch can resolve branch sessions correctly after supervisor restart.
+        for psid, children in self.parent_children.items():
+            for child_sid in children:
+                raw = self._session_store._registry.get(child_sid)
+                if isinstance(raw, dict) and raw.get("node_id") == "__entry_branch__":
+                    self.entry_branch_parents[child_sid] = psid
+                    self.parent_entry_branches.setdefault(psid, set()).add(child_sid)
 
         self.rebuild_from_events(eventlog.events)
 
@@ -313,41 +325,57 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         if not sid:
             return {"ok": False, "error": "session_id required"}
         with self._lock:
-            if sid not in self.sessions:
+            # [Fork/Merge 2026-05-17] Why: switch_node can be invoked from an
+            # entry branch, but future inbound routing reads overrides from the
+            # parent session. How: normalize the supplied session id before
+            # mutating session_entry_overrides or writing node_switch. Purpose:
+            # the switch survives branch merge/cleanup.
+            route_sid = self._route_session_id_for_session_locked(sid)
+            if route_sid not in self.sessions:
                 return {"ok": False, "error": "session not found"}
             default_node = self._default_entry_node()
             if target and target != default_node:
-                self.session_entry_overrides[sid] = target
+                self.session_entry_overrides[route_sid] = target
             else:
-                self.session_entry_overrides.pop(sid, None)
+                self.session_entry_overrides.pop(route_sid, None)
                 target = ""  # 清除覆盖
             self.eventlog.append(
-                session_id=sid,
+                session_id=route_sid,
                 component="engine",
                 type_="node_switch",
                 payload={
                     "target_node_id": target,
                     "default_node_id": default_node,
                     "ts": _now().isoformat(),
+                    "requested_session_id": sid,
                 },
             )
             return {
                 "ok": True,
-                "session_id": sid,
+                "session_id": route_sid,
                 "target_node_id": target or default_node,
                 "is_override": bool(target),
             }
 
     def get_session_active_node(self, session_id: str) -> dict[str, Any]:
-        """获取 session 当前实际使用的入口节点。"""
+        """获取 session 当前实际使用的入口节点。
+        优先级: AI switch override > 上次 inbound 实际用的节点 > 全局默认"""
         sid = (session_id or "").strip()
         with self._lock:
-            override = self.session_entry_overrides.get(sid, "").strip()
+            # [Fork/Merge 2026-05-17] Why: callers may ask using a branch id seen
+            # in task metadata. How: resolve entry branches to their parent before
+            # reading override/last-entry maps. Purpose: active-node queries match
+            # the session that will receive the next inbound.
+            route_sid = self._route_session_id_for_session_locked(sid)
+            override = self.session_entry_overrides.get(route_sid, "").strip()
+            last_used = self.session_last_entry_node.get(route_sid, "").strip()
             default_node = self._default_entry_node()
+            node_id = override or last_used or default_node
             return {
-                "node_id": override or default_node,
+                "node_id": node_id,
                 "is_override": bool(override),
                 "default_node_id": default_node,
+                "session_id": route_sid,
             }
 
     # ------------------------------------------------------------------ #

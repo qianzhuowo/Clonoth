@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import sys
@@ -9,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import Response
 
@@ -54,6 +56,45 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+# [WS events 2026-05-17] Why: WebSocket clients should keep long-lived event
+# streams through proxies. How: send an application-level ping at this cadence
+# when no EventLog row is available. Purpose: avoid idle timeout without changing
+# the EventLog schema.
+_WS_HEARTBEAT_SEC = 30.0
+
+# [WS events 2026-05-17] Why: clients may optionally send {"last_seq": n}
+# immediately after connect, but old clients may send nothing. How: wait briefly
+# for that first message and then default to zero. Purpose: support both replayed
+# and fresh streams without blocking connection setup forever.
+_WS_INITIAL_MESSAGE_TIMEOUT_SEC = 0.5
+
+
+def _parse_ws_initial_last_seq(message: str) -> int:
+    """Parse the optional initial WebSocket message into a non-negative seq."""
+    # [WS events 2026-05-17] Why: the WebSocket handshake is intentionally loose
+    # to keep compatibility with simple clients. How: malformed JSON or invalid
+    # values fall back to zero. Purpose: clients can connect without a setup frame.
+    try:
+        data = json.loads(message or "{}")
+    except Exception:
+        return 0
+    if not isinstance(data, dict):
+        return 0
+    try:
+        return max(0, int(data.get("last_seq") or 0))
+    except Exception:
+        return 0
+
+
+async def _send_ws_json(websocket: WebSocket, payload: dict[str, Any]) -> None:
+    """Send one JSON object over a WebSocket as UTF-8 text."""
+    # [WS events 2026-05-17] Why: EventLog payloads are plain dicts but may later
+    # contain values FastAPI's send_json cannot serialize by default. How: use the
+    # same explicit json.dumps path for events and ping frames. Purpose: make the
+    # wire shape predictable and resilient to harmless non-string values.
+    await websocket.send_text(json.dumps(payload, ensure_ascii=False, default=str))
+
+
 def create_app(
     *,
     state: SupervisorState,
@@ -86,12 +127,14 @@ def create_app(
         return cs.get_openai_public()
 
     @app.get("/v1/config/openai/secret", response_model=OpenAIConfigSecret)
-    async def get_openai_config_secret() -> OpenAIConfigSecret:
+    async def get_openai_config_secret(request: Request) -> OpenAIConfigSecret:
+        verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
         return cs.get_openai_secret()
 
     @app.post("/v1/config/openai", response_model=AppConfigPublic)
-    async def update_openai_config(body: OpenAIConfigUpdateIn) -> AppConfigPublic:
+    async def update_openai_config(body: OpenAIConfigUpdateIn, request: Request) -> AppConfigPublic:
+        verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
         st: SupervisorState = app.state.state
 
@@ -109,7 +152,8 @@ def create_app(
         return out
 
     @app.post("/v1/config/reload", response_model=ConfigReloadOut)
-    async def reload_config() -> ConfigReloadOut:
+    async def reload_config(request: Request) -> ConfigReloadOut:
+        verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
         st: SupervisorState = app.state.state
 
@@ -313,13 +357,15 @@ def create_app(
         """Engine worker registers itself with a generation ID on startup.
 
         Direction 2: triggers cleanup of orphaned tasks from previous generations.
+        Direction 2: triggers cleanup of orphaned tasks from previous generations.
         """
         st: SupervisorState = app.state.state
         worker_id = str(body.get("worker_id") or "").strip()
         generation_id = str(body.get("generation_id") or "").strip()
         if not worker_id or not generation_id:
             raise HTTPException(status_code=400, detail="worker_id and generation_id required")
-        return st.register_engine(worker_id, generation_id)
+        result = st.register_engine(worker_id, generation_id)
+        return result
 
     @app.get("/v1/tools/reload-seq")
     async def tools_reload_seq() -> dict[str, Any]:
@@ -383,6 +429,96 @@ def create_app(
                 continue
         return out
 
+    @app.websocket("/v1/sessions/{session_id}/ws")
+    async def session_ws(websocket: WebSocket, session_id: str) -> None:
+        """Stream durable EventLog rows for one session over WebSocket."""
+        st: SupervisorState = app.state.state
+        if session_id not in st.sessions:
+            await websocket.close(code=4004, reason="session not found")
+            return
+        await websocket.accept()
+
+        last_seq = 0
+        try:
+            initial_message = await asyncio.wait_for(
+                websocket.receive_text(),
+                timeout=_WS_INITIAL_MESSAGE_TIMEOUT_SEC,
+            )
+            last_seq = _parse_ws_initial_last_seq(initial_message)
+        except asyncio.TimeoutError:
+            last_seq = 0
+        except WebSocketDisconnect:
+            return
+        except Exception:
+            last_seq = 0
+
+        # [WS events 2026-05-17] Why: subscribing only after replay creates a race
+        # where an event appended between list_events() and subscribe() is lost.
+        # How: subscribe first, replay EventLog rows next, then skip queued rows at
+        # or below the highest sent seq. Purpose: clients still observe catch-up
+        # before live delivery while the server closes the replay/live gap.
+        queue = st.eventlog.subscribe(session_id)
+        sent_seq = last_seq
+        receive_task: asyncio.Task | None = None
+        try:
+            for evt in st.list_events(session_id=session_id, after_seq=last_seq):
+                await _send_ws_json(websocket, evt)
+                try:
+                    sent_seq = max(sent_seq, int(evt.get("seq", 0) or 0))
+                except Exception:
+                    pass
+
+            receive_task = asyncio.create_task(websocket.receive_text())
+            while True:
+                event_task = asyncio.create_task(queue.get())
+                done, _pending = await asyncio.wait(
+                    {event_task, receive_task},
+                    timeout=_WS_HEARTBEAT_SEC,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if not done:
+                    event_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await event_task
+                    await _send_ws_json(websocket, {"type": "ping"})
+                    continue
+
+                if event_task in done:
+                    evt = event_task.result()
+                    try:
+                        evt_seq = int(evt.get("seq", 0) or 0)
+                    except Exception:
+                        evt_seq = 0
+                    if evt_seq > sent_seq:
+                        await _send_ws_json(websocket, evt)
+                        sent_seq = evt_seq
+                else:
+                    event_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await event_task
+
+                if receive_task in done:
+                    try:
+                        receive_task.result()
+                    except WebSocketDisconnect:
+                        break
+                    except Exception:
+                        break
+                    # [WS events 2026-05-17] Why: clients may send harmless control
+                    # frames after the initial last_seq. How: consume and ignore the
+                    # text, then wait for the next client frame. Purpose: a normal
+                    # client message does not terminate the event stream.
+                    receive_task = asyncio.create_task(websocket.receive_text())
+        except WebSocketDisconnect:
+            pass
+        finally:
+            if receive_task is not None and not receive_task.done():
+                receive_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await receive_task
+            st.eventlog.unsubscribe(session_id, queue)
+
     @app.get("/v1/events", response_model=list[Event])
     async def global_events(
         after_seq: int = Query(0, ge=0),
@@ -441,10 +577,72 @@ def create_app(
             st.update_context_usage(session_id, dict(ev.payload or {}))
         return {"ok": True}
 
+    @app.get("/v1/sessions")
+    async def list_sessions(
+        channel: str = Query("", description="Filter by channel (e.g. 'web')"),
+        limit: int = Query(50, ge=1, le=200),
+    ) -> list[dict[str, Any]]:
+        """List sessions, optionally filtered by channel."""
+        st: SupervisorState = app.state.state
+        results = []
+        for sid, si in st.sessions.items():
+            if channel and si.channel != channel:
+                continue
+            results.append({
+                "session_id": si.session_id,
+                "conversation_key": si.conversation_key,
+                "channel": si.channel,
+                "created_at": si.created_at.isoformat() if si.created_at else "",
+                "updated_at": si.updated_at.isoformat() if si.updated_at else "",
+            })
+        # Sort by updated_at desc, most recent first
+        results.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
+        return results[:limit]
+
+    @app.delete("/v1/sessions/{session_id}")
+    async def delete_session(session_id: str) -> dict[str, Any]:
+        """Delete a session and its conversation store."""
+        st: SupervisorState = app.state.state
+        if session_id not in st.sessions:
+            raise HTTPException(status_code=404, detail="session not found")
+        si = st.sessions[session_id]
+        # Remove from sessions and conversation_map
+        with st._lock:
+            del st.sessions[session_id]
+            conv_key = si.conversation_key
+            if conv_key and st.conversation_map.get(conv_key) == session_id:
+                del st.conversation_map[conv_key]
+        # Delete ConversationStore JSONL
+        try:
+            from pathlib import Path
+            from engine.conversation_store import ConversationStore
+            conv_store = ConversationStore(Path(st.workspace_root) / "data" / "conversations")
+            conv_store.delete(session_id)
+        except Exception:
+            pass
+        # Clean up node contexts
+        try:
+            from engine.context_store import cleanup_session_contexts
+            cleanup_session_contexts(st.workspace_root, session_id)
+        except Exception:
+            pass
+        # Mark as reset in sessions.json
+        try:
+            st._session_store.on_session_reset(session_id)
+        except Exception:
+            pass
+        return {"ok": True, "session_id": session_id}
+
     @app.get("/v1/sessions/{session_id}/messages")
     async def session_messages(session_id: str, limit: int = Query(50, ge=0, le=500)) -> list[dict[str, Any]]:
         st: SupervisorState = app.state.state
         return st.session_messages(session_id=session_id, limit=limit)
+
+    @app.get("/v1/sessions/{session_id}/history")
+    async def session_history(session_id: str, limit: int = Query(200, ge=0, le=1000)) -> list[dict[str, Any]]:
+        """Structured message history from ConversationStore (for web frontend)."""
+        st: SupervisorState = app.state.state
+        return st.session_history_structured(session_id=session_id, limit=limit)
 
     @app.post("/v1/sessions/{session_id}/cancel")
     async def session_cancel(session_id: str) -> dict[str, Any]:
@@ -509,9 +707,15 @@ def create_app(
     ) -> dict[str, Any]:
         """取消 session 中所有活跃 task。供 AI 工具调用。"""
         st: SupervisorState = app.state.state
-        if session_id not in st.sessions:
-            raise HTTPException(status_code=404, detail="session not found")
-        return st.cancel_active_tasks(session_id, exclude_task_id=exclude_task_id)
+        with st._lock:
+            # [Fork/Merge 2026-05-17] Why: this endpoint can still be called with
+            # a branch id from ToolContext in older workers. How: normalize entry
+            # branches to the parent before cancellation. Purpose: sibling branches
+            # under the same user conversation are included.
+            route_session_id = st._route_session_id_for_session_locked(session_id)
+            if route_session_id not in st.sessions:
+                raise HTTPException(status_code=404, detail="session not found")
+        return st.cancel_active_tasks(route_session_id, exclude_task_id=exclude_task_id)
 
     @app.post("/v1/sessions/{session_id}/switch_node")
     async def session_switch_node(session_id: str, body: dict[str, Any]) -> dict[str, Any]:
@@ -530,9 +734,15 @@ def create_app(
     async def session_context_window(session_id: str) -> dict[str, Any]:
         """获取 session 当前上下文窗口的 token 用量信息。"""
         st: SupervisorState = app.state.state
-        if session_id not in st.sessions:
-            raise HTTPException(status_code=404, detail="session not found")
-        return st.get_session_context_usage(session_id)
+        with st._lock:
+            # [Fork/Merge 2026-05-17] Why: context_usage events are emitted on the
+            # parent route session while branch sessions are temporary storage.
+            # How: normalize entry branches to the parent for this read endpoint.
+            # Purpose: get_context_window reports real session usage.
+            route_session_id = st._route_session_id_for_session_locked(session_id)
+            if route_session_id not in st.sessions:
+                raise HTTPException(status_code=404, detail="session not found")
+        return st.get_session_context_usage(route_session_id)
 
     @app.post("/v1/approvals/request", response_model=Approval)
     async def approval_request(inp: ApprovalRequestIn) -> Approval:
@@ -560,12 +770,14 @@ def create_app(
         return st.request_operation(session_id=inp.session_id, op=inp.op, parameters=inp.parameters)
 
     @app.get("/v1/admin/state", response_model=AdminStateOut)
-    async def admin_state() -> AdminStateOut:
+    async def admin_state(request: Request) -> AdminStateOut:
+        verify_admin_token(request)
         st: SupervisorState = app.state.state
         return st.admin_state()
 
     @app.post("/v1/admin/restart", response_model=RestartOut)
-    async def admin_restart(inp: RestartIn) -> RestartOut:
+    async def admin_restart(inp: RestartIn, request: Request) -> RestartOut:
+        verify_admin_token(request)
         pm: ProcessManager | None = app.state.process_manager
         st: SupervisorState = app.state.state
 
@@ -747,6 +959,11 @@ def create_app(
         context_key = str(body.get("context_key") or "").strip() or None
         source_inbound_seq = body.get("source_inbound_seq")
         caller_node_id = str(body.get("caller_node_id") or "").strip()
+        # [Fork/Merge 2026-05-17] Why: newer engine workers include the parent
+        # route session when an async dispatch is requested from a branch. How:
+        # read it as a fallback for branch index recovery. Purpose: async children
+        # are anchored to the durable conversation even if branch indexes are stale.
+        parent_session_id = str(body.get("parent_session_id") or "").strip()
         # [2026-04-22] 读取父节点传来的附件列表，透传到 input_data 供 runner.py 消费
         attachments = body.get("attachments")
 
@@ -774,22 +991,44 @@ def create_app(
                 pass
 
         with st._lock:
+            # [2026-05-14] 异步子任务应挂到 parent session 而非 caller 的 branch。
+            # 问题：caller 跑在 entry branch 上，caller finish 后 branch 被清理，
+            # 导致异步子任务被连带 cancelled。
+            # 修复：如果 session_id 是 entry branch，追溯到 parent session。
+            # 子任务完成后 _inject_async_dispatch_result_locked 会往 parent 注入
+            # inbound 并 fork 新 branch 处理结果，路径不受影响。
+            st._ensure_entry_branch_indexes_locked()
+            _task_session_id = session_id
+            _task_generation = session_generation
+            _parent_of_branch = st.entry_branch_parents.get(session_id)
+            if not _parent_of_branch and parent_session_id:
+                # [Fork/Merge 2026-05-17] Why: a restarted supervisor may have to
+                # infer branch ancestry from the request payload or sessions.json.
+                # How: trust parent_session_id only when the supplied session is an
+                # entry branch for that parent. Purpose: avoid misrouting ordinary
+                # child sessions while recovering branch async dispatch routing.
+                if st._is_entry_branch_session_locked(session_id, parent_session_id=parent_session_id):
+                    _parent_of_branch = parent_session_id
+            if _parent_of_branch:
+                _task_session_id = _parent_of_branch
+                _task_generation = st._current_session_generation_locked(_task_session_id) or 1
+
             # Child Session 隔离（Phase B）：async dispatch 也走 child session
             _child_sid, _is_new = st.get_or_create_child_session(
-                session_id, node_id, context_key or "", context_mode,
+                _task_session_id, node_id, context_key or "", context_mode,
             )
             input_data["child_session_id"] = _child_sid
             input_data["context_mode"] = context_mode
             input_data["use_context"] = False
             if context_mode == "fork":
-                input_data["fork_from_session_id"] = session_id
+                input_data["fork_from_session_id"] = _task_session_id
             # 审计报告 Step 1（2026-04-16）：删除 async dispatch 的 accumulate fallback。
             # engine/runner.py:514 在 child_session_id 非空时会无条件清空 context_ref，
             # 此 fallback 注入永远不会被消费，属于兼容期死代码。
 
             task = st._create_task_locked(
-                session_id=session_id,
-                session_generation=session_generation,
+                session_id=_task_session_id,
+                session_generation=_task_generation,
                 kind=TaskKind.node,
                 node_id=node_id,
                 input_data=input_data,
@@ -813,13 +1052,26 @@ def create_app(
 
     from fastapi import Request as _Req  # noqa: already imported above
 
-    admin_dir = state.workspace_root / "public" / "admin"
+    # 2026-05-14: admin assets moved from public/admin to platform/admin as
+    # part of the platform/ consolidation. The static route now serves the
+    # moved directory so the web console keeps working after public/ removal.
+    admin_dir = state.workspace_root / "platform" / "admin"
     admin_dir.mkdir(parents=True, exist_ok=True)
     app.mount("/admin", StaticFiles(directory=str(admin_dir), html=True), name="admin")
 
-    # 启动时打印 token
+    # [2026-05-16] Web chat frontend
+    web_dist = state.workspace_root / "platform" / "web" / "frontend" / "dist"
+    if web_dist.is_dir():
+        app.mount("/web", StaticFiles(directory=str(web_dist), html=True), name="web")
+        print(f"[web] 前端地址: http://{{host}}:{{port}}/web/", flush=True)
+
+    # 启动时打印 token 并写入共享文件供 engine 读取
     token = get_admin_token()
+    _token_file = state.workspace_root / "data" / ".admin_token"
+    _token_file.parent.mkdir(parents=True, exist_ok=True)
+    _token_file.write_text(token, encoding="utf-8")
     print(f"[admin] 管理界面地址: http://{{host}}:{{port}}/admin/", flush=True)
     print(f"[admin] 管理 Token: {token}", flush=True)
+    print(f"[admin] Token 已写入: {_token_file}", flush=True)
 
     return app

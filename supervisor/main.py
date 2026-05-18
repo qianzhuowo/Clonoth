@@ -26,7 +26,9 @@ from .types import TaskStatus
 
 
 def main() -> None:
-    load_dotenv()
+    # [2026-05-14] override=True: .env 文件值覆盖继承的环境变量。
+    # 多实例部署时，每个实例读自己 cwd 下的 .env，互不干扰。
+    load_dotenv(override=True)
 
     parser = argparse.ArgumentParser(description="Clonoth Supervisor")
     parser.add_argument("--host", default=os.getenv("CLONOTH_HOST", "127.0.0.1"))
@@ -165,14 +167,25 @@ def main() -> None:
                         if not task.lease_expires_at:
                             continue
                         if task.lease_expires_at + _GRACE < now:
-                            # 如果该 task 所属 session 有待审批，跳过回收
-                            if task.session_id in _sessions_with_pending_approval:
+                            # [Fork/Merge 2026-05-17] Why: approvals and user-visible
+                            # events may now be attached to the parent route session
+                            # while the running task itself is on a branch. How: check
+                            # both runtime and route session before reaping. Purpose:
+                            # approval waits are not killed because of branch routing.
+                            route_session_id = state._route_session_id_for_task_locked(task)
+                            if task.session_id in _sessions_with_pending_approval or route_session_id in _sessions_with_pending_approval:
                                 continue
                             task.status = TaskStatus.failed
                             task.updated_at = now
                             task.lease_expires_at = None
                             task.result = {"action": "fail", "error": "lease expired (zombie reaped by background)"}
                             state._event_task_snapshot("task_completed", task)
+                            # [Fork/Merge 2026-05-17] Why: failing a branch task must
+                            # still merge/cleanup the branch and emit a parent-routed
+                            # error response. How: reuse the normal completion router
+                            # after recording the task snapshot. Purpose: background
+                            # zombie reaping follows the same terminal path as API reaping.
+                            state._route_completed_task_locked(task)
                             _log(f"[zombie-reaper] reaped task {task.task_id[:12]} node={task.node_id}")
             except Exception as e:
                 _log(f"[zombie-reaper] error: {e}")

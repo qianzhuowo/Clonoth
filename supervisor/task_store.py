@@ -190,6 +190,8 @@ class TaskStoreMixin:
             or str(payload.get("entry_node_id") or "").strip()
             or default_node
         )
+        # Record the actual entry node used for this session (for getActiveNode API)
+        self.session_last_entry_node[session_id] = entry_node
         generation = self._current_session_generation_locked(session_id) or 1
         if not self.session_generations.get(session_id):
             self.session_generations[session_id] = generation
@@ -475,11 +477,26 @@ class TaskStoreMixin:
             task.preempt_message = message
             if attachments:
                 task.preempt_attachments = attachments
+            # [Fork/Merge 2026-05-17] Why: a task can be running inside a
+            # temporary entry branch, but session event consumers watch the
+            # durable parent session. How: use the task route helper when the
+            # supervisor includes it, and keep the runtime branch id in the
+            # payload for diagnostics. Purpose: accepted preempt requests remain
+            # visible without changing the task-local preempt flag semantics.
+            route_for_task = getattr(self, "_route_session_id_for_task_locked", None)
+            route_session_id = (
+                str(route_for_task(task) or "").strip()
+                if callable(route_for_task)
+                else ""
+            ) or task.session_id
+            payload = {"task_id": task_id, "session_id": route_session_id, "has_message": bool(message)}
+            if route_session_id != task.session_id:
+                payload["runtime_session_id"] = task.session_id
             self.eventlog.append(
-                session_id=task.session_id,
+                session_id=route_session_id,
                 component="supervisor",
                 type_="preempt_requested",
-                payload={"task_id": task_id, "session_id": task.session_id, "has_message": bool(message)},
+                payload=payload,
                 transient=True,
             )
             return True

@@ -109,6 +109,29 @@ class SessionMixin:
                 branch_ids.add(child_sid)
         return branch_ids
 
+    def _route_session_id_for_session_locked(self, session_id: str) -> str:
+        """Return the user-facing parent session for an entry branch session."""
+        # [Fork/Merge 2026-05-17] Why: public session APIs may still be called with
+        # a branch_xxx runtime id from older engine paths or task metadata. How:
+        # resolve active branch indexes first, then sessions.json entry-branch
+        # records, and fall back to the original id for normal sessions. Purpose:
+        # switch_node/context/cancel endpoints mutate the durable conversation.
+        self._ensure_entry_branch_indexes_locked()
+        sid = str(session_id or "").strip()
+        if not sid:
+            return ""
+        parent = self.entry_branch_parents.get(sid, "")
+        if parent:
+            return parent
+        entry = getattr(self, "_session_store", None)
+        registry = getattr(entry, "_registry", {}) if entry is not None else {}
+        raw = registry.get(sid) if isinstance(registry, dict) else None
+        if isinstance(raw, dict) and raw.get("node_id") == "__entry_branch__":
+            stored_parent = str(raw.get("parent_session_id") or "").strip()
+            if stored_parent:
+                return stored_parent
+        return sid
+
     def _remove_child_mapping_for_session_locked(self, child_session_id: str) -> None:
         """Remove child_session_map entries that point at one session id."""
         # [Fork/Merge 2026-05-12] 分支清理需要删除 branch 自身及其派生 child。
@@ -797,6 +820,49 @@ class SessionMixin:
         if limit > 0:
             msgs = msgs[-limit:]
         return msgs
+
+    # ---- 结构化历史 (ConversationStore) ----
+
+    def session_history_structured(self, *, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        """Read structured messages from ConversationStore for web frontend.
+
+        Returns Message objects with thinking, tool_calls, and tool results
+        as structured fields rather than flattened text.
+        """
+        from pathlib import Path
+        from engine.conversation_store import ConversationStore
+
+        store = ConversationStore(Path(self.workspace_root) / "data" / "conversations")
+        messages = store.load(session_id)
+
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            entry: dict[str, Any] = {
+                "id": msg.id,
+                "role": msg.role,
+                "content": msg.content,
+                "message_type": msg.message_type,
+                "created_at": msg.created_at,
+                "source_node_id": msg.source_node_id,
+            }
+            # Extract thinking/reasoning from meta
+            if isinstance(msg.meta, dict):
+                reasoning = msg.meta.get("reasoning", "")
+                if reasoning:
+                    entry["thinking"] = reasoning
+            # Tool calls (assistant requesting tools)
+            if msg.tool_calls:
+                entry["tool_calls"] = msg.tool_calls
+            # Tool result fields
+            if msg.tool_call_id:
+                entry["tool_call_id"] = msg.tool_call_id
+            if msg.name:
+                entry["tool_name"] = msg.name
+            result.append(entry)
+
+        if limit > 0:
+            result = result[-limit:]
+        return result
 
     # ---- 上下文窗口用量 ----
 

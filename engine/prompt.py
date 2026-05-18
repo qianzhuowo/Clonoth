@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import locale
-import platform
+# 2026-05-14: platform/ is now a project package, so this module aliases the
+# standard-library platform import explicitly. This keeps OS metadata collection
+# using the stdlib API while avoiding confusion with platform.shell imports.
+import platform as _stdlib_platform
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,8 +67,8 @@ def _build_variables(
     merged.setdefault("now", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
     merged.setdefault("default_language", "zh-CN")
     merged.setdefault("workspace_root", str(workspace_root.resolve()))
-    merged.setdefault("os_name", platform.system())
-    merged.setdefault("os_version", platform.version())
+    merged.setdefault("os_name", _stdlib_platform.system())
+    merged.setdefault("os_version", _stdlib_platform.version())
     merged.setdefault("timezone", str(datetime.now().astimezone().tzinfo or "UTC"))
     merged.setdefault("user_language", locale.getdefaultlocale()[0] or "en_US")
     return merged

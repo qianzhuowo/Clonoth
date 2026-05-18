@@ -417,10 +417,11 @@ async def _register_engine(
     supervisor_url: str,
     worker_id: str,
     generation_id: str,
-) -> None:
+) -> dict[str, Any] | None:
     """Register this engine instance with supervisor (Direction 2: Generation ID).
 
     Triggers cleanup of orphaned tasks from previous engine instances.
+    Returns the registration response dict.
     """
     try:
         r = await http.post(
@@ -434,10 +435,13 @@ async def _register_engine(
                 print(f"[engine] registered generation {generation_id[:8]}, cancelled {orphans} orphan(s)", flush=True)
             else:
                 print(f"[engine] registered generation {generation_id[:8]}", flush=True)
+            return data
         else:
             print(f"[engine] registration failed: HTTP {r.status_code}", flush=True)
+            return None
     except Exception as e:
         print(f"[engine] failed to register with supervisor: {e}", flush=True)
+        return None
 
 
 async def wait_supervisor(
@@ -471,14 +475,30 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
     poll_sec = get_float(runtime_cfg, "engine.poll_interval_sec", 1.0, min_value=0.1, max_value=60.0)
     max_workers = get_int(runtime_cfg, "engine.max_workers", 4, min_value=1, max_value=32)
 
+    # Resolve admin token: env var > shared file > (removed: register response)
+    _admin_token = os.environ.get("CLONOTH_ADMIN_TOKEN", "").strip()
+    if not _admin_token:
+        _token_file = workspace_root / "data" / ".admin_token"
+        if _token_file.is_file():
+            _admin_token = _token_file.read_text(encoding="utf-8").strip()
+            if _admin_token:
+                print("[engine] loaded admin token from shared file", flush=True)
+
+    _sup_headers: dict[str, str] = {"User-Agent": "Clonoth"}
+    if _admin_token:
+        _sup_headers["Authorization"] = f"Bearer {_admin_token}"
+
     async with (
-        httpx.AsyncClient(timeout=sup_timeout, trust_env=False, headers={"User-Agent": "Clonoth"}) as http,
+        httpx.AsyncClient(timeout=sup_timeout, trust_env=False, headers=_sup_headers) as http,
         httpx.AsyncClient(timeout=llm_timeout, trust_env=False, headers={"User-Agent": "Clonoth"}) as llm_http,
     ):
         await wait_supervisor(http, supervisor_url)
 
         # Direction 2: register generation with supervisor, triggering orphan cleanup
-        await _register_engine(http, supervisor_url, wid, generation_id)
+        _reg_result = await _register_engine(http, supervisor_url, wid, generation_id)
+
+        # Token should already be resolved from env or shared file above.
+        # Register no longer returns admin_token to avoid API-based token leakage.
 
         mcp_count = await registry.load_mcp_tools()
         if mcp_count:
@@ -957,11 +977,19 @@ async def _run_tool_task(
     tool_name = str(task.get("tool_name") or "").strip() or str(input_data.get("tool_name") or "").strip()
     arguments = dict(input_data.get("arguments") or {})
 
+    # [Fork/Merge 2026-05-17] Why: standalone tool tasks can be spawned under
+    # an entry branch but still need user-visible supervisor side effects to route
+    # to the parent session. How: read parent_session_id propagated in task input.
+    # Purpose: tool-task approvals, progress, and session-scoped built-ins avoid
+    # temporary branch sessions.
+    parent_session_id = str(input_data.get("parent_session_id") or "").strip()
     kctx = ToolContext(
         supervisor_url=sup_url, session_id=session_id, run_id=task_id,
         worker_id=worker_id, workspace_root=ws_root, http=http,
         registry=registry, task_id=task_id,
-        session_generation=session_generation, approval_poll_interval_sec=0.5,
+        session_generation=session_generation,
+        parent_session_id=parent_session_id,
+        approval_poll_interval_sec=0.5,
     )
 
     await kctx.emit_event("handoff_progress", {

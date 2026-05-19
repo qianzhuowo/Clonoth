@@ -163,7 +163,6 @@ class MemoryExtractHandler:
                 last_count,
             )
             if current_count > last_count:
-                log.warning("memory_extract TRACE: scheduling FALLBACK timer (%ds) for session %s", fallback_delay, session_id)
                 # [2026-05-18] Why: short conversations with new messages used to
                 # return here forever when they never reached min_increment. How:
                 # prepare the same pending extraction range as the normal path but
@@ -176,6 +175,7 @@ class MemoryExtractHandler:
                     min_value=5,
                     max_value=3600,
                 )
+                log.warning("memory_extract TRACE: scheduling FALLBACK timer (%ds) for session %s", fallback_delay, session_id)
                 pending_extract = self._prepare_memory_extract_pending_locked(
                     ctx=ctx,
                     task=task,

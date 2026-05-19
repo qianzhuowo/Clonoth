@@ -318,6 +318,18 @@ class EventRouter:
             trigger = self._state.get_trigger(src_seq)
             if trigger:
                 trigger.task_id = task_id
+                branch_session_id = str(p.get("session_id") or event.session_id or "")
+                if branch_session_id:
+                    # [2026-05-19 approval ownership fix]
+                    # Why: several platform adapters can poll the same global event stream,
+                    # and approval events may later reference the branch session instead of
+                    # the parent session. Without this mapping, an owned branch approval can
+                    # look unowned, while another adapter may accidentally act on it.
+                    # How: when a root task is created from this adapter's trigger, map the
+                    # branch session back to the same conversation_key in this router's local
+                    # SessionState. Purpose: keep approval handling adapter-local and preserve
+                    # branch-session approval routing.
+                    self._state.session_conv_map.setdefault(branch_session_id, trigger.conversation_key)
                 try:
                     await self._cb.on_task_created(trigger, task_id)
                 except Exception:
@@ -665,19 +677,28 @@ class EventRouter:
             logger.warning("workspace_root not configured, treating all approvals as requiring manual review")
             is_external = True  # 没配置 workspace_root 视为全部需要人工审批
 
+        conv_key = self._state.get_conversation_key(ap_session) or ""
+        if not conv_key and result:
+            conv_key = result[1].conversation_key or ""
+        if not conv_key:
+            # [2026-05-19 approval ownership fix]
+            # Why: /v1/events is global, so every adapter process sees every approval_requested
+            # event. A QQ adapter with auto_approve_internal=True was able to auto-approve a
+            # Discord approval because this handler did not first prove that the session belongs
+            # to the current adapter. How: only handle approvals whose parent/branch session is
+            # registered in this router's local SessionState. Branch sessions are registered in
+            # _handle_task_created when source_inbound_seq matches this adapter's trigger.
+            # Purpose: approval UI and auto-approval are scoped to the adapter that submitted the
+            # inbound message, preventing cross-adapter automatic release.
+            logger.debug("approval_requested ignored by unowned router: id=%s session=%s", appr_id, ap_session)
+            return
+
         # 决定是否自动放行
+        logger.warning("APPROVAL_DEBUG: appr_id=%s conv_key=%s is_external=%s auto_approve_internal=%s => manual=%s",
+                       appr_id, conv_key, is_external, self._config.auto_approve_internal,
+                       is_external or not self._config.auto_approve_internal)
         if is_external or not self._config.auto_approve_internal:
             # 外部操作 或 bot 未开启自动放行 → 通知适配器展示审批 UI
-            conv_key = self._state.get_conversation_key(ap_session) or ""
-            # [2026-05-16] Fallback for child sessions: child_xxx sessions
-            # never appear in inbound events so session_conv_map has no entry.
-            # Walk all registered triggers to find one whose session ancestry
-            # matches, and borrow its conversation_key.
-            if not conv_key:
-                for _trig in self._state.triggers.values():
-                    if _trig.conversation_key and _trig.conversation_key.startswith("discord:"):
-                        conv_key = _trig.conversation_key
-                        break
             try:
                 await self._cb.show_approval_ui(
                     appr_id, operation, details,

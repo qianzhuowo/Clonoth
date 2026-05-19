@@ -680,17 +680,16 @@ class EventRouter:
         conv_key = self._state.get_conversation_key(ap_session) or ""
         if not conv_key and result:
             conv_key = result[1].conversation_key or ""
-        if not conv_key:
-            # [2026-05-19 approval ownership fix]
-            # Why: /v1/events is global, so every adapter process sees every approval_requested
-            # event. A QQ adapter with auto_approve_internal=True was able to auto-approve a
-            # Discord approval because this handler did not first prove that the session belongs
-            # to the current adapter. How: only handle approvals whose parent/branch session is
-            # registered in this router's local SessionState. Branch sessions are registered in
-            # _handle_task_created when source_inbound_seq matches this adapter's trigger.
-            # Purpose: approval UI and auto-approval are scoped to the adapter that submitted the
-            # inbound message, preventing cross-adapter automatic release.
-            logger.debug("approval_requested ignored by unowned router: id=%s session=%s", appr_id, ap_session)
+        # [2026-05-19 approval ownership fix v2]
+        # Why: multiple adapters (Discord + QQ) share the same Supervisor event stream.
+        # The v1 fix only checked if conv_key was empty, but branch sessions can inherit
+        # a conv_key from any adapter's trigger. How: also verify the conv_key prefix
+        # matches this adapter's conversation_key_prefix. Purpose: a QQ adapter with
+        # auto_approve_internal=True cannot auto-approve a Discord adapter's approval.
+        _prefix = self._config.conversation_key_prefix or ""
+        if not conv_key or (_prefix and not conv_key.startswith(_prefix + ":")):
+            logger.debug("approval_requested ignored (not owned by prefix=%s): id=%s session=%s conv_key=%s",
+                         _prefix, appr_id, ap_session, conv_key)
             return
 
         # 决定是否自动放行

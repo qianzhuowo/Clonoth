@@ -102,6 +102,42 @@ class TaskRouterMixin:
             or ""
         )
 
+    def _merge_branch_transcript_locked(self, parent_session_id: str, branch_session_id: str) -> int:
+        """Append branch transcript records into parent transcript, rewriting session_id.
+
+        Returns number of records merged.
+        """
+        from pathlib import Path
+        import json
+        transcript_dir = Path(self.workspace_root) / "data" / "transcripts"
+        branch_path = transcript_dir / f"{branch_session_id}.jsonl"
+        if not branch_path.exists():
+            return 0
+        parent_path = transcript_dir / f"{parent_session_id}.jsonl"
+        count = 0
+        try:
+            with open(branch_path, "r", encoding="utf-8") as bf:
+                lines = bf.readlines()
+            with open(parent_path, "a", encoding="utf-8") as pf:
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                        # Rewrite session_id so snip_history and summary write-back
+                        # can find the record under the parent session.
+                        rec["session_id"] = parent_session_id
+                        pf.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                        count += 1
+                    except json.JSONDecodeError:
+                        continue
+            if count:
+                log.info("Merged %d transcript records from %s → %s", count, branch_session_id, parent_session_id[:12])
+        except Exception as e:
+            log.warning("Failed to merge branch transcript %s: %s", branch_session_id, e)
+        return count
+
     def _finalize_branch_task_locked(self, task: Task, *, merge: bool) -> str:
         """Merge and clean an entry branch task once; return the routing session id."""
         parent_session_id = str(task.input.get("parent_session_id") or "").strip()
@@ -119,6 +155,12 @@ class TaskRouterMixin:
             except Exception:
                 base_count = 0
             merged_count = self._merge_branch_locked(parent_session_id, branch_session_id, base_count)
+            # [2026-05-19] Merge branch transcript records into parent transcript.
+            # Why: engine writes TaskRecord to branch_xxx.jsonl (keyed by task.session_id),
+            # but turn_summary and snip_history look up records in the parent transcript.
+            # How: append all branch transcript lines to parent transcript file.
+            # Purpose: ensure turn summary write-back and snip_history can find the records.
+            self._merge_branch_transcript_locked(parent_session_id, branch_session_id)
         # [Fork/Merge 2026-05-12] finalize 标记写入 task.input。
         # 原因：完成、取消、僵尸回收等路径都可能尝试收束同一个入口分支。
         # 做法：用 _branch_finalized 做进程内幂等保护，并记录 merged_count 供调试。

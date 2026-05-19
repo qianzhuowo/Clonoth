@@ -88,6 +88,8 @@ class MemoryExtractHandler:
         if task_input.get("_system_task"):
             log.debug("memory_extract gate: blocked by _system_task")
             return
+        # [TEMP DEBUG 2026-05-19] warning-level gate tracing
+        log.warning("memory_extract TRACE: entered gate check for task %s node=%s", str(getattr(task, 'task_id', '?') or '?')[:8], getattr(task, 'node_id', '?'))
 
         workspace_root = ctx.get("workspace_root")
         if workspace_root is None:
@@ -114,7 +116,7 @@ class MemoryExtractHandler:
         # avoid duplicate memory entries from automatic extraction.
         tool_names = (getattr(task, "result", None) or {}).get("_tool_names") or []
         if "save_memory" in tool_names:
-            log.debug("memory_extract: skip, save_memory already used")
+            log.warning("memory_extract TRACE: BLOCKED by save_memory in tool_names")
             return
 
         session_messages = ctx.get("session_messages")
@@ -130,18 +132,28 @@ class MemoryExtractHandler:
         if not session_id:
             log.debug("memory_extract: skip, empty session_id")
             return
+        log.warning("memory_extract TRACE: session_id=%s (ctx=%s task=%s)", session_id, ctx.get('session_id'), getattr(task, 'session_id', '?'))
         msgs = session_messages(session_id, limit=0)
         non_system = [m for m in msgs if m.get("role") != "system"]
         current_count = len(non_system)
 
         min_messages = get_int(runtime_cfg, "memory.auto_extract.min_messages", 4, min_value=2, max_value=100)
         if current_count < min_messages:
-            log.debug("memory_extract: skip, current_count=%d < min_messages=%d", current_count, min_messages)
+            log.warning("memory_extract TRACE: BLOCKED current_count=%d < min_messages=%d", current_count, min_messages)
             return
 
         min_increment = get_int(runtime_cfg, "memory.auto_extract.min_increment", 10, min_value=1, max_value=100)
         last_count = self._memory_extract_msg_counts.get(session_id, 0)
+        # [2026-05-19] Why: context compaction can shrink the session message count
+        # below the stored cursor. How: reset cursor to 0 when current < last so the
+        # next increment calculation works correctly. Purpose: prevent permanent
+        # negative-increment stall after compaction.
+        if current_count < last_count:
+            log.warning("memory_extract TRACE: cursor reset (compact detected) session=%s count=%d < last=%d", session_id, current_count, last_count)
+            last_count = 0
+            self._memory_extract_msg_counts[session_id] = 0
         increment = current_count - last_count
+        log.warning("memory_extract TRACE: count=%d last=%d increment=%d min_incr=%d", current_count, last_count, increment, min_increment)
         if increment < min_increment:
             log.debug(
                 "memory_extract: increment=%d < min_increment=%d (count=%d, last=%d)",
@@ -151,6 +163,7 @@ class MemoryExtractHandler:
                 last_count,
             )
             if current_count > last_count:
+                log.warning("memory_extract TRACE: scheduling FALLBACK timer (%ds) for session %s", fallback_delay, session_id)
                 # [2026-05-18] Why: short conversations with new messages used to
                 # return here forever when they never reached min_increment. How:
                 # prepare the same pending extraction range as the normal path but
@@ -182,8 +195,6 @@ class MemoryExtractHandler:
                         timer_label="fallback idle",
                     )
             return
-        log.debug("memory_extract: scheduling idle timer for session %s count=%d", session_id, current_count)
-
         pending_extract = self._prepare_memory_extract_pending_locked(
             ctx=ctx,
             task=task,
@@ -201,6 +212,7 @@ class MemoryExtractHandler:
         # the main session history and could exceed context budgets. The extractor
         # node prompt already contains duplicate-prevention instructions.
         idle_delay = get_int(runtime_cfg, "memory.auto_extract.idle_delay_sec", 15, min_value=5, max_value=120)
+        log.warning("memory_extract TRACE: scheduling NORMAL timer (%ds) for session %s count=%d", idle_delay, session_id, current_count)
         self._schedule_memory_extract_idle_locked(
             ctx=ctx,
             session_id=session_id,
@@ -269,12 +281,13 @@ class MemoryExtractHandler:
         old_timer = self._memory_extract_timers.pop(session_id, None)
         if old_timer is not None:
             old_timer.cancel()
+            log.warning("memory_extract TRACE: cancelled old timer for session %s", session_id)
         self._memory_extract_pending[session_id] = pending_extract
         timer = threading.Timer(delay_sec, self._fire_memory_extract_idle, args=[dict(ctx), session_id])
         timer.daemon = True
         self._memory_extract_timers[session_id] = timer
         timer.start()
-        log.debug("Scheduled %s memory extract timer for session %s after %s seconds", timer_label, session_id, delay_sec)
+        log.warning("memory_extract TRACE: TIMER STARTED [%s] session=%s delay=%ds", timer_label, session_id, delay_sec)
 
     def _cancel_memory_extract_idle_locked(self, session_id: str) -> None:
         """Cancel a pending idle memory extraction for one session."""
@@ -286,7 +299,7 @@ class MemoryExtractHandler:
             timer.cancel()
         pending = self._memory_extract_pending.pop(sid, None)
         if timer is not None or pending is not None:
-            log.debug("Cancelled idle memory extract timer for session %s (new inbound)", sid)
+            log.warning("memory_extract TRACE: INBOUND CANCEL timer for session %s (had_timer=%s had_pending=%s)", sid, timer is not None, pending is not None)
 
     def _fire_memory_extract_idle(self, ctx: dict[str, Any], session_id: str) -> None:
         """Fire a pending automatic memory extraction after the idle window."""

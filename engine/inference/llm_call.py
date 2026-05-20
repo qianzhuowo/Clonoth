@@ -153,12 +153,24 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
         if ls.use_stream:
             text_buf = _StreamBuffer(ls.rctx, ls.node.id, "text")
             think_buf = _StreamBuffer(ls.rctx, ls.node.id, "thinking")
+
+            async def _emit_tool_delta(payload: dict[str, Any]) -> None:
+                # [tool-stream 2026-05-19] 将 provider 的工具调用增量接入 RunContext 事件流。
+                # 原因：provider 现在能实时解析 tool_call 参数，但 supervisor 只认识 emit_event。
+                # 做法：复制 payload，补充 node_id/task_id 后以 tool_call_delta 事件发送。
+                # 目的：tool_call 与 text/thinking 一样通过 supervisor 和前端 WebSocket 流动。
+                event_payload = dict(payload or {})
+                event_payload.setdefault("node_id", ls.node.id)
+                event_payload.setdefault("task_id", ls.rctx.task_id)
+                await ls.rctx.emit_event("tool_call_delta", event_payload)
+
             stream_task = asyncio.create_task(
                 ls.provider.chat_stream(
                     messages=llm_messages,
                     tools=tools_arg,
                     on_text=text_buf.push,
                     on_thinking=think_buf.push,
+                    on_tool_delta=_emit_tool_delta,
                 )
             )
             while True:

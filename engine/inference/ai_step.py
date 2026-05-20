@@ -769,7 +769,11 @@ async def _run_async_tool(
             result = await registry.execute(name=tool_name, arguments=tool_args, ctx=tool_ctx)
 
         _elapsed = time.monotonic() - _started
-        _summary = summarize_result(tool_name, result)
+        # [summary-args 2026-05-19] Why: async tool completion is reported through
+        # preempt text and should identify the original call. How: pass the saved
+        # tool arguments into summarize_result(). Purpose: keep async summaries as
+        # informative as synchronous handoff_progress rows.
+        _summary = summarize_result(tool_name, result, args=tool_args)
         _fmt, raw = result_to_raw(tool_name, result)
 
         _async_tool_tasks[async_tool_id] = {
@@ -928,6 +932,12 @@ async def _execute_real_tools(
         _is_async = _spec.get("async_mode", False) if _spec else False
 
         if _is_async:
+            # [WS tool result fields 2026-05-19] Why: tool_call_end now exposes
+            # elapsed_ms for both synchronous and async-started tools. How: capture
+            # a monotonic timestamp before the lifecycle start event is emitted.
+            # Purpose: downstream WebSocket consumers can show one consistent
+            # duration field without depending on SignalBus internals.
+            _tool_t0 = time.monotonic()
             # [WS tool events 2026-05-17] Why: WebSocket clients need structured
             # tool lifecycle events in the durable EventLog, not only localized
             # handoff_progress text. How: emit a non-transient start event before
@@ -945,7 +955,7 @@ async def _execute_real_tools(
             _async_tool_tasks[_async_id] = {
                 "tool_name": _t_name,
                 "status": "running",
-                "started_at": time.monotonic(),
+                "started_at": _tool_t0,
                 "task_id": ls.rctx.task_id,
             }
             asyncio.create_task(
@@ -967,12 +977,21 @@ async def _execute_real_tools(
                 name=f"async_tool_{_t_name}_{_async_id}",
             )
             _async_summary = f"异步执行已启动 (id: {_async_id})，结果将通过 preempt 自动回传"
+            # [WS tool result fields 2026-05-19] Why: async-started calls have no
+            # final tool result yet, but clients still need the same result schema.
+            # How: define the same local variables used by the synchronous branch,
+            # with result=None and the immediate placeholder text as raw_inline.
+            # Purpose: tool_call_end consumers can parse sync and async lifecycle
+            # events without special-casing missing keys.
+            _t_result = None
+            _t_fmt = "text"
+            _t_raw_inline = f'\u23f3 Async tool "{_t_name}" started (id: {_async_id}). Result will be delivered via preempt when ready.'
             _tool_entries.append({
                 "id": _rtc.get("id", ""),
                 "name": _t_name,
                 "args": _t_args,
-                "format": "text",
-                "raw_inline": f'\u23f3 Async tool "{_t_name}" started (id: {_async_id}). Result will be delivered via preempt when ready.',
+                "format": _t_fmt,
+                "raw_inline": _t_raw_inline,
                 "truncated": False,
                 "ref": "",
                 "summary": _async_summary,
@@ -989,6 +1008,10 @@ async def _execute_real_tools(
                 "tool_name": _t_name,
                 "status": "async_started",
                 "summary": _async_summary,
+                "result": _t_result,
+                "raw_inline": _t_raw_inline,
+                "format": _t_fmt,
+                "elapsed_ms": round((time.monotonic() - _tool_t0) * 1000, 1) if "_tool_t0" in dir() else None,
             })
             await ls.rctx.emit_event("handoff_progress", {
                 "message": f"[{ls.node.id}] {_t_name}: 异步执行已启动",
@@ -998,6 +1021,11 @@ async def _execute_real_tools(
             continue
 
         # ---- 同步工具：阻塞等待执行完成（原有逻辑）----
+        # [WS tool result fields 2026-05-19] Why: tool_call_end should include the
+        # tool execution duration. How: capture a monotonic start timestamp before
+        # emitting the structured start event and running the registry call. Purpose:
+        # expose elapsed_ms without changing SignalBus span behavior.
+        _tool_t0 = time.monotonic()
         # [WS tool events 2026-05-17] Why: handoff_progress remains for legacy
         # consumers, but the web UI needs structured lifecycle data. How: emit a
         # durable tool_call_start immediately before the SignalBus span. Purpose:
@@ -1020,7 +1048,12 @@ async def _execute_real_tools(
         # 模型下次看到的是「我调了工具但被用户取消了」而非 tool_use 悬空无响应。
         _t_cancelled = isinstance(_t_result, dict) and _t_result.get("cancelled")
 
-        _t_summary = summarize_result(_t_name, _t_result)
+        # [summary-args 2026-05-19] Why: handoff_progress keeps the legacy
+        # "[node] tool: summary" format, so argument detail must come from the
+        # summary itself. How: pass the parsed tool arguments alongside the result.
+        # Purpose: show commands, queries, and target paths without changing the
+        # event payload shape.
+        _t_summary = summarize_result(_t_name, _t_result, args=_t_args)
         _t_fmt, _t_raw = result_to_raw(_t_name, _t_result)
         # [2026-04-17] 移除工具结果截断机制：不再截断、不再写 artifact，直接传完整结果。
         _t_raw_inline = _t_raw
@@ -1048,6 +1081,15 @@ async def _execute_real_tools(
             "tool_name": _t_name,
             "status": "cancelled" if _t_cancelled else ("error" if (isinstance(_t_result, dict) and _t_result.get("error")) else "success"),
             "summary": _t_summary,
+            # [WS tool result fields 2026-05-19] Why: SDKs and adapters need the
+            # complete returned object, not only a short summary. How: carry the
+            # original result plus the same formatted inline representation that is
+            # appended to the model transcript. Purpose: leave truncation decisions
+            # to consuming adapters while preserving the raw engine result here.
+            "result": _t_result,
+            "raw_inline": _t_raw_inline,
+            "format": _t_fmt,
+            "elapsed_ms": round((time.monotonic() - _tool_t0) * 1000, 1) if "_tool_t0" in dir() else None,
         })
 
         # [硬取消-场景1] 已取消的工具结果已存入 entries（上方 append），不处理附件和进度事件，

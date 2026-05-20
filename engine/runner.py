@@ -1008,7 +1008,11 @@ async def _run_tool_task(
 
     tool_attachments = result.get("attachments") if isinstance(result, dict) and isinstance(result.get("attachments"), list) else []
 
-    summary = summarize_result(tool_name, result)
+    # [summary-args 2026-05-19] Why: standalone tool tasks emit the same compact
+    # handoff_progress row as AI-driven tools. How: pass the task arguments into
+    # summarize_result(). Purpose: make tool-node logs include the command, query,
+    # or other key parameters without changing the surrounding message format.
+    summary = summarize_result(tool_name, result, args=arguments)
     fmt, raw = result_to_raw(tool_name, result)
     # [2026-04-17] 移除工具结果截断机制：不再对 raw 做 max_inline 截断和 artifact 写入，
     # 直接将完整结果传递给下游，避免信息丢失。

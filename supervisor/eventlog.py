@@ -45,6 +45,12 @@ class EventLog:
         # append() can fan out each new event without changing persistence or the
         # existing polling API.
         self._subscribers: dict[str, list[asyncio.Queue]] = {}
+        # [WS events 2026-05-19] Why: the web client needs an all-session stream
+        # in addition to the existing per-session stream. How: keep a separate
+        # subscriber list that append() fans out to after the session-specific
+        # queues. Purpose: add global observation without changing session
+        # isolation for subscribe()/unsubscribe().
+        self._global_subscribers: list[asyncio.Queue] = []
 
         self._path.parent.mkdir(parents=True, exist_ok=True)
         self._load_existing()
@@ -164,6 +170,12 @@ class EventLog:
             # How: copy the current session queues and fan out after leaving the
             # lock. Purpose: keep append() fast and avoid awaiting under this lock.
             subscribers = list(self._subscribers.get(session_id, []))
+            # [WS events 2026-05-19] Why: /v1/ws must see every EventLog row.
+            # How: snapshot global subscribers under the same lock used for
+            # per-session subscribers, then fan out outside the critical section.
+            # Purpose: avoid races with subscribe_global()/unsubscribe_global()
+            # while preserving the existing append() lock behavior.
+            global_subscribers = list(self._global_subscribers)
 
         for queue in subscribers:
             try:
@@ -171,6 +183,15 @@ class EventLog:
             except asyncio.QueueFull:
                 # The current queues are unbounded, but this keeps future bounded
                 # queues from breaking event persistence if a client falls behind.
+                continue
+        for queue in global_subscribers:
+            try:
+                queue.put_nowait(evt)
+            except asyncio.QueueFull:
+                # [WS events 2026-05-19] Why: global observers are optional
+                # consumers and must not block persistence. How: mirror the
+                # per-session overflow behavior. Purpose: a slow global client
+                # cannot affect EventLog writes or session-specific streams.
                 continue
         return evt
 
@@ -203,6 +224,27 @@ class EventLog:
                 return
             if not queues:
                 self._subscribers.pop(session_id, None)
+
+    def subscribe_global(self) -> asyncio.Queue:
+        """Subscribe to all new events across all sessions."""
+        queue: asyncio.Queue = asyncio.Queue()
+        # [WS events 2026-05-19] Why: global subscribers must not be mixed into
+        # the per-session mapping. How: append their queues to a dedicated list.
+        # Purpose: unsubscribe_global() can clean up without knowing a session id.
+        with self._lock:
+            self._global_subscribers.append(queue)
+        return queue
+
+    def unsubscribe_global(self, queue: asyncio.Queue) -> None:
+        """Remove a queue previously returned by subscribe_global()."""
+        # [WS events 2026-05-19] Why: disconnected global WebSocket clients should
+        # not retain queues. How: remove the exact queue if it is still present.
+        # Purpose: keep cleanup deterministic and independent of session streams.
+        with self._lock:
+            try:
+                self._global_subscribers.remove(queue)
+            except ValueError:
+                pass
 
     def list_events(self, *, session_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
         # 简单线性过滤（MVP）。后续可按 session 建索引或 snapshot。

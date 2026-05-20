@@ -519,6 +519,95 @@ def create_app(
                     await receive_task
             st.eventlog.unsubscribe(session_id, queue)
 
+    @app.websocket("/v1/ws")
+    async def global_ws(websocket: WebSocket) -> None:
+        """Stream durable EventLog rows for all sessions over WebSocket."""
+        st: SupervisorState = app.state.state
+        await websocket.accept()
+
+        last_seq = 0
+        try:
+            initial_message = await asyncio.wait_for(
+                websocket.receive_text(),
+                timeout=_WS_INITIAL_MESSAGE_TIMEOUT_SEC,
+            )
+            last_seq = _parse_ws_initial_last_seq(initial_message)
+        except asyncio.TimeoutError:
+            last_seq = 0
+        except WebSocketDisconnect:
+            return
+        except Exception:
+            last_seq = 0
+
+        # [WS events 2026-05-19] Why: the global endpoint must not lose events
+        # appended between replay and live subscription. How: subscribe globally
+        # before replaying list_all_events(), then skip live rows at or below the
+        # highest sent seq. Purpose: give /v1/ws the same replay/live race safety
+        # as the existing per-session WebSocket endpoint.
+        queue = st.eventlog.subscribe_global()
+        sent_seq = last_seq
+        receive_task: asyncio.Task | None = None
+        try:
+            for evt in st.eventlog.list_all_events(after_seq=last_seq):
+                await _send_ws_json(websocket, evt)
+                try:
+                    sent_seq = max(sent_seq, int(evt.get("seq", 0) or 0))
+                except Exception:
+                    pass
+
+            receive_task = asyncio.create_task(websocket.receive_text())
+            while True:
+                event_task = asyncio.create_task(queue.get())
+                done, _pending = await asyncio.wait(
+                    {event_task, receive_task},
+                    timeout=_WS_HEARTBEAT_SEC,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+
+                if not done:
+                    event_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await event_task
+                    await _send_ws_json(websocket, {"type": "ping"})
+                    continue
+
+                if event_task in done:
+                    evt = event_task.result()
+                    try:
+                        evt_seq = int(evt.get("seq", 0) or 0)
+                    except Exception:
+                        evt_seq = 0
+                    if evt_seq > sent_seq:
+                        await _send_ws_json(websocket, evt)
+                        sent_seq = evt_seq
+                else:
+                    event_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await event_task
+
+                if receive_task in done:
+                    try:
+                        receive_task.result()
+                    except WebSocketDisconnect:
+                        break
+                    except Exception:
+                        break
+                    # [WS events 2026-05-19] Why: clients may send control frames
+                    # after the initial last_seq. How: consume and ignore each text
+                    # frame, then wait for another. Purpose: keep global streaming
+                    # behavior aligned with the per-session WebSocket endpoint.
+                    receive_task = asyncio.create_task(websocket.receive_text())
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            pass
+        finally:
+            if receive_task is not None and not receive_task.done():
+                receive_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await receive_task
+            st.eventlog.unsubscribe_global(queue)
+
     @app.get("/v1/events", response_model=list[Event])
     async def global_events(
         after_seq: int = Query(0, ge=0),
@@ -561,7 +650,11 @@ def create_app(
         if session_id not in st.sessions:
             raise HTTPException(status_code=404, detail="session not found")
 
-        transient = ev.type in {"stream_delta", "stream_end"}
+        transient = ev.type in {"stream_delta", "stream_end", "tool_call_delta"}
+        # [tool-stream 2026-05-19] tool_call_delta 是实时展示事件，不写入 JSONL。
+        # 原因：参数片段可能很碎，持久化会膨胀事件日志且与 stream_delta 语义一致。
+        # 做法：把它加入 supervisor transient 类型集合。
+        # 目的：WebSocket 继续实时广播，但磁盘事件日志只保留稳定状态事件。
         if ev.type == "context_usage":
             transient = True
         evt = st.eventlog.append(

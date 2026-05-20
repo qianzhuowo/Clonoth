@@ -24,6 +24,7 @@ Phase 3 step 2 (2026-04-17): 初始创建。
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import re
 import time
@@ -93,6 +94,10 @@ class EventRouter:
     # 与 bot_adapter.py _outbound_poller() 中的过滤列表一致。
     # 2026-04-17: 追加 compact_start/compact_done/compact_failed，
     # 使 _handle_compact 处理器能接收到这些事件。
+    # [SDK WS 2026-05-19] Why: WS mode receives all event types, but HTTP poll
+    # fallback still relies on this explicit whitelist. How: include the new
+    # tool streaming, stream lifecycle, and approval decision rows. Purpose:
+    # fallback preserves the same adapter-visible raw-event surface as WS mode.
     _EVENT_TYPES = (
         "inbound_message,outbound_message,intermediate_reply,"
         "handoff_progress,stream_delta,approval_requested,"
@@ -100,8 +105,17 @@ class EventRouter:
         "node_started,node_completed,cancel_requested,"
         "context_reset,inbound_accepted,task_preempted,"
         "compact_start,compact_done,compact_failed,snip_compact,"
-    "engine_registered"
+        "tool_call_start,tool_call_end,tool_call_delta,"
+        "stream_end,approval_decided,engine_registered"
     )
+
+    # [SDK WS 2026-05-19] Why: transient websocket failures should not push the
+    # SDK straight back to polling. How: retry WS a small fixed number of times,
+    # with the requested 2-second delay, before entering the legacy poll loop.
+    # Purpose: prefer realtime delivery without sacrificing existing fallback.
+    _WS_MAX_RETRIES_BEFORE_POLL = 3
+    _WS_RETRY_DELAY = 2.0
+    _WS_SWEEP_INTERVAL = 3.0
 
     def __init__(
         self,
@@ -162,11 +176,85 @@ class EventRouter:
         return self._after_seq
 
     async def run(self) -> None:
-        """事件轮询主循环。阻塞运行，直到被取消或调用 stop()。"""
+        """事件主循环。优先消费全局 WS；连续失败后降级到 HTTP poll。"""
         self._running = True
         await self._init_seq()
         logger.info("EventRouter started, after_seq=%d", self._after_seq)
 
+        ws_failures = 0
+        while self._running:
+            try:
+                # [SDK WS 2026-05-19] Why: adapters should receive realtime event
+                # rows without waiting for the poll interval. How: run the global
+                # websocket consumer first and let it raise on disconnect. Purpose:
+                # keep WS as the default transport while preserving the old loop.
+                await self._run_ws()
+                ws_failures = 0
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if not self._running:
+                    break
+                ws_failures += 1
+                if ws_failures >= self._WS_MAX_RETRIES_BEFORE_POLL:
+                    logger.warning(
+                        "WS connection failed %d times: %s; falling back to HTTP poll",
+                        ws_failures,
+                        e,
+                        exc_info=True,
+                    )
+                    try:
+                        await self._run_poll()
+                    except asyncio.CancelledError:
+                        # Why: cancellation can arrive after WS has already
+                        # downgraded to the fallback loop. How: convert it to the
+                        # same clean stop path used above. Purpose: preserve the
+                        # previous run() cancellation behavior and final log line.
+                        break
+                    break
+                logger.warning(
+                    "WS connection failed (%d/%d): %s; retrying in %.1fs",
+                    ws_failures,
+                    self._WS_MAX_RETRIES_BEFORE_POLL,
+                    e,
+                    self._WS_RETRY_DELAY,
+                    exc_info=True,
+                )
+                await asyncio.sleep(self._WS_RETRY_DELAY)
+
+        logger.info("EventRouter stopped")
+
+    def stop(self) -> None:
+        """通知主循环停止。下一轮 poll 结束后退出。"""
+        self._running = False
+
+    async def _run_ws(self) -> None:
+        """WebSocket 模式主循环。断线或连接结束时抛异常交给 run()。"""
+        # [SDK WS 2026-05-19] Why: WS receive can block for a long time when no
+        # events arrive, but typing refresh and progress updates must continue.
+        # How: run a small periodic sweep task beside the socket iterator and
+        # cancel it in finally. Purpose: keep adapter UI behavior equivalent to
+        # the old poll loop.
+        sweep_task = asyncio.create_task(self._run_ws_sweep_loop())
+        try:
+            async for raw_event in self._client.ws_connect(last_seq=self._after_seq):
+                if not self._running:
+                    break
+                if raw_event.get("type") == "ping":
+                    continue
+                event = Event.from_dict(raw_event)
+                self._after_seq = max(self._after_seq, event.seq)
+                await self._dispatch(event)
+            if self._running:
+                raise ConnectionError("WebSocket stream ended")
+        finally:
+            sweep_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await sweep_task
+
+    async def _run_poll(self) -> None:
+        """HTTP poll fallback loop，保留旧版 EventRouter 的完整行为。"""
+        logger.info("EventRouter HTTP poll fallback started, after_seq=%d", self._after_seq)
         while self._running:
             try:
                 await asyncio.sleep(self._poll_interval)
@@ -183,52 +271,72 @@ class EventRouter:
                     logger.info("Fast-forward to seq=%d", self._after_seq)
                     continue
 
-                # 超时 trigger 清理（10 分钟阈值）
-                stale = self._state.cleanup_stale_triggers(timeout=600.0)
-                for t in stale:
-                    try:
-                        await self._cb.delete_status_message(t)
-                    except Exception:
-                        pass
-
-                # 逐事件分发
-                for event in events:
-                    self._after_seq = max(self._after_seq, event.seq)
-                    await self._dispatch(event)
-
-                # Sweep 阶段：遍历所有活跃 trigger，
-                # 刷新 typing 并通知适配器更新主任务进度显示
-                for seq, trigger in list(self._state.triggers.items()):
-                    try:
-                        await self._cb.refresh_typing(trigger)
-                    except Exception:
-                        pass
-
-                    main_state = self._state.get_main_state(seq)
-                    if main_state:
-                        try:
-                            await self._cb.update_progress(trigger, main_state)
-                        except Exception:
-                            pass
-
-                # Sweep 阶段：遍历所有活跃子任务，通知适配器刷新显示
-                for task_key, child_state in list(self._state.child_task_states.items()):
-                    try:
-                        await self._cb.update_child_progress(task_key, child_state)
-                    except Exception:
-                        pass
+                await self._cleanup_stale_triggers()
+                await self._dispatch_events(events)
+                await self._refresh_active_states()
 
             except asyncio.CancelledError:
-                break
+                raise
             except Exception as e:
+                # Why: fallback must be as resilient as the previous all-poll
+                # router. How: keep logging and sleeping on transient failures.
+                # Purpose: introducing WS cannot make the legacy path brittle.
                 logger.error("Poll error: %s", e, exc_info=True)
                 await asyncio.sleep(5)
 
-        logger.info("EventRouter stopped")
+    async def _run_ws_sweep_loop(self) -> None:
+        """WS 模式的定时 sweep；每 3 秒刷新 typing 和进度状态。"""
+        while self._running:
+            await asyncio.sleep(self._WS_SWEEP_INTERVAL)
+            await self._sweep_once()
 
-    def stop(self) -> None:
-        """通知主循环停止。下一轮 poll 结束后退出。"""
-        self._running = False
+    async def _sweep_once(self) -> None:
+        """执行一次完整 sweep，用于 WS 定时器和后续共享调用。"""
+        await self._cleanup_stale_triggers()
+        await self._refresh_active_states()
+
+    async def _cleanup_stale_triggers(self) -> None:
+        """清理超时 trigger，并通知适配器删除对应状态消息。"""
+        # [SDK WS 2026-05-19] Why: stale-trigger cleanup used to be tied to poll
+        # ticks. How: isolate it so both HTTP poll and WS sweep can call it.
+        # Purpose: switching transports does not leave old status messages behind.
+        stale = self._state.cleanup_stale_triggers(timeout=600.0)
+        for trigger in stale:
+            try:
+                await self._cb.delete_status_message(trigger)
+            except Exception:
+                pass
+
+    async def _dispatch_events(self, events: list[Event]) -> None:
+        """按 seq 推进游标并逐条分发事件。"""
+        for event in events:
+            self._after_seq = max(self._after_seq, event.seq)
+            await self._dispatch(event)
+
+    async def _refresh_active_states(self) -> None:
+        """刷新所有活跃 trigger 和子任务进度显示。"""
+        # [SDK WS 2026-05-19] Why: typing refresh and progress edits are adapter
+        # responsibilities, but the SDK decides when to ask for them. How: keep the
+        # old sweep body in one helper. Purpose: WS mode and HTTP fallback share
+        # identical progress-refresh semantics.
+        for seq, trigger in list(self._state.triggers.items()):
+            try:
+                await self._cb.refresh_typing(trigger)
+            except Exception:
+                pass
+
+            main_state = self._state.get_main_state(seq)
+            if main_state:
+                try:
+                    await self._cb.update_progress(trigger, main_state)
+                except Exception:
+                    pass
+
+        for task_key, child_state in list(self._state.child_task_states.items()):
+            try:
+                await self._cb.update_child_progress(task_key, child_state)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     #  初始化与分发
@@ -987,6 +1095,15 @@ class EventRouter:
         except Exception as e:
             logger.error("on_engine_restarted callback error: %s", e)
 
+    async def _handle_raw_only_event(self, event: Event) -> None:
+        """处理仅面向 on_raw_event hook 的事件类型。"""
+        # [SDK WS 2026-05-19] Why: tool_call_* / stream_end /
+        # approval_decided are display-layer signals and do not require SDK state
+        # mutation yet. How: register a no-op handler after the raw-event hook has
+        # already run. Purpose: make these event types explicit in the dispatch
+        # table while preserving AdapterCallbacks compatibility.
+        return None
+
     # ==================================================================
     #  Handler 分发表
     #  类变量，映射 event.type → 处理器方法。
@@ -1016,4 +1133,13 @@ class EventRouter:
         "context_reset":     _handle_context_reset,
         "inbound_accepted":  _handle_inbound_accepted,
         "engine_registered": _handle_engine_registered,
+        # [SDK WS 2026-05-19] Why: these new events should reach raw-event hooks
+        # but do not need SDK-owned state changes. How: route them to a no-op
+        # handler after Layer 1 dispatch. Purpose: unknown-handler silence remains
+        # available for future events while these supported events are explicit.
+        "tool_call_start":  _handle_raw_only_event,
+        "tool_call_end":    _handle_raw_only_event,
+        "tool_call_delta":  _handle_raw_only_event,
+        "stream_end":       _handle_raw_only_event,
+        "approval_decided": _handle_raw_only_event,
     }

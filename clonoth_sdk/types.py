@@ -26,7 +26,7 @@ class InboundResult:
 class Event:
     """Supervisor 事件流中的单个事件。
 
-    对应 GET /v1/events 返回的事件对象。
+    对应 GET /v1/events 和 WS /v1/ws 返回的事件对象。
     ts 保留为 ISO 格式字符串，调用方可按需用 datetime.fromisoformat() 解析。
     """
     seq: int
@@ -37,6 +37,11 @@ class Event:
     component: str
     type: str
     payload: dict[str, Any] = field(default_factory=dict)
+    # [SDK WS 2026-05-19] Why: the Supervisor event schema includes a version
+    # field on both HTTP and WebSocket rows. How: keep it as a defaulted trailing
+    # dataclass field so existing positional construction remains compatible.
+    # Purpose: raw-event hooks can inspect the schema version when needed.
+    schema_version: int = 1
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Event:
@@ -53,6 +58,7 @@ class Event:
             component=str(d.get("component", "")),
             type=str(d.get("type", "")),
             payload=dict(d.get("payload") or {}),
+            schema_version=int(d.get("schema_version", 1) or 1),
         )
 
 

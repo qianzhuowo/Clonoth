@@ -19,7 +19,8 @@ SDK 是纯协议层，不包含任何平台（Discord / Telegram 等）相关逻
 """
 from __future__ import annotations
 
-from typing import Any
+import json
+from typing import Any, AsyncGenerator
 
 import httpx
 
@@ -44,26 +45,60 @@ class ClonothClient:
         await client.close()
     """
 
-    def __init__(self, base_url: str, *, timeout: float = 10.0):
+    def __init__(self, base_url: str, *, timeout: float = 10.0, admin_token: str = "",
+                 admin_token_path: str = ""):
         """初始化客户端。
 
         Args:
             base_url: Supervisor HTTP API 地址，如 "http://127.0.0.1:8765"
             timeout: 每次 HTTP 请求的超时时间（秒）
+            admin_token: Supervisor admin token，用于鉴权受保护的端点
+            admin_token_path: admin token 文件路径，每次请求时重新读取
         """
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        self._admin_token = admin_token.strip()
+        self._admin_token_path = admin_token_path
         self._client: httpx.AsyncClient | None = None
+        self._last_token: str = self._admin_token
 
     @property
     def base_url(self) -> str:
         """Supervisor 基础地址（只读）。"""
         return self._base_url
 
+    def _resolve_admin_token(self) -> str:
+        """获取当前 admin token：优先从文件读取最新值，fallback 到初始值。"""
+        if self._admin_token_path:
+            try:
+                from pathlib import Path
+                p = Path(self._admin_token_path)
+                if p.exists():
+                    token = p.read_text().strip()
+                    if token:
+                        return token
+            except Exception:
+                pass
+        return self._admin_token
+
     def _http(self) -> httpx.AsyncClient:
-        """获取或创建共享 httpx 客户端。惰性初始化，首次调用时创建。"""
+        """获取或创建共享 httpx 客户端。token 变化时自动重建。"""
+        current_token = self._resolve_admin_token()
+        # token 变了 → 关旧 client，重建
+        if self._client is not None and not self._client.is_closed and current_token != self._last_token:
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self._client.aclose())
+            except RuntimeError:
+                pass
+            self._client = None
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=self._timeout)
+            headers = {}
+            if current_token:
+                headers["Authorization"] = f"Bearer {current_token}"
+            self._client = httpx.AsyncClient(timeout=self._timeout, headers=headers)
+            self._last_token = current_token
         return self._client
 
     # ================================================================
@@ -156,6 +191,52 @@ class ClonothClient:
         resp = await self._http().get(f"{self._base_url}/v1/events", params=params)
         resp.raise_for_status()
         return [Event.from_dict(e) for e in resp.json()]
+
+    async def ws_connect(self, last_seq: int = 0) -> AsyncGenerator[dict[str, Any], None]:
+        """连接全局 WebSocket 事件流，逐条 yield 解析后的事件字典。
+
+        对应 WS /v1/ws。调用方先发送 {"last_seq": N}，Supervisor 会 replay
+        游标之后的持久事件，然后继续推送所有 session 的新事件。
+        """
+        # [SDK WS 2026-05-19] Why: EventRouter needs lower-latency delivery than
+        # HTTP polling while keeping /v1/events as fallback. How: derive /v1/ws
+        # from the configured HTTP base URL and send the durable EventLog cursor as
+        # the first frame. Purpose: let adapters consume the global event stream
+        # without learning websocket URL construction or handshake details.
+        try:
+            import websockets
+        except ImportError as exc:  # pragma: no cover - exercised only in lean installs.
+            raise RuntimeError("websockets package is required for ClonothClient.ws_connect") from exc
+
+        if self._base_url.startswith("https://"):
+            ws_url = "wss://" + self._base_url[len("https://"):]
+        elif self._base_url.startswith("http://"):
+            ws_url = "ws://" + self._base_url[len("http://"):]
+        else:
+            ws_url = self._base_url
+        ws_url = f"{ws_url}/v1/ws"
+
+        connect_kwargs: dict[str, Any] = {"open_timeout": self._timeout}
+        if self._admin_token:
+            # Why: deployments may protect every Supervisor endpoint with the same
+            # bearer token used by HTTP. How: pass the header through websockets'
+            # extra_headers parameter. Purpose: keep WS auth behavior aligned with
+            # the shared httpx client.
+            connect_kwargs["extra_headers"] = {"Authorization": f"Bearer {self._admin_token}"}
+
+        async with websockets.connect(ws_url, **connect_kwargs) as ws:
+            await ws.send(json.dumps({"last_seq": int(last_seq or 0)}))
+            async for message in ws:
+                data = json.loads(message)
+                if not isinstance(data, dict):
+                    continue
+                if data.get("type") == "ping":
+                    # Why: Supervisor sends heartbeat frames when the stream is
+                    # idle. How: consume them here instead of yielding pseudo
+                    # events. Purpose: EventRouter and adapters only see durable
+                    # EventLog rows.
+                    continue
+                yield data
 
     # ================================================================
     #  Approval — 审批决策

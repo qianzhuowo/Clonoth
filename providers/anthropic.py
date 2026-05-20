@@ -475,9 +475,10 @@ class AnthropicProvider(BaseProvider):
         self,
         *,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
+        tools: list[dict[str, Any]] | None = None,
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> ProviderResponse:
         """Streaming request to Anthropic Messages API via SSE.
 
@@ -560,6 +561,17 @@ class AnthropicProvider(BaseProvider):
                                 "name": block.get("name", ""),
                                 "args_parts": [],
                             }
+                            # [tool-stream 2026-05-19] Anthropic 的 tool_use block start 是明确开始信号。
+                            # 原因：此前只登记 active_tools，实时链路看不到工具调用已开始。
+                            # 做法：在 content_block_start 时发送统一 tool_call_start payload。
+                            # 目的：让 Anthropic 工具调用与 OpenAI/Gemini 使用同一前端事件格式。
+                            if on_tool_delta:
+                                await on_tool_delta({
+                                    "event": "tool_call_start",
+                                    "index": idx,
+                                    "id": active_tools[idx]["id"],
+                                    "name": active_tools[idx]["name"],
+                                })
                         elif block.get("type") == "thinking":
                             # [2026-05-01] 开始追踪 thinking block，
                             # 累积文本，最终在 content_block_stop 时组装含 signature 的完整 block
@@ -605,6 +617,16 @@ class AnthropicProvider(BaseProvider):
                             partial = delta.get("partial_json", "")
                             if partial and idx in active_tools:
                                 active_tools[idx]["args_parts"].append(partial)
+                                # [tool-stream 2026-05-19] 逐片段转发 Anthropic input_json_delta。
+                                # 原因：partial_json 本身就是 provider 的参数流式增量。
+                                # 做法：在累积 args_parts 的同时发出统一 args_delta。
+                                # 目的：保留最终 JSON 解析能力，并补齐实时工具参数预览。
+                                if on_tool_delta:
+                                    await on_tool_delta({
+                                        "event": "tool_call_args_delta",
+                                        "index": idx,
+                                        "delta": partial,
+                                    })
 
                     elif evt == "content_block_stop":
                         idx = data.get("index", 0)
@@ -617,6 +639,12 @@ class AnthropicProvider(BaseProvider):
                                 tb["signature"] = info["signature"]
                             thinking_blocks.append(tb)
                         elif idx in active_tools:
+                            # [tool-stream 2026-05-19] content_block_stop 是 Anthropic 的明确结束信号。
+                            # 原因：工具参数流结束后，前端需要知道该 index 不再追加 delta。
+                            # 做法：在 pop active_tools 之前发送可选 tool_call_done。
+                            # 目的：为支持 done 语义的 provider 暴露完整生命周期事件。
+                            if on_tool_delta:
+                                await on_tool_delta({"event": "tool_call_done", "index": idx})
                             # Finalize the tool call
                             tool_info = active_tools.pop(idx)
                             args_str = "".join(tool_info["args_parts"])

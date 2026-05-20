@@ -355,6 +355,7 @@ class OpenAIResponsesProvider(BaseProvider):
         tools: list[dict[str, Any]] | None = None,
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> ProviderResponse:
         instructions, input_items = self._convert_messages(messages)
         payload = self._build_payload(
@@ -374,6 +375,11 @@ class OpenAIResponsesProvider(BaseProvider):
             thinking_parts: list[str] = []
             # tool_calls keyed by output index so we can accumulate arguments
             pending_calls: dict[int, dict[str, str]] = {}  # idx → {name, call_id, arguments}
+            # [tool-stream 2026-05-19] 记录已发送 done 的 output index。
+            # 原因：Responses API 可能同时给 arguments.done 与 output_item.done。
+            # 做法：每次尝试内用集合去重生命周期结束事件。
+            # 目的：前端只收到一次 tool_call_done，同时 final ProviderResponse 仍按 pending_calls 构建。
+            done_indices: set[int] = set()
             usage: dict[str, int] = {}
             raw_output_items: list[dict[str, Any]] = []  # captured from response.completed
             retry_without_encrypted = False
@@ -445,20 +451,76 @@ class OpenAIResponsesProvider(BaseProvider):
                         # --- new function_call item added ---
                         elif etype == "response.output_item.added":
                             item = event.get("item", {})
-                            idx = event.get("output_index", 0)
+                            idx = int(event.get("output_index", 0) or 0)
                             if item.get("type") == "function_call":
                                 pending_calls[idx] = {
                                     "name": item.get("name", ""),
                                     "call_id": item.get("call_id", ""),
                                     "arguments": "",
                                 }
+                                # [tool-stream 2026-05-19] Responses 的 output_item.added 是 function_call 起点。
+                                # 原因：之前只创建 pending_calls，实时链路无法知道工具调用已开始。
+                                # 做法：登记 pending_calls 后发送统一 tool_call_start。
+                                # 目的：Responses provider 与 Chat Completions provider 暴露相同事件格式。
+                                if on_tool_delta:
+                                    await on_tool_delta({
+                                        "event": "tool_call_start",
+                                        "index": idx,
+                                        "id": pending_calls[idx]["call_id"],
+                                        "name": pending_calls[idx]["name"],
+                                    })
 
                         # --- function_call arguments delta ---
                         elif etype == "response.function_call_arguments.delta":
-                            idx = event.get("output_index", 0)
+                            idx = int(event.get("output_index", 0) or 0)
                             delta = event.get("delta", "")
                             if idx in pending_calls:
                                 pending_calls[idx]["arguments"] += delta
+                                # [tool-stream 2026-05-19] 转发 Responses 参数增量。
+                                # 原因：response.function_call_arguments.delta 已是最小参数片段。
+                                # 做法：保留原有字符串累积，同时把 delta 透传给 on_tool_delta。
+                                # 目的：不改变最终 JSON 解析，又支持工具参数实时显示。
+                                if delta and on_tool_delta:
+                                    await on_tool_delta({
+                                        "event": "tool_call_args_delta",
+                                        "index": idx,
+                                        "delta": delta,
+                                    })
+
+                        # --- function_call arguments done ---
+                        elif etype == "response.function_call_arguments.done":
+                            idx = int(event.get("output_index", 0) or 0)
+                            arguments = event.get("arguments")
+                            if isinstance(arguments, str) and idx in pending_calls and not pending_calls[idx]["arguments"]:
+                                pending_calls[idx]["arguments"] = arguments
+                            # [tool-stream 2026-05-19] Responses 有显式 arguments.done 时发送 done。
+                            # 原因：OpenAI Responses 相比 Chat Completions 多了参数完成事件。
+                            # 做法：按 output_index 去重后发送 tool_call_done。
+                            # 目的：让支持结束信号的 provider 暴露完整工具调用生命周期。
+                            if idx in pending_calls and idx not in done_indices:
+                                done_indices.add(idx)
+                                if on_tool_delta:
+                                    await on_tool_delta({"event": "tool_call_done", "index": idx})
+
+                        # --- function_call output item done ---
+                        elif etype == "response.output_item.done":
+                            item = event.get("item", {})
+                            idx = int(event.get("output_index", 0) or 0)
+                            if item.get("type") == "function_call" and idx in pending_calls:
+                                if item.get("name"):
+                                    pending_calls[idx]["name"] = item.get("name", "")
+                                if item.get("call_id"):
+                                    pending_calls[idx]["call_id"] = item.get("call_id", "")
+                                if isinstance(item.get("arguments"), str) and not pending_calls[idx]["arguments"]:
+                                    pending_calls[idx]["arguments"] = item.get("arguments", "")
+                                # [tool-stream 2026-05-19] output_item.done 作为兜底结束信号。
+                                # 原因：不同 Responses 版本可能只发送 output_item.done。
+                                # 做法：复用 done_indices 去重，避免与 arguments.done 重复。
+                                # 目的：在事件形态变化时仍能通知前端工具调用结束。
+                                if idx not in done_indices:
+                                    done_indices.add(idx)
+                                    if on_tool_delta:
+                                        await on_tool_delta({"event": "tool_call_done", "index": idx})
 
                         # --- response completed: extract usage + raw output ---
                         elif etype in ("response.completed", "response.done"):

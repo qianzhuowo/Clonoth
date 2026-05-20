@@ -143,11 +143,12 @@ class OpenAIProvider(BaseProvider):
         self,
         *,
         messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
+        tools: list[dict[str, Any]] | None = None,
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> ProviderResponse:
-        """流式聊天补全。逐块回调 on_text / on_thinking，最终返回组装好的 ProviderResponse。"""
+        """流式聊天补全。逐块回调 on_text / on_thinking / on_tool_delta，最终返回组装好的 ProviderResponse。"""
 
         url = f"{self._base_url}/chat/completions"
 
@@ -239,21 +240,45 @@ class OpenAIProvider(BaseProvider):
                             if not isinstance(tc, dict):
                                 continue
                             idx = int(tc.get("index", 0))
+                            fn = tc.get("function") or {}
+                            if not isinstance(fn, dict):
+                                fn = {}
+                            fn_name = fn.get("name")
                             if idx not in tc_map:
                                 tc_map[idx] = {
                                     "id": tc.get("id") or "",
-                                    "name": (tc.get("function") or {}).get("name") or "",
+                                    "name": fn_name or "",
                                     "arg_parts": [],
                                 }
+                                # [tool-stream 2026-05-19] 同步发出工具调用开始事件。
+                                # 原因：OpenAI SSE 的 tool_calls delta 已经携带 index/id/name，过去只进入 tc_map。
+                                # 做法：新 index 第一次出现时调用可选 on_tool_delta，不改变后续聚合逻辑。
+                                # 目的：前端能实时看到 tool_call 建立，同时最终 ProviderResponse 仍完整返回。
+                                if on_tool_delta:
+                                    await on_tool_delta({
+                                        "event": "tool_call_start",
+                                        "index": idx,
+                                        "id": tc_map[idx]["id"],
+                                        "name": tc_map[idx]["name"],
+                                    })
                             else:
                                 if tc.get("id"):
                                     tc_map[idx]["id"] = tc["id"]
-                                fn_name = (tc.get("function") or {}).get("name")
                                 if fn_name:
                                     tc_map[idx]["name"] = fn_name
-                            arg_chunk = (tc.get("function") or {}).get("arguments", "")
+                            arg_chunk = fn.get("arguments", "")
                             if arg_chunk:
                                 tc_map[idx]["arg_parts"].append(arg_chunk)
+                                # [tool-stream 2026-05-19] 逐片段转发工具参数。
+                                # 原因：参数字符串可能很长，等完整 JSON 结束才返回会阻塞实时 UI。
+                                # 做法：保留 arg_parts 组装，同时把原始片段作为 args_delta 发出。
+                                # 目的：实现 tool_call 参数与文本、thinking 一致的流式通道。
+                                if on_tool_delta:
+                                    await on_tool_delta({
+                                        "event": "tool_call_args_delta",
+                                        "index": idx,
+                                        "delta": arg_chunk,
+                                    })
 
                 text = "".join(text_parts) if text_parts else None
                 # [refactor 2026-04-18] thinking_text 局部变量 → reasoning_text，

@@ -62,7 +62,12 @@ class BaseProvider(ABC):
         tools: list[dict[str, Any]] | None = None,
         on_text: Callable[[str], Awaitable[None]] | None = None,
         on_thinking: Callable[[str], Awaitable[None]] | None = None,
+        on_tool_delta: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> ProviderResponse:
         # [provider-registry 2026-05-03] 所有内置 provider 已实现流式接口。
         # 在 ABC 中显式声明它，目的：插件作者能看到完整合约，抽象类也能阻止漏实现。
+        # [tool-stream 2026-05-19] 新增 on_tool_delta。
+        # 原因：tool_call 参数过去只在 provider 内部攒完后返回，前端无法实时预览。
+        # 做法：把工具调用增量作为可选 callback 加入统一流式合约。
+        # 目的：text、thinking、tool_call 共享同一条实时事件管道，同时不破坏 ProviderResponse。
         raise NotImplementedError

@@ -22,6 +22,10 @@ PLUGIN_META = {
         ("on_schedule_tick", "on_tick"),
     ],
     "priority": 100,
+    # Why: dream reorganizes memory entries that knowledge_inject caches.
+    # How: declare the dependency so loader ensures knowledge_inject loads first.
+    # Purpose: fail clearly if knowledge_inject is missing.
+    "requires": ["knowledge_injector"],
 }
 
 

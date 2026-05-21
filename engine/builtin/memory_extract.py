@@ -23,6 +23,10 @@ PLUGIN_META = {
         ("on_inbound_message", "on_inbound"),
     ],
     "priority": 100,
+    # Why: memory_extract writes new entries that knowledge_inject must cache-invalidate.
+    # How: declare the dependency so loader ensures knowledge_inject loads first.
+    # Purpose: fail clearly if knowledge_inject is missing rather than silent runtime errors.
+    "requires": ["knowledge_injector"],
 }
 
 

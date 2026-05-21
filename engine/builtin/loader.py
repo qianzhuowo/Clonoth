@@ -29,12 +29,21 @@ def auto_discover_and_register(
     read PLUGIN_META, instantiate its handler class, and register the declared
     methods on the provided registry. Purpose: keep handler placement, metadata,
     and registration in one file per handler.
+
+    Two-phase loading: first collect all modules and their PLUGIN_META, then
+    instantiate in dependency order. A plugin whose `requires` list references
+    a handler_name that failed or is missing will be skipped with a clear error.
     """
     base_dir = Path(directory) if directory is not None else Path(__file__).parent
     handlers: dict[str, Any] = {}
     if not base_dir.is_dir():
         return handlers
 
+    # Phase 1: import all modules, collect metadata
+    # Why: we need the full set of plugin names before resolving dependencies.
+    # How: scan once, store (module, meta, py_file) tuples keyed by handler_name.
+    # Purpose: enable Phase 2 to check `requires` against the complete set.
+    pending: dict[str, tuple[Any, dict, Path]] = {}  # handler_name -> (module, meta, py_file)
     for py_file in sorted(base_dir.glob("*.py")):
         if _should_skip(py_file):
             continue
@@ -44,9 +53,42 @@ def auto_discover_and_register(
             meta = getattr(module, "PLUGIN_META", None)
             if not isinstance(meta, dict):
                 continue
+            # Peek at handler_class to derive handler_name for dependency keys
+            class_name = str(meta.get("handler_class") or "").strip()
+            if not class_name:
+                continue
+            cls = getattr(module, class_name, None)
+            preview_name = str(getattr(cls, "name", "") or "") if cls else ""
+            handler_name = preview_name or py_file.stem
+            pending[handler_name] = (module, meta, py_file)
+        except Exception as exc:
+            logger.error("Failed to import built-in hook %s: %s", module_name, exc, exc_info=True)
+
+    # Phase 2: topological instantiation respecting `requires`
+    # Why: plugins like memory_extract and dream depend on knowledge_inject being
+    # loaded first. How: resolve in dependency order; skip plugins whose
+    # requirements are not satisfied. Purpose: fail clearly instead of silently
+    # breaking at runtime when a dependency is missing.
+    loaded: set[str] = set()
+    load_order = _resolve_load_order(pending)
+    for handler_name in load_order:
+        module, meta, py_file = pending[handler_name]
+        module_name = f"{package}.{py_file.stem}"
+        # Check requires
+        requires = meta.get("requires")
+        if isinstance(requires, list):
+            missing = [r for r in requires if str(r) not in loaded]
+            if missing:
+                logger.error(
+                    "Skipping plugin %s: unsatisfied requires %s (loaded: %s)",
+                    handler_name, missing, sorted(loaded),
+                )
+                continue
+        try:
             instance = _instantiate_handler(module, meta)
             handler_name = str(getattr(instance, "name", "") or py_file.stem)
             handlers[handler_name] = instance
+            loaded.add(handler_name)
             priority = meta.get("priority", getattr(instance, "priority", None))
             for hook_point, method_name in _iter_hook_points(meta):
                 method = getattr(instance, method_name)
@@ -56,6 +98,36 @@ def auto_discover_and_register(
         except Exception as exc:
             logger.error("Failed to load built-in hook %s: %s", module_name, exc, exc_info=True)
     return handlers
+
+
+def _resolve_load_order(pending: dict[str, tuple]) -> list[str]:
+    """Return handler names in dependency-first order.
+
+    Why: plugins declare `requires` listing other handler_names that must load
+    first. How: simple topological sort — plugins with no or satisfied deps go
+    first; cycles or missing deps are caught in Phase 2 and skipped. Purpose:
+    ensure knowledge_inject loads before memory_extract/dream without hardcoding.
+    """
+    order: list[str] = []
+    visited: set[str] = set()
+    names = set(pending.keys())
+
+    def _visit(name: str) -> None:
+        if name in visited:
+            return
+        visited.add(name)
+        _, meta, _ = pending[name]
+        requires = meta.get("requires")
+        if isinstance(requires, list):
+            for dep in requires:
+                dep = str(dep)
+                if dep in names and dep not in visited:
+                    _visit(dep)
+        order.append(name)
+
+    for name in pending:
+        _visit(name)
+    return order
 
 
 def _should_skip(py_file: Path) -> bool:

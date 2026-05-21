@@ -270,7 +270,11 @@ def _apply_memories(
 
     # Invalidate engine cache
     try:
-        from engine.memory import _MemoryCache
+        # Why: the memory runtime cache moved into the knowledge plugin. How:
+        # import _MemoryCache from engine.builtin.knowledge_inject instead of the
+        # deleted memory runtime module. Purpose: extracted memories are visible to
+        # the next prompt build without reviving the old module boundary.
+        from engine.builtin.knowledge_inject import _MemoryCache
         _MemoryCache.invalidate(workspace_root)
     except Exception:
         pass

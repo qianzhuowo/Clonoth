@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import re
+import shutil
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
+import yaml
+
 from clonoth_runtime import get_int
-from engine import memory as memory_runtime
-from engine.knowledge_match import build_scan_text, match_keywords
 from engine.node import Node
-from toolbox import skills_runtime
+from toolbox._common import request_guard, resolve_under_allowed_roots
+from toolbox.builtins import SKILL_NAME_RE
+from toolbox.context import ToolContext
 
 # Why: engine.builtin handlers must not depend on the hook package after relocation.
 # How: return a local HookResult-compatible shape instead. Purpose: avoid
@@ -25,8 +30,492 @@ PLUGIN_META = {
         ("before_prompt_build", "handle"),
     ],
     "priority": 50,
+    # Why: the six skill and memory CRUD tools now belong to the knowledge
+    # plugin rather than toolbox.registry.py. How: the concrete declarations are
+    # attached after their functions are defined below. Purpose: keep one source
+    # of truth for knowledge behavior and tool registration metadata.
+    "tools": [],
 }
 
+
+
+# ---------------------------------------------------------------------------
+#  Keyword matching
+# ---------------------------------------------------------------------------
+
+def compile_keyword(kw: str) -> re.Pattern[str] | str:
+    """Compile a skill or memory keyword entry."""
+    # Why: skill and memory keyword matching now lives inside the knowledge
+    # plugin instead of the old standalone matcher file. How: keep the exact legacy
+    # /pattern/flags parsing and lower-case substring fallback. Purpose: preserve
+    # activation behavior while removing the standalone matcher module.
+    kw = (kw or "").strip()
+    if not kw:
+        return ""
+    if kw.startswith("/"):
+        last_slash = kw.rfind("/")
+        if last_slash > 0:
+            pattern = kw[1:last_slash]
+            flags_str = kw[last_slash + 1:]
+            flags = 0
+            if "i" in flags_str:
+                flags |= re.IGNORECASE
+            if "s" in flags_str:
+                flags |= re.DOTALL
+            if "m" in flags_str:
+                flags |= re.MULTILINE
+            try:
+                return re.compile(pattern, flags)
+            except re.error:
+                pass
+    return kw.lower()
+
+
+def match_keywords(compiled: list[re.Pattern[str] | str], text: str) -> bool:
+    """Return True when any compiled keyword matches text."""
+    # Why: both skill and memory entries use the same activation semantics. How:
+    # run regex entries against original text and literal entries against lowered
+    # text, matching the old helper exactly. Purpose: prevent behavior drift while
+    # the duplicated matcher files are removed.
+    if not compiled or not text:
+        return False
+    text_lower = text.lower()
+    for kw in compiled:
+        if not kw:
+            continue
+        if isinstance(kw, re.Pattern):
+            if kw.search(text):
+                return True
+        elif kw in text_lower:
+            return True
+    return False
+
+
+def build_scan_text(
+    instruction_text: str,
+    history: list[dict[str, Any]] | None,
+    scan_depth: int,
+) -> str:
+    """Build the text scanned for keyword activation."""
+    # Why: skill and memory scan-depth handling must stay identical. How: always
+    # include the current instruction and append the last scan_depth conversation
+    # rounds using the legacy user-message boundary rule. Purpose: keep keyword
+    # activation scope unchanged after the files are merged.
+    parts: list[str] = [instruction_text or ""]
+    if history and scan_depth > 0:
+        # Why: the old implementation defined a round as a user message that
+        # starts after a non-user message. How: walk backward until enough round
+        # starts are found. Purpose: preserve keyword activation scope exactly.
+        round_starts: list[int] = []
+        for i in range(len(history) - 1, -1, -1):
+            role = history[i].get("role", "")
+            if role != "user":
+                continue
+            if i == 0 or history[i - 1].get("role", "") != "user":
+                round_starts.append(i)
+                if len(round_starts) >= scan_depth:
+                    break
+
+        if round_starts:
+            start_idx = round_starts[-1]
+            for msg in history[start_idx:]:
+                role = msg.get("role", "")
+                if role not in ("user", "assistant"):
+                    continue
+                content = msg.get("content")
+                if isinstance(content, str):
+                    parts.append(content)
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+#  Skill frontmatter, catalog loading, and legacy skill builder
+# ---------------------------------------------------------------------------
+
+def parse_skill_frontmatter(text: str) -> tuple[dict[str, Any], str]:
+    """Parse YAML frontmatter from SKILL.md content."""
+    # Why: skill CRUD and skill injection now share this module after deleting
+    # the old separate skill runtime file. How: keep the same frontmatter delimiter
+    # and YAML fallback behavior. Purpose: preserve SKILL.md compatibility during
+    # the move.
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---\n", 4)
+    if end < 0:
+        return {}, text
+    head = text[4:end]
+    body = text[end + 5:]
+    try:
+        meta = yaml.safe_load(head) or {}
+    except Exception:
+        meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    return meta, body
+
+
+class _SkillCache:
+    """Per-workspace skill catalog cache keyed on file mtimes."""
+
+    # Why: skill catalog scans can happen several times in one prompt build. How:
+    # keep the old short time-based cache in the merged plugin. Purpose: avoid
+    # extra filesystem reads without changing cache lifetime.
+    _lock = threading.Lock()
+    _entries: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+    _mtimes: dict[str, dict[str, float]] = {}
+    _TTL = 2.0
+
+    @classmethod
+    def get(cls, workspace_root: Path) -> list[dict[str, Any]] | None:
+        key = str(workspace_root)
+        with cls._lock:
+            entry = cls._entries.get(key)
+            if entry is None:
+                return None
+            ts, items = entry
+            if time.monotonic() - ts > cls._TTL:
+                return None
+            return items
+
+    @classmethod
+    def put(cls, workspace_root: Path, items: list[dict[str, Any]]) -> None:
+        key = str(workspace_root)
+        with cls._lock:
+            cls._entries[key] = (time.monotonic(), items)
+
+
+def load_skill_catalog(workspace_root: Path, *, _use_cache: bool = True) -> list[dict[str, Any]]:
+    """Scan ``skills/*/SKILL.md`` and return metadata + body for each skill."""
+    # Why: skill scanning is now owned by the knowledge plugin. How: move the
+    # former skill catalog loader here byte-for-byte except for local matcher
+    # references. Purpose: keep skill injection output stable while removing the
+    # old runtime module.
+    if _use_cache:
+        cached = _SkillCache.get(workspace_root)
+        if cached is not None:
+            return cached
+
+    skills_dir = workspace_root / "skills"
+    if not skills_dir.exists() or not skills_dir.is_dir():
+        return []
+
+    items: list[dict[str, Any]] = []
+    for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
+        try:
+            text = skill_md.read_text(encoding="utf-8")
+            meta, body = parse_skill_frontmatter(text)
+            name = str(meta.get("name") or skill_md.parent.name).strip() or skill_md.parent.name
+            description = str(meta.get("description") or "").strip()
+            enabled = bool(meta.get("enabled", True))
+
+            strategy = str(meta.get("strategy") or "normal").strip().lower()
+            if strategy not in ("constant", "normal"):
+                strategy = "normal"
+
+            raw_kw = meta.get("keywords")
+            keywords: list[str] = []
+            if isinstance(raw_kw, list):
+                keywords = [str(k).strip() for k in raw_kw if isinstance(k, str) and str(k).strip()]
+            elif isinstance(raw_kw, str) and raw_kw.strip():
+                keywords = [raw_kw.strip()]
+
+            order = 0
+            if isinstance(meta.get("order"), (int, float)):
+                order = int(meta["order"])
+            priority = 0
+            if isinstance(meta.get("priority"), (int, float)):
+                priority = int(meta["priority"])
+            scan_depth = 0
+            if isinstance(meta.get("scan_depth"), (int, float)):
+                scan_depth = max(0, int(meta["scan_depth"]))
+
+            raw_node_ids = meta.get("node_ids")
+            node_ids: list[str] = []
+            if isinstance(raw_node_ids, list):
+                node_ids = [str(n).strip() for n in raw_node_ids if isinstance(n, str) and str(n).strip()]
+            elif isinstance(raw_node_ids, str) and raw_node_ids.strip():
+                node_ids = [raw_node_ids.strip()]
+
+            items.append({
+                "name": name,
+                "description": description,
+                "enabled": enabled,
+                "path": skill_md.relative_to(workspace_root).as_posix(),
+                "strategy": strategy,
+                "keywords": keywords,
+                "compiled_keywords": [compile_keyword(k) for k in keywords],
+                "order": order,
+                "priority": priority,
+                "scan_depth": scan_depth,
+                "body": body.strip(),
+                "node_ids": node_ids,
+            })
+        except Exception:
+            continue
+    _SkillCache.put(workspace_root, items)
+    return items
+
+
+def build_skill_messages(
+    workspace_root: Path,
+    *,
+    node_id: str = "",
+    instruction_text: str = "",
+    history: list[dict[str, Any]] | None = None,
+    skill_mode: str = "all",
+    skill_allow: list[str] | None = None,
+    max_budget_chars: int = 0,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Build system messages for skill injection through the unified pipeline."""
+    # Why: legacy callers need a compatible skill message builder after the old
+    # runtime module is removed. How: delegate to the unified knowledge pipeline
+    # with memory disabled. Purpose: preserve the public behavior while keeping
+    # one injection implementation.
+    skill_static, skill_dynamic, _memory_static, _memory_dynamic = build_knowledge_messages(
+        workspace_root,
+        normalize_skill_entries(load_skill_catalog(workspace_root)),
+        node_id=node_id,
+        instruction_text=instruction_text,
+        history=history,
+        skill_mode=skill_mode,
+        skill_allow=skill_allow,
+        memory_mode="none",
+        memory_allow=None,
+        skill_max_budget_chars=max_budget_chars,
+        memory_max_budget_chars=0,
+        knowledge_max_budget_chars=0,
+    )
+    return skill_static, skill_dynamic
+
+
+# ---------------------------------------------------------------------------
+#  Memory catalog loading, hit tracking, and legacy memory builder
+# ---------------------------------------------------------------------------
+
+# Why: _update_last_hit_bg runs in a daemon thread and may fire concurrently for
+# the same book file. How: serialize all YAML writes through one lock. Purpose:
+# prevent partial-write corruption without adding heavyweight flock.
+_yaml_write_lock = threading.Lock()
+
+
+class _MemoryCache:
+    """Per-workspace memory catalog cache keyed on time."""
+
+    # Why: memory catalog scans are now in this plugin, but prompt builds still
+    # need the same short cache. How: preserve the old cache API including
+    # invalidate(). Purpose: keep memory extraction and CRUD invalidation working.
+    _lock = threading.Lock()
+    _entries: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+    _TTL = 2.0
+
+    @classmethod
+    def get(cls, workspace_root: Path) -> list[dict[str, Any]] | None:
+        key = str(workspace_root)
+        with cls._lock:
+            entry = cls._entries.get(key)
+            if entry is None:
+                return None
+            ts, items = entry
+            if time.monotonic() - ts > cls._TTL:
+                return None
+            return items
+
+    @classmethod
+    def put(cls, workspace_root: Path, items: list[dict[str, Any]]) -> None:
+        key = str(workspace_root)
+        with cls._lock:
+            cls._entries[key] = (time.monotonic(), items)
+
+    @classmethod
+    def invalidate(cls, workspace_root: Path) -> None:
+        key = str(workspace_root)
+        with cls._lock:
+            cls._entries.pop(key, None)
+
+
+def memory_dir(workspace_root: Path) -> Path:
+    """Return the memory storage directory path."""
+    # Why: memory storage path helpers move with the memory catalog loader. How:
+    # keep the same data/memory location. Purpose: preserve existing book files.
+    return workspace_root / "data" / "memory"
+
+
+def load_memory_catalog(
+    workspace_root: Path,
+    *,
+    _use_cache: bool = True,
+) -> list[dict[str, Any]]:
+    """Scan ``data/memory/*.yaml`` and return parsed entries."""
+    # Why: memory scanning is now owned by the knowledge plugin. How: move the
+    # former memory loader here and compile keywords with the local helper.
+    # Purpose: remove the old separate file without changing memory activation.
+    if _use_cache:
+        cached = _MemoryCache.get(workspace_root)
+        if cached is not None:
+            return cached
+
+    mem_dir = memory_dir(workspace_root)
+    if not mem_dir.exists() or not mem_dir.is_dir():
+        return []
+
+    items: list[dict[str, Any]] = []
+    for yaml_path in sorted(mem_dir.glob("*.yaml")):
+        try:
+            text = yaml_path.read_text(encoding="utf-8")
+            data = yaml.safe_load(text)
+            if not isinstance(data, dict):
+                continue
+            book = str(data.get("book") or yaml_path.stem).strip()
+            entries = data.get("entries")
+            if not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                eid = str(entry.get("id") or "").strip()
+                if not eid:
+                    continue
+                if not entry.get("enabled", True):
+                    continue
+
+                content = str(entry.get("content") or "").strip()
+                if not content:
+                    continue
+
+                raw_kw = entry.get("keywords")
+                keywords: list[str] = []
+                if isinstance(raw_kw, list):
+                    keywords = [
+                        str(k).strip()
+                        for k in raw_kw
+                        if isinstance(k, str) and str(k).strip()
+                    ]
+                elif isinstance(raw_kw, str) and raw_kw.strip():
+                    keywords = [raw_kw.strip()]
+
+                constant = bool(entry.get("constant", False))
+                priority = 0
+                if isinstance(entry.get("priority"), (int, float)):
+                    priority = int(entry["priority"])
+                scan_depth = 0
+                if isinstance(entry.get("scan_depth"), (int, float)):
+                    scan_depth = max(0, int(entry["scan_depth"]))
+
+                # Why: old memory books accepted node_ids as either a list or a
+                # comma-separated string. How: keep the same coercion. Purpose:
+                # node-scoped memories continue to load without migration.
+                raw_node_ids = entry.get("node_ids")
+                node_ids: list[str] = []
+                if isinstance(raw_node_ids, list):
+                    node_ids = [str(n).strip() for n in raw_node_ids if isinstance(n, str) and str(n).strip()]
+                elif isinstance(raw_node_ids, str) and raw_node_ids.strip():
+                    node_ids = [n.strip() for n in raw_node_ids.split(",") if n.strip()]
+
+                source = str(entry.get("source", "")).strip()
+                created_at = str(entry.get("created_at", "")).strip()
+                last_hit_at = str(entry.get("last_hit_at", "")).strip()
+
+                items.append({
+                    "book": book,
+                    "id": eid,
+                    "keywords": keywords,
+                    "compiled_keywords": [compile_keyword(k) for k in keywords],
+                    "content": content,
+                    "constant": constant,
+                    "priority": priority,
+                    "scan_depth": scan_depth,
+                    "node_ids": node_ids,
+                    "source": source,
+                    "created_at": created_at,
+                    "last_hit_at": last_hit_at,
+                })
+        except Exception:
+            continue
+
+    _MemoryCache.put(workspace_root, items)
+    return items
+
+
+def _update_last_hit_bg(workspace_root: Path, entries: list[dict[str, Any]]) -> None:
+    """Update last_hit_at for matched entries. Debounced: skip if <24h old."""
+    # Why: last_hit_at updates moved into this plugin with the rest of the memory
+    # runtime. How: keep the same daemon-thread update, debounce, and cache
+    # invalidation behavior. Purpose: preserve memory lifecycle metadata.
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    threshold = 86400
+
+    by_book: dict[str, list[str]] = {}
+    for e in entries:
+        b, eid = e.get("book", ""), e.get("id", "")
+        if b and eid:
+            by_book.setdefault(b, []).append(eid)
+    mem_dir = memory_dir(workspace_root)
+    for book, eids in by_book.items():
+        bp = mem_dir / f"{book}.yaml"
+        if not bp.exists():
+            continue
+        try:
+            data = yaml.safe_load(bp.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                continue
+            eid_set = set(eids)
+            changed = False
+            for entry in data.get("entries", []):
+                if not isinstance(entry, dict) or entry.get("id") not in eid_set:
+                    continue
+                old = entry.get("last_hit_at", "")
+                if old:
+                    try:
+                        old_dt = datetime.fromisoformat(old)
+                        if (now - old_dt).total_seconds() < threshold:
+                            continue
+                    except Exception:
+                        pass
+                entry["last_hit_at"] = now_iso
+                changed = True
+            if changed:
+                with _yaml_write_lock:
+                    bp.write_text(
+                        yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False),
+                        encoding="utf-8",
+                    )
+        except Exception:
+            continue
+    _MemoryCache.invalidate(workspace_root)
+
+
+def build_memory_messages(
+    workspace_root: Path,
+    *,
+    node_id: str = "",
+    instruction_text: str = "",
+    history: list[dict[str, Any]] | None = None,
+    max_budget_chars: int = 0,
+    memory_mode: str = "all",
+    memory_allow: list[str] | None = None,
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Build system messages for memory injection through the unified pipeline."""
+    # Why: legacy callers still need build_memory_messages after the old memory
+    # module is deleted. How: delegate to the unified knowledge pipeline with skills
+    # disabled. Purpose: keep public memory message behavior compatible.
+    _skill_static, _skill_dynamic, memory_static, memory_dynamic = build_knowledge_messages(
+        workspace_root,
+        normalize_memory_entries(load_memory_catalog(workspace_root)),
+        node_id=node_id,
+        instruction_text=instruction_text,
+        history=history,
+        skill_mode="none",
+        skill_allow=None,
+        memory_mode=memory_mode,
+        memory_allow=memory_allow,
+        skill_max_budget_chars=0,
+        memory_max_budget_chars=max_budget_chars,
+        knowledge_max_budget_chars=0,
+    )
+    return memory_static, memory_dynamic
 
 def _short_text(s: str, max_chars: int = 240) -> str:
     """Return the same short skill description used by the legacy index."""
@@ -259,7 +748,7 @@ def _classify_and_match_entries(
         # receives every matched memory entry. Purpose: preserve lifecycle data
         # even when a matched memory is later dropped by a budget limit.
         threading.Thread(
-            target=memory_runtime._update_last_hit_bg,
+            target=_update_last_hit_bg,
             args=(workspace_root, matched_memories),
             daemon=True,
         ).start()
@@ -544,11 +1033,12 @@ def build_knowledge_context(
     """
     safe_runtime_cfg = runtime_cfg or {}
 
-    # Why: loaders still own their storage formats and caches. How: keep skill
-    # and memory loading in their original modules, then normalize only the
-    # in-memory records here. Purpose: unify injection without merging storage.
-    entries = normalize_skill_entries(skills_runtime.load_skill_catalog(workspace_root))
-    entries.extend(normalize_memory_entries(memory_runtime.load_memory_catalog(workspace_root)))
+    # Why: the knowledge plugin now owns both storage loaders and the unified
+    # injection pipeline. How: load skill and memory catalogs locally, normalize
+    # them into one Entry shape, and render through build_knowledge_messages.
+    # Purpose: keep prompt injection behavior stable while deleting the old files.
+    entries = normalize_skill_entries(load_skill_catalog(workspace_root))
+    entries.extend(normalize_memory_entries(load_memory_catalog(workspace_root)))
 
     return build_knowledge_messages(
         workspace_root,
@@ -566,6 +1056,501 @@ def build_knowledge_context(
     )
 
 
+
+# ---------------------------------------------------------------------------
+#  Skill CRUD tools
+# ---------------------------------------------------------------------------
+
+async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Create or update a skill under skills/<name>/SKILL.md."""
+    # Why: skill management tools now live beside skill loading and injection.
+    # How: move the old skill-tool implementation here and keep the
+    # async tool signature unchanged. Purpose: let PLUGIN_META register the tool
+    # without hard-coding it in toolbox.registry.py.
+    name = str(args.get("name", "")).strip()
+    description = str(args.get("description", "")).strip()
+    content = args.get("content")
+    enabled = bool(args.get("enabled", True))
+
+    strategy = str(args.get("strategy", "")).strip().lower() or None
+    raw_keywords = args.get("keywords")
+    keywords: list[str] | None = None
+    if isinstance(raw_keywords, list):
+        keywords = [str(k).strip() for k in raw_keywords if isinstance(k, str) and str(k).strip()]
+
+    order: int | None = None
+    if args.get("order") is not None:
+        try:
+            order = int(args["order"])
+        except (TypeError, ValueError):
+            pass
+    priority: int | None = None
+    if args.get("priority") is not None:
+        try:
+            priority = int(args["priority"])
+        except (TypeError, ValueError):
+            pass
+    scan_depth: int | None = None
+    if args.get("scan_depth") is not None:
+        try:
+            scan_depth = max(0, int(args["scan_depth"]))
+        except (TypeError, ValueError):
+            pass
+
+    if not name:
+        return {"ok": False, "error": "empty skill name"}
+    if not SKILL_NAME_RE.fullmatch(name):
+        return {"ok": False, "error": "invalid skill name: only [A-Za-z0-9][A-Za-z0-9_-]{0,63} is allowed"}
+
+    path = f"skills/{name}/SKILL.md"
+    if not isinstance(content, str) or not content.strip():
+        meta: dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "enabled": enabled,
+        }
+        if strategy:
+            meta["strategy"] = strategy
+        if keywords is not None:
+            meta["keywords"] = keywords
+        if order is not None:
+            meta["order"] = order
+        if priority is not None:
+            meta["priority"] = priority
+        if scan_depth is not None:
+            meta["scan_depth"] = scan_depth
+        body = description or f"Skill {name}"
+        content = "---\n" + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip() + "\n---\n\n" + body.strip() + "\n"
+    else:
+        meta, body = parse_skill_frontmatter(content)
+        if not isinstance(meta, dict):
+            meta = {}
+        meta["name"] = name
+        if description:
+            meta["description"] = description
+        elif not isinstance(meta.get("description"), str):
+            meta["description"] = ""
+        meta["enabled"] = enabled
+        if strategy:
+            meta["strategy"] = strategy
+        if keywords is not None:
+            meta["keywords"] = keywords
+        if order is not None:
+            meta["order"] = order
+        if priority is not None:
+            meta["priority"] = priority
+        if scan_depth is not None:
+            meta["scan_depth"] = scan_depth
+        content = "---\n" + yaml.safe_dump(meta, sort_keys=False, allow_unicode=True).strip() + "\n---\n\n" + str(body or "").strip() + "\n"
+
+    # Why: write_file already centralizes policy approval and path checks. How:
+    # import it lazily from toolbox.builtins after moving this function out of that
+    # package. Purpose: preserve the guarded write behavior without a module cycle.
+    from toolbox.builtins.write_file import write_file
+
+    res = await write_file({"path": path, "content": content}, ctx)
+    if not res.get("ok"):
+        return res
+    return {"ok": True, "path": path, "name": name, "enabled": enabled}
+
+
+async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """List local skills under skills/*/SKILL.md."""
+    # Why: the listing tool was moved with the skill parser. How: keep the same
+    # filesystem scan and metadata coercion. Purpose: preserve tool output shape.
+    skills_dir = ctx.workspace_root / "skills"
+    if not skills_dir.exists():
+        return {"ok": True, "skills": []}
+
+    items: list[dict[str, Any]] = []
+    for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
+        try:
+            rel = skill_md.relative_to(ctx.workspace_root).as_posix()
+            text = skill_md.read_text(encoding="utf-8")
+            meta, _body = parse_skill_frontmatter(text)
+            if not isinstance(meta, dict):
+                meta = {}
+            strategy = str(meta.get("strategy") or "normal").strip().lower()
+            if strategy not in ("constant", "normal"):
+                strategy = "normal"
+            raw_kw = meta.get("keywords")
+            kw_list: list[str] = []
+            if isinstance(raw_kw, list):
+                kw_list = [str(k).strip() for k in raw_kw if isinstance(k, str) and str(k).strip()]
+            item_order = 0
+            if isinstance(meta.get("order"), (int, float)):
+                item_order = int(meta["order"])
+            item_priority = 0
+            if isinstance(meta.get("priority"), (int, float)):
+                item_priority = int(meta["priority"])
+            item_scan_depth = 0
+            if isinstance(meta.get("scan_depth"), (int, float)):
+                item_scan_depth = max(0, int(meta["scan_depth"]))
+            items.append(
+                {
+                    "name": str(meta.get("name") or skill_md.parent.name),
+                    "description": str(meta.get("description") or ""),
+                    "enabled": bool(meta.get("enabled", True)),
+                    "strategy": strategy,
+                    "keywords": kw_list,
+                    "order": item_order,
+                    "priority": item_priority,
+                    "scan_depth": item_scan_depth,
+                    "path": rel,
+                }
+            )
+        except Exception as e:
+            items.append({"name": skill_md.parent.name, "path": skill_md.relative_to(ctx.workspace_root).as_posix(), "error": str(e)})
+
+    return {"ok": True, "skills": items}
+
+
+async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Delete a skill directory under skills/<name>/."""
+    # Why: delete_skill is now plugin-owned like the other knowledge tools. How:
+    # keep the old guard and shutil.rmtree behavior. Purpose: preserve approval
+    # and deletion semantics while removing the old skill-tool file.
+    name = str(args.get("name", "")).strip()
+    if not name:
+        return {"ok": False, "error": "empty skill name"}
+    if not SKILL_NAME_RE.fullmatch(name):
+        return {"ok": False, "error": "invalid skill name"}
+
+    skill_dir = resolve_under_allowed_roots(ctx.workspace_root, f"skills/{name}")
+    if not skill_dir.exists():
+        return {"ok": False, "error": f"skill not found: {name}"}
+    if not skill_dir.is_dir():
+        return {"ok": False, "error": f"not a skill directory: {name}"}
+
+    _op, err = await request_guard(ctx, "write_file", {"path": f"skills/{name}/SKILL.md", "delete": True})
+    if err is not None:
+        return err
+
+    shutil.rmtree(skill_dir)
+    return {"ok": True, "deleted": True, "name": name}
+
+
+# ---------------------------------------------------------------------------
+#  Memory CRUD tools
+# ---------------------------------------------------------------------------
+
+_MEMORY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,127}$")
+_BOOK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_\-]{0,63}$")
+
+
+def _load_book(path: Path) -> dict[str, Any]:
+    """Load a memory book yaml. Returns default structure if missing."""
+    # Why: memory CRUD moved into the injection plugin with the cache. How: keep
+    # the same tolerant YAML load and default book structure. Purpose: avoid
+    # changing how malformed or missing memory books are handled.
+    if not path.exists():
+        return {"book": path.stem, "entries": []}
+    try:
+        text = path.read_text(encoding="utf-8")
+        data = yaml.safe_load(text)
+    except Exception:
+        return {"book": path.stem, "entries": []}
+    if not isinstance(data, dict):
+        return {"book": path.stem, "entries": []}
+    if not isinstance(data.get("entries"), list):
+        data["entries"] = []
+    return data
+
+
+def _save_book(path: Path, data: dict[str, Any]) -> None:
+    """Write a memory book yaml back to disk."""
+    # Why: save_memory and delete_memory still write YAML books directly. How:
+    # retain the old safe_dump format and parent creation. Purpose: keep files
+    # compatible with existing memory books.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = yaml.safe_dump(
+        data, sort_keys=False, allow_unicode=True, default_flow_style=False,
+    )
+    path.write_text(text, encoding="utf-8")
+
+
+def _invalidate_cache(workspace_root: Path) -> None:
+    """Clear the memory cache so the next prompt build picks up changes."""
+    # Why: memory CRUD functions now share the same module as _MemoryCache. How:
+    # call invalidate directly and keep the best-effort wrapper. Purpose: preserve
+    # the old failure-tolerant cache invalidation behavior.
+    try:
+        _MemoryCache.invalidate(workspace_root)
+    except Exception:
+        pass
+
+
+async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Create or update a memory entry in a book."""
+    # Why: memory management tools now live beside memory loading and injection.
+    # How: move the old memory-tool implementation here and keep the
+    # async tool signature unchanged. Purpose: let PLUGIN_META register the tool
+    # without hard-coding it in toolbox.registry.py.
+    mid = str(args.get("id") or "").strip()
+    if not mid:
+        return {"ok": False, "error": "empty memory id"}
+    if not _MEMORY_ID_RE.fullmatch(mid):
+        return {
+            "ok": False,
+            "error": "invalid id: only [A-Za-z0-9][A-Za-z0-9_.-]{0,127} allowed",
+        }
+
+    book = str(args.get("book") or "default").strip()
+    if not _BOOK_NAME_RE.fullmatch(book):
+        return {"ok": False, "error": "invalid book name"}
+
+    content = str(args.get("content") or "").strip()
+    if not content:
+        return {"ok": False, "error": "empty content"}
+
+    raw_keywords = args.get("keywords")
+    keywords: list[str] = []
+    if isinstance(raw_keywords, list):
+        keywords = [
+            str(k).strip()
+            for k in raw_keywords
+            if isinstance(k, str) and str(k).strip()
+        ]
+    elif isinstance(raw_keywords, str) and raw_keywords.strip():
+        keywords = [raw_keywords.strip()]
+
+    constant = bool(args.get("constant", False))
+    enabled = bool(args.get("enabled", True))
+
+    # Why: existing memory tools accepted node_ids as a list or comma-separated
+    # string. How: preserve both forms. Purpose: node-scoped memory entries keep
+    # their tool API compatibility.
+    raw_node_ids = args.get("node_ids")
+    node_ids: list[str] = []
+    if isinstance(raw_node_ids, list):
+        node_ids = [str(n).strip() for n in raw_node_ids if isinstance(n, str) and str(n).strip()]
+    elif isinstance(raw_node_ids, str) and raw_node_ids.strip():
+        node_ids = [n.strip() for n in raw_node_ids.split(",") if n.strip()]
+
+    priority = 0
+    if args.get("priority") is not None:
+        try:
+            priority = int(args["priority"])
+        except (TypeError, ValueError):
+            pass
+
+    scan_depth = 0
+    if args.get("scan_depth") is not None:
+        try:
+            scan_depth = max(0, int(args["scan_depth"]))
+        except (TypeError, ValueError):
+            pass
+
+    book_path = memory_dir(ctx.workspace_root) / f"{book}.yaml"
+    data = _load_book(book_path)
+    data.setdefault("book", book)
+
+    new_entry: dict[str, Any] = {
+        "id": mid,
+        "content": content,
+        "keywords": keywords,
+        "constant": constant,
+        "enabled": enabled,
+        "priority": priority,
+        "scan_depth": scan_depth,
+    }
+
+    entries = data["entries"]
+    found = False
+    for i, e in enumerate(entries):
+        if isinstance(e, dict) and str(e.get("id") or "").strip() == mid:
+            entries[i] = new_entry
+            found = True
+            break
+    if not found:
+        entries.append(new_entry)
+
+    _save_book(book_path, data)
+    _invalidate_cache(ctx.workspace_root)
+    return {"ok": True, "book": book, "id": mid, "updated": found}
+
+
+async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """List memory entries, optionally filtered by book."""
+    # Why: list_memories is now plugin-owned like the memory catalog. How: keep
+    # the old book scan and preview fields. Purpose: preserve the tool response.
+    book_filter = str(args.get("book") or "").strip() or None
+    mem_dir = memory_dir(ctx.workspace_root)
+    if not mem_dir.exists():
+        return {"ok": True, "entries": []}
+
+    result: list[dict[str, Any]] = []
+    for yaml_path in sorted(mem_dir.glob("*.yaml")):
+        try:
+            data = _load_book(yaml_path)
+            bname = str(data.get("book") or yaml_path.stem).strip()
+            if book_filter and bname != book_filter:
+                continue
+            for e in data.get("entries", []):
+                if not isinstance(e, dict):
+                    continue
+                result.append({
+                    "book": bname,
+                    "id": str(e.get("id") or ""),
+                    "content": str(e.get("content") or "")[:200],
+                    "keywords": e.get("keywords", []),
+                    "constant": bool(e.get("constant", False)),
+                    "enabled": bool(e.get("enabled", True)),
+                    "priority": int(e.get("priority") or 0),
+                    "scan_depth": int(e.get("scan_depth") or 0),
+                    "node_ids": e.get("node_ids", []),
+                })
+        except Exception:
+            continue
+
+    return {"ok": True, "entries": result}
+
+
+async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Delete a memory entry from a book."""
+    # Why: delete_memory moved into the knowledge plugin with save_memory. How:
+    # keep the old constant-memory protection and empty-book removal behavior.
+    # Purpose: avoid any tool-level behavior change during registration refactor.
+    mid = str(args.get("id") or "").strip()
+    if not mid:
+        return {"ok": False, "error": "empty memory id"}
+
+    book = str(args.get("book") or "default").strip()
+    book_path = memory_dir(ctx.workspace_root) / f"{book}.yaml"
+    if not book_path.exists():
+        return {"ok": False, "error": f"book not found: {book}"}
+
+    data = _load_book(book_path)
+    entries = data.get("entries", [])
+
+    # Why: constant memories are treated as protected baseline context. How: keep
+    # the old refusal before filtering entries. Purpose: prevent accidental removal
+    # of always-injected memory through the tool API.
+    for e in entries:
+        if isinstance(e, dict) and str(e.get("id") or "").strip() == mid:
+            if bool(e.get("constant", False)):
+                return {"ok": False, "error": f"cannot delete constant memory: {mid}"}
+            break
+
+    new_entries = [
+        e for e in entries
+        if not (isinstance(e, dict) and str(e.get("id") or "").strip() == mid)
+    ]
+    if len(new_entries) == len(entries):
+        return {"ok": False, "error": f"memory not found: {mid}"}
+
+    data["entries"] = new_entries
+    if new_entries:
+        _save_book(book_path, data)
+    else:
+        try:
+            book_path.unlink()
+        except Exception:
+            pass
+
+    _invalidate_cache(ctx.workspace_root)
+    return {"ok": True, "book": book, "id": mid, "deleted": True}
+
+
+# ---------------------------------------------------------------------------
+#  PLUGIN_META tool declarations
+# ---------------------------------------------------------------------------
+
+# Why: toolbox.registry.py no longer owns these knowledge tool specs. How: attach
+# exact copied descriptions and input schemas to PLUGIN_META after the functions
+# exist. Purpose: let engine.builtin.loader register plugin-owned builtin tools.
+PLUGIN_META["tools"] = [
+    {
+        "name": "create_or_update_skill",
+        "description": "Create or update a skill under skills/<name>/SKILL.md.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "description": {"type": "string"},
+                "content": {"type": "string", "description": "full SKILL.md content (optional; frontmatter will be normalized)"},
+                "enabled": {"type": "boolean"},
+                "strategy": {"type": "string", "description": "constant (always injected) or normal (keyword-triggered); default normal", "enum": ["constant", "normal"]},
+                "keywords": {"type": "array", "items": {"type": "string"}, "description": "activation keywords; supports /regex/flags syntax"},
+                "order": {"type": "integer", "description": "injection order within the same block; higher values are placed later (closer to conversation)"},
+                "priority": {"type": "integer", "description": "budget priority; higher values are kept first when token budget is exceeded"},
+                "scan_depth": {"type": "integer", "description": "number of recent conversation rounds to scan for keyword matching; 0 = current message only"},
+            },
+            "required": ["name"],
+        },
+        "func": create_or_update_skill,
+    },
+    {
+        "name": "list_skills",
+        "description": "List local skills under skills/*/SKILL.md.",
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+        "func": list_skills,
+    },
+    {
+        "name": "delete_skill",
+        "description": "Delete a skill directory under skills/<name>/.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+            },
+            "required": ["name"],
+        },
+        "func": delete_skill,
+    },
+    {
+        "name": "save_memory",
+        "description": "Save or update a memory entry in a book. "
+        "Use this when you learn something worth remembering across conversations: "
+        "user preferences, corrections, project context, external resource pointers, "
+        "or character profiles in group chat.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Unique entry id (e.g. user_zhangsan, rule_no_mock)."},
+                "book": {"type": "string", "description": "Book name (file grouping). Default 'default'. Use e.g. 'people' for character profiles, 'rules' for behavioral rules."},
+                "content": {"type": "string", "description": "Memory content text."},
+                "keywords": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Activation keywords. Supports /regex/flags. When any keyword matches user input, this memory is injected into context.",
+                },
+                "constant": {"type": "boolean", "description": "If true, always injected regardless of keywords. Default false."},
+                "enabled": {"type": "boolean", "description": "Whether this entry is active. Default true."},
+                "priority": {"type": "integer", "description": "Budget priority; higher = kept first when budget exceeded."},
+                "scan_depth": {"type": "integer", "description": "Number of recent conversation rounds to scan for keywords. 0 = current message only."},
+            },
+            "required": ["id", "content"],
+        },
+        "func": save_memory,
+    },
+    {
+        "name": "list_memories",
+        "description": "List memory entries, optionally filtered by book name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "book": {"type": "string", "description": "Filter by book name. Omit to list all."},
+            },
+            "required": [],
+        },
+        "func": list_memories,
+    },
+    {
+        "name": "delete_memory",
+        "description": "Delete a memory entry from a book.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Memory entry id to delete."},
+                "book": {"type": "string", "description": "Book name. Default 'default'."},
+            },
+            "required": ["id"],
+        },
+        "func": delete_memory,
+    },
+]
+
 class KnowledgeInjector:
     """Glue handler for skill and memory prompt injection."""
 
@@ -575,8 +1560,8 @@ class KnowledgeInjector:
     async def handle(self, ctx: Any) -> Any | None:
         """Build skill and memory messages, then optionally rebuild the prompt.
 
-        Why: skill_inject.py and memory_inject.py duplicated prompt-hook glue and
-        filtered conversation history separately. How: filter history once, call
+        Why: the previous separate skill and memory prompt hooks duplicated glue
+        and filtered conversation history separately. How: filter history once, call
         the unified knowledge builder with either independent or global budgets,
         and store the same ctx.extra keys as before. Purpose: unify ownership
         without changing prompt content, order, labels, or downstream contracts.
@@ -616,7 +1601,7 @@ class KnowledgeInjector:
 def _rebuild_prompt_messages(ctx: Any) -> None:
     """Rebuild ctx.messages with all prompt injections currently in ctx.extra.
 
-    Why: the old SkillInjector helper was shared by MemoryInjector and therefore
+    Why: the previous prompt rebuild helper was shared by both knowledge paths and
     had to survive the merge. How: keep the same assemble_messages_with_injections
     call in the unified module and read the unchanged ctx.extra key names.
     Purpose: preserve the existing prompt layout while removing the old modules.

@@ -5,7 +5,10 @@ from __future__ import annotations
 import importlib
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from toolbox.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +20,7 @@ def auto_discover_and_register(
     *,
     package: str = "engine.builtin",
     directory: Path | None = None,
+    tool_registry: "ToolRegistry | None" = None,
 ) -> dict[str, Any]:
     """Scan built-in handler modules and register PLUGIN_META declarations.
 
@@ -47,6 +51,7 @@ def auto_discover_and_register(
             for hook_point, method_name in _iter_hook_points(meta):
                 method = getattr(instance, method_name)
                 registry.register(str(hook_point), method, priority=priority)
+            _register_declared_tools(module_name, meta, tool_registry)
             _register_meta(registry, py_file, meta, handler_name)
         except Exception as exc:
             logger.error("Failed to load built-in hook %s: %s", module_name, exc, exc_info=True)
@@ -75,6 +80,40 @@ def _instantiate_handler(module: Any, meta: dict[str, Any]) -> Any:
         raise ValueError("PLUGIN_META.handler_class is required")
     cls = getattr(module, class_name)
     return cls()
+
+
+def _register_declared_tools(module_name: str, meta: dict[str, Any], tool_registry: "ToolRegistry | None") -> None:
+    """Register PLUGIN_META.tools declarations into the provided ToolRegistry."""
+    # Why: built-in plugins can now own their tool implementations and schemas.
+    # How: when a ToolRegistry is provided, validate each metadata declaration and
+    # pass it through register_builtin_tool(). Purpose: remove hard-coded knowledge
+    # tools from toolbox.registry.py while keeping loader failures localized.
+    raw_tools = meta.get("tools")
+    if raw_tools is None:
+        return
+    if tool_registry is None:
+        return
+    if not isinstance(raw_tools, list):
+        raise ValueError(f"{module_name} PLUGIN_META.tools must be a list")
+
+    register_builtin_tool = getattr(tool_registry, "register_builtin_tool", None)
+    if not callable(register_builtin_tool):
+        raise TypeError("tool_registry must provide register_builtin_tool")
+
+    for tool in raw_tools:
+        if not isinstance(tool, dict):
+            raise ValueError(f"{module_name} has invalid tool declaration: {tool!r}")
+        name = str(tool.get("name") or "").strip()
+        description = str(tool.get("description") or "")
+        input_schema = tool.get("input_schema")
+        func = tool.get("func")
+        if not name:
+            raise ValueError(f"{module_name} tool declaration missing name")
+        if not isinstance(input_schema, dict):
+            raise ValueError(f"{module_name}.{name} input_schema must be a dict")
+        if not callable(func):
+            raise ValueError(f"{module_name}.{name} func must be callable")
+        register_builtin_tool(name, description, input_schema, func)
 
 
 def _iter_hook_points(meta: dict[str, Any]) -> list[tuple[str, str]]:
@@ -107,6 +146,18 @@ def _register_meta(registry: Any, py_file: Path, meta: dict[str, Any], handler_n
     if not callable(register_plugin_meta):
         return
     display_meta = dict(meta)
+    if isinstance(display_meta.get("tools"), list):
+        # Why: tool declarations contain live callables that diagnostic metadata
+        # should not expose. How: keep only small serializable tool records.
+        # Purpose: HookRegistry.list_plugins() remains safe to inspect and encode.
+        display_meta["tools"] = [
+            {
+                "name": str(tool.get("name") or ""),
+                "description": str(tool.get("description") or ""),
+            }
+            for tool in display_meta["tools"]
+            if isinstance(tool, dict)
+        ]
     display_meta.setdefault("name", handler_name)
     display_meta.setdefault("version", "builtin")
     display_meta.setdefault("description", "")

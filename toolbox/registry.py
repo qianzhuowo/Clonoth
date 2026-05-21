@@ -190,6 +190,37 @@ class ToolRegistry:
 
         self.reload()
 
+    def register_builtin_tool(self, name: str, description: str, input_schema: dict[str, Any], func: ToolFunc) -> None:
+        """Register one builtin tool declared by a built-in plugin."""
+        # Why: some built-in tools now live with their owning plugin instead of
+        # the central registry table. How: install the spec and callable into the
+        # active maps and, when available, into the builtin snapshots used by
+        # reload(). Purpose: plugin-owned builtin tools remain visible after tools
+        # hot-reload and cannot be overridden by external script tools.
+        clean_name = str(name or "").strip()
+        if not clean_name:
+            raise ValueError("builtin tool name is required")
+        if not isinstance(input_schema, dict):
+            input_schema = {"type": "object", "properties": {}, "required": []}
+        if not callable(func):
+            raise TypeError(f"builtin tool function is not callable: {clean_name}")
+
+        spec = {
+            "name": clean_name,
+            "description": str(description or ""),
+            "input_schema": input_schema,
+        }
+        self._tool_specs[clean_name] = spec
+        self._tool_funcs[clean_name] = func
+
+        # Why: plugin tools are registered after ToolRegistry.__init__ has already
+        # captured its builtin snapshot. How: refresh the snapshots when they
+        # exist. Purpose: later reload() calls keep plugin-declared tools.
+        if hasattr(self, "_builtin_specs"):
+            self._builtin_specs[clean_name] = spec
+        if hasattr(self, "_builtin_funcs"):
+            self._builtin_funcs[clean_name] = func
+
     def _load_builtin_meta_tools(self) -> None:
         builtins: list[tuple[str, str, dict[str, Any], ToolFunc]] = [
             (
@@ -323,44 +354,6 @@ class ToolRegistry:
                     "required": ["query"],
                 },
                 _builtins.search_in_files,
-            ),
-            (
-                "create_or_update_skill",
-                "Create or update a skill under skills/<name>/SKILL.md.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                        "description": {"type": "string"},
-                        "content": {"type": "string", "description": "full SKILL.md content (optional; frontmatter will be normalized)"},
-                        "enabled": {"type": "boolean"},
-                        "strategy": {"type": "string", "description": "constant (always injected) or normal (keyword-triggered); default normal", "enum": ["constant", "normal"]},
-                        "keywords": {"type": "array", "items": {"type": "string"}, "description": "activation keywords; supports /regex/flags syntax"},
-                        "order": {"type": "integer", "description": "injection order within the same block; higher values are placed later (closer to conversation)"},
-                        "priority": {"type": "integer", "description": "budget priority; higher values are kept first when token budget is exceeded"},
-                        "scan_depth": {"type": "integer", "description": "number of recent conversation rounds to scan for keyword matching; 0 = current message only"},
-                    },
-                    "required": ["name"],
-                },
-                _builtins.create_or_update_skill,
-            ),
-            (
-                "list_skills",
-                "List local skills under skills/*/SKILL.md.",
-                {"type": "object", "properties": {}, "required": []},
-                _builtins.list_skills,
-            ),
-            (
-                "delete_skill",
-                "Delete a skill directory under skills/<name>/.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string"},
-                    },
-                    "required": ["name"],
-                },
-                _builtins.delete_skill,
             ),
             (
                 "create_or_update_mcp_client",
@@ -497,66 +490,14 @@ class ToolRegistry:
                 {"type": "object", "properties": {}, "required": []},
                 _builtins.get_context_window,
             ),
-            (
-                "save_memory",
-                "Save or update a memory entry in a book. "
-                "Use this when you learn something worth remembering across conversations: "
-                "user preferences, corrections, project context, external resource pointers, "
-                "or character profiles in group chat.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "Unique entry id (e.g. user_zhangsan, rule_no_mock)."},
-                        "book": {"type": "string", "description": "Book name (file grouping). Default 'default'. Use e.g. 'people' for character profiles, 'rules' for behavioral rules."},
-                        "content": {"type": "string", "description": "Memory content text."},
-                        "keywords": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Activation keywords. Supports /regex/flags. When any keyword matches user input, this memory is injected into context.",
-                        },
-                        "constant": {"type": "boolean", "description": "If true, always injected regardless of keywords. Default false."},
-                        "enabled": {"type": "boolean", "description": "Whether this entry is active. Default true."},
-                        "priority": {"type": "integer", "description": "Budget priority; higher = kept first when budget exceeded."},
-                        "scan_depth": {"type": "integer", "description": "Number of recent conversation rounds to scan for keywords. 0 = current message only."},
-                    },
-                    "required": ["id", "content"],
-                },
-                _builtins.save_memory,
-            ),
-            (
-                "list_memories",
-                "List memory entries, optionally filtered by book name.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "book": {"type": "string", "description": "Filter by book name. Omit to list all."},
-                    },
-                    "required": [],
-                },
-                _builtins.list_memories,
-            ),
-            (
-                "delete_memory",
-                "Delete a memory entry from a book.",
-                {
-                    "type": "object",
-                    "properties": {
-                        "id": {"type": "string", "description": "Memory entry id to delete."},
-                        "book": {"type": "string", "description": "Book name. Default 'default'."},
-                    },
-                    "required": ["id"],
-                },
-                _builtins.delete_memory,
-            ),
         ]
 
         for name, desc, schema, func in builtins:
-            self._tool_specs[name] = {
-                "name": name,
-                "description": desc,
-                "input_schema": schema,
-            }
-            self._tool_funcs[name] = func
+            # Why: built-in tools now have a public registration path shared by
+            # registry-owned and plugin-owned tools. How: seed the central table
+            # through register_builtin_tool(). Purpose: keep one code path for
+            # validating and storing builtin specs.
+            self.register_builtin_tool(name, desc, schema, func)
 
     def reload(self) -> int:
         """Reload external tools under tools/.

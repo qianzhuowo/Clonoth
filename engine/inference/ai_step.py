@@ -1300,7 +1300,11 @@ async def run_ai_node(
     # 自己的 hook point。做法：自动扫描内置目录并注册到共享 hook_registry；
     # HookRegistry 会按名称替换旧实例。目的：删除集中硬编码注册，同时保持
     # finish_guard、approval、prompt 注入等内置规则始终可用。
-    auto_discover_and_register(hook_registry)
+    # Why: PLUGIN_META can now also declare builtin tools. How: pass the active
+    # ToolRegistry into discovery so plugin-owned tools are registered before the
+    # model-visible tool list is built. Purpose: keep hook and tool registration
+    # in one plugin discovery pass.
+    auto_discover_and_register(hook_registry, tool_registry=registry)
     # Phase 3 External Hook Plugins：每次进入 AI 节点时扫描工作区 plugins/。
     # 原因：用户需要在不修改 engine 源码的情况下添加自定义 handler。
     # 做法：调用幂等的外部插件加载器；HookRegistry 会按 handler.name 替换旧实例。

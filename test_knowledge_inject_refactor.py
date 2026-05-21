@@ -7,11 +7,12 @@ from types import SimpleNamespace
 
 def test_knowledge_match_keyword_and_scan_text_semantics() -> None:
     """Protect the shared matcher against behavior drift during the refactor."""
-    # Why: skills and memory used identical keyword semantics before this refactor.
-    # How: exercise regex flags, invalid-regex fallback, substring matching, and
-    # round-based history scanning through the new shared module. Purpose: keep
-    # both injection paths byte-compatible with the duplicated legacy functions.
-    from engine.knowledge_match import build_scan_text, compile_keyword, match_keywords
+    # Why: the matcher is being moved into the knowledge plugin and the deleted
+    # standalone matcher module must not remain the public dependency. How:
+    # import the helpers from engine.builtin.knowledge_inject before exercising the
+    # same regex, literal, and scan-depth cases. Purpose: keep behavior unchanged
+    # while proving the new plugin owns the shared keyword logic.
+    from engine.builtin.knowledge_inject import build_scan_text, compile_keyword, match_keywords
 
     assert match_keywords([compile_keyword("/hello/i")], "HeLLo world") is True
     assert match_keywords([compile_keyword("Broken[")], "a broken[ keyword") is True
@@ -108,3 +109,49 @@ def test_knowledge_inject_sets_existing_extra_keys_and_rebuilds_prompt(tmp_path:
     )
     assert ctx.messages == expected_messages
     assert ctx.extra["is_block_mode"] is expected_block_mode
+
+
+def test_loader_registers_knowledge_tools_from_plugin_meta(tmp_path: Path) -> None:
+    """Knowledge tools should be declared by PLUGIN_META and installed by loader."""
+    # Why: skill and memory CRUD tools are being removed from registry.py's hard-
+    # coded list. How: create a real ToolRegistry, run built-in auto-discovery with
+    # that registry, and verify the six knowledge tools appear and survive reload.
+    # Purpose: make plugin-owned tool registration executable instead of relying on
+    # implicit imports from toolbox.builtins.
+    from engine.builtin.loader import auto_discover_and_register
+    from engine.hooks import HookRegistry
+    from toolbox.registry import ToolRegistry
+
+    tool_registry = ToolRegistry(workspace_root=tmp_path, tools_dir=tmp_path / "tools")
+    assert tool_registry.get_spec("save_memory") is None
+    assert tool_registry.get_spec("create_or_update_skill") is None
+
+    hook_registry = HookRegistry()
+    handlers = auto_discover_and_register(hook_registry, tool_registry=tool_registry)
+
+    assert "knowledge_inject" in handlers
+    assert hook_registry.list_hooks()["before_prompt_build"] == ["knowledge_inject"]
+    for name in (
+        "save_memory",
+        "list_memories",
+        "delete_memory",
+        "create_or_update_skill",
+        "list_skills",
+        "delete_skill",
+    ):
+        spec = tool_registry.get_spec(name)
+        assert spec is not None
+        assert spec["name"] == name
+        assert isinstance(spec["input_schema"], dict)
+
+    assert tool_registry.reload() >= 1
+    assert tool_registry.get_spec("save_memory") is not None
+
+    result = asyncio.run(
+        tool_registry.execute(
+            name="list_skills",
+            arguments={},
+            ctx=SimpleNamespace(workspace_root=tmp_path),
+        )
+    )
+    assert result == {"ok": True, "skills": []}

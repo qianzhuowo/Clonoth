@@ -1,0 +1,168 @@
+"""Regression tests for persisted session entry-node routing.
+
+[2026-05-21] These tests are written before the implementation because the
+failure only appears after a supervisor restart: in-memory node overrides are
+cleared, and inbound callbacks must still route through the session's own
+entry_node_id instead of falling back to the global runtime default.
+"""
+from __future__ import annotations
+
+import json
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+# Why: tests are executed from a source checkout without an installed package.
+# How: prepend the repository root to sys.path. Purpose: import the edited
+# supervisor modules directly so the persistence regression is covered.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from supervisor._helpers import SessionInfo  # noqa: E402
+from supervisor.eventlog import EventLog  # noqa: E402
+from supervisor.policy import PolicyEngine  # noqa: E402
+from supervisor.session_store import SessionStore  # noqa: E402
+from supervisor.state import SupervisorState  # noqa: E402
+
+
+def _write_runtime_config(workspace: Path, entry_node_id: str = "global.default") -> None:
+    """Write the smallest runtime config needed by entry-node routing tests."""
+    # Why: the production default may change between deployments. How: tests write
+    # an explicit shell.entry_node_id into the temporary workspace. Purpose: make
+    # assertions about global fallback routing deterministic.
+    path = workspace / "config" / "runtime.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"shell:\n  entry_node_id: {entry_node_id}\n", encoding="utf-8")
+
+
+def _make_state(workspace: Path) -> SupervisorState:
+    """Create a SupervisorState backed only by temporary persistence files."""
+    # Why: entry_node_id must survive the same file-backed path used in production.
+    # How: instantiate EventLog and SessionStore through SupervisorState using the
+    # provided workspace. Purpose: cover restart behavior without touching live data.
+    eventlog = EventLog(workspace / "data" / "events.jsonl", run_id="run-entry-persist")
+    return SupervisorState(
+        workspace_root=workspace,
+        eventlog=eventlog,
+        policy=PolicyEngine(workspace_root=workspace),
+    )
+
+
+def test_session_store_persists_and_restores_entry_node_id(tmp_path: Path) -> None:
+    """SessionStore should write new entry_node_id values and read old files safely."""
+    store_path = tmp_path / "data" / "sessions.json"
+    store = SessionStore(store_path)
+    created_at = datetime(2026, 5, 21, tzinfo=timezone.utc)
+
+    store.on_session_created(
+        SessionInfo(
+            session_id="session-new",
+            channel="discord",
+            conversation_key="discord:new",
+            created_at=created_at,
+            updated_at=created_at,
+            entry_node_id="persisted.entry",
+        )
+    )
+    raw = json.loads(store_path.read_text(encoding="utf-8"))
+    # Why: the restart path can only recover the route if sessions.json contains
+    # the selected entry node. How: assert the serialized registry stores the new
+    # field next to the existing session metadata. Purpose: prevent regressions in
+    # the write path.
+    assert raw["session-new"]["entry_node_id"] == "persisted.entry"
+
+    raw["session-old"] = {
+        "session_id": "session-old",
+        "channel": "discord",
+        "conversation_key": "discord:old",
+        "created_at": created_at.isoformat(),
+        "reset": False,
+    }
+    store_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    restored, conv_map, child_map, parent_children = SessionStore(store_path).load()
+
+    # Why: existing deployments already have sessions.json entries without the new
+    # field. How: missing entry_node_id is normalized to an empty string. Purpose:
+    # old session registries continue loading after the schema extension.
+    assert restored["session-new"].entry_node_id == "persisted.entry"
+    assert restored["session-old"].entry_node_id == ""
+    assert conv_map["discord:new"] == "session-new"
+    assert child_map == {}
+    assert parent_children == {}
+
+
+def test_recorded_entry_node_is_used_after_restart(tmp_path: Path) -> None:
+    """Inbound task creation should prefer the session record over the global default."""
+    _write_runtime_config(tmp_path, entry_node_id="global.default")
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="discord", conversation_key="discord:restart")
+    state.sessions[session_id].entry_node_id = "recorded.entry"
+    state._session_store.update_entry_node(session_id, "recorded.entry")
+
+    restarted = _make_state(tmp_path)
+    with restarted._lock:
+        task = restarted._create_entry_task_for_inbound_locked(
+            inbound_seq=1,
+            session_id=session_id,
+            payload={"text": "hello after restart"},
+        )
+
+    # Why: callbacks arriving after a supervisor restart no longer have the
+    # in-memory override map. How: route selection reads SessionInfo.entry_node_id
+    # before the global default. Purpose: ClonothZX sessions keep their original
+    # node binding after process restarts.
+    assert task is not None
+    assert task.node_id == "recorded.entry"
+    assert restarted.session_last_entry_node[session_id] == "recorded.entry"
+    assert restarted.get_session_active_node(session_id)["node_id"] == "recorded.entry"
+
+
+def test_first_inbound_records_entry_node_when_session_has_none(tmp_path: Path) -> None:
+    """The first routed inbound should backfill entry_node_id into sessions.json."""
+    _write_runtime_config(tmp_path, entry_node_id="global.default")
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="discord", conversation_key="discord:first")
+
+    with state._lock:
+        task = state._create_entry_task_for_inbound_locked(
+            inbound_seq=2,
+            session_id=session_id,
+            payload={"text": "hello", "entry_node_id": "frontend.entry"},
+        )
+
+    raw = json.loads((tmp_path / "data" / "sessions.json").read_text(encoding="utf-8"))
+    # Why: some sessions are created before the frontend-selected entry node is
+    # known. How: the first inbound writes the actual node used for routing back
+    # into both memory and sessions.json. Purpose: a later restart can reproduce
+    # the same route without relying on the inbound payload being resent.
+    assert task is not None
+    assert task.node_id == "frontend.entry"
+    assert state.sessions[session_id].entry_node_id == "frontend.entry"
+    assert raw[session_id]["entry_node_id"] == "frontend.entry"
+
+
+def test_switch_session_node_persists_and_clears_entry_node(tmp_path: Path) -> None:
+    """switch_node persistence should survive restart and clear stale targets."""
+    _write_runtime_config(tmp_path, entry_node_id="global.default")
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="discord", conversation_key="discord:switch")
+
+    result = state.switch_session_node(session_id, "switched.entry")
+    raw = json.loads((tmp_path / "data" / "sessions.json").read_text(encoding="utf-8"))
+
+    # Why: switch_node is the source of session-level entry overrides. How: the
+    # selected target is written to SessionInfo and SessionStore immediately.
+    # Purpose: restart clears volatile overrides without losing the intended route.
+    assert result["ok"] is True
+    assert state.sessions[session_id].entry_node_id == "switched.entry"
+    assert raw[session_id]["entry_node_id"] == "switched.entry"
+    assert _make_state(tmp_path).sessions[session_id].entry_node_id == "switched.entry"
+
+    state.switch_session_node(session_id, "global.default")
+    raw_after_clear = json.loads((tmp_path / "data" / "sessions.json").read_text(encoding="utf-8"))
+
+    # Why: clearing an override must not leave an old target in sessions.json.
+    # How: switching back to the runtime default persists an empty entry-node
+    # marker. Purpose: restart fallback returns to the configured global default.
+    assert state.sessions[session_id].entry_node_id == ""
+    assert raw_after_clear[session_id]["entry_node_id"] == ""

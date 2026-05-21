@@ -92,8 +92,12 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # preserve handler-owned timer/cursor state while removing cyclic imports
         # and hard-coded registration.
         _builtin_handlers = auto_discover_and_register(self.hook_registry)
-        self._memory_extract_handler = _builtin_handlers["memory_extract"]
-        self._dream_handler = _builtin_handlers["dream"]
+        # Why: the Clonoth runtime may temporarily run with a reduced built-in
+        # handler set while features are being rolled out. How: keep optional
+        # references with dict.get instead of indexing. Purpose: synchronizing
+        # this file does not remove the existing deployment compatibility guard.
+        self._memory_extract_handler = _builtin_handlers.get("memory_extract")
+        self._dream_handler = _builtin_handlers.get("dream")
 
         # External plugins: same mechanism as engine, scan plugins/ directory
         from engine.hooks.loader import load_external_plugins
@@ -336,9 +340,21 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             default_node = self._default_entry_node()
             if target and target != default_node:
                 self.session_entry_overrides[route_sid] = target
+                persisted_entry_node = target
             else:
                 self.session_entry_overrides.pop(route_sid, None)
                 target = ""  # 清除覆盖
+                persisted_entry_node = ""
+            info = self.sessions.get(route_sid)
+            if info is not None and info.entry_node_id != persisted_entry_node:
+                # Why: switch_node is an explicit session-level route change, but
+                # session_entry_overrides is intentionally cleared on restart.
+                # How: mirror the effective override state into SessionInfo and
+                # sessions.json whenever the live switch endpoint runs. Purpose:
+                # restart recovery uses the same entry node, and clearing a switch
+                # does not leave a stale persisted target behind.
+                info.entry_node_id = persisted_entry_node
+                self._session_store.update_entry_node(route_sid, persisted_entry_node)
             self.eventlog.append(
                 session_id=route_sid,
                 component="engine",
@@ -359,7 +375,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
     def get_session_active_node(self, session_id: str) -> dict[str, Any]:
         """获取 session 当前实际使用的入口节点。
-        优先级: AI switch override > 上次 inbound 实际用的节点 > 全局默认"""
+        优先级: AI switch override > 上次 inbound 实际用的节点 > session 记录 > 全局默认"""
         sid = (session_id or "").strip()
         with self._lock:
             # [Fork/Merge 2026-05-17] Why: callers may ask using a branch id seen
@@ -369,8 +385,14 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             route_sid = self._route_session_id_for_session_locked(sid)
             override = self.session_entry_overrides.get(route_sid, "").strip()
             last_used = self.session_last_entry_node.get(route_sid, "").strip()
+            info = self.sessions.get(route_sid)
+            # Why: immediately after restart, getActiveNode has no last-used
+            # memory. How: include the persisted SessionInfo.entry_node_id before
+            # falling back to the global default. Purpose: UI callers see the
+            # same session-level route that inbound task creation will use.
+            recorded = (info.entry_node_id if info else "").strip() if info else ""
             default_node = self._default_entry_node()
-            node_id = override or last_used or default_node
+            node_id = override or last_used or recorded or default_node
             return {
                 "node_id": node_id,
                 "is_override": bool(override),

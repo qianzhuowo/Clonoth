@@ -11,7 +11,8 @@ session 信息仍可从此文件完整恢复。
     "channel": "discord_dm",
     "conversation_key": "discord:1491668801836548166",
     "created_at": "2026-04-15T...",
-    "reset": false
+    "reset": false,
+    "entry_node_id": "ereuna_main"
   },
   ...
 }
@@ -125,6 +126,11 @@ class SessionStore:
                     conversation_key=str(entry.get("conversation_key") or ""),
                     created_at=created_at,
                     updated_at=created_at,
+                    # Why: older sessions.json files do not have entry_node_id.
+                    # How: normalize a missing or empty value to "" during load.
+                    # Purpose: schema extension remains backward compatible while
+                    # still restoring per-session routing when the field exists.
+                    entry_node_id=str(entry.get("entry_node_id") or ""),
                 )
                 sessions[info.session_id] = info
                 if info.conversation_key:
@@ -152,8 +158,25 @@ class SessionStore:
             "conversation_key": info.conversation_key,
             "created_at": info.created_at.isoformat(),
             "reset": False,
+            # Why: session creation can already know the desired entry node in
+            # restored or specialized flows. How: serialize the SessionInfo field
+            # beside the existing metadata. Purpose: restart recovery can route
+            # inbound callbacks without relying on volatile supervisor memory.
+            "entry_node_id": info.entry_node_id,
         }
         self._flush()
+
+    def update_entry_node(self, session_id: str, entry_node_id: str) -> None:
+        """更新 session 的入口节点并落盘。"""
+        entry = self._registry.get(session_id)
+        if entry is not None:
+            # Why: switch_node and first inbound routing can change the effective
+            # session entry after the session row was created. How: update only
+            # the entry_node_id field on the in-memory registry and flush the
+            # complete sessions.json atomically. Purpose: preserve all other
+            # session metadata while making the new route survive restarts.
+            entry["entry_node_id"] = entry_node_id
+            self._flush()
 
     def on_session_reset(self, session_id: str) -> None:
         """将 session 标记为已重置。"""

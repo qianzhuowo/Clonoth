@@ -409,12 +409,20 @@ class SessionMixin:
         if not session_id:
             return
         created_at = _now()
+        existing_info = self.sessions.get(session_id)
+        existing_entry_node = existing_info.entry_node_id if existing_info else ""
         info = SessionInfo(
             session_id=str(session_id or ""),
             channel=str(payload.get("channel") or ""),
             conversation_key=str(payload.get("conversation_key") or ""),
             created_at=created_at,
             updated_at=created_at,
+            # Why: sessions.json is loaded before event replay, but older
+            # session_created events do not contain entry_node_id. How: preserve
+            # a value already restored from SessionStore, while still accepting
+            # a future event payload that may include the field. Purpose: replay
+            # cannot erase the persisted session entry-node binding.
+            entry_node_id=str(payload.get("entry_node_id") or existing_entry_node or ""),
         )
         self.sessions[info.session_id] = info
         conv = info.conversation_key

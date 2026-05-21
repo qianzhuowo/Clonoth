@@ -182,14 +182,29 @@ class TaskStoreMixin:
         has_attachments = isinstance(payload.get("attachments"), list) and bool(payload.get("attachments"))
         if not text and not has_attachments:
             return None
-        # 优先级: session 覆盖（AI switch） > 前端指定 > 全局默认
+        # 优先级: session 覆盖（AI switch） > 前端指定 > session 记录的 > 全局默认
         default_node = self._default_entry_node()
         session_override = self.session_entry_overrides.get(session_id, "").strip()
+        session_info = self.sessions.get(session_id)
+        # Why: after a supervisor restart, session_entry_overrides is deliberately
+        # cleared. How: read the persisted SessionInfo.entry_node_id before using
+        # the global runtime default. Purpose: callbacks keep the node binding
+        # selected when the session was first routed or switched.
+        session_recorded = (session_info.entry_node_id if session_info else "").strip() if session_info else ""
+        payload_entry = str(payload.get("entry_node_id") or "").strip()
         entry_node = (
             session_override
-            or str(payload.get("entry_node_id") or "").strip()
+            or payload_entry
+            or session_recorded
             or default_node
         )
+        if session_info and not session_info.entry_node_id:
+            # Why: newly-created sessions may not yet know their frontend-selected
+            # entry node. How: once an inbound is actually routed, copy the node
+            # into memory and sessions.json. Purpose: later restarts can reproduce
+            # the same route even if the callback payload has no entry_node_id.
+            session_info.entry_node_id = entry_node
+            self._session_store.update_entry_node(session_id, entry_node)
         # Record the actual entry node used for this session (for getActiveNode API)
         self.session_last_entry_node[session_id] = entry_node
         generation = self._current_session_generation_locked(session_id) or 1

@@ -25,7 +25,7 @@ PLUGIN_META = {
     # Why: dream reorganizes memory entries that knowledge_inject caches.
     # How: declare the dependency so loader ensures knowledge_inject loads first.
     # Purpose: fail clearly if knowledge_inject is missing.
-    "requires": ["knowledge_injector"],
+    "requires": ["knowledge_inject"],
 }
 
 

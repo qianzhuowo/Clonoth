@@ -166,14 +166,18 @@ class MemoryExtractHandler:
 
         min_increment = get_int(runtime_cfg, "memory.auto_extract.min_increment", 10, min_value=1, max_value=100)
         last_count = self._memory_extract_msg_counts.get(session_id, 0)
-        # [2026-05-19] Why: context compaction can shrink the session message count
-        # below the stored cursor. How: reset cursor to 0 when current < last so the
-        # next increment calculation works correctly. Purpose: prevent permanent
-        # negative-increment stall after compaction.
+        # [2026-05-23] Why: context compaction shrinks the session message count below
+        # the stored cursor. Old behavior (reset to 0) caused the next extraction to
+        # span non_sys[0:current_count] — the entire history including ancient summaries,
+        # which is why users saw "memories from days ago" being extracted repeatedly.
+        # How: advance cursor to current_count instead of 0 so the next extraction only
+        # covers genuinely new messages added after compaction.
+        # Purpose: ensure memory extraction focuses on recent conversation, not stale
+        # compressed summaries from the beginning of the session.
         if current_count < last_count:
-            log.debug("memory_extract TRACE: cursor reset (compact detected) session=%s count=%d < last=%d", session_id, current_count, last_count)
-            last_count = 0
-            self._memory_extract_msg_counts[session_id] = 0
+            log.debug("memory_extract TRACE: cursor advance (compact detected) session=%s count=%d < last=%d → cursor=%d", session_id, current_count, last_count, current_count)
+            last_count = current_count
+            self._memory_extract_msg_counts[session_id] = current_count
         increment = current_count - last_count
         log.debug("memory_extract TRACE: count=%d last=%d increment=%d min_incr=%d", current_count, last_count, increment, min_increment)
         if increment < min_increment:

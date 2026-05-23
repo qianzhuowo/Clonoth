@@ -30,8 +30,11 @@ def _normalize_base_url(base_url: str | None) -> str:
     - https://api.openai.com
     - https://api.openai.com/v1
     - https://proxy.example.com/v1
+    - https://api.deepseek.com
 
-    Returns a base URL that ends with `/v1`.
+    Returns a base URL with trailing slash stripped. Does NOT force /v1 suffix
+    — the caller writes the full path they intend, provider appends
+    /chat/completions directly.
     """
 
     base = (base_url or "").strip().rstrip("/")
@@ -41,9 +44,6 @@ def _normalize_base_url(base_url: str | None) -> str:
     # 缺少协议前缀时补上 https://
     if base and not base.startswith("http://") and not base.startswith("https://"):
         base = "https://" + base
-
-    if not base.endswith("/v1"):
-        base = base + "/v1"
 
     return base
 

@@ -139,16 +139,22 @@ class FallbackProviderHandler:
             status_code, original_error, original_model, len(fallbacks),
         )
 
-        # Try each fallback
+        # Collect primary provider attrs for inheritance
+        _primary_base_url = getattr(original_provider, "_base_url", "") or ""
+        _primary_api_key = getattr(original_provider, "_api_key", "") or ""
+        _primary_provider_name = getattr(original_provider, "provider_name", "openai") or "openai"
+
+        # Try each fallback in chain order
         for i, fb_cfg in enumerate(fallbacks):
-            fb_provider_type = fb_cfg.get("provider", "openai").strip().lower()
-            fb_base_url = fb_cfg.get("base_url", "").strip()
-            fb_api_key = fb_cfg.get("api_key", "").strip()
-            fb_model = fb_cfg.get("model", "").strip() or original_model
+            # Inherit from primary if not specified
+            fb_provider_type = (fb_cfg.get("provider") or "").strip().lower() or _primary_provider_name
+            fb_base_url = (fb_cfg.get("base_url") or "").strip() or _primary_base_url
+            fb_api_key = (fb_cfg.get("api_key") or "").strip() or _primary_api_key
+            fb_model = (fb_cfg.get("model") or "").strip() or original_model
 
             if not fb_base_url or not fb_api_key:
                 logger.warning(
-                    "fallback_provider: skipping fallback[%d] — missing base_url or api_key",
+                    "fallback_provider: skipping fallback[%d] — no base_url/api_key (even after inheritance)",
                     i,
                 )
                 continue

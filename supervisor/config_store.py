@@ -53,6 +53,7 @@ class ConfigStore:
         self.path = path
         self._lock = threading.Lock()
         self._config: AppConfigSecret = AppConfigSecret()
+        self._extra_keys: dict[str, Any] = {}  # preserve unknown top-level keys
 
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.reload()
@@ -73,7 +74,13 @@ class ConfigStore:
         return data
 
     def _save_yaml(self, cfg: AppConfigSecret) -> None:
+        # [2026-05-24] Preserve unknown top-level keys (e.g. fallbacks) that
+        # plugins may have added to config.yaml but are not part of the
+        # AppConfigSecret Pydantic model. Without this, reload() would strip
+        # any key not declared in the model.
         data = cfg.model_dump(mode="json")
+        if self._extra_keys:
+            data.update(self._extra_keys)
         text = yaml.safe_dump(
             data,
             sort_keys=False,
@@ -89,6 +96,9 @@ class ConfigStore:
                 self._save_yaml(self._config)
                 return self._config.model_copy(deep=True)
 
+            # Capture top-level keys not in the Pydantic model
+            _known_keys = set(AppConfigSecret.model_fields.keys())
+            self._extra_keys = {k: v for k, v in data.items() if k not in _known_keys}
             try:
                 self._config = AppConfigSecret.model_validate(data)
             except Exception:

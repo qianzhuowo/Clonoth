@@ -101,15 +101,14 @@ class MemoryExtractHandler:
         if caller_tid:
             log.debug("memory_extract gate: blocked by caller_task_id=%s (child task)", str(caller_tid)[:8])
             return
-        # [2026-05-22] Entry tasks created from inbound run on temporary branch
-        # sessions (session_id starts with 'branch_'). These are merged back into
-        # the parent session after completion. The hook context passes the merged
-        # parent session_id separately. Check both task_id and session_id for the
-        # branch prefix to catch all branch-originated tasks.
+        # [2026-05-23 fix] Entry tasks run on temporary branch sessions (task.session_id
+        # starts with 'branch_'), but they represent real user conversation turns. The
+        # on_entry_task_complete hook passes the merged parent session in ctx["session_id"].
+        # Only filter by task_id prefix (which is never 'branch_' for entry tasks);
+        # do NOT filter by task.session_id — that would block all entry task extractions.
         task_id_str = str(getattr(task, "task_id", "") or "")
-        task_session_str = str(getattr(task, "session_id", "") or "")
-        if task_id_str.startswith("branch_") or task_session_str.startswith("branch_"):
-            log.debug("memory_extract gate: blocked by branch (task=%s session=%s)", task_id_str[:16], task_session_str[:16])
+        if task_id_str.startswith("branch_"):
+            log.debug("memory_extract gate: blocked by branch task_id=%s", task_id_str[:16])
             return
         log.debug("memory_extract: entered gate check for task %s node=%s", task_id_str[:8], getattr(task, 'node_id', '?'))
 

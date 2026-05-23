@@ -291,25 +291,22 @@ def _compact_context_spec() -> dict:
 
 
 def _preempt_task_spec() -> dict:
-    """伪工具：软打断一个正在运行的子任务，或向其注入追加指令。"""
+    """伪工具：向正在运行的子任务注入追加指令。"""
     return {
         "type": "function",
         "function": {
             "name": "preempt_task",
             "description": (
-                "Soft-interrupt a running child task. The target task will finish its current "
-                "atomic operation (e.g. tool call), persist a context snapshot, and then exit gracefully.\n\n"
-                "If `message` is provided, the child task will NOT exit — instead the message is injected "
-                "as a new user instruction and the child continues working with the updated direction. "
-                "This is useful for adding corrections or supplementary instructions mid-task.\n\n"
-                "If `message` is omitted, the child task exits after its current step and returns partial results.\n\n"
+                "Inject an additional instruction into a running child task. The child task will "
+                "finish its current atomic operation (e.g. tool call), receive your message as a new "
+                "user instruction, and continue working with the updated direction.\n\n"
+                "This is NOT for cancelling tasks — use cancel_active_tasks for that.\n\n"
                 "Use cases:\n"
-                "- A dispatched child node is taking too long and you want to reclaim control (no message).\n"
-                "- The user's new message makes the child's current work unnecessary (no message).\n"
-                "- You want to inject updated/additional instructions into a running child (with message).\n"
-                "- You want to 'continue' a finished node by preempting and re-dispatching with updated instructions.\n\n"
+                "- You need to add corrections or supplementary instructions to a running child.\n"
+                "- The user provided new information that the child task needs to incorporate.\n"
+                "- You want to steer an ongoing task in a different direction without restarting it.\n\n"
                 "This is non-terminating — your node keeps running after the call. "
-                "The preempted task will return its partial result (if any) via the normal dispatch callback."
+                "The child task continues with the injected message and returns results via the normal dispatch callback."
             ),
             "parameters": {
                 "type": "object",
@@ -320,10 +317,10 @@ def _preempt_task_spec() -> dict:
                     },
                     "message": {
                         "type": "string",
-                        "description": "可选。追加指令文本。若提供，子任务不会退出，而是将此消息作为新的用户指令注入并继续执行。",
+                        "description": "追加指令文本。子任务会将此消息作为新的用户指令注入并继续执行。",
                     },
                 },
-                "required": ["task_id"],
+                "required": ["task_id", "message"],
             },
         },
     }

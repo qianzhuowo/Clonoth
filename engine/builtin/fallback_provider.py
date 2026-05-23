@@ -32,32 +32,47 @@ PLUGIN_META = {
 }
 
 
-def _load_fallbacks(workspace_root: str | Path) -> list[dict[str, Any]]:
-    """Read top-level fallbacks list from data/config.yaml.
-
-    Expected format:
-        fallbacks:
-          - provider: openai
-            base_url: https://backup.com/v1
-            api_key: sk-xxx
-            model: optional-override
-          - provider: openai
-            base_url: https://backup2.com/v1
-            api_key: sk-yyy
-    """
+def _load_config(workspace_root: str | Path) -> dict[str, Any]:
+    """Read full data/config.yaml."""
     cfg_path = Path(workspace_root) / "data" / "config.yaml"
     if not cfg_path.exists():
-        return []
+        return {}
     try:
         with open(cfg_path, encoding="utf-8") as f:
-            cfg = yaml.safe_load(f) or {}
-        fallbacks = cfg.get("fallbacks", [])
-        if not isinstance(fallbacks, list):
-            return []
-        return fallbacks
+            return yaml.safe_load(f) or {}
     except Exception as exc:
         logger.warning("fallback_provider: failed to load config: %s", exc)
-        return []
+        return {}
+
+
+def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Resolve a fallback entry by merging with its provider config block.
+
+    Expected config layout:
+        deepseek:
+          base_url: https://api.deepseek.com
+          api_key: sk-xxx
+          model: deepseek-v4-pro
+        fallbacks:
+          - provider: deepseek          # just reference, auto-inherits from deepseek: block
+          - provider: openai            # inherits from openai: block
+            model: claude-sonnet-4-6    # override model only
+
+    Resolution order for each field (base_url, api_key, model):
+      1. Explicit value in fallback entry
+      2. Value from the provider config block (e.g. deepseek:)
+    """
+    provider_name = (fb_cfg.get("provider") or "openai").strip().lower()
+    provider_block = full_cfg.get(provider_name, {})
+    if not isinstance(provider_block, dict):
+        provider_block = {}
+
+    return {
+        "provider": provider_name,
+        "base_url": (fb_cfg.get("base_url") or "").strip() or (provider_block.get("base_url") or "").strip(),
+        "api_key": (fb_cfg.get("api_key") or "").strip() or (provider_block.get("api_key") or "").strip(),
+        "model": (fb_cfg.get("model") or "").strip() or (provider_block.get("model") or "").strip(),
+    }
 
 
 def _is_retryable(status_code: int | None) -> bool:
@@ -123,8 +138,9 @@ class FallbackProviderHandler:
         if not workspace_root:
             return None
 
-        fallbacks = _load_fallbacks(workspace_root)
-        if not fallbacks:
+        full_cfg = _load_config(workspace_root)
+        fallbacks_raw = full_cfg.get("fallbacks", [])
+        if not isinstance(fallbacks_raw, list) or not fallbacks_raw:
             return None
 
         original_error = getattr(resp, "error", "unknown")
@@ -136,26 +152,23 @@ class FallbackProviderHandler:
         logger.warning(
             "fallback_provider: primary failed (status=%s error=%s model=%s), "
             "trying %d fallback(s)",
-            status_code, original_error, original_model, len(fallbacks),
+            status_code, original_error, original_model, len(fallbacks_raw),
         )
 
-        # Collect primary provider attrs for inheritance
-        _primary_base_url = getattr(original_provider, "_base_url", "") or ""
-        _primary_api_key = getattr(original_provider, "_api_key", "") or ""
-        _primary_provider_name = getattr(original_provider, "provider_name", "openai") or "openai"
-
         # Try each fallback in chain order
-        for i, fb_cfg in enumerate(fallbacks):
-            # Inherit from primary if not specified
-            fb_provider_type = (fb_cfg.get("provider") or "").strip().lower() or _primary_provider_name
-            fb_base_url = (fb_cfg.get("base_url") or "").strip() or _primary_base_url
-            fb_api_key = (fb_cfg.get("api_key") or "").strip() or _primary_api_key
-            fb_model = (fb_cfg.get("model") or "").strip() or original_model
+        for i, fb_raw in enumerate(fallbacks_raw):
+            if not isinstance(fb_raw, dict):
+                continue
+            fb_cfg = _resolve_fallback_entry(fb_raw, full_cfg)
+            fb_provider_type = fb_cfg["provider"]
+            fb_base_url = fb_cfg["base_url"]
+            fb_api_key = fb_cfg["api_key"]
+            fb_model = fb_cfg["model"] or original_model
 
             if not fb_base_url or not fb_api_key:
                 logger.warning(
-                    "fallback_provider: skipping fallback[%d] — no base_url/api_key (even after inheritance)",
-                    i,
+                    "fallback_provider: skipping fallback[%d] (%s) — no base_url/api_key after resolve",
+                    i, fb_provider_type,
                 )
                 continue
 
@@ -234,7 +247,7 @@ class FallbackProviderHandler:
         logger.error(
             "fallback_provider: all %d fallback(s) failed, "
             "original error stands (status=%s)",
-            len(fallbacks), status_code,
+            len(fallbacks_raw), status_code,
         )
         try:
             from engine.signals import get_bus, Signal
@@ -244,7 +257,7 @@ class FallbackProviderHandler:
                 payload={
                     "original_error": original_error,
                     "original_status": status_code,
-                    "fallback_count": len(fallbacks),
+                    "fallback_count": len(fallbacks_raw),
                     "success": False,
                 },
             ))

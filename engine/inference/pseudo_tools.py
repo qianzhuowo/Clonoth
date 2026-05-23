@@ -291,7 +291,7 @@ def _compact_context_spec() -> dict:
 
 
 def _preempt_task_spec() -> dict:
-    """伪工具：软打断一个正在运行的子任务。"""
+    """伪工具：软打断一个正在运行的子任务，或向其注入追加指令。"""
     return {
         "type": "function",
         "function": {
@@ -299,9 +299,14 @@ def _preempt_task_spec() -> dict:
             "description": (
                 "Soft-interrupt a running child task. The target task will finish its current "
                 "atomic operation (e.g. tool call), persist a context snapshot, and then exit gracefully.\n\n"
+                "If `message` is provided, the child task will NOT exit — instead the message is injected "
+                "as a new user instruction and the child continues working with the updated direction. "
+                "This is useful for adding corrections or supplementary instructions mid-task.\n\n"
+                "If `message` is omitted, the child task exits after its current step and returns partial results.\n\n"
                 "Use cases:\n"
-                "- A dispatched child node is taking too long and you want to reclaim control.\n"
-                "- The user's new message makes the child's current work unnecessary.\n"
+                "- A dispatched child node is taking too long and you want to reclaim control (no message).\n"
+                "- The user's new message makes the child's current work unnecessary (no message).\n"
+                "- You want to inject updated/additional instructions into a running child (with message).\n"
                 "- You want to 'continue' a finished node by preempting and re-dispatching with updated instructions.\n\n"
                 "This is non-terminating — your node keeps running after the call. "
                 "The preempted task will return its partial result (if any) via the normal dispatch callback."
@@ -312,6 +317,10 @@ def _preempt_task_spec() -> dict:
                     "task_id": {
                         "type": "string",
                         "description": "要打断的任务 ID（完整或前缀均可）。可从 dispatch 回调或 active_tasks 中获取。",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "可选。追加指令文本。若提供，子任务不会退出，而是将此消息作为新的用户指令注入并继续执行。",
                     },
                 },
                 "required": ["task_id"],

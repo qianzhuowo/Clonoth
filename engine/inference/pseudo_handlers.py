@@ -241,11 +241,23 @@ async def _handle_pseudo_compact(ls: _LoopState, pseudo_call, step: int) -> Task
 async def _handle_pseudo_preempt_task(ls: _LoopState, pseudo_call, args: dict) -> None:
     """处理 preempt_task 伪工具。始终返回 None（非终止）。"""
     _pt_tid = str(args.get("task_id") or "").strip()
+    _pt_msg = str(args.get("message") or "").strip()
     if _pt_tid:
         try:
-            _pt_resp = await ls.rctx.http.post(f"{ls.rctx.supervisor_url}/v1/tasks/{_pt_tid}/preempt")
+            # [2026-05-23] Pass message to supervisor so preempt can inject
+            # additional instructions instead of just stopping the child.
+            _pt_body: dict[str, Any] = {}
+            if _pt_msg:
+                _pt_body["message"] = _pt_msg
+            _pt_resp = await ls.rctx.http.post(
+                f"{ls.rctx.supervisor_url}/v1/tasks/{_pt_tid}/preempt",
+                json=_pt_body if _pt_body else None,
+            )
             if _pt_resp.status_code == 200:
-                _pt_result = f"已标记 task {_pt_tid[:8]} 为 preempt，等待优雅退出"
+                if _pt_msg:
+                    _pt_result = f"已向 task {_pt_tid[:8]} 注入追加指令，子任务继续执行"
+                else:
+                    _pt_result = f"已标记 task {_pt_tid[:8]} 为 preempt，等待优雅退出"
             elif _pt_resp.status_code == 404:
                 _pt_result = f"task {_pt_tid[:8]} 不存在或已结束"
             else:

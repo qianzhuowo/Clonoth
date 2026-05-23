@@ -33,15 +33,25 @@ PLUGIN_META = {
 
 
 def _load_fallbacks(workspace_root: str | Path) -> list[dict[str, Any]]:
-    """Read fallbacks list from data/config.yaml -> openai.fallbacks."""
+    """Read top-level fallbacks list from data/config.yaml.
+
+    Expected format:
+        fallbacks:
+          - provider: openai
+            base_url: https://backup.com/v1
+            api_key: sk-xxx
+            model: optional-override
+          - provider: openai
+            base_url: https://backup2.com/v1
+            api_key: sk-yyy
+    """
     cfg_path = Path(workspace_root) / "data" / "config.yaml"
     if not cfg_path.exists():
         return []
     try:
         with open(cfg_path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
-        openai_cfg = cfg.get("openai", {})
-        fallbacks = openai_cfg.get("fallbacks", [])
+        fallbacks = cfg.get("fallbacks", [])
         if not isinstance(fallbacks, list):
             return []
         return fallbacks
@@ -55,6 +65,32 @@ def _is_retryable(status_code: int | None) -> bool:
     if status_code is None:
         return True  # unknown error, try fallback
     return status_code in _RETRYABLE_STATUS_CODES
+
+
+def _create_fallback_provider(
+    *,
+    provider_type: str,
+    base_url: str,
+    api_key: str,
+    model: str,
+    timeout: float = 600.0,
+) -> Any | None:
+    """Instantiate a provider by type string. Returns None for unsupported types."""
+    try:
+        if provider_type == "openai":
+            from providers.openai import OpenAIProvider
+            return OpenAIProvider(base_url=base_url, api_key=api_key, model=model, timeout=timeout)
+        elif provider_type == "anthropic":
+            from providers.anthropic import AnthropicProvider
+            return AnthropicProvider(base_url=base_url, api_key=api_key, model=model, timeout=timeout)
+        elif provider_type == "gemini":
+            from providers.gemini import GeminiProvider
+            return GeminiProvider(api_key=api_key, model=model, timeout=timeout)
+        else:
+            return None
+    except Exception as exc:
+        logger.warning("fallback_provider: failed to create %s provider: %s", provider_type, exc)
+        return None
 
 
 class FallbackProviderHandler:
@@ -100,6 +136,7 @@ class FallbackProviderHandler:
 
         # Try each fallback
         for i, fb_cfg in enumerate(fallbacks):
+            fb_provider_type = fb_cfg.get("provider", "openai").strip().lower()
             fb_base_url = fb_cfg.get("base_url", "").strip()
             fb_api_key = fb_cfg.get("api_key", "").strip()
             fb_model = fb_cfg.get("model", "").strip() or original_model
@@ -112,16 +149,19 @@ class FallbackProviderHandler:
                 continue
 
             try:
-                # Dynamically import to avoid circular deps at module load time
-                from providers.openai import OpenAIProvider
-
-                fb_timeout = getattr(original_provider, "timeout", 600.0)
-                fb_provider = OpenAIProvider(
+                fb_provider = _create_fallback_provider(
+                    provider_type=fb_provider_type,
                     base_url=fb_base_url,
                     api_key=fb_api_key,
                     model=fb_model,
-                    timeout=fb_timeout,
+                    timeout=getattr(original_provider, "timeout", 600.0),
                 )
+                if fb_provider is None:
+                    logger.warning(
+                        "fallback_provider: skipping fallback[%d] — unsupported provider type '%s'",
+                        i, fb_provider_type,
+                    )
+                    continue
 
                 logger.info(
                     "fallback_provider: trying fallback[%d] base_url=%s model=%s",

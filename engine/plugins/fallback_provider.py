@@ -75,19 +75,24 @@ def _create_fallback_provider(
     model: str,
     timeout: float = 600.0,
 ) -> Any | None:
-    """Instantiate a provider by type string. Returns None for unsupported types."""
+    """Instantiate a provider by type string using ProviderRegistry.
+
+    Supports any provider registered in providers/__init__.py — no hardcoding.
+    """
     try:
-        if provider_type == "openai":
-            from providers.openai import OpenAIProvider
-            return OpenAIProvider(base_url=base_url, api_key=api_key, model=model, timeout=timeout)
-        elif provider_type == "anthropic":
-            from providers.anthropic import AnthropicProvider
-            return AnthropicProvider(base_url=base_url, api_key=api_key, model=model, timeout=timeout)
-        elif provider_type == "gemini":
-            from providers.gemini import GeminiProvider
-            return GeminiProvider(api_key=api_key, model=model, timeout=timeout)
-        else:
+        from providers import registry
+        provider_cls = registry.get(provider_type)
+        if provider_cls is None:
+            logger.warning("fallback_provider: unknown provider type '%s' (available: %s)",
+                           provider_type, registry.list())
             return None
+        # Build kwargs — different providers accept different params
+        kwargs: dict[str, Any] = {"model": model, "api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        if timeout:
+            kwargs["timeout"] = timeout
+        return provider_cls(**kwargs)
     except Exception as exc:
         logger.warning("fallback_provider: failed to create %s provider: %s", provider_type, exc)
         return None

@@ -18,6 +18,7 @@ from pathlib import Path
 # ── Paths ──────────────────────────────────────
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 EVENTS_FILE = DATA_DIR / "events.jsonl"
+SIGNALS_FILE = DATA_DIR / "signals.jsonl"
 LOG_FILE = DATA_DIR / "logs" / "cleanup.log"
 
 # ── Thresholds ─────────────────────────────────
@@ -71,6 +72,29 @@ def rotate_events():
             p.rename(DATA_DIR / f"events.jsonl.{i + 1}")
     EVENTS_FILE.rename(DATA_DIR / "events.jsonl.1")
     logging.info("[events] done")
+
+
+# ── 1b. signals.jsonl rotation ────────────────
+SIGNALS_MAX_BYTES = 20 * 1024 * 1024  # 20 MB
+SIGNALS_BACKUPS = 2
+
+def rotate_signals():
+    if not SIGNALS_FILE.exists():
+        return
+    sz = SIGNALS_FILE.stat().st_size
+    if sz < SIGNALS_MAX_BYTES:
+        logging.info("[signals] %dKB < %dMB threshold, skip",
+                     sz // 1024, SIGNALS_MAX_BYTES // (1024 * 1024))
+        return
+    logging.info("[signals] %dMB — rotating", sz // (1024 * 1024))
+    for i in range(SIGNALS_BACKUPS, 0, -1):
+        p = DATA_DIR / f"signals.jsonl.{i}"
+        if i == SIGNALS_BACKUPS and p.exists():
+            p.unlink()
+        elif p.exists():
+            p.rename(DATA_DIR / f"signals.jsonl.{i + 1}")
+    SIGNALS_FILE.rename(DATA_DIR / "signals.jsonl.1")
+    logging.info("[signals] done")
 
 
 # ── generic dir purge ─────────────────────────
@@ -152,6 +176,7 @@ def main():
 
     tasks = [
         (rotate_events, {}),
+        (rotate_signals, {}),
         # Phase D：node_contexts 已被 child session 替代，启用定期清理
         (purge_dir, dict(directory=DATA_DIR / "node_contexts",
                          max_age=NODE_CONTEXTS_MAX_AGE, label="node_contexts",

@@ -187,6 +187,17 @@ class MemoryExtractHandler:
         # repair it when compaction makes the durable message count smaller.
         # Purpose: skip compacted summaries instead of replaying old history,
         # while leaving the task counter untouched and monotonic.
+        # [2026-05-24] Scheme B: on first encounter after restart, set cursor
+        # to current_msg_count so we only extract genuinely new messages, not
+        # the entire session history. This avoids re-extracting stale content
+        # from old conversation turns every time the engine restarts.
+        _is_first_encounter = session_id not in self._memory_extract_msg_cursors
+        if _is_first_encounter:
+            self._memory_extract_msg_cursors[session_id] = current_msg_count
+            log.debug(
+                "memory_extract: first encounter for session %s, setting msg cursor to %d (skip history)",
+                session_id[:12], current_msg_count,
+            )
         last_msg_cursor = self._memory_extract_msg_cursors.get(session_id, 0)
         if current_msg_count < last_msg_cursor:
             log.debug(

@@ -297,6 +297,11 @@ def build_skill_messages(
 # prevent partial-write corruption without adding heavyweight flock.
 _yaml_write_lock = threading.Lock()
 
+# [2026-05-24] Process-level debounce for _update_last_hit_bg.
+# Why: yaml.safe_load on 660KB default.yaml per LLM call was eating 45% CPU.
+# How: mutable list so the value can be updated from nested scope.
+_last_hit_update_ts: list[float] = [0.0]
+
 
 class _MemoryCache:
     """Per-workspace memory catalog cache keyed on time."""
@@ -747,11 +752,17 @@ def _classify_and_match_entries(
         # before budget truncation. How: keep a background daemon thread that
         # receives every matched memory entry. Purpose: preserve lifecycle data
         # even when a matched memory is later dropped by a budget limit.
-        threading.Thread(
-            target=_update_last_hit_bg,
-            args=(workspace_root, matched_memories),
-            daemon=True,
-        ).start()
+        # [2026-05-24] Perf fix: debounce at process level — skip if last update
+        # was < 60s ago. The old 24h debounce was per-entry inside the thread,
+        # but the thread itself (yaml.safe_load 660KB) was the CPU killer.
+        _now = time.monotonic()
+        if _now - _last_hit_update_ts[0] > 60:
+            _last_hit_update_ts[0] = _now
+            threading.Thread(
+                target=_update_last_hit_bg,
+                args=(workspace_root, matched_memories),
+                daemon=True,
+            ).start()
 
     return buckets
 

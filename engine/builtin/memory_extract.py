@@ -174,16 +174,8 @@ class MemoryExtractHandler:
         self._memory_extract_task_counts[session_id] = task_count
 
         msgs = session_messages(session_id, limit=0)
-        # [2026-05-24] Why: compact summaries ("[Task summary — original messages
-        # snipped]") inflate the non-system count but contain no extractable content.
-        # How: exclude messages whose content contains the compact snip marker when
-        # computing current_msg_count. Purpose: cursor and count only track messages
-        # with real conversation content, so the extraction window always covers the
-        # genuinely active portion of the session.
-        _SNIP_MARKER = "original messages snipped"
         non_system = [m for m in msgs if m.get("role") != "system"]
-        real_msgs = [m for m in non_system if _SNIP_MARKER not in (m.get("content") or "")]
-        current_msg_count = len(real_msgs)
+        current_msg_count = len(non_system)
 
         min_messages = get_int(runtime_cfg, "memory.auto_extract.min_messages", 4, min_value=2, max_value=100)
         if current_msg_count < min_messages:
@@ -490,34 +482,20 @@ def _conversation_store_transcript(workspace_root: Path, session_id: str, last_c
 
         store = ConversationStore(workspace_root / "data" / "conversations")
         all_msgs = store.load(session_id)
-        _SNIP = "original messages snipped"
-        # [2026-05-24] Filter out compact summaries before slicing so that
-        # cursor indexes align with the gate check's real_msgs count.
-        non_sys = [m for m in all_msgs if m.role != "system" and _SNIP not in (m.content or "")]
+        non_sys = [m for m in all_msgs if m.role != "system"]
         start = max(0, min(len(non_sys), int(last_count)))
         end = max(start, min(len(non_sys), int(current_count)))
         range_msgs = non_sys[start:end]
     except Exception:
         return ""
 
-    # [2026-05-24] Why: compact summaries ("[Task summary — original messages
-    # snipped]") are not real conversation content and confuse the extractor.
-    # How: skip any message whose content contains the snip marker.  Also format
-    # as a natural conversation log ("User: …" / "Assistant: …") concatenated
-    # into one readable string, not raw [role]\ncontent per message.
-    # Purpose: give the extractor only real, recent conversation in a human-readable
-    # format so it extracts genuinely useful memories.
-    _SNIP_MARKER = "original messages snipped"
     parts: list[str] = []
     for tm in range_msgs:
-        content = (tm.content or "").strip()
-        if not content or _SNIP_MARKER in content:
-            continue
+        content = tm.content or ""
         if len(content) > 2000:
             content = content[:2000] + "...<truncated>"
-        role_label = "User" if tm.role == "user" else "Assistant" if tm.role == "assistant" else tm.role
-        parts.append(f"{role_label}: {content}")
-    return "\n\n".join(parts)
+        parts.append(f"[{tm.role}]\n{content}")
+    return "\n\n---\n\n".join(parts)
 
 
 def _non_system_message_range(messages: list[dict[str, Any]], last_count: int, current_count: int) -> list[dict[str, Any]]:
@@ -526,8 +504,7 @@ def _non_system_message_range(messages: list[dict[str, Any]], last_count: int, c
     # ConversationStore slice. How: apply the same bounded start/end indexes to
     # the non-system dictionaries supplied by session_messages. Purpose: keep
     # fallback transcript creation faithful to the committed message cursor.
-    _SNIP = "original messages snipped"
-    non_system = [m for m in messages if m.get("role") != "system" and _SNIP not in (m.get("content") or "")]
+    non_system = [m for m in messages if m.get("role") != "system"]
     start = max(0, min(len(non_system), int(last_count)))
     end = max(start, min(len(non_system), int(current_count)))
     return non_system[start:end]
@@ -539,9 +516,6 @@ def _format_transcript_for_extract(messages: list[dict[str, Any]], *, max_chars:
     # a minimal context. How: keep the pure formatting logic local without any
     # supervisor imports. Purpose: make the handler robust while preserving the new
     # dependency boundary.
-    # [2026-05-24] Aligned with _conversation_store_transcript: skip compact
-    # summaries containing the snip marker and format as "User: …" / "Assistant: …".
-    _SNIP_MARKER = "original messages snipped"
     parts: list[str] = []
     total = 0
     for msg in reversed(messages):
@@ -554,19 +528,15 @@ def _format_transcript_for_extract(messages: list[dict[str, Any]], *, max_chars:
             content = "\n".join(texts)
         if not isinstance(content, str):
             content = str(content)
-        content = content.strip()
-        if not content or _SNIP_MARKER in content:
-            continue
         if len(content) > 2000:
             content = content[:2000] + "...<truncated>"
-        role_label = "User" if role == "user" else "Assistant" if role == "assistant" else role
-        line = f"{role_label}: {content}"
+        line = f"[{role}]\n{content}"
         total += len(line)
         if total > max_chars:
             break
         parts.append(line)
     parts.reverse()
-    return "\n\n".join(parts)
+    return "\n\n---\n\n".join(parts)
 
 
 def _safe_int(value: Any, default: int) -> int:

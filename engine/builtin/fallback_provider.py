@@ -75,22 +75,27 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
     }
 
 
-_RETRYABLE_ERROR_MARKERS = frozenset({
-    "content_filter", "safety", "blocked", "SAFETY",
-    "finish_reason=content_filter",
-})
-
-
 def _is_retryable(status_code: int | None, error: str | None = None) -> bool:
-    """Check if the error is worth retrying on a different provider."""
-    # Content filter / safety blocks come with HTTP 200 but ok=False
-    if error:
-        err_lower = error.lower()
-        if any(marker.lower() in err_lower for marker in _RETRYABLE_ERROR_MARKERS):
-            return True
+    """Check if the error is worth retrying on a different provider.
+
+    Covers both HTTP-level errors (429/5xx) and upstream provider errors
+    that arrive as ok=False with HTTP 200 (e.g. content_filter, safety
+    blocks, rate limits, empty responses via SSE error objects).
+    """
+    # Any response marked ok=False that reaches us is worth retrying,
+    # unless it's a definitive client error (4xx other than 429).
     if status_code is None:
-        return True  # unknown error, try fallback
-    return status_code in _RETRYABLE_STATUS_CODES
+        return True  # unknown / connection-level error
+    if status_code in _RETRYABLE_STATUS_CODES:
+        return True
+    # HTTP 200 but ok=False → upstream signaled error through body/SSE
+    # (content_filter, safety block, quota via SSE error object, etc.)
+    if status_code == 200 and error:
+        return True
+    # 4xx (except 429) are client errors — don't retry
+    if 400 <= status_code < 500:
+        return False
+    return True  # anything else (1xx, 3xx, unknown) → try fallback
 
 
 def _create_fallback_provider(

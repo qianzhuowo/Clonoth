@@ -314,16 +314,27 @@ class OpenAIProvider(BaseProvider):
                             args = fallback if fallback is not None else {"_raw": raw_args}
                     tool_calls.append(ToolCall(id=tc_data["id"], name=name.strip(), arguments=args))
 
-                # [2026-05-24] Detect content_filter / safety blocks from SSE stream.
-                # Proxied Gemini returns HTTP 200 but finish_reason=content_filter
-                # and/or an SSE error object with code=content_filter.
-                if _stream_finish_reason == "content_filter" or _stream_error:
-                    _err_msg = _stream_error or f"Response blocked (finish_reason={_stream_finish_reason})"
+                # [2026-05-24] Detect upstream errors from SSE stream.
+                # Various proxied providers (Gemini, OpenAI, Anthropic via relay)
+                # may return HTTP 200 but signal failure through:
+                #   1. SSE error objects: data: {"error": {"message": ..., "code": ...}}
+                #   2. Abnormal finish_reason with empty content (content_filter, error, etc.)
+                # Normal finish_reasons: stop, tool_calls — anything else with no
+                # content is treated as an upstream error.
+                _normal_finish = {"stop", "tool_calls", None}
+                if _stream_error:
                     return ProviderResponse(
                         ok=False, text=text, tool_calls=[],
                         reasoning=reasoning_text, status_code=status, usage=stream_usage,
                         inline_data=[], provider_meta={},
-                        error=_err_msg,
+                        error=_stream_error,
+                    )
+                if _stream_finish_reason not in _normal_finish and not text and not tool_calls:
+                    return ProviderResponse(
+                        ok=False, text=None, tool_calls=[],
+                        reasoning=reasoning_text, status_code=status, usage=stream_usage,
+                        inline_data=[], provider_meta={},
+                        error=f"Upstream error (finish_reason={_stream_finish_reason})",
                     )
 
                 # [refactor 2026-04-18] thinking= → reasoning=，新增 inline_data / provider_meta

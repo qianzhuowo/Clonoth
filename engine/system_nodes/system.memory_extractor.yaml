@@ -11,6 +11,8 @@ tool_access:
     - delete_memory
 skills:
   mode: none
+memory_books:
+  mode: none
 prompt: |
   You are a silent memory extraction agent. You analyze conversation transcripts
   and actively extract information worth saving to persistent memory.

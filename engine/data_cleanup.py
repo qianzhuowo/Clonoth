@@ -183,6 +183,8 @@ def main():
                          recursive=True)),
         (purge_expired_child_sessions, {}),
         (purge_temp_globs, {}),
+        (purge_dir, dict(directory=DATA_DIR / "temp",
+                         max_age=TEMP_MAX_AGE, label="temp", recursive=True)),
         (purge_dir, dict(directory=DATA_DIR / "temp_summary",
                          max_age=TEMP_MAX_AGE, label="temp_summary")),
         (purge_dir, dict(directory=DATA_DIR / "artifacts",

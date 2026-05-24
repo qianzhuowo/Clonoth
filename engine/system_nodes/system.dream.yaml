@@ -15,7 +15,7 @@ tool_access:
     - list_skills
 skills:
   mode: none
-memory_books:
+memories:
   mode: none
 prompt: |
   你是一个记忆整理 agent（Dream）。你的任务是从最近的对话中搜集新信号，

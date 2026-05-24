@@ -9,7 +9,7 @@ tool_access:
   mode: none
 skills:
   mode: none
-memory_books:
+memories:
   mode: none
 prompt: |
   You are a LOG ANALYZER. You will receive a COMPLETED task log.

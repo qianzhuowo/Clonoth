@@ -7,7 +7,7 @@ tool_access:
   mode: none
 skills:
   mode: none
-memory_books:
+memories:
   mode: none
 prompt: |
   你是一个对话摘要生成器。只输出摘要内容，不要输出任何多余文字。

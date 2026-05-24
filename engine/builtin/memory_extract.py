@@ -174,8 +174,16 @@ class MemoryExtractHandler:
         self._memory_extract_task_counts[session_id] = task_count
 
         msgs = session_messages(session_id, limit=0)
+        # [2026-05-24] Why: compact summaries ("[Task summary — original messages
+        # snipped]") inflate the non-system count but contain no extractable content.
+        # How: exclude messages whose content contains the compact snip marker when
+        # computing current_msg_count. Purpose: cursor and count only track messages
+        # with real conversation content, so the extraction window always covers the
+        # genuinely active portion of the session.
+        _SNIP_MARKER = "original messages snipped"
         non_system = [m for m in msgs if m.get("role") != "system"]
-        current_msg_count = len(non_system)
+        real_msgs = [m for m in non_system if _SNIP_MARKER not in (m.get("content") or "")]
+        current_msg_count = len(real_msgs)
 
         min_messages = get_int(runtime_cfg, "memory.auto_extract.min_messages", 4, min_value=2, max_value=100)
         if current_msg_count < min_messages:
@@ -482,7 +490,10 @@ def _conversation_store_transcript(workspace_root: Path, session_id: str, last_c
 
         store = ConversationStore(workspace_root / "data" / "conversations")
         all_msgs = store.load(session_id)
-        non_sys = [m for m in all_msgs if m.role != "system"]
+        _SNIP = "original messages snipped"
+        # [2026-05-24] Filter out compact summaries before slicing so that
+        # cursor indexes align with the gate check's real_msgs count.
+        non_sys = [m for m in all_msgs if m.role != "system" and _SNIP not in (m.content or "")]
         start = max(0, min(len(non_sys), int(last_count)))
         end = max(start, min(len(non_sys), int(current_count)))
         range_msgs = non_sys[start:end]
@@ -515,7 +526,8 @@ def _non_system_message_range(messages: list[dict[str, Any]], last_count: int, c
     # ConversationStore slice. How: apply the same bounded start/end indexes to
     # the non-system dictionaries supplied by session_messages. Purpose: keep
     # fallback transcript creation faithful to the committed message cursor.
-    non_system = [m for m in messages if m.get("role") != "system"]
+    _SNIP = "original messages snipped"
+    non_system = [m for m in messages if m.get("role") != "system" and _SNIP not in (m.get("content") or "")]
     start = max(0, min(len(non_system), int(last_count)))
     end = max(start, min(len(non_system), int(current_count)))
     return non_system[start:end]

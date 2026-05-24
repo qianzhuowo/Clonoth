@@ -194,6 +194,8 @@ class OpenAIProvider(BaseProvider):
                 tc_map: dict[int, dict[str, Any]] = {}
 
                 stream_usage: dict[str, int] | None = None
+                _stream_finish_reason: str | None = None
+                _stream_error: str | None = None
                 async for line in resp.aiter_lines():
                     line = line.strip()
                     if not line or not line.startswith("data: "):
@@ -207,6 +209,12 @@ class OpenAIProvider(BaseProvider):
                     except Exception:
                         continue
 
+                    # [2026-05-24] Capture SSE-level error objects
+                    # Proxied Gemini sends {"error": {"message": ..., "code": "content_filter"}}
+                    _err_obj = chunk.get("error")
+                    if isinstance(_err_obj, dict):
+                        _stream_error = _err_obj.get("message") or str(_err_obj)
+
                     # 捕获 usage（流式最后一个 chunk 携带）
                     raw_usage = chunk.get("usage")
                     if isinstance(raw_usage, dict):
@@ -215,6 +223,10 @@ class OpenAIProvider(BaseProvider):
                     choices = chunk.get("choices")
                     if not isinstance(choices, list) or not choices:
                         continue
+                    # [2026-05-24] Capture finish_reason for content_filter detection
+                    _fr = choices[0].get("finish_reason")
+                    if _fr:
+                        _stream_finish_reason = _fr
                     delta = choices[0].get("delta") or {}
 
                     # 文本内容
@@ -301,6 +313,18 @@ class OpenAIProvider(BaseProvider):
                             fallback = _parse_first_json_object(raw_args)
                             args = fallback if fallback is not None else {"_raw": raw_args}
                     tool_calls.append(ToolCall(id=tc_data["id"], name=name.strip(), arguments=args))
+
+                # [2026-05-24] Detect content_filter / safety blocks from SSE stream.
+                # Proxied Gemini returns HTTP 200 but finish_reason=content_filter
+                # and/or an SSE error object with code=content_filter.
+                if _stream_finish_reason == "content_filter" or _stream_error:
+                    _err_msg = _stream_error or f"Response blocked (finish_reason={_stream_finish_reason})"
+                    return ProviderResponse(
+                        ok=False, text=text, tool_calls=[],
+                        reasoning=reasoning_text, status_code=status, usage=stream_usage,
+                        inline_data=[], provider_meta={},
+                        error=_err_msg,
+                    )
 
                 # [refactor 2026-04-18] thinking= → reasoning=，新增 inline_data / provider_meta
                 return ProviderResponse(

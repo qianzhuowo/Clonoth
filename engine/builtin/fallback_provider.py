@@ -75,8 +75,19 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
     }
 
 
-def _is_retryable(status_code: int | None) -> bool:
+_RETRYABLE_ERROR_MARKERS = frozenset({
+    "content_filter", "safety", "blocked", "SAFETY",
+    "finish_reason=content_filter",
+})
+
+
+def _is_retryable(status_code: int | None, error: str | None = None) -> bool:
     """Check if the error is worth retrying on a different provider."""
+    # Content filter / safety blocks come with HTTP 200 but ok=False
+    if error:
+        err_lower = error.lower()
+        if any(marker.lower() in err_lower for marker in _RETRYABLE_ERROR_MARKERS):
+            return True
     if status_code is None:
         return True  # unknown error, try fallback
     return status_code in _RETRYABLE_STATUS_CODES
@@ -125,7 +136,8 @@ class FallbackProviderHandler:
             return None  # success or no response, don't intervene
 
         status_code = getattr(resp, "status_code", None)
-        if not _is_retryable(status_code):
+        original_error = getattr(resp, "error", None) or ""
+        if not _is_retryable(status_code, original_error):
             logger.debug(
                 "fallback_provider: skipping non-retryable error (status=%s)",
                 status_code,

@@ -1552,12 +1552,12 @@ async def run_ai_node(
         _usage_result = await hook_registry.afire("after_llm_call", _usage_ctx)
         if _usage_result.action is not None:
             return _usage_result.action
-
-        # LEGACY: replaced by hook UsageTracker.
-        # if resp.usage and isinstance(resp.usage, dict):
-        #     for _uk in ("prompt_tokens", "completion_tokens", "total_tokens"):
-        #         if _uk in resp.usage:
-        #             ls.rctx.total_usage[_uk] = ls.rctx.total_usage.get(_uk, 0) + resp.usage[_uk]
+        # [2026-05-24] Allow after_llm_call hooks (e.g. fallback_provider) to
+        # replace the response. Without this, a hook that sets ctx.response to
+        # a successful fallback result would be ignored because the local `resp`
+        # variable still points to the original failed response.
+        if _usage_ctx.response is not resp:
+            resp = _usage_ctx.response
 
         if not resp.ok:
             return _build_failure_action(ls, resp, step)

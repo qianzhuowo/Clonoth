@@ -292,15 +292,74 @@ def build_skill_messages(
 #  Memory catalog loading, hit tracking, and legacy memory builder
 # ---------------------------------------------------------------------------
 
-# Why: _update_last_hit_bg runs in a daemon thread and may fire concurrently for
-# the same book file. How: serialize all YAML writes through one lock. Purpose:
-# prevent partial-write corruption without adding heavyweight flock.
-_yaml_write_lock = threading.Lock()
+# ---------------------------------------------------------------------------
+#  In-memory hit timestamp cache (replaces per-call YAML read/write)
+# ---------------------------------------------------------------------------
+# [2026-05-24] Why: _update_last_hit_bg was yaml.safe_load-ing 660KB+ files
+# on every LLM call, eating 45% CPU. How: track hits in a memory dict,
+# flush to a lightweight JSON sidecar every 10 min or at shutdown.
+# Purpose: zero-IO hot path, dream reads the JSON when it runs.
 
-# [2026-05-24] Process-level debounce for _update_last_hit_bg.
-# Why: yaml.safe_load on 660KB default.yaml per LLM call was eating 45% CPU.
-# How: mutable list so the value can be updated from nested scope.
-_last_hit_update_ts: list[float] = [0.0]
+import atexit as _atexit
+import json as _json
+
+_hit_cache: dict[str, str] = {}          # {entry_id: iso_timestamp}
+_hit_cache_dirty: bool = False
+_hit_cache_lock = threading.Lock()
+_hit_cache_last_flush: float = 0.0
+_HIT_CACHE_FLUSH_INTERVAL = 600          # 10 minutes
+
+
+def _hit_cache_path(workspace_root: Path) -> Path:
+    return workspace_root / "data" / "memory" / ".hit_cache.json"
+
+
+def _load_hit_cache(workspace_root: Path) -> None:
+    """Load hit cache from disk on first access."""
+    global _hit_cache, _hit_cache_last_flush
+    p = _hit_cache_path(workspace_root)
+    if p.exists():
+        try:
+            _hit_cache = _json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            _hit_cache = {}
+    _hit_cache_last_flush = time.monotonic()
+
+
+def _flush_hit_cache(workspace_root: Path | None = None) -> None:
+    """Write dirty hit cache to disk."""
+    global _hit_cache_dirty, _hit_cache_last_flush
+    with _hit_cache_lock:
+        if not _hit_cache_dirty:
+            return
+        if workspace_root is None:
+            return
+        try:
+            p = _hit_cache_path(workspace_root)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(_json.dumps(_hit_cache), encoding="utf-8")
+            _hit_cache_dirty = False
+            _hit_cache_last_flush = time.monotonic()
+        except Exception:
+            pass
+
+
+def _record_hits(workspace_root: Path, entries: list[dict[str, Any]]) -> None:
+    """Record keyword hits in memory. No YAML, no threads."""
+    global _hit_cache_dirty
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with _hit_cache_lock:
+        if not _hit_cache and _hit_cache_last_flush == 0.0:
+            _load_hit_cache(workspace_root)
+        for e in entries:
+            eid = e.get("id", "")
+            if eid:
+                _hit_cache[eid] = now_iso
+                _hit_cache_dirty = True
+        # Periodic flush
+        if _hit_cache_dirty and (time.monotonic() - _hit_cache_last_flush) > _HIT_CACHE_FLUSH_INTERVAL:
+            threading.Thread(target=_flush_hit_cache, args=(workspace_root,), daemon=True).start()
 
 
 class _MemoryCache:
@@ -441,54 +500,9 @@ def load_memory_catalog(
     return items
 
 
-def _update_last_hit_bg(workspace_root: Path, entries: list[dict[str, Any]]) -> None:
-    """Update last_hit_at for matched entries. Debounced: skip if <24h old."""
-    # Why: last_hit_at updates moved into this plugin with the rest of the memory
-    # runtime. How: keep the same daemon-thread update, debounce, and cache
-    # invalidation behavior. Purpose: preserve memory lifecycle metadata.
-    from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc)
-    now_iso = now.isoformat()
-    threshold = 86400
-
-    by_book: dict[str, list[str]] = {}
-    for e in entries:
-        b, eid = e.get("book", ""), e.get("id", "")
-        if b and eid:
-            by_book.setdefault(b, []).append(eid)
-    mem_dir = memory_dir(workspace_root)
-    for book, eids in by_book.items():
-        bp = mem_dir / f"{book}.yaml"
-        if not bp.exists():
-            continue
-        try:
-            data = yaml.safe_load(bp.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                continue
-            eid_set = set(eids)
-            changed = False
-            for entry in data.get("entries", []):
-                if not isinstance(entry, dict) or entry.get("id") not in eid_set:
-                    continue
-                old = entry.get("last_hit_at", "")
-                if old:
-                    try:
-                        old_dt = datetime.fromisoformat(old)
-                        if (now - old_dt).total_seconds() < threshold:
-                            continue
-                    except Exception:
-                        pass
-                entry["last_hit_at"] = now_iso
-                changed = True
-            if changed:
-                with _yaml_write_lock:
-                    bp.write_text(
-                        yaml.safe_dump(data, sort_keys=False, allow_unicode=True, default_flow_style=False),
-                        encoding="utf-8",
-                    )
-        except Exception:
-            continue
+# [2026-05-24] _update_last_hit_bg REMOVED.
+# Was: full yaml.safe_load + safe_dump of 660KB+ files per LLM call.
+# Replaced by: _record_hits() → in-memory dict → periodic JSON flush.
     _MemoryCache.invalidate(workspace_root)
 
 
@@ -748,21 +762,9 @@ def _classify_and_match_entries(
             buckets["skill_index"].append(entry)
 
     if matched_memories:
-        # Why: memory last_hit_at was updated immediately after keyword matches,
-        # before budget truncation. How: keep a background daemon thread that
-        # receives every matched memory entry. Purpose: preserve lifecycle data
-        # even when a matched memory is later dropped by a budget limit.
-        # [2026-05-24] Perf fix: debounce at process level — skip if last update
-        # was < 60s ago. The old 24h debounce was per-entry inside the thread,
-        # but the thread itself (yaml.safe_load 660KB) was the CPU killer.
-        _now = time.monotonic()
-        if _now - _last_hit_update_ts[0] > 60:
-            _last_hit_update_ts[0] = _now
-            threading.Thread(
-                target=_update_last_hit_bg,
-                args=(workspace_root, matched_memories),
-                daemon=True,
-            ).start()
+        # [2026-05-24] Record hits in memory dict (zero IO).
+        # Old _update_last_hit_bg was yaml.safe_load-ing 660KB per call.
+        _record_hits(workspace_root, matched_memories)
 
     return buckets
 

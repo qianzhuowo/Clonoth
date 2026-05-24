@@ -69,15 +69,19 @@ prompt: |
   每条记忆有以下元数据字段（可能缺失）：
   - `source`: "auto" = 自动提取的，缺失/空 = 手动创建或世界书
   - `created_at`: ISO 时间戳，创建时间
-  - `last_hit_at`: ISO 时间戳，最后一次被关键词命中的时间
 
   **只有 `source: auto` 的条目参与过期清理。** 没有 source 字段的条目是手动创建或世界书，禁止自动删除/修改/合并。
+
+  ### 关键词命中记录
+
+  关键词命中时间戳存储在独立文件 `data/memory/.hit_cache.json` 中（JSON 格式：`{entry_id: iso_timestamp}`）。
+  用 `execute_command` 运行 `cat data/memory/.hit_cache.json 2>/dev/null || echo '{}'` 读取。
 
   ### 过期判断（仅对 source: auto）
 
   用 `execute_command` 运行 `date +%s` 获取当前时间戳，然后对比：
-  - `last_hit_at` 超过 30 天未命中 + `created_at` 超过 30 天 → 候选过期
-  - `last_hit_at` 为空且 `created_at` 超过 30 天 → 候选过期
+  - `.hit_cache.json` 中该 entry_id 超过 30 天未命中 + `created_at` 超过 30 天 → 候选过期
+  - `.hit_cache.json` 中不存在该 entry_id 且 `created_at` 超过 30 天 → 候选过期
   - 候选过期不等于直接删：审查内容，确认确实过时/无用后才删
 
   ### 常规清理（所有 source: auto 条目）
@@ -95,7 +99,7 @@ prompt: |
 
   1. `source: auto`（手动/世界书条目不参与）
   2. `created_at` 距今超过 7 天（不是刚建的临时知识）
-  3. `last_hit_at` 在最近 7 天内（说明最近还在被频繁使用）
+  3. `.hit_cache.json` 中该 entry_id 的命中时间在最近 7 天内（说明最近还在被频繁使用）
   4. 内容长度 > 200 字（太短的保持 memory 即可，不值得提升）
 
   ### 提升流程

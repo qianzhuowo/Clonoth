@@ -52,19 +52,20 @@ class MemoryExtractHandler:
         # How: keep a separate committed cursor that only moves when the timer
         # fires. Purpose: compute task increments correctly across cancelled idle windows.
         self._memory_extract_last_extracted_task_counts: dict[str, int] = {}
-        # [2026-05-23] Why: task counts now decide when extraction should run,
-        # but they cannot identify which messages still need to be sent to the
-        # extractor. How: keep a separate message cursor that is committed only
-        # after the idle callback fires. Purpose: slice the full unextracted
-        # transcript range without returning to message-count trigger logic.
-        self._memory_extract_msg_cursors: dict[str, int] = {}
+        # [AutoC 2026-05-24] Why: compact summaries can occupy many durable
+        # message indexes, so a message cursor can select the wrong transcript
+        # slice. How: keep the exact unextracted entry task ids per session and
+        # later match ConversationStore.source_task_id. Purpose: extract only the
+        # messages that belong to completed entry tasks that have not committed.
+        self._memory_extract_pending_task_ids: dict[str, list[str]] = {}
         # Why: automatic extraction waits for user idleness. How: keep one daemon
         # Timer per session and replace it on later qualifying finishes. Purpose:
         # avoid extracting memory while the user is still sending follow-ups.
         self._memory_extract_timers: dict[str, threading.Timer] = {}
-        # Why: the cursor must move only if the idle timer fires. How: keep the
-        # prepared transcript until the timer callback commits it. Purpose:
-        # cancelled idle windows can be retried by the next entry-node finish.
+        # Why: pending task ids must commit only if the idle timer fires. How:
+        # keep the prepared transcript until the timer callback commits it.
+        # Purpose: cancelled idle windows can be retried by the next entry-node
+        # finish without losing the associated source_task_id values.
         self._memory_extract_pending: dict[str, dict[str, Any]] = {}
 
     def on_task_complete(self, ctx: dict[str, Any]) -> None:
@@ -152,124 +153,83 @@ class MemoryExtractHandler:
             log.debug("memory_extract TRACE: BLOCKED by save_memory in tool_names")
             return
 
-        session_messages = ctx.get("session_messages")
-        if not callable(session_messages):
-            log.debug("memory_extract: skip, no session_messages callback")
-            return
         # [Fork/Merge 2026-05-17] Why: completed entry tasks run on temporary
         # branch sessions, while on_entry_task_complete passes the merged parent
         # session in ctx["session_id"]. How: prefer the hook route session and
         # fall back to the task runtime session for legacy/non-branch tasks.
-        # Purpose: min_messages and transcript extraction read durable history.
+        # Purpose: pending task ids and transcript extraction read durable parent
+        # history rather than the temporary branch name after merge.
         session_id = str(ctx.get("session_id") or getattr(task, "session_id", "") or "").strip()
         if not session_id:
             log.debug("memory_extract: skip, empty session_id")
             return
         log.debug("memory_extract TRACE: session_id=%s (ctx=%s task=%s)", session_id, ctx.get('session_id'), getattr(task, 'session_id', '?'))
-        # [2026-05-23] Why: session message counts can shrink after compaction,
-        # so they are no longer safe as the trigger cursor. How: count each entry
-        # task that has passed the gate after resolving the durable parent session.
-        # Purpose: make memory.auto_extract.min_increment operate on entry tasks.
+        # [2026-05-23] Why: entry-task completions remain monotonic within this
+        # handler and are still useful for diagnostics. How: keep the historical
+        # total task counter unchanged. Purpose: preserve observability while the
+        # trigger threshold below uses the unextracted pending-task-id list.
         task_count = self._memory_extract_task_counts.get(session_id, 0) + 1
         self._memory_extract_task_counts[session_id] = task_count
-
-        msgs = session_messages(session_id, limit=0)
-        non_system = [m for m in msgs if m.get("role") != "system"]
-        current_msg_count = len(non_system)
-
-        min_messages = get_int(runtime_cfg, "memory.auto_extract.min_messages", 4, min_value=2, max_value=100)
-        if current_msg_count < min_messages:
-            log.debug("memory_extract TRACE: BLOCKED current_msg_count=%d < min_messages=%d", current_msg_count, min_messages)
-            return
-
-        # [2026-05-23] Why: task counts and message offsets now serve different
-        # purposes. How: read the last committed message cursor separately and
-        # repair it when compaction makes the durable message count smaller.
-        # Purpose: skip compacted summaries instead of replaying old history,
-        # while leaving the task counter untouched and monotonic.
-        # [2026-05-24] Scheme B: on first encounter after restart, set cursor
-        # to current_msg_count so we only extract genuinely new messages, not
-        # the entire session history. This avoids re-extracting stale content
-        # from old conversation turns every time the engine restarts.
-        _is_first_encounter = session_id not in self._memory_extract_msg_cursors
-        if _is_first_encounter:
-            self._memory_extract_msg_cursors[session_id] = current_msg_count
-            log.debug(
-                "memory_extract: first encounter for session %s, setting msg cursor to %d (skip history)",
-                session_id[:12], current_msg_count,
-            )
-        last_msg_cursor = self._memory_extract_msg_cursors.get(session_id, 0)
-        if current_msg_count < last_msg_cursor:
-            log.debug(
-                "memory_extract TRACE: msg cursor advance (compact detected) session=%s current_msg_count=%d < last_msg_cursor=%d -> cursor=%d",
-                session_id,
-                current_msg_count,
-                last_msg_cursor,
-                current_msg_count,
-            )
-            last_msg_cursor = current_msg_count
-            self._memory_extract_msg_cursors[session_id] = current_msg_count
+        # [AutoC 2026-05-24] Why: message indexes are polluted by compact summary
+        # records and no longer identify new dialogue. How: append the exact entry
+        # task id that passed every gate. Purpose: later build the transcript by
+        # ConversationStore.source_task_id membership.
+        pending_task_ids = self._memory_extract_pending_task_ids.setdefault(session_id, [])
+        pending_task_ids.append(task_id_str)
+        pending_task_count = len(pending_task_ids)
 
         min_increment = get_int(runtime_cfg, "memory.auto_extract.min_increment", 3, min_value=1, max_value=100)
         last_extracted_task_count = self._memory_extract_last_extracted_task_counts.get(session_id, 0)
-        increment = task_count - last_extracted_task_count
         log.debug(
-            "memory_extract TRACE: task_count=%d last_extracted_task_count=%d increment=%d min_incr=%d last_msg_cursor=%d current_msg_count=%d",
+            "memory_extract TRACE: task_count=%d last_extracted_task_count=%d pending_task_count=%d min_incr=%d",
             task_count,
             last_extracted_task_count,
-            increment,
+            pending_task_count,
             min_increment,
-            last_msg_cursor,
-            current_msg_count,
         )
-        if increment < min_increment:
+        if pending_task_count < min_increment:
             log.debug(
-                "memory_extract: task increment=%d < min_increment=%d (task_count=%d, last_extracted_task_count=%d)",
-                increment,
+                "memory_extract: pending_task_count=%d < min_increment=%d (task_count=%d, last_extracted_task_count=%d)",
+                pending_task_count,
                 min_increment,
                 task_count,
                 last_extracted_task_count,
             )
-            if task_count > last_extracted_task_count:
-                # [2026-05-23] Why: low-volume sessions may not reach the task
-                # threshold quickly. How: keep the fallback idle path, but use
-                # the same message-cursor transcript range and commit only after
-                # it fires. Purpose: preserve low-volume extraction while keeping
-                # trigger counting independent from transcript slicing.
-                fallback_delay = get_int(
-                    runtime_cfg,
-                    "memory.auto_extract.idle_fallback_delay_sec",
-                    120,
-                    min_value=5,
-                    max_value=3600,
-                )
-                log.debug(
-                    "memory_extract TRACE: scheduling FALLBACK timer (%ds) for session %s task_count=%d last_msg_cursor=%d current_msg_count=%d",
-                    fallback_delay,
-                    session_id,
-                    task_count,
-                    last_msg_cursor,
-                    current_msg_count,
-                )
-                pending_extract = self._prepare_memory_extract_pending_locked(
+            # [2026-05-23 / AutoC 2026-05-24] Why: low-volume sessions may not
+            # reach the task threshold quickly. How: keep the fallback idle path,
+            # but prepare its transcript from pending source_task_id values instead
+            # of a message cursor. Purpose: preserve low-volume extraction without
+            # reintroducing msg-index slicing.
+            fallback_delay = get_int(
+                runtime_cfg,
+                "memory.auto_extract.idle_fallback_delay_sec",
+                120,
+                min_value=5,
+                max_value=3600,
+            )
+            log.debug(
+                "memory_extract TRACE: scheduling FALLBACK timer (%ds) for session %s task_count=%d pending_task_count=%d",
+                fallback_delay,
+                session_id,
+                task_count,
+                pending_task_count,
+            )
+            pending_extract = self._prepare_memory_extract_pending_locked(
+                ctx=ctx,
+                task=task,
+                workspace_root=workspace_root,
+                runtime_cfg=runtime_cfg,
+                session_id=session_id,
+                task_count=task_count,
+            )
+            if pending_extract is not None:
+                self._schedule_memory_extract_idle_locked(
                     ctx=ctx,
-                    task=task,
-                    workspace_root=workspace_root,
-                    runtime_cfg=runtime_cfg,
                     session_id=session_id,
-                    msgs=msgs,
-                    task_count=task_count,
-                    last_msg_cursor=last_msg_cursor,
-                    current_msg_count=current_msg_count,
+                    pending_extract=pending_extract,
+                    delay_sec=fallback_delay,
+                    timer_label="fallback idle",
                 )
-                if pending_extract is not None:
-                    self._schedule_memory_extract_idle_locked(
-                        ctx=ctx,
-                        session_id=session_id,
-                        pending_extract=pending_extract,
-                        delay_sec=fallback_delay,
-                        timer_label="fallback idle",
-                    )
             return
         pending_extract = self._prepare_memory_extract_pending_locked(
             ctx=ctx,
@@ -277,10 +237,7 @@ class MemoryExtractHandler:
             workspace_root=workspace_root,
             runtime_cfg=runtime_cfg,
             session_id=session_id,
-            msgs=msgs,
             task_count=task_count,
-            last_msg_cursor=last_msg_cursor,
-            current_msg_count=current_msg_count,
         )
         if pending_extract is None:
             return
@@ -290,12 +247,11 @@ class MemoryExtractHandler:
         # node prompt already contains duplicate-prevention instructions.
         idle_delay = get_int(runtime_cfg, "memory.auto_extract.idle_delay_sec", 30, min_value=5, max_value=120)
         log.debug(
-            "memory_extract TRACE: scheduling NORMAL timer (%ds) for session %s task_count=%d last_msg_cursor=%d current_msg_count=%d",
+            "memory_extract TRACE: scheduling NORMAL timer (%ds) for session %s task_count=%d pending_task_count=%d",
             idle_delay,
             session_id,
             task_count,
-            last_msg_cursor,
-            current_msg_count,
+            pending_task_count,
         )
         self._schedule_memory_extract_idle_locked(
             ctx=ctx,
@@ -313,30 +269,33 @@ class MemoryExtractHandler:
         workspace_root: Path,
         runtime_cfg: dict[str, Any],
         session_id: str,
-        msgs: list[dict[str, Any]],
         task_count: int,
-        last_msg_cursor: int,
-        current_msg_count: int,
     ) -> dict[str, Any] | None:
         """Build the pending extraction payload shared by normal and fallback timers."""
-        # [2026-05-23] Why: task-count cursors no longer identify message
-        # offsets, but extraction must still cover every unextracted message.
-        # How: build the transcript from last_msg_cursor to current_msg_count
-        # without a fixed 50-message cap. Purpose: use task counts only for the
-        # trigger decision and message cursors only for transcript slicing.
-        transcript = _conversation_store_transcript(workspace_root, session_id, last_msg_cursor, current_msg_count)
-        if not transcript:
-            # Why: ConversationStore can be absent in tests or replay-only sessions.
-            # How: slice the same full non-system message range before delegating
-            # to the injected formatter. Purpose: keep store and callback fallbacks
-            # aligned with the committed message cursor.
-            range_msgs = _non_system_message_range(msgs, last_msg_cursor, current_msg_count)
-            format_transcript = ctx.get("format_transcript")
-            if callable(format_transcript):
-                transcript = str(format_transcript(range_msgs) or "")
-            else:
-                transcript = _format_transcript_for_extract(range_msgs)
+        # [AutoC 2026-05-24] Why: msg-index ranges can include compact summaries
+        # and miss the real new turn. How: copy the current uncommitted task-id
+        # list and read ConversationStore directly. Purpose: prepare a transcript
+        # from messages whose source_task_id exactly belongs to pending entry tasks.
+        pending_task_ids = list(self._memory_extract_pending_task_ids.get(session_id, []))
+        if not pending_task_ids:
+            return None
+        try:
+            from engine.conversation_store import ConversationStore
 
+            store = ConversationStore(workspace_root / "data" / "conversations")
+            all_msgs = store.load(session_id)
+        except Exception as exc:
+            log.debug("memory_extract: failed to load ConversationStore for session %s: %s", session_id, exc)
+            return None
+
+        # [AutoC 2026-05-24] Why: the pending list is ordered for payload
+        # observability, but membership checks should be exact and efficient. How:
+        # convert it to a set only for filtering while preserving store order in
+        # the resulting messages. Purpose: the transcript stays chronologically
+        # readable and includes every message from each pending task.
+        pending_task_id_set = set(pending_task_ids)
+        task_msgs = [m for m in all_msgs if m.source_task_id in pending_task_id_set]
+        transcript = _format_transcript_for_extract(task_msgs)
         if not transcript.strip():
             return None
 
@@ -346,13 +305,7 @@ class MemoryExtractHandler:
             "session_generation": int(getattr(task, "session_generation", 0) or 0),
             "transcript": transcript,
             "task_count": task_count,
-            "last_msg_cursor": last_msg_cursor,
-            "current_msg_count": current_msg_count,
-            # [2026-05-23] Why: older tests and logs referred to message_count.
-            # How: keep it as an alias for the current message cursor position.
-            # Purpose: preserve observability while the code path moves to the
-            # clearer current_msg_count name.
-            "message_count": current_msg_count,
+            "pending_task_ids": pending_task_ids,
             "extractor_node": extractor_node,
             "kind": getattr(task, "kind", "node"),
         }
@@ -417,10 +370,6 @@ class MemoryExtractHandler:
             if not transcript.strip():
                 return
             task_count = _safe_int(pending_extract.get("task_count"), self._memory_extract_task_counts.get(sid, 0))
-            current_msg_count = _safe_int(
-                pending_extract.get("current_msg_count", pending_extract.get("message_count")),
-                self._memory_extract_msg_cursors.get(sid, 0),
-            )
             session_generation = _safe_int(pending_extract.get("session_generation"), 0)
             if session_generation <= 0:
                 current_generation = ctx.get("current_session_generation")
@@ -428,14 +377,14 @@ class MemoryExtractHandler:
             extractor_node = str(pending_extract.get("extractor_node") or "system.memory_extractor").strip()
             extractor_node = extractor_node or "system.memory_extractor"
 
-            # [2026-05-23] Why: cancelled idle windows must not mark task or
-            # message cursors as extracted. How: commit both the last-extracted
-            # task count and the message cursor only inside the timer callback
-            # after pending data is popped. Purpose: cancelled idle windows still
-            # contribute to future task thresholds without losing transcript slices.
+            # [AutoC 2026-05-24] Why: cancelled idle windows must not mark task
+            # ids as extracted. How: commit the total task count and clear the
+            # pending source_task_id list only inside the timer callback after
+            # pending data is popped. Purpose: cancelled idle windows still
+            # contribute to future extraction without losing transcript scope.
             self._memory_extract_task_counts[sid] = task_count
             self._memory_extract_last_extracted_task_counts[sid] = task_count
-            self._memory_extract_msg_cursors[sid] = current_msg_count
+            self._memory_extract_pending_task_ids[sid] = []
 
             create_task = ctx.get("create_task")
             if not callable(create_task):
@@ -470,73 +419,56 @@ def _task_kind_is_node(task: Any) -> bool:
     return str(value) == "node"
 
 
-def _conversation_store_transcript(workspace_root: Path, session_id: str, last_count: int, current_count: int) -> str:
-    """Read the exact unextracted non-system message range from ConversationStore."""
-    # [2026-05-23] Why: task counts no longer map to message offsets, but the
-    # extractor still needs a stable transcript slice. How: read ConversationStore
-    # and slice all non-system messages between the committed message cursor and
-    # the current message count, with no fixed 50-message cap. Purpose: avoid
-    # dropping unextracted messages while keeping trigger logic task-based.
-    try:
-        from engine.conversation_store import ConversationStore
-
-        store = ConversationStore(workspace_root / "data" / "conversations")
-        all_msgs = store.load(session_id)
-        non_sys = [m for m in all_msgs if m.role != "system"]
-        start = max(0, min(len(non_sys), int(last_count)))
-        end = max(start, min(len(non_sys), int(current_count)))
-        range_msgs = non_sys[start:end]
-    except Exception:
-        return ""
-
-    parts: list[str] = []
-    for tm in range_msgs:
-        content = tm.content or ""
-        if len(content) > 2000:
-            content = content[:2000] + "...<truncated>"
-        parts.append(f"[{tm.role}]\n{content}")
-    return "\n\n---\n\n".join(parts)
-
-
-def _non_system_message_range(messages: list[dict[str, Any]], last_count: int, current_count: int) -> list[dict[str, Any]]:
-    """Return the same non-system cursor range for session_messages fallbacks."""
-    # [2026-05-23] Why: callback-based transcript formatting must mirror the
-    # ConversationStore slice. How: apply the same bounded start/end indexes to
-    # the non-system dictionaries supplied by session_messages. Purpose: keep
-    # fallback transcript creation faithful to the committed message cursor.
-    non_system = [m for m in messages if m.get("role") != "system"]
-    start = max(0, min(len(non_system), int(last_count)))
-    end = max(start, min(len(non_system), int(current_count)))
-    return non_system[start:end]
-
-
-def _format_transcript_for_extract(messages: list[dict[str, Any]], *, max_chars: int = 12000) -> str:
-    """Local fallback formatter used only when supervisor omits the callback."""
-    # Why: callback injection is the normal path, but isolated tests may construct
-    # a minimal context. How: keep the pure formatting logic local without any
-    # supervisor imports. Purpose: make the handler robust while preserving the new
-    # dependency boundary.
+def _format_transcript_for_extract(messages: list[Any], *, max_chars: int = 12000) -> str:
+    """Format task-scoped messages into readable transcript text."""
+    # [AutoC 2026-05-24] Why: memory extraction now receives ConversationStore
+    # Message objects selected by source_task_id, and the old [role]\ncontent
+    # blocks are harder for the extractor to read. How: format each message as a
+    # natural role label such as "User: ..." or "Assistant: ...". Purpose: give
+    # the memory extractor only the precise pending-task dialogue in a stable form.
     parts: list[str] = []
     total = 0
-    for msg in reversed(messages):
-        role = msg.get("role", "")
+    for msg in messages:
+        if isinstance(msg, dict):
+            role = str(msg.get("role") or "")
+            content: Any = msg.get("content", "")
+            message_type = str(msg.get("message_type") or msg.get("type") or "")
+            name = str(msg.get("name") or "")
+        else:
+            role = str(getattr(msg, "role", "") or "")
+            content = getattr(msg, "content", "")
+            message_type = str(getattr(msg, "message_type", "") or "")
+            name = str(getattr(msg, "name", "") or "")
         if role == "system":
             continue
-        content = msg.get("content", "")
         if isinstance(content, list):
+            # Why: older session message dictionaries can contain multimodal
+            # content lists. How: preserve only text parts before formatting.
+            # Purpose: avoid leaking raw attachment dictionaries to the extractor.
             texts = [p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str)]
             content = "\n".join(texts)
         if not isinstance(content, str):
             content = str(content)
-        if len(content) > 2000:
-            content = content[:2000] + "...<truncated>"
-        line = f"[{role}]\n{content}"
+        if not content.strip():
+            continue
+        is_tool_result = role == "tool" or message_type == "tool_result"
+        limit = 500 if is_tool_result else 2000
+        if len(content) > limit:
+            content = content[:limit] + "...<truncated>"
+        if is_tool_result:
+            label = f"Tool ({name})" if name else "Tool"
+        elif role == "user":
+            label = "User"
+        elif role == "assistant":
+            label = "Assistant"
+        else:
+            label = role.capitalize() if role else "Message"
+        line = f"{label}: {content}"
         total += len(line)
         if total > max_chars:
             break
         parts.append(line)
-    parts.reverse()
-    return "\n\n---\n\n".join(parts)
+    return "\n\n".join(parts)
 
 
 def _safe_int(value: Any, default: int) -> int:

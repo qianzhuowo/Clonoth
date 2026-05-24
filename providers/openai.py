@@ -464,6 +464,28 @@ class OpenAIProvider(BaseProvider):
             # 解析 usage
             usage = _extract_usage(data)
 
+            # [2026-05-24] Detect upstream errors in non-streaming responses.
+            # Same logic as chat_stream: check for error objects and abnormal
+            # finish_reason (content_filter, safety blocks, etc.)
+            _err_obj = data.get("error")
+            if isinstance(_err_obj, dict):
+                _err_msg = _err_obj.get("message") or str(_err_obj)
+                return ProviderResponse(
+                    ok=False, text=text, tool_calls=[],
+                    status_code=status, usage=usage,
+                    inline_data=[], provider_meta={},
+                    error=_err_msg,
+                )
+            _finish_reason = choice0.get("finish_reason")
+            _normal_finish = {"stop", "tool_calls", None}
+            if _finish_reason not in _normal_finish and not text and not tool_calls:
+                return ProviderResponse(
+                    ok=False, text=None, tool_calls=[],
+                    status_code=status, usage=usage,
+                    inline_data=[], provider_meta={},
+                    error=f"Upstream error (finish_reason={_finish_reason})",
+                )
+
             # [refactor 2026-04-18] 非流式也补齐 inline_data / provider_meta（OpenAI 目前不用）
             return ProviderResponse(ok=True, text=text, tool_calls=tool_calls, status_code=status, usage=usage, inline_data=[], provider_meta={})
 

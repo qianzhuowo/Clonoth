@@ -3,9 +3,18 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import uuid
 from pathlib import Path
+
+# [2026-05-25] Ensure all loggers (including plugins like fallback_provider)
+# output to stderr so PM2 can capture them.
+logging.basicConfig(
+    level=logging.WARNING,
+    format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 
 def main() -> None:

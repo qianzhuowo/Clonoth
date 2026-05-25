@@ -861,6 +861,7 @@ async def _execute_real_tools(
         # route session into ToolContext. Purpose: tool events, approvals, and
         # session-scoped built-ins stay attached to the durable user session.
         parent_session_id=getattr(ls.rctx, "parent_session_id", "") or "",
+        conversation_key=str((getattr(ls.rctx, "task_context", None) or {}).get("conversation_key", "")).strip(),
     )
 
     _tool_entries: list[dict[str, Any]] = []

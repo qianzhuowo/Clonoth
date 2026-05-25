@@ -41,23 +41,9 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
 
     conv_key = str(args.get("conversation_key") or "").strip()
     if not conv_key:
-        # [2026-05-25] Auto-inherit conversation_key from current session
-        # via supervisor API (lightweight, avoids loading 5MB+ sessions.json).
-        try:
-            import httpx as _httpx
-            _route_sid = ctx.route_session_id()
-            _r = _httpx.get(
-                f"{ctx.supervisor_url}/v1/sessions",
-                params={"limit": 200},
-                timeout=3.0,
-            )
-            if _r.status_code == 200:
-                for _s in _r.json():
-                    if _s.get("session_id") == _route_sid:
-                        conv_key = str(_s.get("conversation_key") or "").strip()
-                        break
-        except Exception:
-            pass
+        # [2026-05-25] Auto-inherit from ToolContext (populated by supervisor
+        # task_context → engine RunContext → ToolContext, zero I/O overhead).
+        conv_key = str(getattr(ctx, "conversation_key", "") or "").strip()
     if not conv_key:
         conv_key = f"scheduler:{sid}"
     entry_node_id = str(args.get("entry_node_id") or "").strip()

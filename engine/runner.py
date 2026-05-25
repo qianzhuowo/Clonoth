@@ -983,12 +983,14 @@ async def _run_tool_task(
     # Purpose: tool-task approvals, progress, and session-scoped built-ins avoid
     # temporary branch sessions.
     parent_session_id = str(input_data.get("parent_session_id") or "").strip()
+    _task_ctx = input_data.get("task_context") if isinstance(input_data.get("task_context"), dict) else {}
     kctx = ToolContext(
         supervisor_url=sup_url, session_id=session_id, run_id=task_id,
         worker_id=worker_id, workspace_root=ws_root, http=http,
         registry=registry, task_id=task_id,
         session_generation=session_generation,
         parent_session_id=parent_session_id,
+        conversation_key=str(_task_ctx.get("conversation_key", "")).strip(),
         approval_poll_interval_sec=0.5,
     )
 

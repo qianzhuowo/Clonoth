@@ -24,6 +24,7 @@ class ToolContext:
     # parent separately and let route_session_id() choose it when present. Purpose:
     # approvals, tool events, and session-scoped tools do not target a temporary branch.
     parent_session_id: str = ""
+    conversation_key: str = ""
     approval_poll_interval_sec: float = 0.5
 
     def route_session_id(self) -> str:

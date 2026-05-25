@@ -134,6 +134,11 @@ class TaskRouterMixin:
                         continue
             if count:
                 log.info("Merged %d transcript records from %s → %s", count, branch_session_id, parent_session_id[:12])
+                # [2026-05-25] 用后即焚：合并成功后删除 branch transcript 源文件
+                try:
+                    branch_path.unlink()
+                except Exception:
+                    pass
         except Exception as e:
             log.warning("Failed to merge branch transcript %s: %s", branch_session_id, e)
         return count
@@ -576,12 +581,22 @@ class TaskRouterMixin:
                 if task.batch_id:
                     caller.input["_resume_key"] = f"batch:{task.batch_id}"
                 self._event_task_snapshot("task_resumed", caller)
+                # [2026-05-25] 用后即焚：fresh 模式的子任务完成后删除 child conversation
+                ctx_mode = str(task.input.get("context_mode") or "").strip()
+                child_sid = str(task.input.get("child_session_id") or "").strip()
+                if ctx_mode == "fresh" and child_sid:
+                    self._expire_child_session(child_sid)
                 return
 
         # 没有 suspended caller
         # 异步 dispatch 子任务完成 → 注入 inbound 通知入口节点
         if task.input.get("_async_dispatch"):
             self._inject_async_dispatch_result_locked(task, fallback_result)
+            # [2026-05-25] 用后即焚：fresh 模式异步子任务完成后也清理
+            ctx_mode = str(task.input.get("context_mode") or "").strip()
+            child_sid = str(task.input.get("child_session_id") or "").strip()
+            if ctx_mode == "fresh" and child_sid:
+                self._expire_child_session(child_sid)
             return
 
         # 系统内部任务（如记忆提取）静默完成，不输出给用户

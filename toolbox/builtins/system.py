@@ -32,7 +32,23 @@ def _run_capture(*, args: list[str], cwd: Path, timeout_sec: float = 10.0) -> tu
         return 999, str(e)
 
 
+def _cleanup_old_artifacts(*, workspace_root: Path, current_run_id: str) -> None:
+    """[2026-05-25] 用后即焚：删除非当前 run_id 的 artifact 目录。"""
+    artifacts_root = workspace_root / "data" / "artifacts"
+    if not artifacts_root.exists():
+        return
+    for d in artifacts_root.iterdir():
+        if d.is_dir() and d.name != current_run_id:
+            try:
+                import shutil
+                shutil.rmtree(d)
+            except Exception:
+                pass
+
+
 def _write_text_artifact(*, ctx: ToolContext, filename: str, text: str) -> str:
+    # 写入前清理旧 artifact
+    _cleanup_old_artifacts(workspace_root=ctx.workspace_root, current_run_id=ctx.run_id)
     artifacts_dir = ctx.workspace_root / "data" / "artifacts" / ctx.run_id
     artifacts_dir.mkdir(parents=True, exist_ok=True)
     p = artifacts_dir / filename

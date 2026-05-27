@@ -58,12 +58,7 @@ class Node:
     # 目的：persistent=true 的节点的 child session 能触发自动上下文压缩，
     # 同时 dispatch 该节点时默认使用 accumulate context_mode。
     persistent: bool = False
-    # [2026-05-27] memory_book：该节点的默认记忆 book namespace。
-    # 为什么：不同子节点（如 ereuna_coder、news_reporter）的记忆应隔离，
-    # 避免互相污染。
-    # 怎么改：可选字符串字段，未设置时 save_memory 工具仍使用 "default" book。
-    # 目的：让每个持久节点拥有独立的记忆命名空间。
-    memory_book: str = ""
+
 
 
 def load_node(workspace_root: Path, node_id: str) -> Node | None:
@@ -189,10 +184,11 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
     # 怎么改：解析 yaml 中的 persistent 字段，非布尔值均视为 False。
     persistent = bool(data.get("persistent", False))
 
-    # [2026-05-27] memory_book 字段解析：从 node yaml 读取节点级别的默认记忆 book 名称。
-    # 为什么：持久节点的记忆应隔离到独立 namespace。
-    # 怎么改：解析为字符串，空值表示不设置，沿用原有 "default" book。
-    memory_book = str(data.get("memory_book") or "").strip()
+    # [2026-05-27 refactor] memory_book 字段已从 Node dataclass 移除。
+    # 为什么：memory_book 是记忆插件的业务配置，不应耦合在引擎核心的 Node 定义中。
+    # 怎么改：删除字段定义和解析代码；节点 yaml 中的 memory_book 字段
+    # 由 knowledge_inject.py 的 save_memory 工具自行读取。
+    # 目的：让引擎核心不知道 memory_book 的存在，插件层自给自足。
 
     return Node(
         id=str(data.get("id") or nid).strip(),
@@ -212,5 +208,4 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         provider_options=provider_options,
         delegate_targets=delegate_targets,
         persistent=persistent,
-        memory_book=memory_book,
     )

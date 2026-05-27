@@ -1293,6 +1293,28 @@ def _invalidate_cache(workspace_root: Path) -> None:
         pass
 
 
+def _read_node_memory_book(ctx: ToolContext) -> str:
+    """Read the memory_book field from the current node's yaml file.
+
+    [2026-05-27 refactor] Why: memory_book was removed from Node dataclass to
+    decouple it from engine core. How: use ctx._node_id (set by ai_step) and
+    ctx.workspace_root to locate and parse the node yaml directly. Purpose:
+    the plugin layer reads its own business config without engine core awareness.
+    """
+    node_id = str(getattr(ctx, "_node_id", "") or "").strip()
+    if not node_id:
+        return ""
+    from clonoth_runtime import load_yaml_dict
+    # Check system nodes first, then user config nodes (same order as node.py)
+    for subdir in ("engine/system_nodes", "config/nodes"):
+        yaml_path = ctx.workspace_root / subdir / f"{node_id}.yaml"
+        if yaml_path.is_file():
+            data = load_yaml_dict(yaml_path)
+            if isinstance(data, dict):
+                return str(data.get("memory_book") or "").strip()
+    return ""
+
+
 async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Create or update a memory entry in a book."""
     # Why: memory management tools now live beside memory loading and injection.
@@ -1308,19 +1330,18 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             "error": "invalid id: only [A-Za-z0-9][A-Za-z0-9_.-]{0,127} allowed",
         }
 
-    # [2026-05-27] memory_book namespace 支持：当节点配置了 memory_book 时，
+    # [2026-05-27 refactor] memory_book namespace 支持：当节点 yaml 配置了 memory_book 时，
     # 没有显式指定 book 的 save_memory 调用将使用节点配置的默认 book 名称。
     # 为什么：持久节点的记忆应隔离到独立的 namespace，避免互相污染。
-    # 怎么改：从 ctx.registry 中读取当前节点的 memory_book 配置（通过 task_context 传入），
-    #   当用户未指定 book 时使用节点默认值。
-    # 目的：简化 AI 调用 save_memory 时的参数，自动按节点分离记忆。
+    # 怎么改：memory_book 已从 Node dataclass 解耦，插件层自行从节点 yaml 读取。
+    #   通过 ToolContext._node_id 获取当前节点 ID，然后直接读取对应的 yaml 文件。
+    # 目的：引擎核心不知道 memory_book 的存在，插件层自给自足。
     _user_book = str(args.get("book") or "").strip()
     if _user_book:
         book = _user_book
     else:
-        # 尝试从 ToolContext 获取节点级 memory_book 配置
-        _node_memory_book = str(getattr(ctx, "_node_memory_book", "") or "").strip()
-        book = _node_memory_book if _node_memory_book else "default"
+        # 从节点 yaml 文件直接读取 memory_book 字段
+        book = _read_node_memory_book(ctx) or "default"
     if not _BOOK_NAME_RE.fullmatch(book):
         return {"ok": False, "error": "invalid book name"}
 

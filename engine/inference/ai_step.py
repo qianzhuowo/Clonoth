@@ -866,12 +866,12 @@ async def _execute_real_tools(
         parent_session_id=getattr(ls.rctx, "parent_session_id", "") or "",
         conversation_key=str((getattr(ls.rctx, "task_context", None) or {}).get("conversation_key", "")).strip(),
     )
-    # [2026-05-27] 注入节点级 memory_book 到 ToolContext，供 save_memory 工具读取。
-    # 为什么：持久节点配置了 memory_book 时，save_memory 应默认写入节点的专属 book。
-    # 怎么改：将 Node.memory_book 通过动态属性挂载到 ToolContext。
-    # 目的：避免修改 ToolContext dataclass 的字段定义，保持向后兼容。
-    if hasattr(ls.node, 'memory_book') and ls.node.memory_book:
-        _tool_ctx._node_memory_book = ls.node.memory_book  # type: ignore[attr-defined]
+    # [2026-05-27 refactor] memory_book 专属挂载已移除。
+    # 为什么：memory_book 从 Node dataclass 解耦到插件层，
+    # save_memory 工具现在直接从节点 yaml 文件读取 memory_book 字段。
+    # 怎么改：仅传递通用的 node_id，让插件层自行加载业务配置。
+    # 目的：引擎核心不知道 memory_book 的存在，只提供通用上下文。
+    _tool_ctx._node_id = ls.node.id  # type: ignore[attr-defined]
 
     _tool_entries: list[dict[str, Any]] = []
     _tool_atts: list[dict[str, Any]] = []

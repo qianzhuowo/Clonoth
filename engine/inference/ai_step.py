@@ -1560,6 +1560,7 @@ async def run_ai_node(
         if _usage_ctx.response is not resp:
             resp = _usage_ctx.response
 
+        import sys as _ds2; _ds2.stderr.write(f"[DIAG-AISTEP] post-hook: ok={resp.ok} err={repr((resp.error or '')[:150])} text={repr((resp.text or '')[:80])} st={resp.status_code}\n"); _ds2.stderr.flush()
         if not resp.ok:
             return _build_failure_action(ls, resp, step)
 

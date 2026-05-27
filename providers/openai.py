@@ -338,6 +338,7 @@ class OpenAIProvider(BaseProvider):
                     )
 
                 # [refactor 2026-04-18] thinking= → reasoning=，新增 inline_data / provider_meta
+                import sys as _ds; _ds.stderr.write(f"[DIAG-PROVIDER] stream end: text={repr((text or '')[:120])} fr={_stream_finish_reason} err={_stream_error} tc={len(tool_calls)}\n"); _ds.stderr.flush()
                 return ProviderResponse(
                     ok=True, text=text, tool_calls=tool_calls,
                     reasoning=reasoning_text, status_code=status, usage=stream_usage,

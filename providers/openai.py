@@ -337,24 +337,6 @@ class OpenAIProvider(BaseProvider):
                         error=f"Upstream error (finish_reason={_stream_finish_reason})",
                     )
 
-                # [2026-05-27] Detect safeguard refusals delivered as normal text.
-                # Claude cyber safeguards return HTTP 200 + normal SSE with
-                # finish_reason="stop", but the text is a refusal message.
-                # These must be marked ok=False so fallback_provider can retry.
-                _SAFEGUARD_PATTERNS = (
-                    "triggered Claude safeguards",
-                    "triggered cyber-related safeguards",
-                    "triggered safeguards",
-                    "request was refused",
-                )
-                if text and not tool_calls and any(p in text for p in _SAFEGUARD_PATTERNS):
-                    return ProviderResponse(
-                        ok=False, text=text, tool_calls=[],
-                        reasoning=reasoning_text, status_code=status, usage=stream_usage,
-                        inline_data=[], provider_meta={},
-                        error=f"Claude safeguard refusal: {text[:200]}",
-                    )
-
                 # [refactor 2026-04-18] thinking= → reasoning=，新增 inline_data / provider_meta
                 return ProviderResponse(
                     ok=True, text=text, tool_calls=tool_calls,
@@ -502,21 +484,6 @@ class OpenAIProvider(BaseProvider):
                     status_code=status, usage=usage,
                     inline_data=[], provider_meta={},
                     error=f"Upstream error (finish_reason={_finish_reason})",
-                )
-
-            # [2026-05-27] Detect safeguard refusals in non-streaming responses.
-            _SAFEGUARD_PATTERNS = (
-                "triggered Claude safeguards",
-                "triggered cyber-related safeguards",
-                "triggered safeguards",
-                "request was refused",
-            )
-            if text and not tool_calls and any(p in text for p in _SAFEGUARD_PATTERNS):
-                return ProviderResponse(
-                    ok=False, text=text, tool_calls=[],
-                    status_code=status, usage=usage,
-                    inline_data=[], provider_meta={},
-                    error=f"Claude safeguard refusal: {text[:200]}",
                 )
 
             # [refactor 2026-04-18] 非流式也补齐 inline_data / provider_meta（OpenAI 目前不用）

@@ -58,7 +58,12 @@ class Node:
     # 目的：persistent=true 的节点的 child session 能触发自动上下文压缩，
     # 同时 dispatch 该节点时默认使用 accumulate context_mode。
     persistent: bool = False
-
+    # [2026-05-27] extra: 收集节点 yaml 中 core 不认识的字段，供插件层零 IO 读取。
+    # 为什么：memory_book 等插件业务配置不应定义在 Node dataclass 上，
+    # 但插件每次从 yaml 文件读取也浪费 IO。
+    # 怎么改：load_node 把 yaml 中不属于 core 已知字段的 key-value 全部收进 extra。
+    # 目的：插件通过 ToolContext._node_extra 零 IO 拿到自己的配置。
+    extra: dict = field(default_factory=dict)
 
 
 def load_node(workspace_root: Path, node_id: str) -> Node | None:
@@ -184,11 +189,15 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
     # 怎么改：解析 yaml 中的 persistent 字段，非布尔值均视为 False。
     persistent = bool(data.get("persistent", False))
 
-    # [2026-05-27 refactor] memory_book 字段已从 Node dataclass 移除。
-    # 为什么：memory_book 是记忆插件的业务配置，不应耦合在引擎核心的 Node 定义中。
-    # 怎么改：删除字段定义和解析代码；节点 yaml 中的 memory_book 字段
-    # 由 knowledge_inject.py 的 save_memory 工具自行读取。
-    # 目的：让引擎核心不知道 memory_book 的存在，插件层自给自足。
+    # [2026-05-27] extra dict：收集 yaml 中 core 不认识的字段（如 memory_book），
+    # 供插件层通过 ToolContext._node_extra 零 IO 读取。
+    _KNOWN_KEYS = {
+        "kind", "id", "type", "name", "description", "model", "api_key",
+        "base_url", "prompt", "tool_access", "skills", "memories",
+        "tool_mode", "output_mode", "provider", "provider_options",
+        "delegate_targets", "persistent",
+    }
+    extra = {k: v for k, v in data.items() if k not in _KNOWN_KEYS}
 
     return Node(
         id=str(data.get("id") or nid).strip(),
@@ -208,4 +217,5 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         provider_options=provider_options,
         delegate_targets=delegate_targets,
         persistent=persistent,
+        extra=extra,
     )

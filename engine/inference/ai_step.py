@@ -866,12 +866,13 @@ async def _execute_real_tools(
         parent_session_id=getattr(ls.rctx, "parent_session_id", "") or "",
         conversation_key=str((getattr(ls.rctx, "task_context", None) or {}).get("conversation_key", "")).strip(),
     )
-    # [2026-05-27 refactor] memory_book 专属挂载已移除。
-    # 为什么：memory_book 从 Node dataclass 解耦到插件层，
-    # save_memory 工具现在直接从节点 yaml 文件读取 memory_book 字段。
-    # 怎么改：仅传递通用的 node_id，让插件层自行加载业务配置。
-    # 目的：引擎核心不知道 memory_book 的存在，只提供通用上下文。
+    # [2026-05-27 refactor] 传递通用节点上下文给插件层。
+    # 为什么：插件（如 save_memory）需要读取节点级配置（如 memory_book），
+    # 但不应让插件每次重新读取 yaml 文件。
+    # 怎么改：传递 node_id 和 node.extra dict，插件零 IO 从 extra 读取业务配置。
+    # 目的：引擎核心只提供通用上下文，不知道具体插件字段的存在。
     _tool_ctx._node_id = ls.node.id  # type: ignore[attr-defined]
+    _tool_ctx._node_extra = ls.node.extra  # type: ignore[attr-defined]
 
     _tool_entries: list[dict[str, Any]] = []
     _tool_atts: list[dict[str, Any]] = []

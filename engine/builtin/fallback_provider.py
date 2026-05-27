@@ -92,7 +92,19 @@ def _is_retryable(status_code: int | None, error: str | None = None) -> bool:
     # (content_filter, safety block, quota via SSE error object, etc.)
     if status_code == 200 and error:
         return True
-    # 4xx (except 429) are client errors — don't retry
+    # 4xx (except 429 and certain content moderation 403s) are client errors — don't retry
+    # 403 can be either a true auth rejection or a content moderation refusal (safeguards).
+    # Content moderation refusals are worth retrying on a different provider (e.g., Claude
+    # cyber safeguard → fallback to DeepSeek); auth rejections are not.
+    _CONTENT_MODERATION_KEYWORDS = {
+        'safeguard', 'content_filter', 'refused', 'safety', 'cyber',
+        'not allowed', 'community guidelines', 'moderation',
+    }
+    if status_code == 403 and error:
+        err_lower = error.lower()
+        if any(kw in err_lower for kw in _CONTENT_MODERATION_KEYWORDS):
+            return True  # content moderation → retryable on different provider
+        return False  # auth/permissions rejection → don't retry
     if 400 <= status_code < 500:
         return False
     return True  # anything else (1xx, 3xx, unknown) → try fallback
@@ -217,6 +229,7 @@ class FallbackProviderHandler:
                 elapsed = round((time.monotonic() - t0) * 1000, 1)
 
                 if new_resp.ok:
+                    import sys; print(f"[FB-DIAG] fallback[{i}] SUCCEEDED in {elapsed:.0f}ms model={fb_model}", file=sys.stderr, flush=True)
                     logger.warning(
                         "fallback_provider: fallback[%d] succeeded in %.0fms "
                         "(base_url=%s model=%s)",
@@ -246,15 +259,17 @@ class FallbackProviderHandler:
 
                     return None  # ai_step continues with updated ctx.response
                 else:
+                    _fb_err = getattr(new_resp, 'error', 'unknown')
+                    _fb_st = getattr(new_resp, 'status_code', '?')
+                    import sys; print(f"[FB-DIAG] fallback[{i}] ALSO FAILED status={_fb_st} error={str(_fb_err)[:200]}", file=sys.stderr, flush=True)
                     logger.warning(
                         "fallback_provider: fallback[%d] also failed "
                         "(status=%s error=%s)",
-                        i,
-                        getattr(new_resp, "status_code", "?"),
-                        getattr(new_resp, "error", "unknown"),
+                        i, _fb_st, _fb_err,
                     )
 
             except Exception as exc:
+                import sys, traceback; print(f"[FB-DIAG] fallback[{i}] EXCEPTION: {exc}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
                 logger.error(
                     "fallback_provider: fallback[%d] exception: %s",
                     i, exc, exc_info=True,

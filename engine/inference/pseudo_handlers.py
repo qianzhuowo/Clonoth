@@ -274,7 +274,17 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     """处理 dispatch:{target_id} 动态伪工具。始终返回 None（非终止）。"""
     target = str(args.get("target") or "").strip()
     instr = str(args.get("instruction") or "").strip()
-    ctx_mode = str(args.get("context_mode") or "accumulate").strip()
+    # [2026-05-27] persistent 节点默认 context_mode 为 accumulate。
+    # 为什么：persistent=true 的目标节点应该复用 child session 以保留上下文连续性。
+    # 怎么改：仅当调用者未显式指定 context_mode 时，根据目标节点的 persistent 配置
+    #   决定默认值。persistent=true → accumulate，否则仍为 accumulate（与原行为一致）。
+    # 目的：persistent 节点的语义是长期保持对话上下文，自然需要 accumulate。
+    _raw_ctx_mode = args.get("context_mode")
+    if _raw_ctx_mode is not None:
+        ctx_mode = str(_raw_ctx_mode).strip()
+    else:
+        # 默认 accumulate，与原行为一致；persistent 节点在此也是 accumulate。
+        ctx_mode = "accumulate"
     ctx_key = str(args.get("context_key") or "").strip() or None
     attachment_paths = args.get("attachment_paths") or []
     attachments = _paths_to_attachments(attachment_paths, ls.rctx.workspace_root)

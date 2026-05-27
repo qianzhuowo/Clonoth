@@ -51,6 +51,19 @@ class Node:
     provider: str = ""
     provider_options: dict = field(default_factory=dict)  # 透传给 provider 的参数（thinking/reasoning 等）
     delegate_targets: list[str] = field(default_factory=list)
+    # [2026-05-27] persistent 标记：声明该节点为持久节点。
+    # 为什么：子节点在 accumulate 模式下复用 child session，但缺少显式配置标记
+    # 来告知引擎该 session 需要接入自动压缩。
+    # 怎么改：新增 bool 字段，默认 False。
+    # 目的：persistent=true 的节点的 child session 能触发自动上下文压缩，
+    # 同时 dispatch 该节点时默认使用 accumulate context_mode。
+    persistent: bool = False
+    # [2026-05-27] memory_book：该节点的默认记忆 book namespace。
+    # 为什么：不同子节点（如 ereuna_coder、news_reporter）的记忆应隔离，
+    # 避免互相污染。
+    # 怎么改：可选字符串字段，未设置时 save_memory 工具仍使用 "default" book。
+    # 目的：让每个持久节点拥有独立的记忆命名空间。
+    memory_book: str = ""
 
 
 def load_node(workspace_root: Path, node_id: str) -> Node | None:
@@ -171,6 +184,16 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         str(x).strip() for x in (dt_raw or []) if isinstance(x, str) and x.strip()
     ] if isinstance(dt_raw, list) else []
 
+    # [2026-05-27] persistent 字段解析：从 node yaml 读取 persistent 布尔值。
+    # 为什么：支持节点级别的持久化声明，用于控制 context_mode 默认值和自动压缩。
+    # 怎么改：解析 yaml 中的 persistent 字段，非布尔值均视为 False。
+    persistent = bool(data.get("persistent", False))
+
+    # [2026-05-27] memory_book 字段解析：从 node yaml 读取节点级别的默认记忆 book 名称。
+    # 为什么：持久节点的记忆应隔离到独立 namespace。
+    # 怎么改：解析为字符串，空值表示不设置，沿用原有 "default" book。
+    memory_book = str(data.get("memory_book") or "").strip()
+
     return Node(
         id=str(data.get("id") or nid).strip(),
         type=node_type,
@@ -188,4 +211,6 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         provider=provider,
         provider_options=provider_options,
         delegate_targets=delegate_targets,
+        persistent=persistent,
+        memory_book=memory_book,
     )

@@ -73,10 +73,15 @@ class CompactChecker:
 
 def _compact_target_session_id(ls: Any) -> str:
     """Return the durable session that automatic compact should rewrite."""
-    # [AutoC 2026-05-13] Why: entry tasks can run on forked branch sessions whose
-    # JSONL files are temporary. How: prefer rctx.parent_session_id when present
-    # and fall back to the runtime session for non-branch tasks. Purpose: L2, L3,
-    # and LLM compact all reduce the parent ConversationStore instead of a fork.
+    # [2026-05-27] Why: child sessions (accumulate 模式复用的子节点 session) 的历史
+    # 从自己的 JSONL 加载，应该压缩自己的 session 而非父会话。
+    # How: 优先返回 child_session_id；没有 child_session_id 时（entry branch 场景），
+    # 回退到 parent_session_id or session_id 的旧逻辑。
+    # Purpose: 让 accumulate 模式的子节点也能触发自动上下文压缩，防止多次 dispatch 后上下文爆炸。
+    child_sid = str(getattr(ls.rctx, "child_session_id", "") or "").strip()
+    if child_sid:
+        return child_sid
+    # [AutoC 2026-05-13] entry branch 场景：prefer parent_session_id over branch session
     return str(getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id or "").strip()
 
 

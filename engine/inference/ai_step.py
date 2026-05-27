@@ -215,10 +215,13 @@ async def _check_preempt_and_cancel(ls: _LoopState, step: int) -> TaskAction | N
 
 def _compact_target_session_id(ls: _LoopState) -> str:
     """Return the durable session that automatic compact should rewrite."""
-    # [AutoC 2026-05-13] Why: this legacy helper may still be called by tests or
-    # fallback paths while entry tasks run on branch sessions. How: prefer
-    # parent_session_id and fall back to session_id. Purpose: keep legacy L2/L3/LLM
-    # compact target selection aligned with the active hook implementation.
+    # [2026-05-27] Why: child sessions (accumulate 模式的子节点) 的历史独立存储在自己的
+    # JSONL 中，压缩应针对 child_session_id 而非父会话。
+    # How: 优先返回 child_session_id；不存在时回退到旧逻辑（parent_session_id or session_id）。
+    # Purpose: 与 engine/builtin/compact.py 保持一致，让子节点 session 接入自动压缩。
+    child_sid = str(getattr(ls.rctx, "child_session_id", "") or "").strip()
+    if child_sid:
+        return child_sid
     return str(getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id or "").strip()
 
 
@@ -863,6 +866,12 @@ async def _execute_real_tools(
         parent_session_id=getattr(ls.rctx, "parent_session_id", "") or "",
         conversation_key=str((getattr(ls.rctx, "task_context", None) or {}).get("conversation_key", "")).strip(),
     )
+    # [2026-05-27] 注入节点级 memory_book 到 ToolContext，供 save_memory 工具读取。
+    # 为什么：持久节点配置了 memory_book 时，save_memory 应默认写入节点的专属 book。
+    # 怎么改：将 Node.memory_book 通过动态属性挂载到 ToolContext。
+    # 目的：避免修改 ToolContext dataclass 的字段定义，保持向后兼容。
+    if hasattr(ls.node, 'memory_book') and ls.node.memory_book:
+        _tool_ctx._node_memory_book = ls.node.memory_book  # type: ignore[attr-defined]
 
     _tool_entries: list[dict[str, Any]] = []
     _tool_atts: list[dict[str, Any]] = []

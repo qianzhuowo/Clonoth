@@ -16,6 +16,11 @@ from typing import Any
 import yaml
 
 from .result import hook_result
+# [fix 2026-05-28] Import message formatting utilities so fallback calls go
+# through the same conversion pipeline as the primary call (llm_call.py L171-172).
+# Without this, internal fields like _meta/_ephemeral leak into provider requests.
+from engine.inference.llm_call import _build_messages_for_provider
+from engine.attachments import prepare_messages_for_llm
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +183,13 @@ class FallbackProviderHandler:
         original_provider = ctx.provider
         original_model = getattr(original_provider, "model", "unknown")
 
+        # [fix 2026-05-28] Retrieve formatter from loop_state so we can run the
+        # same message format conversion that llm_call.py does before provider.chat().
+        # Why: without this, messages with _meta/_ephemeral fields are sent raw to
+        # the fallback provider, causing "missing field type" errors on DS etc.
+        _ls = ctx.extra.get("loop_state")
+        _formatter = getattr(_ls, 'formatter', None) if _ls else None
+
         logger.warning(
             "fallback_provider: primary failed (status=%s error=%s model=%s), "
             "trying %d fallback(s)",
@@ -226,9 +238,23 @@ class FallbackProviderHandler:
                     i, fb_base_url[:40], fb_model,
                 )
 
+                # [fix 2026-05-28] Format messages for this specific fallback
+                # provider before calling chat(). Mirrors llm_call.py L171-172:
+                #   1. _build_messages_for_provider: L2 formatter / bypass based
+                #      on provider type (e.g. Responses/Gemini skip L2)
+                #   2. prepare_messages_for_llm: resolve file:// image refs → base64
+                # The third arg MUST be fb_provider (not original_provider) because
+                # different providers need different format conversion paths.
+                _fb_formatted = _build_messages_for_provider(
+                    messages, _formatter, fb_provider,
+                )
+                _fb_messages = prepare_messages_for_llm(
+                    _fb_formatted, workspace_root,
+                ) if workspace_root else _fb_formatted
+
                 t0 = time.monotonic()
                 new_resp = await fb_provider.chat(
-                    messages=messages,
+                    messages=_fb_messages,
                     tools=tools,
                 )
                 elapsed = round((time.monotonic() - t0) * 1000, 1)

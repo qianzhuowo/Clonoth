@@ -90,6 +90,34 @@ def _content_to_blocks(content: Any) -> list[dict]:
     return []
 
 
+def _sanitize_input_schema(schema: Any) -> Any:
+    """递归清洗 JSON Schema，使其符合 Anthropic 要求的 draft 2020-12。
+
+    [2026-05-29 fallback schema fix] Why: MCP 工具（exa/github/mcp-time 等）声明的
+    input_schema 普遍带有 `$schema: http://json-schema.org/draft-07/schema#`。
+    Anthropic 的 tool input_schema 要求 draft 2020-12，遇到显式的旧 draft 声明会
+    直接返回 400 (tools.N.custom.input_schema invalid)。DeepSeek 不校验 schema，
+    所以仅在 fallback 到 Claude 时暴露。How: 递归剥除 `$schema` 字段，并把 draft-07
+    的 `definitions` 关键字迁移为 2020-12 的 `$defs`。Purpose: 让任何来源的工具
+    schema 都能安全地传给 Anthropic，不影响其他 provider。
+    """
+    if isinstance(schema, dict):
+        cleaned: dict[str, Any] = {}
+        for k, v in schema.items():
+            # 剥除显式 draft 声明（draft-07 等与 2020-12 不兼容）
+            if k == "$schema":
+                continue
+            # draft-07 的 definitions → 2020-12 的 $defs
+            if k == "definitions":
+                cleaned["$defs"] = _sanitize_input_schema(v)
+                continue
+            cleaned[k] = _sanitize_input_schema(v)
+        return cleaned
+    if isinstance(schema, list):
+        return [_sanitize_input_schema(item) for item in schema]
+    return schema
+
+
 def _convert_tools(tools: list[dict] | None) -> list[dict]:
     """Convert OpenAI function-calling tool definitions to Anthropic tool format.
 
@@ -101,10 +129,11 @@ def _convert_tools(tools: list[dict] | None) -> list[dict]:
     result = []
     for t in tools:
         fn = t.get("function", {})
+        raw_schema = fn.get("parameters", {"type": "object", "properties": {}})
         converted = {
             "name": fn.get("name", ""),
             "description": fn.get("description", ""),
-            "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
+            "input_schema": _sanitize_input_schema(raw_schema),
         }
         result.append(converted)
     return result

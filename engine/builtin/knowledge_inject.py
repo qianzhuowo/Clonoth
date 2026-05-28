@@ -368,13 +368,17 @@ class _MemoryCache:
     # Why: memory catalog scans are now in this plugin, but prompt builds still
     # need the same short cache. How: preserve the old cache API including
     # invalidate(). Purpose: keep memory extraction and CRUD invalidation working.
+    # [2026-05-28] cache key 从 str(workspace_root) 改为 (str(workspace_root), memory_book)。
+    # 为什么：记忆 namespace 隔离后，不同 memory_book 的 catalog 互不相同。
+    # 怎么改：所有方法增加 keyword-only memory_book 参数，cache key 改为元组。
+    # 目的：不同 namespace 各自独立缓存，互不污染。
     _lock = threading.Lock()
-    _entries: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+    _entries: dict[tuple[str, str], tuple[float, list[dict[str, Any]]]] = {}
     _TTL = 2.0
 
     @classmethod
-    def get(cls, workspace_root: Path) -> list[dict[str, Any]] | None:
-        key = str(workspace_root)
+    def get(cls, workspace_root: Path, *, memory_book: str = "") -> list[dict[str, Any]] | None:
+        key = (str(workspace_root), memory_book)
         with cls._lock:
             entry = cls._entries.get(key)
             if entry is None:
@@ -385,40 +389,52 @@ class _MemoryCache:
             return items
 
     @classmethod
-    def put(cls, workspace_root: Path, items: list[dict[str, Any]]) -> None:
-        key = str(workspace_root)
+    def put(cls, workspace_root: Path, items: list[dict[str, Any]], *, memory_book: str = "") -> None:
+        key = (str(workspace_root), memory_book)
         with cls._lock:
             cls._entries[key] = (time.monotonic(), items)
 
     @classmethod
-    def invalidate(cls, workspace_root: Path) -> None:
-        key = str(workspace_root)
+    def invalidate(cls, workspace_root: Path, *, memory_book: str = "") -> None:
+        key = (str(workspace_root), memory_book)
         with cls._lock:
             cls._entries.pop(key, None)
 
 
-def memory_dir(workspace_root: Path) -> Path:
-    """Return the memory storage directory path."""
-    # Why: memory storage path helpers move with the memory catalog loader. How:
-    # keep the same data/memory location. Purpose: preserve existing book files.
-    return workspace_root / "data" / "memory"
+def memory_dir(workspace_root: Path, memory_book: str = "") -> Path:
+    """Return the memory storage directory path.
+
+    [2026-05-28] 增加 memory_book 参数支持 namespace 隔离。
+    为什么：持久化子节点的记忆应隔离到独立子目录，避免互相污染。
+    怎么改：memory_book 非空时返回 data/memory/{memory_book}/，否则返回 data/memory/。
+    目的：save_memory 和 load_memory_catalog 共用此路径计算。
+    """
+    base = workspace_root / "data" / "memory"
+    if memory_book:
+        return base / memory_book
+    return base
 
 
 def load_memory_catalog(
     workspace_root: Path,
     *,
+    memory_book: str = "",
     _use_cache: bool = True,
 ) -> list[dict[str, Any]]:
-    """Scan ``data/memory/*.yaml`` and return parsed entries."""
-    # Why: memory scanning is now owned by the knowledge plugin. How: move the
-    # former memory loader here and compile keywords with the local helper.
-    # Purpose: remove the old separate file without changing memory activation.
+    """Scan memory yaml files and return parsed entries.
+
+    [2026-05-28] 增加 memory_book 参数支持 namespace 隔离。
+    为什么：持久化子节点的记忆应存储在独立子目录，与主节点互不干扰。
+    怎么改：memory_book 非空时扫 data/memory/{memory_book}/*.yaml，
+    否则扫 data/memory/*.yaml（现有行为，不递归）。
+    缓存 key 用 (workspace_root, memory_book) 元组区分。
+    """
     if _use_cache:
-        cached = _MemoryCache.get(workspace_root)
+        cached = _MemoryCache.get(workspace_root, memory_book=memory_book)
         if cached is not None:
             return cached
 
-    mem_dir = memory_dir(workspace_root)
+    mem_dir = memory_dir(workspace_root, memory_book)
     if not mem_dir.exists() or not mem_dir.is_dir():
         return []
 
@@ -496,7 +512,7 @@ def load_memory_catalog(
         except Exception:
             continue
 
-    _MemoryCache.put(workspace_root, items)
+    _MemoryCache.put(workspace_root, items, memory_book=memory_book)
     return items
 
 
@@ -1051,7 +1067,12 @@ def build_knowledge_context(
     # them into one Entry shape, and render through build_knowledge_messages.
     # Purpose: keep prompt injection behavior stable while deleting the old files.
     entries = normalize_skill_entries(load_skill_catalog(workspace_root))
-    entries.extend(normalize_memory_entries(load_memory_catalog(workspace_root)))
+    # [2026-05-28] namespace 隔离：从 node.extra 获取 memory_book，加载对应子目录的记忆。
+    # 为什么：持久化子节点的记忆存储在 data/memory/{memory_book}/ 下。
+    # 怎么改：传 memory_book 给 load_memory_catalog，让它扫描正确的目录。
+    # 目的：节点只看到自己 namespace 下的记忆条目。
+    _mb = str(node.extra.get("memory_book") or "").strip()
+    entries.extend(normalize_memory_entries(load_memory_catalog(workspace_root, memory_book=_mb)))
 
     return build_knowledge_messages(
         workspace_root,
@@ -1282,13 +1303,15 @@ def _save_book(path: Path, data: dict[str, Any]) -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def _invalidate_cache(workspace_root: Path) -> None:
-    """Clear the memory cache so the next prompt build picks up changes."""
-    # Why: memory CRUD functions now share the same module as _MemoryCache. How:
-    # call invalidate directly and keep the best-effort wrapper. Purpose: preserve
-    # the old failure-tolerant cache invalidation behavior.
+def _invalidate_cache(workspace_root: Path, *, memory_book: str = "") -> None:
+    """Clear the memory cache so the next prompt build picks up changes.
+
+    [2026-05-28] 增加 memory_book 参数，与 _MemoryCache.invalidate 对齐。
+    为什么：namespace 隔离后 cache key 包含 memory_book，invalidate 也需指定。
+    目的：精确清除对应 namespace 的缓存。
+    """
     try:
-        _MemoryCache.invalidate(workspace_root)
+        _MemoryCache.invalidate(workspace_root, memory_book=memory_book)
     except Exception:
         pass
 
@@ -1366,7 +1389,12 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         except (TypeError, ValueError):
             pass
 
-    book_path = memory_dir(ctx.workspace_root) / f"{book}.yaml"
+    # [2026-05-28] 从节点 extra 获取 memory_book namespace，用于写入子目录和 invalidate 对应缓存。
+    # 为什么：持久化子节点的记忆应写入 data/memory/{memory_book}/。
+    # 怎么改：传 memory_book 给 memory_dir 来计算实际路径。
+    _ns_extra = getattr(ctx, "_node_extra", None) or {}
+    _ns_memory_book = str(_ns_extra.get("memory_book") or "").strip()
+    book_path = memory_dir(ctx.workspace_root, _ns_memory_book) / f"{book}.yaml"
     data = _load_book(book_path)
     data.setdefault("book", book)
 
@@ -1391,7 +1419,8 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         entries.append(new_entry)
 
     _save_book(book_path, data)
-    _invalidate_cache(ctx.workspace_root)
+    # invalidate 时也传 memory_book，精确清除对应 namespace 的缓存
+    _invalidate_cache(ctx.workspace_root, memory_book=_ns_memory_book)
     return {"ok": True, "book": book, "id": mid, "updated": found}
 
 
@@ -1399,8 +1428,11 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     """List memory entries, optionally filtered by book."""
     # Why: list_memories is now plugin-owned like the memory catalog. How: keep
     # the old book scan and preview fields. Purpose: preserve the tool response.
+    # [2026-05-28] namespace 隔离：使用节点 memory_book 确定扫描目录。
     book_filter = str(args.get("book") or "").strip() or None
-    mem_dir = memory_dir(ctx.workspace_root)
+    _ns_extra = getattr(ctx, "_node_extra", None) or {}
+    _ns_memory_book = str(_ns_extra.get("memory_book") or "").strip()
+    mem_dir = memory_dir(ctx.workspace_root, _ns_memory_book)
     if not mem_dir.exists():
         return {"ok": True, "entries": []}
 
@@ -1440,8 +1472,11 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     if not mid:
         return {"ok": False, "error": "empty memory id"}
 
+    # [2026-05-28] namespace 隔离：使用节点 memory_book 确定存储目录。
+    _ns_extra = getattr(ctx, "_node_extra", None) or {}
+    _ns_memory_book = str(_ns_extra.get("memory_book") or "").strip()
     book = str(args.get("book") or "default").strip()
-    book_path = memory_dir(ctx.workspace_root) / f"{book}.yaml"
+    book_path = memory_dir(ctx.workspace_root, _ns_memory_book) / f"{book}.yaml"
     if not book_path.exists():
         return {"ok": False, "error": f"book not found: {book}"}
 
@@ -1473,7 +1508,8 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
         except Exception:
             pass
 
-    _invalidate_cache(ctx.workspace_root)
+    # [2026-05-28] invalidate 时传 memory_book，精确清除对应 namespace 的缓存
+    _invalidate_cache(ctx.workspace_root, memory_book=_ns_memory_book)
     return {"ok": True, "book": book, "id": mid, "deleted": True}
 
 

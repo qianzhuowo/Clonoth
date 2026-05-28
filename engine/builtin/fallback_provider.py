@@ -22,6 +22,33 @@ from .result import hook_result
 from engine.inference.llm_call import _build_messages_for_provider
 from engine.attachments import prepare_messages_for_llm
 
+
+def _strip_image_blocks(messages: list[dict]) -> list[dict]:
+    """Remove image_url content blocks from all messages.
+
+    Why: fallback providers like DeepSeek don't support vision/multimodal.
+    How: for each message with list-type content, filter out image_url blocks.
+    If a message becomes empty after stripping, replace with placeholder text.
+    """
+    result = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            result.append(msg)
+            continue
+        filtered = [p for p in content if not (isinstance(p, dict) and p.get("type") == "image_url")]
+        if not filtered:
+            new_msg = {**msg, "content": "[image content removed]"}
+        elif len(filtered) == 1 and isinstance(filtered[0], dict) and filtered[0].get("type") == "text":
+            new_msg = {**msg, "content": filtered[0].get("text", "")}
+        elif len(filtered) == len(content):
+            result.append(msg)
+            continue
+        else:
+            new_msg = {**msg, "content": filtered}
+        result.append(new_msg)
+    return result
+
 logger = logging.getLogger(__name__)
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
@@ -251,6 +278,12 @@ class FallbackProviderHandler:
                 _fb_messages = prepare_messages_for_llm(
                     _fb_formatted, workspace_root,
                 ) if workspace_root else _fb_formatted
+
+                # [fix 2026-05-28] Strip image_url blocks for non-vision
+                # fallback providers (e.g. DeepSeek). Without this, messages
+                # containing multimodal content cause deserialization errors
+                # like: unknown variant `image_url`, expected `text`.
+                _fb_messages = _strip_image_blocks(_fb_messages)
 
                 t0 = time.monotonic()
                 new_resp = await fb_provider.chat(

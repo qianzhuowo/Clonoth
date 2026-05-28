@@ -53,6 +53,14 @@ class InboundMessageIn(BaseModel):
     attachments: list[dict[str, Any]] | None = None
     use_context: bool = True
     entry_node_id: str | None = None
+    # [2026-05-28] 异步 dispatch 统一走 inbound：新增 3 个可选字段。
+    # 为什么：异步子节点委派改为 POST /v1/inbound，需要在 payload 中携带回调元数据。
+    # dispatch_origin: 回调目标信息（parent_session_id, caller_node_id）
+    # dispatch_context_mode: 上下文模式（accumulate/fresh/fork）
+    # dispatch_fork_from_session: fork 模式的源 session ID
+    dispatch_origin: dict[str, Any] | None = None
+    dispatch_context_mode: str | None = None
+    dispatch_fork_from_session: str | None = None
 
 
 class InboundMessageOut(BaseModel):

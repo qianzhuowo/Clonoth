@@ -172,6 +172,12 @@ def create_app(
         st: SupervisorState = app.state.state
         session_id = st.get_or_create_session(channel=msg.channel, conversation_key=msg.conversation_key)
 
+        # [2026-05-28] 异步 dispatch 统一走 inbound：透传新增的 dispatch 字段到 payload。
+        # 为什么：model_dump() 已包含这些字段，但 record_inbound_message_event 依赖
+        #   payload dict 来传递给 _create_entry_task_for_inbound_locked。
+        # 怎么改：无需额外处理，Pydantic model_dump 已包含新字段。
+        # 目的：确保 dispatch_origin/dispatch_context_mode/dispatch_fork_from_session
+        #   能通过 event payload 传递到 task 创建逻辑。
         evt = st.eventlog.append(
             session_id=session_id,
             component="shell",
@@ -343,6 +349,30 @@ def create_app(
                     "parent_session_id": str(task.input.get("parent_session_id") or (session_id if branch_session_id else "")),
                 })
         return {"tasks": tasks}
+
+    # [2026-05-28] 全局按 node_id 查找活跃任务（跨 session）。
+    # 为什么：dispatch 到持久节点的任务运行在独立 session 上，调用方不知道目标 session_id。
+    # 怎么改：新增端点，遍历所有活跃 task，按 node_id 匹配返回第一个。
+    # 目的：支持 preempt_task 跨 session 查找持久节点任务。
+    @app.get("/v1/tasks/active-by-node/{node_id}")
+    async def global_task_by_node(node_id: str) -> dict[str, Any]:
+        """[2026-05-28] 全局查找指定 node_id 的活跃任务（running/pending）。
+
+        遍历所有任务，不限定 session。用于跨 session 定位持久节点任务。
+        """
+        st: SupervisorState = app.state.state
+        with st._lock:
+            for task in st.tasks.values():
+                if task.node_id != node_id:
+                    continue
+                if task.status not in (TaskStatus.running, TaskStatus.pending):
+                    continue
+                return {
+                    "task_id": task.task_id,
+                    "session_id": task.session_id,
+                    "status": task.status.value,
+                }
+        raise HTTPException(status_code=404, detail=f"no active task for node '{node_id}'")
 
     # [2026-05-28] 按 node_id 查找 session 中活跃任务。
     # 为什么：preempt_task 原本只接受 task_id（UUID），调用者需知道精确 ID 才能操作。

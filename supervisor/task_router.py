@@ -589,7 +589,16 @@ class TaskRouterMixin:
                 return
 
         # 没有 suspended caller
-        # 异步 dispatch 子任务完成 → 注入 inbound 通知入口节点
+        # [2026-05-28] 新路径：通过 inbound dispatch_origin 回调。
+        # 为什么：异步 dispatch 统一走 inbound 后，子任务完成时通过 _dispatch_origin
+        #   中记录的 parent_session_id 将结果注入回调用方 session。
+        # 怎么改：在旧 _async_dispatch 判断之前新增 _dispatch_origin 检查。
+        # 目的：支持新路径的同时保持旧路径向后兼容。
+        if task.input.get("_dispatch_origin"):
+            self._inject_dispatch_result_via_origin_locked(task, fallback_result)
+            return
+
+        # 旧路径（向后兼容）：异步 dispatch 子任务完成 → 注入 inbound 通知入口节点
         if task.input.get("_async_dispatch"):
             self._inject_async_dispatch_result_locked(task, fallback_result)
             # [2026-05-25] 用后即焚：fresh 模式异步子任务完成后也清理
@@ -700,6 +709,97 @@ class TaskRouterMixin:
             inbound_seq=seq, session_id=route_session_id, payload=payload,
         )
 
+    # ------------------------------------------------------------------ #
+    #  [2026-05-28] 新路径：通过 dispatch_origin 回调结果
+    # ------------------------------------------------------------------ #
+
+    def _inject_dispatch_result_via_origin_locked(
+        self, task: Task, fallback_result: dict[str, Any],
+    ) -> None:
+        """dispatch_origin 路径的回调注入。
+
+        [2026-05-28] 异步 dispatch 统一走 inbound 后，子任务完成时通过
+        task.input["_dispatch_origin"] 中记录的 parent_session_id 将结果
+        作为新 inbound 注入回调用方 session。
+
+        与 _inject_async_dispatch_result_locked 逻辑基本一致，区别在于：
+        - 从 task.input["_dispatch_origin"] 读取回调目标
+        - 目标是 dispatch_origin.parent_session_id（不是 task 自身的 route session）
+
+        此方法在 self._lock 内调用。
+        """
+        origin = task.input.get("_dispatch_origin") or {}
+        target_session_id = str(origin.get("parent_session_id") or "").strip()
+        caller_node = str(origin.get("caller_node_id") or "").strip()
+
+        if not target_session_id:
+            log.warning(
+                "dispatch_origin callback skipped: no parent_session_id in task %s",
+                task.task_id[:12],
+            )
+            return
+
+        session_info = self.sessions.get(target_session_id)
+        if not session_info:
+            log.warning(
+                "dispatch_origin callback skipped: session %s not found for task %s",
+                target_session_id[:12], task.task_id[:12],
+            )
+            return
+
+        # 检查 session generation 是否过期
+        current_gen = self._current_session_generation_locked(target_session_id)
+        if task.session_generation and current_gen and task.session_generation != current_gen:
+            return
+        # 检查 session 是否已被 cancel
+        if target_session_id in self._cancelled_sessions:
+            return
+
+        # 组装结果文本
+        result_text = str(fallback_result.get("text") or "").strip()
+        result_summary = str(fallback_result.get("summary") or "").strip()
+        notify_parts: list[str] = [f"[异步子任务完成] 节点 {task.node_id} 已完成。"]
+        if caller_node:
+            notify_parts[0] = f"[异步子任务完成] {caller_node} 委派的 {task.node_id} 已完成。"
+        if result_summary:
+            notify_parts.append(f"摘要：{result_summary}")
+        if result_text:
+            notify_parts.append(f"结果：\n{result_text}")
+        notify_text = "\n".join(notify_parts)
+
+        result_atts = (
+            fallback_result.get("attachments")
+            if isinstance(fallback_result.get("attachments"), list)
+            else None
+        )
+
+        # 构造 inbound payload 并注入目标 session
+        conv_key = session_info.conversation_key
+        channel = session_info.channel
+        msg_id = f"dispatch_origin:{task.task_id}"
+
+        payload: dict[str, Any] = {
+            "channel": channel,
+            "conversation_key": conv_key,
+            "message_id": msg_id,
+            "text": notify_text,
+        }
+        if result_atts:
+            payload["attachments"] = result_atts
+
+        evt = self.eventlog.append(
+            session_id=target_session_id,
+            component="supervisor",
+            type_="inbound_message",
+            payload=payload,
+        )
+        seq = int(evt.get("seq", 0))
+        self._apply_inbound_message(seq=seq, session_id=target_session_id, payload=payload)
+        self._advance_inbound_cursor()
+        self._create_entry_task_for_inbound_locked(
+            inbound_seq=seq, session_id=target_session_id, payload=payload,
+        )
+
     def inject_async_result(self, session_id: str, text: str, attachments: list | None = None) -> dict[str, Any]:
         """注入异步工具结果到 session，并创建新的 inbound 分支。
 
@@ -762,8 +862,12 @@ class TaskRouterMixin:
             # 排除：有 caller 的子任务
             if t.caller_task_id:
                 continue
-            # 排除：异步 dispatch 子任务自身
+            # 排除：异步 dispatch 子任务自身（旧路径）
             if t.input.get("_async_dispatch"):
+                continue
+            # [2026-05-28] 排除：通过 inbound dispatch_origin 创建的子任务。
+            # 为什么：这类任务是异步委派的执行体，不应被视为用户入口 task。
+            if t.input.get("_dispatch_origin"):
                 continue
             # 排除：系统内部任务
             if t.input.get("_system_task"):

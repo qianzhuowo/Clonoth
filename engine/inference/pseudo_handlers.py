@@ -273,9 +273,21 @@ async def _handle_pseudo_preempt_task(ls: _LoopState, pseudo_call, args: dict) -
                     _node_data = _node_resp.json()
                     real_task_id = _node_data.get("task_id", "")
                 elif _node_resp.status_code == 404:
-                    _pt_result = f"节点 '{_pt_tid}' 在当前 session 中无活跃任务"
-                    _emit_pseudo_tool_result(ls, pseudo_call, _pt_result)
-                    return None
+                    # [2026-05-28] fallback 到全局 by-node 查找。
+                    # 为什么：持久节点的任务运行在独立 session 上，
+                    #   session 内查找找不到。
+                    # 怎么改：404 时 fallback 到 /v1/tasks/active-by-node/{node_id}。
+                    # 目的：跨 session 支持 preempt 持久节点任务。
+                    _global_resp = await ls.rctx.http.get(
+                        f"{ls.rctx.supervisor_url}/v1/tasks/active-by-node/{_pt_tid}",
+                    )
+                    if _global_resp.status_code == 200:
+                        _global_data = _global_resp.json()
+                        real_task_id = _global_data.get("task_id", "")
+                    else:
+                        _pt_result = f"节点 '{_pt_tid}' 在当前 session 及全局范围内均无活跃任务"
+                        _emit_pseudo_tool_result(ls, pseudo_call, _pt_result)
+                        return None
                 else:
                     _pt_result = f"查询节点 '{_pt_tid}' 的任务失败: HTTP {_node_resp.status_code}"
                     _emit_pseudo_tool_result(ls, pseudo_call, _pt_result)
@@ -309,52 +321,76 @@ async def _handle_pseudo_preempt_task(ls: _LoopState, pseudo_call, args: dict) -
 
 
 async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> None:
-    """处理 dispatch:{target_id} 动态伪工具。始终返回 None（非终止）。"""
+    """处理 dispatch:{target_id} 动态伪工具。始终返回 None（非终止）。
+
+    [2026-05-28] 所有异步 dispatch 统一走 inbound 路径。
+    为什么：让异步子节点复用现有的 session / entry-branch / conversation 机制，
+    而不是用单独的 dispatch-async 端点。
+    怎么改：构造 inbound payload（含 dispatch_origin 回调信息），POST /v1/inbound。
+    目的：统一生命周期管理，为 persistent node 支持铺路。
+    """
     target = str(args.get("target") or "").strip()
     instr = str(args.get("instruction") or "").strip()
-    # [2026-05-27] persistent 节点默认 context_mode 为 accumulate。
-    # 为什么：persistent=true 的目标节点应该复用 child session 以保留上下文连续性。
-    # 怎么改：仅当调用者未显式指定 context_mode 时，根据目标节点的 persistent 配置
-    #   决定默认值。persistent=true → accumulate，否则仍为 accumulate（与原行为一致）。
-    # 目的：persistent 节点的语义是长期保持对话上下文，自然需要 accumulate。
     _raw_ctx_mode = args.get("context_mode")
     if _raw_ctx_mode is not None:
         ctx_mode = str(_raw_ctx_mode).strip()
     else:
-        # 默认 accumulate，与原行为一致；persistent 节点在此也是 accumulate。
         ctx_mode = "accumulate"
     ctx_key = str(args.get("context_key") or "").strip() or None
     attachment_paths = args.get("attachment_paths") or []
     attachments = _paths_to_attachments(attachment_paths, ls.rctx.workspace_root)
-    try:
-        payload: dict[str, Any] = {
-            "session_id": ls.rctx.session_id,
-            "session_generation": ls.rctx.session_generation,
-            "node_id": target,
-            "instruction": instr,
-            "context_mode": ctx_mode,
-            "context_key": ctx_key,
+
+    # 获取父 session 信息
+    parent_session_id = getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id
+    parent_conv_key = ls.rctx.task_context.get("conversation_key", "")
+    parent_channel = ls.rctx.task_context.get("channel", "internal")
+    target_node_id = target
+
+    # 生成 conversation_key
+    if ctx_mode in ("fresh", "fork"):
+        import uuid as _uuid
+        conv_key = f"agent:{target_node_id}:{parent_conv_key}:{_uuid.uuid4()}"
+    else:  # accumulate
+        if ctx_key:
+            conv_key = f"agent:{target_node_id}:{ctx_key}:{parent_conv_key}"
+        else:
+            conv_key = f"agent:{target_node_id}:{parent_conv_key}"
+
+    # 构造 inbound payload
+    inbound_payload: dict[str, Any] = {
+        "channel": parent_channel,
+        "conversation_key": conv_key,
+        "text": instr,
+        "entry_node_id": target_node_id,
+        "use_context": True,
+        "attachments": attachments or [],
+        "dispatch_origin": {
+            "parent_session_id": parent_session_id,
             "caller_node_id": ls.node.id,
-        }
-        # [Fork/Merge 2026-05-17] Why: async dispatch API may receive a branch
-        # session from older engine paths or after a supervisor index rebuild.
-        # How: include the parent route session when RunContext has it. Purpose:
-        # supervisor can anchor async child tasks to the durable conversation.
-        parent_session_id = getattr(ls.rctx, "parent_session_id", "") or ""
-        if parent_session_id:
-            payload["parent_session_id"] = parent_session_id
-        if attachments:
-            payload["attachments"] = attachments
+        },
+        "dispatch_context_mode": ctx_mode,
+    }
+    if ctx_mode == "fork":
+        inbound_payload["dispatch_fork_from_session"] = parent_session_id
+
+    try:
         _dispatch_resp = await ls.rctx.http.post(
-            f"{ls.rctx.supervisor_url}/v1/tasks/dispatch-async",
-            json=payload,
+            f"{ls.rctx.supervisor_url}/v1/inbound",
+            json=inbound_payload,
             timeout=10.0,
         )
         if _dispatch_resp.status_code == 200:
             _d_data = _dispatch_resp.json()
-            _dispatch_result = json.dumps({"success": True, "task_id": _d_data.get("task_id", ""), "message": f"已异步委派给 {target}"}, ensure_ascii=False)
+            _dispatch_result = json.dumps({
+                "success": True,
+                "session_id": _d_data.get("session_id", ""),
+                "message": f"已异步委派给 {target}",
+            }, ensure_ascii=False)
         else:
-            _dispatch_result = json.dumps({"success": False, "error": f"dispatch API 返回 {_dispatch_resp.status_code}: {_dispatch_resp.text}"}, ensure_ascii=False)
+            _dispatch_result = json.dumps({
+                "success": False,
+                "error": f"inbound API 返回 {_dispatch_resp.status_code}: {_dispatch_resp.text}",
+            }, ensure_ascii=False)
     except Exception as e:
         _dispatch_result = json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
     _emit_pseudo_tool_result(ls, pseudo_call, _dispatch_result)

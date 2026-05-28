@@ -782,6 +782,37 @@ class SessionMixin:
             for k in keys_to_remove:
                 del self.child_session_map[k]
 
+            # [2026-05-28] dispatch session 级联清理。
+            # 为什么：异步 dispatch 统一走 inbound 后，子节点 session 的 conversation_key
+            #   以 agent:{node_id}:{parent_conv_key} 为前缀。重置父会话时应级联清除。
+            # 怎么改：扫描 conversation_map 中以 agent:*:{conversation_key} 为前缀的
+            #   条目，删除对应 session 及其 JSONL。
+            # 目的：避免父会话重置后赖留已无用的 dispatch session。
+            _dispatch_prefix = f":{conversation_key}"
+            _dispatch_keys_to_remove: list[str] = []
+            for ck, sid in self.conversation_map.items():
+                if ck.startswith("agent:") and ck.endswith(_dispatch_prefix):
+                    _dispatch_keys_to_remove.append(ck)
+                elif ck.startswith("agent:") and _dispatch_prefix + ":" in ck:
+                    # 匹配 fresh/fork 模式的 agent:{node}:{parent_conv}:{uuid}
+                    _dispatch_keys_to_remove.append(ck)
+            for ck in _dispatch_keys_to_remove:
+                _dsid = self.conversation_map.pop(ck, None)
+                if _dsid:
+                    # 清理 dispatch session 的 JSONL 和内存状态
+                    _d_jsonl = conv_dir / f"{_dsid}.jsonl"
+                    if _d_jsonl.exists():
+                        try:
+                            _d_jsonl.unlink()
+                        except Exception:
+                            pass
+                    self.sessions.pop(_dsid, None)
+                    self.session_generations.pop(_dsid, None)
+                    self._cancelled_sessions.discard(_dsid)
+                    self._session_context_usage.pop(_dsid, None)
+                    self._session_store.on_session_reset(_dsid)
+                    cleared_children += 1
+
             return {"ok": True, "old_session_id": old_session_id,
                     "conversation_key": conversation_key,
                     "cleared_children": cleared_children}

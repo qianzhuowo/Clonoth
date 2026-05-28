@@ -192,12 +192,20 @@ class TaskStoreMixin:
         # selected when the session was first routed or switched.
         session_recorded = (session_info.entry_node_id if session_info else "").strip() if session_info else ""
         payload_entry = str(payload.get("entry_node_id") or "").strip()
-        entry_node = (
-            session_override
-            or payload_entry
-            or session_recorded
-            or default_node
-        )
+        # [2026-05-28] dispatch 场景下跳过 session_override，用 payload 指定的 entry_node。
+        # 为什么：dispatch inbound 的 entry_node_id 由调用方精确指定，不应被
+        #   session 级覆盖（如 AI switch_node）干扰。
+        # 怎么改：检查 dispatch_origin 存在时走简化路径。
+        # 目的：确保 dispatch 的目标节点始终准确。
+        if payload.get("dispatch_origin"):
+            entry_node = payload_entry or default_node
+        else:
+            entry_node = (
+                session_override
+                or payload_entry
+                or session_recorded
+                or default_node
+            )
         if session_info and not session_info.entry_node_id:
             # Why: newly-created sessions may not yet know their frontend-selected
             # entry node. How: once an inbound is actually routed, copy the node
@@ -211,6 +219,20 @@ class TaskStoreMixin:
         if not self.session_generations.get(session_id):
             self.session_generations[session_id] = generation
         self._cancelled_sessions.discard(session_id)
+        # [2026-05-28] fork 处理：dispatch 的 fork 模式下，将调用方历史复制到目标 session。
+        # 为什么：fork context_mode 语义是"从父会话的上下文开始"，目标 session 初始时
+        #   应含有父历史。怎么改：在创建 entry branch 之前检查 dispatch_fork_from_session，
+        #   如果目标 session 当前为空则从源 session fork 一份。
+        # 目的：fork 模式下目标节点启动时能看到调用方的对话上下文。
+        _fork_from = str(payload.get("dispatch_fork_from_session") or "").strip()
+        if _fork_from:
+            from engine.conversation_store import ConversationStore
+            _fork_store = ConversationStore(self.workspace_root / "data" / "conversations")
+            if _fork_store.message_count(session_id) == 0:
+                try:
+                    _fork_store.fork(_fork_from, session_id)
+                except Exception:
+                    pass
         # [Fork/Merge 2026-05-12] 每条 inbound 都创建独立入口分支。
         # 原因：同一主 session 的新消息不再抢占旧入口 task，而是并发运行在各自
         # branch session 上。做法：在 supervisor 持锁期间 fork ConversationStore，
@@ -276,6 +298,14 @@ class TaskStoreMixin:
             source_inbound_seq=inbound_seq,
             caller_task_id=None,
         )
+        # [2026-05-28] dispatch_origin 透传：异步 dispatch 走 inbound 时将回调元数据写入 task.input。
+        # 为什么：task 完成后 task_router 需要知道结果应发回哪个 session。
+        # 怎么改：从 payload 读取 dispatch_origin dict，写入 task.input 供回调路由使用。
+        # 目的：task_router._resume_caller_or_output_locked 能根据 _dispatch_origin 注入结果。
+        _dispatch_origin = payload.get("dispatch_origin")
+        if isinstance(_dispatch_origin, dict) and _dispatch_origin:
+            task.input["_dispatch_origin"] = _dispatch_origin
+            task.input["_caller_node_id"] = str(_dispatch_origin.get("caller_node_id") or "")
         # Emit transient inbound_accepted so Bot can advance watermark
         self.eventlog.append(
             session_id=session_id,

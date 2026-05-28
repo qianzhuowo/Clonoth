@@ -26,28 +26,63 @@ _MAX_FILE_SIZE = 1024 * 1024 * 64  # 64 MiB — generous but bounded
 #  Helpers
 # ---------------------------------------------------------------------------
 
+
+def _find_match_lines(content: str, search: str, limit: int = 20) -> list[int]:
+    """找出 search 在 content 中所有匹配位置的起始行号(1-based)。
+
+    改进2辅助函数：在多匹配场景下，提供每个匹配的行号候选列表，
+    帮助 AI 快速定位正确的 start_line，而不是只返回匹配数量。
+    """
+    lines: list[int] = []
+    start = 0
+    while len(lines) < limit:
+        idx = content.find(search, start)
+        if idx == -1:
+            break
+        line_no = content[:idx].count('\n') + 1
+        lines.append(line_no)
+        start = idx + max(1, len(search))
+    return lines
+
+
 def _find_and_replace(
     content: str,
     search: str,
     replace: str,
     start_line: int | None,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, list[int] | None]:
     """Apply a single search/replace on *content*.
 
-    Returns (new_content, error_message | None).
+    Returns (new_content, error_message | None, candidate_lines | None).
     error_message is None on success.
+    candidate_lines is populated when multiple matches exist without a valid start_line.
     """
     if not search:
-        return content, "Empty search string is not allowed."
+        return content, "Empty search string is not allowed.", None
+
+    # 改进1 & 2: 先做全局计数，用于唯一匹配优先判断和候选行号收集
+    count = content.count(search)
 
     if start_line is not None:
-        # Scoped search: only look in the region starting at start_line.
+        # 改进1: 唯一匹配时忽略 start_line —— 即使 AI 给了过期的行号，
+        # 只要 search 内容在文件中唯一，就直接替换，不因行号偏移而失败。
+        if count == 1:
+            new_content = content.replace(search, replace, 1)
+            return new_content, None, None
+
+        if count == 0:
+            return content, (
+                "No exact match found. "
+                "Please verify the content matches exactly."
+            ), None
+
+        # count > 1: 多匹配场景，使用 start_line 定位（原有逻辑）
         lines = content.split("\n")
         if start_line < 1 or start_line > len(lines):
             return content, (
                 f"start_line {start_line} is out of range "
                 f"(file has {len(lines)} lines)."
-            )
+            ), None
 
         # Build the prefix (lines before start_line) and the search region.
         prefix = "\n".join(lines[: start_line - 1])
@@ -58,29 +93,31 @@ def _find_and_replace(
             return content, (
                 "No exact match found starting from line "
                 f"{start_line}. Please verify the content matches exactly."
-            )
+            ), None
 
         # Replace the *first* occurrence in region.
         new_region = region[:idx] + replace + region[idx + len(search):]
         separator = "\n" if prefix else ""
         new_content = prefix + separator + new_region
-        return new_content, None
+        return new_content, None, None
 
     # Global search: require unique match.
-    count = content.count(search)
     if count == 0:
         return content, (
             "No exact match found. "
             "Please verify the content matches exactly."
-        )
+        ), None
     if count > 1:
+        # 改进2: 多匹配时返回候选行号，帮助 AI 快速定位正确位置
+        candidate_lines = _find_match_lines(content, search)
         return content, (
             f"Multiple matches found ({count}). "
-            "Please provide 'start_line' parameter to specify which match to use."
-        )
+            "Please provide 'start_line' parameter to specify which match to use. "
+            f"Candidate match lines: {', '.join(str(l) for l in candidate_lines)}."
+        ), candidate_lines
 
     new_content = content.replace(search, replace, 1)
-    return new_content, None
+    return new_content, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +206,10 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     failed_count = 0
     failed_diffs: list[dict[str, Any]] = []
 
+    # 改进3: lineDelta 行号偏移维护 —— 前面的 diff 增删行后，后续 diff
+    # 的 start_line 需要相应调整，避免因行号漂移导致定位失败。
+    line_delta = 0
+
     for i, diff_entry in enumerate(diffs):
         if not isinstance(diff_entry, dict):
             failed_count += 1
@@ -203,12 +244,28 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
                 })
                 continue
 
-        new_content, error = _find_and_replace(content, search, replace, start_line)
+        # 改进3: 用累积的 line_delta 调整 start_line，补偿前序 diff 的行数增减
+        adjusted_start_line = start_line
+        if start_line is not None:
+            adjusted_start_line = start_line + line_delta
+
+        new_content, error, candidate_lines = _find_and_replace(
+            content, search, replace, adjusted_start_line,
+        )
         if error is not None:
             failed_count += 1
-            failed_diffs.append({"index": i, "error": error})
+            fail_entry: dict[str, Any] = {"index": i, "error": error}
+            # 改进2: 在 failed_diffs 条目中附带候选行号，方便 AI 重试时选择正确行
+            if candidate_lines is not None:
+                fail_entry["candidateLines"] = candidate_lines
+            failed_diffs.append(fail_entry)
             # Don't update content — skip this diff and continue with next.
             continue
+
+        # 改进3: 计算本次 diff 的行数变化并累加到 line_delta
+        old_line_count = search.count('\n') + 1
+        new_line_count = replace.count('\n') + 1
+        line_delta += new_line_count - old_line_count
 
         content = new_content
         applied_count += 1

@@ -596,6 +596,13 @@ class TaskRouterMixin:
         # 目的：支持新路径的同时保持旧路径向后兼容。
         if task.input.get("_dispatch_origin"):
             self._inject_dispatch_result_via_origin_locked(task, fallback_result)
+            # [2026-05-28] fresh/fork session 清理：conversation_key 带 uuid 的
+            # dispatch session 完成后删除，避免资源积累。
+            _d_ctx_mode = str(task.input.get("_dispatch_origin", {}).get("context_mode") or "").strip()
+            if not _d_ctx_mode:
+                _d_ctx_mode = str(task.input.get("dispatch_context_mode") or "").strip()
+            if _d_ctx_mode in ("fresh", "fork"):
+                self._cleanup_dispatch_session_locked(task)
             return
 
         # 旧路径（向后兼容）：异步 dispatch 子任务完成 → 注入 inbound 通知入口节点
@@ -799,6 +806,45 @@ class TaskRouterMixin:
         self._create_entry_task_for_inbound_locked(
             inbound_seq=seq, session_id=target_session_id, payload=payload,
         )
+
+    def _cleanup_dispatch_session_locked(self, task: Task) -> None:
+        """清理 fresh/fork 模式 dispatch 创建的临时 session。
+
+        [2026-05-28] fresh/fork dispatch 的 conversation_key 带 uuid，
+        完成后不会被复用。清理对应的 session 和 JSONL，释放资源。
+        """
+        # task 运行在 entry branch 上，需要找到其 parent session
+        _parent_sid = str(task.input.get("parent_session_id") or "").strip()
+        _branch_sid = str(task.input.get("branch_session_id") or "").strip()
+        # dispatch session 是 branch 的 parent
+        _dispatch_sid = _parent_sid or ""
+        if not _dispatch_sid:
+            return
+        _info = self.sessions.get(_dispatch_sid)
+        if not _info:
+            return
+        # 只清理 agent: 前缀的 dispatch session
+        if not _info.conversation_key.startswith("agent:"):
+            return
+        try:
+            _conv_dir = self.workspace_root / "data" / "conversations"
+            _jsonl = _conv_dir / f"{_dispatch_sid}.jsonl"
+            if _jsonl.exists():
+                _jsonl.unlink()
+            # 清理 branch JSONL（如果还在）
+            if _branch_sid:
+                _branch_jsonl = _conv_dir / f"{_branch_sid}.jsonl"
+                if _branch_jsonl.exists():
+                    _branch_jsonl.unlink()
+            # 从内存中移除
+            self.conversation_map.pop(_info.conversation_key, None)
+            self.sessions.pop(_dispatch_sid, None)
+            self.session_generations.pop(_dispatch_sid, None)
+            self._cancelled_sessions.discard(_dispatch_sid)
+            self._session_context_usage.pop(_dispatch_sid, None)
+            self._session_store.on_session_reset(_dispatch_sid)
+        except Exception as e:
+            log.warning("cleanup dispatch session %s failed: %s", _dispatch_sid[:12], e)
 
     def inject_async_result(self, session_id: str, text: str, attachments: list | None = None) -> dict[str, Any]:
         """注入异步工具结果到 session，并创建新的 inbound 分支。

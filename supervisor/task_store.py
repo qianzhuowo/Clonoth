@@ -231,8 +231,8 @@ class TaskStoreMixin:
             if _fork_store.message_count(session_id) == 0:
                 try:
                     _fork_store.fork(_fork_from, session_id)
-                except Exception:
-                    pass
+                except Exception as _fork_err:
+                    logger.warning("dispatch fork from %s to %s failed: %s", _fork_from[:12], session_id[:12], _fork_err)
         # [Fork/Merge 2026-05-12] 每条 inbound 都创建独立入口分支。
         # 原因：同一主 session 的新消息不再抢占旧入口 task，而是并发运行在各自
         # branch session 上。做法：在 supervisor 持锁期间 fork ConversationStore，

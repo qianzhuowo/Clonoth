@@ -65,6 +65,35 @@ def _has_resource_limit_marker(error: str | None) -> bool:
     return any(marker in err for marker in _RESOURCE_LIMIT_ERROR_MARKERS)
 
 
+# [fix 2026-05-28] Why: some upstream providers (e.g. zoaholic proxies) return
+# HTTP 200 but embed server-side errors (429, 503, overloaded, capacity) inside
+# the SSE stream body. The provider parser sets ok=False but keeps status_code=200.
+# How: define explicit transient server-error markers that indicate recoverable
+# failures, separate from content-policy refusals (safeguard, refused, etc.).
+# Purpose: retry genuine server-side transient errors that arrive via HTTP 200
+# streams, while leaving content-policy refusals for fallback_provider to handle
+# via a different provider (retrying the same provider for safeguard is futile).
+_STREAM_SERVER_ERROR_MARKERS = (
+    "429",
+    "503",
+    "rate_limit",
+    "rate limit",
+    "overloaded",
+    "capacity",
+    "too many requests",
+    "server_error",
+    "internal_error",
+    "service_unavailable",
+)
+
+
+def _has_stream_server_error(error: str | None) -> bool:
+    """Return whether an error text indicates a transient server-side error
+    embedded in an HTTP 200 stream (e.g. SSE error objects with 429/503)."""
+    err = (error or "").lower()
+    return any(marker in err for marker in _STREAM_SERVER_ERROR_MARKERS)
+
+
 def _is_retryable_error(resp) -> bool:
     """判定 ProviderResponse 是否属于可重试的临时性错误。"""
     if resp.ok:
@@ -77,6 +106,15 @@ def _is_retryable_error(resp) -> bool:
             return True
         if status_code in _RESOURCE_LIMIT_CLIENT_STATUS_CODES:
             return _has_resource_limit_marker(getattr(resp, "error", None))
+        # [fix 2026-05-28] Why: SSE streams can return HTTP 200 but contain
+        # server errors (429/503/overloaded) in the event data. The provider
+        # parser sets ok=False but preserves status_code=200. How: check error
+        # text for transient server-error markers. Purpose: retry genuine
+        # server-side transient errors while leaving content-policy refusals
+        # (safeguard blocks) for fallback_provider to handle via a different
+        # provider rather than retrying the same one.
+        if status_code == 200:
+            return _has_stream_server_error(getattr(resp, "error", None))
         return False
     return True
 

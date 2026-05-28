@@ -184,6 +184,11 @@ class FallbackProviderHandler:
             status_code, original_error, original_model, len(fallbacks_raw),
         )
 
+        # [fix 2026-05-28] Collect per-fallback error details so that when all
+        # fallbacks fail, the user sees what was attempted and why each failed,
+        # instead of only seeing the original provider's error message.
+        fallback_errors: list[str] = []
+
         # Try each fallback in chain order
         for i, fb_raw in enumerate(fallbacks_raw):
             if not isinstance(fb_raw, dict):
@@ -267,6 +272,11 @@ class FallbackProviderHandler:
                         "(status=%s error=%s)",
                         i, _fb_st, _fb_err,
                     )
+                    # [fix 2026-05-28] Record this fallback's failure for later
+                    # aggregation into the user-facing error message.
+                    fallback_errors.append(
+                        f"[Fallback {fb_provider_type} failed: {str(_fb_err)[:150]}]"
+                    )
 
             except Exception as exc:
                 import sys, traceback; print(f"[FB-DIAG] fallback[{i}] EXCEPTION: {exc}\n{traceback.format_exc()}", file=sys.stderr, flush=True)
@@ -274,6 +284,18 @@ class FallbackProviderHandler:
                     "fallback_provider: fallback[%d] exception: %s",
                     i, exc, exc_info=True,
                 )
+                # [fix 2026-05-28] Record exception-type failures too.
+                fallback_errors.append(
+                    f"[Fallback {fb_cfg.get('provider', '?')} exception: {str(exc)[:150]}]"
+                )
+
+        # [fix 2026-05-28] Why: when all fallbacks fail, the user only sees the
+        # original provider's error and has no idea fallbacks were even attempted.
+        # How: append each fallback's failure reason to ctx.response.error.
+        # Purpose: give the user full visibility into what was tried.
+        if fallback_errors and hasattr(ctx.response, "error"):
+            fb_summary = " | ".join(fallback_errors)
+            ctx.response.error = f"{original_error} | {fb_summary}"
 
         # All fallbacks failed, emit signal and let original error flow
         logger.error(

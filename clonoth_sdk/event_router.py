@@ -443,6 +443,64 @@ class EventRouter:
                 except Exception:
                     pass
 
+        # [2026-05-29 dispatch child-session visibility]
+        # Why: async dispatch now routes through /v1/inbound, so a delegated child
+        # node (e.g. ereuna_coder, scout) runs in its OWN session, not the parent's
+        # branch. Its handoff_progress / approval events carry that child session_id,
+        # which this router has never seen, so progress was silently dropped and the
+        # user saw nothing in DM. How: task_created payload is a full task.model_dump()
+        # including input._dispatch_origin.parent_session_id. When that parent session
+        # is one THIS router already owns (get_conversation_key returns a key), map the
+        # child session_id to the same conversation_key. Purpose: scope visibility to
+        # child sessions spawned under the current session only, so subsequent child
+        # events resolve to the right channel without touching the supervisor.
+        self._register_dispatch_child_session(event, p)
+
+    def _register_dispatch_child_session(self, event: Event, payload: dict) -> None:
+        """将 dispatch 子节点的独立 session 映射到父 session 的 conversation_key。
+
+        异步 dispatch 统一走 /v1/inbound 后，被委派的子节点（coder/scout 等）
+        运行在自己的 session 上，其 handoff_progress / approval 事件携带的是
+        子 session_id。本 router 从未注册过该 session，导致进度被静默丢弃。
+
+        task_created 的 payload 是完整 task.model_dump()，input._dispatch_origin
+        里带 parent_session_id。仅当该父 session 是本 router 已知（能查到
+        conv_key）的 session 时，才把子 session 注册进 session_conv_map——
+        这样既实现「只监听本 session 下面的子 session」，又让后续子事件能
+        通过 get_conversation_key 解析到正确频道。
+        """
+        try:
+            task_input = payload.get("input")
+            if not isinstance(task_input, dict):
+                return
+            origin = task_input.get("_dispatch_origin")
+            if not isinstance(origin, dict):
+                return
+            parent_sid = str(origin.get("parent_session_id") or "").strip()
+            child_sid = str(payload.get("session_id") or event.session_id or "").strip()
+            if not parent_sid or not child_sid or parent_sid == child_sid:
+                return
+            # 只接管本 router 已知父 session 下的子 session
+            parent_conv_key = self._state.get_conversation_key(parent_sid)
+            if not parent_conv_key:
+                return
+            self._state.session_conv_map.setdefault(child_sid, parent_conv_key)
+            # DM 场景：子节点进度靠 get_dm_channel(child_sid) 定位私聊频道，
+            # 子 session 从未注册过 DM 频道，会 fallback 到群聊日志频道。
+            # 把父 session 的 DM 频道继承给子 session，确保 DM 下进度正确归属。
+            try:
+                _parent_dm = self._state.get_dm_channel(parent_sid)
+                if _parent_dm and self._state.get_dm_channel(child_sid) is None:
+                    self._state.register_dm_channel(child_sid, _parent_dm)
+            except Exception:
+                pass
+            logger.info(
+                "dispatch child session %s mapped to parent conv_key %s",
+                child_sid[:12], parent_conv_key,
+            )
+        except Exception as e:
+            logger.error("_register_dispatch_child_session error: %s", e)
+
     # ------------------------------------------------------------------
     #  outbound_message — 主节点回复 / fallback 发送
     # ------------------------------------------------------------------

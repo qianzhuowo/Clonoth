@@ -148,6 +148,15 @@ class EventRouter:
         self._after_seq = 0
         self._caught_up = False
         self._running = False
+        # [2026-05-29 restart detection fix] Why: request_restart(target=engine)
+        # actually triggers a FULL restart (supervisor+engine), wiping supervisor's
+        # in-memory _engine_generations dict. So engine_registered arrives with an
+        # EMPTY previous_generation_id, and the old `if not prev_gen: return` guard
+        # mistook every restart for a first boot — skipping on_engine_restarted and
+        # leaving stale progress logs open. How: the bot tracks the last generation
+        # it has seen itself, independent of supervisor's prev field. Purpose: detect
+        # restarts reliably by comparing the new generation against our own record.
+        self._last_seen_generation: str | None = None
 
         # Layer 1 hook: 原始事件拦截器
         # 返回 None → SDK 继续默认处理；返回 'handled' → SDK 跳过此事件
@@ -443,60 +452,91 @@ class EventRouter:
                 except Exception:
                     pass
 
-        # [2026-05-29 dispatch child-session visibility]
-        # Why: async dispatch now routes through /v1/inbound, so a delegated child
-        # node (e.g. ereuna_coder, scout) runs in its OWN session, not the parent's
-        # branch. Its handoff_progress / approval events carry that child session_id,
-        # which this router has never seen, so progress was silently dropped and the
-        # user saw nothing in DM. How: task_created payload is a full task.model_dump()
-        # including input._dispatch_origin.parent_session_id. When that parent session
-        # is one THIS router already owns (get_conversation_key returns a key), map the
-        # child session_id to the same conversation_key. Purpose: scope visibility to
-        # child sessions spawned under the current session only, so subsequent child
-        # events resolve to the right channel without touching the supervisor.
+        # [2026-05-29 dispatch child-session visibility / revised]
+        # Why: async dispatch routes through /v1/inbound, so a delegated child node
+        # (ereuna_coder, scout, ...) runs in its OWN session whose conversation_key
+        # has the form `agent:{node_id}:{parent_conv_key}[:{uuid}]`. Its progress and
+        # approval events carry that child session_id, which this router never
+        # registered, so they were silently dropped. How: parse the parent channel
+        # conv_key out of the child's conversation_key (carried in task_context) and
+        # map every related child session_id to it. Purpose: scope visibility to child
+        # sessions under channels THIS router owns, without depending on
+        # _dispatch_origin (which is lost during branch fork).
         self._register_dispatch_child_session(event, p)
 
     def _register_dispatch_child_session(self, event: Event, payload: dict) -> None:
-        """将 dispatch 子节点的独立 session 映射到父 session 的 conversation_key。
+        """将 dispatch 子节点的独立 session 映射到父频道的 conversation_key。
 
         异步 dispatch 统一走 /v1/inbound 后，被委派的子节点（coder/scout 等）
         运行在自己的 session 上，其 handoff_progress / approval 事件携带的是
-        子 session_id。本 router 从未注册过该 session，导致进度被静默丢弃。
+        子 session_id。本 router 从未注册过该 session，导致进度/审批被静默丢弃。
 
-        task_created 的 payload 是完整 task.model_dump()，input._dispatch_origin
-        里带 parent_session_id。仅当该父 session 是本 router 已知（能查到
-        conv_key）的 session 时，才把子 session 注册进 session_conv_map——
-        这样既实现「只监听本 session 下面的子 session」，又让后续子事件能
-        通过 get_conversation_key 解析到正确频道。
+        [2026-05-29 修订] 不再依赖 _dispatch_origin（branch fork 后会丢失），
+        改为解析子节点的 conversation_key。dispatch 生成的 conv_key 形如
+        `agent:{node_id}:{父conv_key}[:{uuid}]`，内嵌了父频道 conv_key。只要
+        父 conv_key 是本 router 已知（出现在 conversation_sessions）的频道，就把
+        该子任务相关的所有 session_id 映射到父 conv_key 并继承 DM 频道——既实现
+        「只接管本频道下的子 session」，又让后续子事件正确归属。
         """
         try:
             task_input = payload.get("input")
             if not isinstance(task_input, dict):
                 return
-            origin = task_input.get("_dispatch_origin")
-            if not isinstance(origin, dict):
+            # 子 session 的 conversation_key 在 task_context 里
+            task_context = task_input.get("task_context")
+            child_conv_key = ""
+            if isinstance(task_context, dict):
+                child_conv_key = str(task_context.get("conversation_key") or "").strip()
+            if not child_conv_key or not child_conv_key.startswith("agent:"):
                 return
-            parent_sid = str(origin.get("parent_session_id") or "").strip()
-            child_sid = str(payload.get("session_id") or event.session_id or "").strip()
-            if not parent_sid or not child_sid or parent_sid == child_sid:
+            # 剥掉 agent:{node_id}: 前缀，剩余部分含父 conv_key
+            rest = child_conv_key[len("agent:"):]
+            if ":" not in rest:
                 return
-            # 只接管本 router 已知父 session 下的子 session
-            parent_conv_key = self._state.get_conversation_key(parent_sid)
+            _node_id, remainder = rest.split(":", 1)
+            # 在本 router 已知的 conv_key 中定位父频道（startswith 命中常见情形）
+            parent_conv_key = ""
+            for known in list(self._state.conversation_sessions.keys()):
+                if not known:
+                    continue
+                if remainder == known or remainder.startswith(known + ":"):
+                    parent_conv_key = known
+                    break
+            # 兜底：context_key 在前缀时父 conv_key 可能落在中段/尾部
             if not parent_conv_key:
+                for known in list(self._state.conversation_sessions.keys()):
+                    if known and (":" + known) in (":" + remainder):
+                        parent_conv_key = known
+                        break
+            if not parent_conv_key:
+                logger.debug(
+                    "dispatch child conv_key %s: no known parent channel (known=%d)",
+                    child_conv_key, len(self._state.conversation_sessions),
+                )
                 return
-            self._state.session_conv_map.setdefault(child_sid, parent_conv_key)
-            # DM 场景：子节点进度靠 get_dm_channel(child_sid) 定位私聊频道，
-            # 子 session 从未注册过 DM 频道，会 fallback 到群聊日志频道。
-            # 把父 session 的 DM 频道继承给子 session，确保 DM 下进度正确归属。
-            try:
-                _parent_dm = self._state.get_dm_channel(parent_sid)
-                if _parent_dm and self._state.get_dm_channel(child_sid) is None:
-                    self._state.register_dm_channel(child_sid, _parent_dm)
-            except Exception:
-                pass
+            # 父频道的 DM 频道（供子 session 继承）
+            parent_sid = self._state.get_session_id(parent_conv_key) or ""
+            parent_dm = self._state.get_dm_channel(parent_sid) if parent_sid else None
+            # 收集该子任务相关的所有 session_id：dispatch 主 session、branch、payload
+            child_sids = set()
+            for _k in ("parent_session_id", "branch_session_id"):
+                _v = str(task_input.get(_k) or "").strip()
+                if _v:
+                    child_sids.add(_v)
+            _payload_sid = str(payload.get("session_id") or event.session_id or "").strip()
+            if _payload_sid:
+                child_sids.add(_payload_sid)
+            child_sids.discard(parent_sid)  # 排除父 session 自身
+            for csid in child_sids:
+                self._state.session_conv_map.setdefault(csid, parent_conv_key)
+                if parent_dm and self._state.get_dm_channel(csid) is None:
+                    try:
+                        self._state.register_dm_channel(csid, parent_dm)
+                    except Exception:
+                        pass
             logger.info(
-                "dispatch child session %s mapped to parent conv_key %s",
-                child_sid[:12], parent_conv_key,
+                "dispatch child sessions %s -> parent conv_key %s (dm=%s)",
+                [s[:12] for s in child_sids], parent_conv_key, bool(parent_dm),
             )
         except Exception as e:
             logger.error("_register_dispatch_child_session error: %s", e)
@@ -1142,11 +1182,36 @@ class EventRouter:
     # ------------------------------------------------------------------
 
     async def _handle_engine_registered(self, event: Event) -> None:
-        """Handle engine_registered: notify adapter when engine restarts."""
+        """Handle engine_registered: notify adapter when engine restarts.
+
+        [2026-05-29 restart detection fix] The old logic trusted supervisor's
+        previous_generation_id, but a full restart (the only restart path now,
+        since target=engine is disabled in api.py) wipes supervisor's in-memory
+        generation map, so that field is empty and every restart looked like a
+        first boot. We now track the generation ourselves and compare.
+        """
         p = event.payload
+        cur_gen = (p.get("generation_id") or "").strip()
         prev_gen = (p.get("previous_generation_id") or "").strip()
-        if not prev_gen:
-            # First boot, not a restart — skip
+
+        # Determine whether this is a real restart:
+        #  - supervisor reports a non-empty previous_generation_id (in-process
+        #    engine restart, generation map survived) → trust it; OR
+        #  - we've seen a different generation before (full restart wiped the
+        #    supervisor field, but our own record proves the generation changed).
+        is_restart = bool(prev_gen) or (
+            self._last_seen_generation is not None
+            and cur_gen != ""
+            and cur_gen != self._last_seen_generation
+        )
+
+        # Record current generation for the next comparison regardless of outcome.
+        if cur_gen:
+            self._last_seen_generation = cur_gen
+
+        if not is_restart:
+            # Genuine first boot (we had no prior generation on record) — skip
+            # cleanup, just remember the generation above.
             return
         try:
             await self._cb.on_engine_restarted(p)

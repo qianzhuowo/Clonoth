@@ -344,6 +344,29 @@ def create_app(
                 })
         return {"tasks": tasks}
 
+    # [2026-05-28] 按 node_id 查找 session 中活跃任务。
+    # 为什么：preempt_task 原本只接受 task_id（UUID），调用者需知道精确 ID 才能操作。
+    # 怎么改：新增端点，遍历 session 内所有活跃 task，按 node_id 匹配返回第一个。
+    # 目的：允许 engine 侧用 node_id（如 "bob"）定位子节点任务再执行 preempt。
+    @app.get("/v1/sessions/{session_id}/tasks/by-node/{node_id}")
+    async def session_task_by_node(session_id: str, node_id: str) -> dict[str, Any]:
+        """按 node_id 查找 session 中活跃（running/pending）的 task。"""
+        st: SupervisorState = app.state.state
+        if session_id not in st.sessions:
+            raise HTTPException(status_code=404, detail="session not found")
+        with st._lock:
+            # 与 running_tasks 端点一致，查询主 session 及其入口分支
+            session_ids = {session_id, *st._entry_branch_ids_for_parent_locked(session_id)}
+            for task in st.tasks.values():
+                if task.session_id not in session_ids:
+                    continue
+                if task.node_id != node_id:
+                    continue
+                if task.status not in (TaskStatus.running, TaskStatus.pending):
+                    continue
+                return {"task_id": task.task_id, "status": task.status.value}
+        raise HTTPException(status_code=404, detail=f"no active task for node '{node_id}'")
+
     @app.post("/v1/tasks/{task_id}/renew_lease")
     async def renew_lease(task_id: str, body: dict[str, Any]) -> dict[str, Any]:
         st: SupervisorState = app.state.state
@@ -796,7 +819,13 @@ def create_app(
 
     @app.post("/v1/sessions/{session_id}/cancel_active_tasks")
     async def session_cancel_active_tasks(
-        session_id: str, exclude_task_id: str = Query(""),
+        session_id: str,
+        exclude_task_id: str = Query(""),
+        # [2026-05-28] 可选 node_id 过滤：只取消指定节点的活跃任务。
+        # 为什么：有时只想取消某个子节点的任务，而非 session 内全部。
+        # 怎么改：新增 query param，透传到 cancel_active_tasks 方法。
+        # 目的：更细粒度的任务取消控制。
+        node_id: str = Query(""),
     ) -> dict[str, Any]:
         """取消 session 中所有活跃 task。供 AI 工具调用。"""
         st: SupervisorState = app.state.state
@@ -808,7 +837,10 @@ def create_app(
             route_session_id = st._route_session_id_for_session_locked(session_id)
             if route_session_id not in st.sessions:
                 raise HTTPException(status_code=404, detail="session not found")
-        return st.cancel_active_tasks(route_session_id, exclude_task_id=exclude_task_id)
+        return st.cancel_active_tasks(
+            route_session_id, exclude_task_id=exclude_task_id,
+            node_id=node_id or None,
+        )
 
     @app.post("/v1/sessions/{session_id}/switch_node")
     async def session_switch_node(session_id: str, body: dict[str, Any]) -> dict[str, Any]:

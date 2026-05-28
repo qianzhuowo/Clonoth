@@ -319,10 +319,15 @@ class TaskStoreMixin:
             })
         return result
 
-    def cancel_active_tasks(self, session_id: str, *, exclude_task_id: str | None = None) -> dict[str, Any]:
+    # [2026-05-28] 新增可选 node_id 参数：只取消指定节点的活跃任务。
+    # 为什么：原本 cancel_active_tasks 会取消 session 内所有任务，粒度太粗。
+    # 怎么改：传入 node_id 时，跳过不匹配的任务。
+    # 目的：允许调用方按节点粒度管理任务生命周期。
+    def cancel_active_tasks(self, session_id: str, *, exclude_task_id: str | None = None, node_id: str | None = None) -> dict[str, Any]:
         sid = (session_id or "").strip()
         if not sid:
             return {"ok": False}
+        _filter_node = (node_id or "").strip() or None
         with self._lock:
             keep_ids: set[str] = set()
             tid = (exclude_task_id or "").strip()
@@ -338,6 +343,9 @@ class TaskStoreMixin:
             session_ids = {sid, *self._entry_branch_ids_for_parent_locked(sid)}
             for task in self.tasks.values():
                 if task.session_id not in session_ids or self._task_terminal(task) or task.task_id in keep_ids:
+                    continue
+                # node_id 过滤：仅当指定了 node_id 且不匹配时跳过
+                if _filter_node and task.node_id != _filter_node:
                     continue
                 if task.status == TaskStatus.pending:
                     task.cancel_requested = True

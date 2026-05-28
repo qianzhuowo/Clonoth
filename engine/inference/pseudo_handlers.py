@@ -238,28 +238,66 @@ async def _handle_pseudo_compact(ls: _LoopState, pseudo_call, step: int) -> Task
     return None
 
 
+# [2026-05-28] 判断字符串是否像 UUID 或 hex 前缀（task_id 支持前缀匹配）。
+# 为什么：preempt_task 新增 node_id 支持，需要区分传入值是 task_id 还是 node_id。
+# 怎么判断：全 hex+连字符且长度≥8 视为 task_id/前缀，否则视为 node_id。
+import re as _re
+_UUID_FULL_PATTERN = _re.compile(r'^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$', _re.I)
+
+def _looks_like_task_id(s: str) -> bool:
+    """Return True if s looks like a UUID or hex prefix (for task_id prefix match)."""
+    if _UUID_FULL_PATTERN.fullmatch(s):
+        return True
+    # hex prefix: all hex chars (plus optional dashes), length >= 8
+    return len(s) >= 8 and all(c in '0123456789abcdef-' for c in s.lower())
+
+
 async def _handle_pseudo_preempt_task(ls: _LoopState, pseudo_call, args: dict) -> None:
     """处理 preempt_task 伪工具。始终返回 None（非终止）。"""
     _pt_tid = str(args.get("task_id") or "").strip()
     _pt_msg = str(args.get("message") or "").strip()
     if _pt_tid:
         try:
+            # [2026-05-28] 支持按 node_id 查找活跃任务再 preempt。
+            # 为什么：调用方通常只知道子节点名（如 "bob"），不知道动态 task_id。
+            # 怎么改：如果传入值不像 UUID/hex 前缀，视为 node_id，先查出真实 task_id。
+            # 目的：简化 preempt 调用，无需事先查询 task_id。
+            real_task_id = _pt_tid
+            if not _looks_like_task_id(_pt_tid):
+                # 当作 node_id 处理，查询当前 session 中该节点的活跃任务
+                _route_sid = ls.rctx.parent_session_id or ls.rctx.session_id
+                _node_resp = await ls.rctx.http.get(
+                    f"{ls.rctx.supervisor_url}/v1/sessions/{_route_sid}/tasks/by-node/{_pt_tid}",
+                )
+                if _node_resp.status_code == 200:
+                    _node_data = _node_resp.json()
+                    real_task_id = _node_data.get("task_id", "")
+                elif _node_resp.status_code == 404:
+                    _pt_result = f"节点 '{_pt_tid}' 在当前 session 中无活跃任务"
+                    _emit_pseudo_tool_result(ls, pseudo_call, _pt_result)
+                    return None
+                else:
+                    _pt_result = f"查询节点 '{_pt_tid}' 的任务失败: HTTP {_node_resp.status_code}"
+                    _emit_pseudo_tool_result(ls, pseudo_call, _pt_result)
+                    return None
+
             # [2026-05-23] Pass message to supervisor so preempt can inject
             # additional instructions instead of just stopping the child.
             _pt_body: dict[str, Any] = {}
             if _pt_msg:
                 _pt_body["message"] = _pt_msg
             _pt_resp = await ls.rctx.http.post(
-                f"{ls.rctx.supervisor_url}/v1/tasks/{_pt_tid}/preempt",
+                f"{ls.rctx.supervisor_url}/v1/tasks/{real_task_id}/preempt",
                 json=_pt_body if _pt_body else None,
             )
+            _display_id = _pt_tid if _looks_like_task_id(_pt_tid) else f"{_pt_tid}({real_task_id[:8]})"
             if _pt_resp.status_code == 200:
                 if _pt_msg:
-                    _pt_result = f"已向 task {_pt_tid[:8]} 注入追加指令，子任务继续执行"
+                    _pt_result = f"已向 task {_display_id} 注入追加指令，子任务继续执行"
                 else:
-                    _pt_result = f"已标记 task {_pt_tid[:8]} 为 preempt，等待优雅退出"
+                    _pt_result = f"已标记 task {_display_id} 为 preempt，等待优雅退出"
             elif _pt_resp.status_code == 404:
-                _pt_result = f"task {_pt_tid[:8]} 不存在或已结束"
+                _pt_result = f"task {_display_id} 不存在或已结束"
             else:
                 _pt_result = f"API 返回 {_pt_resp.status_code}"
         except Exception as _pt_e:

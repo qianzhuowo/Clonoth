@@ -14,9 +14,17 @@ async def cancel_active_tasks(args: dict[str, Any], ctx: ToolContext) -> dict[st
         # parent-first route session. Purpose: sibling branch tasks under the same
         # user conversation can be cancelled together.
         route_session_id = ctx.route_session_id()
+        # [2026-05-28] 支持可选 node_id 过滤：只取消指定节点的活跃任务。
+        # 为什么：有时只需取消某个子节点的任务，而非 session 内全部。
+        # 怎么改：如果 args 中有 node_id，作为 query param 传给 supervisor。
+        # 目的：更细粒度的任务取消控制。
+        params: dict[str, str] = {"exclude_task_id": ctx.task_id}
+        _node_id = str(args.get("node_id") or "").strip()
+        if _node_id:
+            params["node_id"] = _node_id
         r = await ctx.http.post(
             f"{ctx.supervisor_url}/v1/sessions/{route_session_id}/cancel_active_tasks",
-            params={"exclude_task_id": ctx.task_id},
+            params=params,
         )
         if r.status_code >= 400:
             return {"ok": False, "error": r.text}

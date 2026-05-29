@@ -452,91 +452,222 @@ class EventRouter:
                 except Exception:
                     pass
 
-        # [2026-05-29 dispatch child-session visibility / revised]
-        # Why: async dispatch routes through /v1/inbound, so a delegated child node
-        # (ereuna_coder, scout, ...) runs in its OWN session whose conversation_key
-        # has the form `agent:{node_id}:{parent_conv_key}[:{uuid}]`. Its progress and
-        # approval events carry that child session_id, which this router never
-        # registered, so they were silently dropped. How: parse the parent channel
-        # conv_key out of the child's conversation_key (carried in task_context) and
-        # map every related child session_id to it. Purpose: scope visibility to child
-        # sessions under channels THIS router owns, without depending on
-        # _dispatch_origin (which is lost during branch fork).
+        # [2026-05-29 方案C第一步] 为什么：async dispatch 子节点运行在独立
+        # session 上，后续审批和进度事件只带子 session。怎么改：task_created
+        # 到达时用结构化 dispatch_origin.parent_conversation_key 注册子 session
+        # 到父频道；只有旧任务缺少结构化字段时才走兼容解析。目的：不再依赖
+        # agent: 字符串模糊反推父频道。
         self._register_dispatch_child_session(event, p)
 
+    def _payload_task_input_and_context(self, payload: dict) -> tuple[dict, dict]:
+        """Return task.input and task.input.task_context from an event payload."""
+        # [2026-05-29 方案C第一步] 为什么：task_created、审批、进度处理都需要
+        # 使用同一套 route 元数据读取规则。怎么改：集中取出 payload.input 与
+        # task_context，缺失时返回空 dict。目的：后续 resolver 复用同一入口。
+        task_input = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+        task_context = task_input.get("task_context") if isinstance(task_input.get("task_context"), dict) else {}
+        return task_input, task_context
+
+    def _adapter_owns_conversation_key(self, conv_key: str) -> bool:
+        """Return whether a conversation key belongs to this adapter prefix."""
+        # [2026-05-29 方案C第一步] 为什么：多个 adapter 共享全局事件流，不能在
+        # 去重或创建进度前接管其他平台的事件。怎么改：集中检查 conversation_key
+        # 是否匹配当前 adapter 的 prefix。目的：审批和子进度都先判归属再处理。
+        conv_key = str(conv_key or "").strip()
+        if not conv_key:
+            return False
+        prefix = self._config.conversation_key_prefix or ""
+        return not prefix or conv_key.startswith(prefix + ":")
+
+    def _structured_parent_conversation_key(self, payload: dict) -> str:
+        """Read structured parent route key from dispatch metadata if present."""
+        task_input, task_context = self._payload_task_input_and_context(payload)
+        origins: list[dict] = []
+        for raw in (
+            task_input.get("_dispatch_origin"),
+            task_input.get("dispatch_origin"),
+            payload.get("dispatch_origin"),
+            payload.get("_dispatch_origin"),
+        ):
+            if isinstance(raw, dict):
+                origins.append(raw)
+        # [2026-05-29 方案C第一步] 为什么：审计要求优先使用
+        # dispatch_origin.parent_conversation_key，这是唯一不会受 agent: 存储
+        # key 变形影响的路由可见性字段。怎么改：先扫 origin，再扫 task_context
+        # 的兼容字段。目的：嵌套 dispatch 仍能稳定回到根父频道。
+        for origin in origins:
+            conv_key = str(
+                origin.get("parent_conversation_key")
+                or origin.get("route_conversation_key")
+                or ""
+            ).strip()
+            if conv_key:
+                return conv_key
+        for key in ("parent_conversation_key", "route_conversation_key"):
+            conv_key = str(task_context.get(key) or payload.get(key) or "").strip()
+            if conv_key:
+                return conv_key
+        return ""
+
+    def _legacy_parent_conversation_key_from_child_key(self, child_conv_key: str) -> str:
+        """Best-effort fallback for old agent:-prefixed dispatch conversation keys."""
+        child_conv_key = str(child_conv_key or "").strip()
+        if not child_conv_key.startswith("agent:"):
+            return ""
+        rest = child_conv_key[len("agent:"):]
+        if ":" not in rest:
+            return ""
+        _node_id, remainder = rest.split(":", 1)
+        known_keys = [
+            key for key in self._state.conversation_sessions.keys()
+            if key and self._adapter_owns_conversation_key(key)
+        ]
+        known_keys.sort(key=len, reverse=True)
+        # [2026-05-29 方案C第一步] 为什么：旧代码用 `(:known) in remainder`
+        # 模糊匹配，可能把无关子串误判成父频道。怎么改：兼容路径只允许三种
+        # 有边界的旧格式：父 key 等于剩余串、位于 fresh/fork 的开头、位于
+        # context_key accumulate 的结尾。目的：保留旧任务可见性，同时删除脆弱
+        # 的任意子串匹配。
+        for known in known_keys:
+            if remainder == known:
+                return known
+            if remainder.startswith(known + ":"):
+                return known
+            if remainder.endswith(":" + known):
+                return known
+        return ""
+
+    def _resolve_route_conversation_key(
+        self,
+        event: Event,
+        payload: dict,
+        *,
+        trigger_result: tuple[int, TriggerInfo] | None = None,
+    ) -> str:
+        """Resolve the user-visible conversation key for an SDK event."""
+        structured = self._structured_parent_conversation_key(payload)
+        if structured:
+            return structured
+
+        if trigger_result:
+            # [2026-05-29 方案C第一步] 为什么：source_inbound_seq 是 SDK
+            # 对入口请求的精确绑定，比可能尚未修正的子 session 映射更可靠。
+            # 怎么改：结构化 dispatch route 缺失时，先使用已解析 trigger 的
+            # conversation_key，再退回 session_conv_map。目的：避免旧 agent: 或
+            # 其他 adapter 的临时映射覆盖本 adapter 的精确触发归属。
+            conv_key = str(trigger_result[1].conversation_key or "").strip()
+            if conv_key:
+                return conv_key
+
+        task_input, task_context = self._payload_task_input_and_context(payload)
+        session_ids: list[str] = []
+        for raw in (
+            payload.get("session_id"),
+            event.session_id,
+            payload.get("parent_session_id"),
+            payload.get("branch_session_id"),
+            task_input.get("parent_session_id"),
+            task_input.get("branch_session_id"),
+        ):
+            sid = str(raw or "").strip()
+            if sid and sid not in session_ids:
+                session_ids.append(sid)
+        for sid in session_ids:
+            conv_key = str(self._state.get_conversation_key(sid) or "").strip()
+            if not conv_key:
+                continue
+            legacy = self._legacy_parent_conversation_key_from_child_key(conv_key)
+            return legacy or conv_key
+
+        child_conv_key = str(
+            task_context.get("conversation_key")
+            or payload.get("conversation_key")
+            or ""
+        ).strip()
+        if child_conv_key:
+            legacy = self._legacy_parent_conversation_key_from_child_key(child_conv_key)
+            return legacy or child_conv_key
+        return ""
+
+    def _resolve_owned_route_conversation_key(
+        self,
+        event: Event,
+        payload: dict,
+        *,
+        trigger_result: tuple[int, TriggerInfo] | None = None,
+    ) -> str:
+        """Resolve route key and return it only when this adapter owns it."""
+        # [2026-05-29 方案C第一步] 为什么：审批和子进度如果先写去重或状态，
+        # 非本 adapter 的事件会被永久吞掉或错误发到日志频道。怎么改：所有
+        # 需要创建状态的路径先调用此 resolver。目的：未确认归属时直接跳过，
+        # 让其他 adapter 继续处理。
+        conv_key = self._resolve_route_conversation_key(
+            event, payload, trigger_result=trigger_result,
+        )
+        if self._adapter_owns_conversation_key(conv_key):
+            return conv_key
+        return ""
+
     def _register_dispatch_child_session(self, event: Event, payload: dict) -> None:
-        """将 dispatch 子节点的独立 session 映射到父频道的 conversation_key。
-
-        异步 dispatch 统一走 /v1/inbound 后，被委派的子节点（coder/scout 等）
-        运行在自己的 session 上，其 handoff_progress / approval 事件携带的是
-        子 session_id。本 router 从未注册过该 session，导致进度/审批被静默丢弃。
-
-        [2026-05-29 修订] 不再依赖 _dispatch_origin（branch fork 后会丢失），
-        改为解析子节点的 conversation_key。dispatch 生成的 conv_key 形如
-        `agent:{node_id}:{父conv_key}[:{uuid}]`，内嵌了父频道 conv_key。只要
-        父 conv_key 是本 router 已知（出现在 conversation_sessions）的频道，就把
-        该子任务相关的所有 session_id 映射到父 conv_key 并继承 DM 频道——既实现
-        「只接管本频道下的子 session」，又让后续子事件正确归属。
-        """
+        """Map dispatch child sessions to their parent conversation key."""
         try:
-            task_input = payload.get("input")
-            if not isinstance(task_input, dict):
+            task_input, _task_context = self._payload_task_input_and_context(payload)
+            if not task_input:
                 return
-            # 子 session 的 conversation_key 在 task_context 里
-            task_context = task_input.get("task_context")
-            child_conv_key = ""
-            if isinstance(task_context, dict):
-                child_conv_key = str(task_context.get("conversation_key") or "").strip()
-            if not child_conv_key or not child_conv_key.startswith("agent:"):
+            dispatch_origin = task_input.get("_dispatch_origin") if isinstance(task_input.get("_dispatch_origin"), dict) else {}
+            child_conv_key = str(_task_context.get("conversation_key") or payload.get("conversation_key") or "").strip()
+            if not dispatch_origin and not child_conv_key.startswith("agent:"):
+                # [2026-05-29 方案C第一步] 为什么：普通入口 task 也会进入
+                # task_created 处理器，但不应该被当成 dispatch 子 session 重新映射。
+                # 怎么改：只有存在结构化 dispatch_origin，或旧任务使用 agent:
+                # conversation_key 时才继续。目的：避免主入口分支被误注册为子任务。
                 return
-            # 剥掉 agent:{node_id}: 前缀，剩余部分含父 conv_key
-            rest = child_conv_key[len("agent:"):]
-            if ":" not in rest:
-                return
-            _node_id, remainder = rest.split(":", 1)
-            # 在本 router 已知的 conv_key 中定位父频道（startswith 命中常见情形）
-            parent_conv_key = ""
-            for known in list(self._state.conversation_sessions.keys()):
-                if not known:
-                    continue
-                if remainder == known or remainder.startswith(known + ":"):
-                    parent_conv_key = known
-                    break
-            # 兜底：context_key 在前缀时父 conv_key 可能落在中段/尾部
-            if not parent_conv_key:
-                for known in list(self._state.conversation_sessions.keys()):
-                    if known and (":" + known) in (":" + remainder):
-                        parent_conv_key = known
-                        break
+            parent_conv_key = self._resolve_owned_route_conversation_key(event, payload)
             if not parent_conv_key:
                 logger.debug(
-                    "dispatch child conv_key %s: no known parent channel (known=%d)",
-                    child_conv_key, len(self._state.conversation_sessions),
+                    "dispatch child session ignored: no owned parent route for task=%s session=%s",
+                    str(payload.get("task_id") or "")[:12], event.session_id[:12],
                 )
                 return
-            # 父频道的 DM 频道（供子 session 继承）
+
             parent_sid = self._state.get_session_id(parent_conv_key) or ""
             parent_dm = self._state.get_dm_channel(parent_sid) if parent_sid else None
-            # 收集该子任务相关的所有 session_id：dispatch 主 session、branch、payload
-            child_sids = set()
-            for _k in ("parent_session_id", "branch_session_id"):
-                _v = str(task_input.get(_k) or "").strip()
-                if _v:
-                    child_sids.add(_v)
-            _payload_sid = str(payload.get("session_id") or event.session_id or "").strip()
-            if _payload_sid:
-                child_sids.add(_payload_sid)
-            child_sids.discard(parent_sid)  # 排除父 session 自身
-            for csid in child_sids:
-                self._state.session_conv_map.setdefault(csid, parent_conv_key)
-                if parent_dm and self._state.get_dm_channel(csid) is None:
+            child_sids: set[str] = set()
+            for key in ("parent_session_id", "branch_session_id"):
+                sid = str(task_input.get(key) or payload.get(key) or "").strip()
+                if sid:
+                    child_sids.add(sid)
+            origin = dispatch_origin
+            origin_parent_sid = str(origin.get("parent_session_id") or "").strip() if isinstance(origin, dict) else ""
+            if origin_parent_sid:
+                child_sids.add(origin_parent_sid)
+            payload_sid = str(payload.get("session_id") or event.session_id or "").strip()
+            if payload_sid:
+                child_sids.add(payload_sid)
+            if parent_sid:
+                child_sids.discard(parent_sid)
+            if not child_sids:
+                return
+            # [2026-05-29 方案C第一步] 为什么：inbound_message 已经把 dispatch
+            # session 映射为 agent: 存储 key，使用 setdefault 会保留错误可见性。
+            # 怎么改：用结构化 parent_conversation_key 强制覆盖子 session 的反向映射。
+            # 目的：后续审批和进度按父频道归属，而不是被 agent: 前缀过滤。
+            for child_sid in child_sids:
+                previous = self._state.session_conv_map.get(child_sid)
+                self._state.session_conv_map[child_sid] = parent_conv_key
+                if previous and previous != parent_conv_key:
+                    logger.info(
+                        "dispatch child session %s conv_key remapped %s -> %s",
+                        child_sid[:12], previous, parent_conv_key,
+                    )
+                if parent_dm and self._state.get_dm_channel(child_sid) is None:
                     try:
-                        self._state.register_dm_channel(csid, parent_dm)
+                        self._state.register_dm_channel(child_sid, parent_dm)
                     except Exception:
                         pass
             logger.info(
                 "dispatch child sessions %s -> parent conv_key %s (dm=%s)",
-                [s[:12] for s in child_sids], parent_conv_key, bool(parent_dm),
+                [sid[:12] for sid in child_sids], parent_conv_key, bool(parent_dm),
             )
         except Exception as e:
             logger.error("_register_dispatch_child_session error: %s", e)
@@ -700,27 +831,36 @@ class EventRouter:
                 pass
         # 非入口节点 → 子任务日志
         elif node_id and node_id != self._entry_node_id:
+            # [2026-05-29 方案C第一步] 为什么：子节点生命周期事件可能来自其他
+            # adapter 的子 session，旧逻辑会在确认归属前创建 ChildTaskState，并把
+            # 无归属事件回退到日志频道。怎么改：创建状态前先走共享 route resolver。
+            # 目的：非本 adapter 的事件直接跳过，不污染本地状态。
+            conv_key = self._resolve_owned_route_conversation_key(
+                event, p, trigger_result=result,
+            )
+            if not conv_key:
+                logger.debug(
+                    "node event ignored (unowned route): type=%s node=%s session=%s",
+                    event.type, node_id, event.session_id,
+                )
+                return
             task_key = p.get("task_id") or f"{node_id}:{event.session_id}"
-            # 自动创建子任务状态：确保 ▶ 节点启动 等生命周期事件不丢失
             child_state, is_new = self._state.get_or_create_child_state(
                 task_key, prefix=node_id,
             )
             child_state.lines.append(msg)
 
             if is_new:
-                # 新创建：通知适配器创建消息
-                conv_key = self._state.get_conversation_key(event.session_id) or ""
                 try:
                     await self._cb.create_child_progress(
                         task_key, child_state,
-                        trigger=None,  # 系统任务或孤儿任务无关联 trigger
+                        trigger=result[1] if result else None,
                         conversation_key=conv_key,
                         session_id=event.session_id,
                     )
                 except Exception:
                     pass
             else:
-                # 已存在：仅刷新显示
                 try:
                     await self._cb.update_child_progress(task_key, child_state)
                 except Exception:
@@ -769,32 +909,42 @@ class EventRouter:
         if not node_id or node_id == self._entry_node_id or not hp_msg:
             return
 
+        # [Fork/Merge 2026-05-12] Use only source_inbound_seq for trigger attachment.
+        # Why: session fallback is ambiguous when several branch tasks share one parent session.
+        # How: resolve_trigger keeps the old signature but ignores event.session_id. Purpose:
+        # child progress is attached only to the inbound that created this task.
+        result = self._state.resolve_trigger(src_seq, event.session_id)
+        # [2026-05-29 方案C第一步] 为什么：子进度事件可能属于其他 adapter，旧逻辑
+        # 在解析 conversation_key 前就创建状态，并在无匹配时回退到日志频道。怎么改：
+        # 使用与 dispatch 子 session 相同的 route resolver，只有确认归属后才创建
+        # ChildTaskState。目的：非本 adapter 的子事件直接跳过，让正确 adapter 处理。
+        conv_key = self._resolve_owned_route_conversation_key(
+            event, p, trigger_result=result,
+        )
+        if not conv_key:
+            logger.debug(
+                "handoff_progress ignored (unowned route): task=%s node=%s session=%s",
+                str(p.get("task_id") or "")[:12], node_id, event.session_id,
+            )
+            return
+
         task_key = p.get("task_id") or f"{node_id}:{event.session_id}"
         child_state, is_new = self._state.get_or_create_child_state(
             task_key, prefix=node_id,
         )
 
         if is_new:
-            # 新子任务：追加首条消息 → 通知适配器创建显示消息
             child_state.lines.append(hp_msg)
-            # [Fork/Merge 2026-05-12] Use only source_inbound_seq for trigger attachment.
-            # Why: session fallback is ambiguous when several branch tasks share one parent session.
-            # How: resolve_trigger keeps the old signature but ignores event.session_id. Purpose:
-            # child progress is attached only to the inbound that created this task.
-            result = self._state.resolve_trigger(src_seq, event.session_id)
-            trigger = result[1] if result else None
-            conv_key = self._state.get_conversation_key(event.session_id) or ""
             try:
                 await self._cb.create_child_progress(
                     task_key, child_state,
-                    trigger=trigger,
+                    trigger=result[1] if result else None,
                     conversation_key=conv_key,
                     session_id=event.session_id,
                 )
             except Exception as e:
                 logger.error("create_child_progress failed: %s", e)
         else:
-            # 已有子任务：追加新行 → 通知适配器刷新显示
             child_state.lines.append(hp_msg)
             try:
                 await self._cb.update_child_progress(task_key, child_state)
@@ -845,11 +995,6 @@ class EventRouter:
         if not appr_id:
             return
 
-        # 全局去重
-        if self._approval.is_handled(appr_id):
-            return
-        self._approval.mark_handled(appr_id)
-
         # [Fork/Merge 2026-05-12] per-trigger 去重只能按 source_inbound_seq 精确挂载。
         # Why: approval events may be routed through a shared parent session while multiple branch
         # tasks are active. How: do not call find_trigger_by_session; if the payload has no source
@@ -858,6 +1003,25 @@ class EventRouter:
         ap_session = str(p.get("session_id") or event.session_id)
         src_seq = int(p.get("source_inbound_seq") or 0)
         result = self._state.resolve_trigger(src_seq, ap_session)
+        conv_key = self._resolve_owned_route_conversation_key(
+            event, p, trigger_result=result,
+        )
+        # [2026-05-29 方案C第一步] 为什么：旧审批逻辑先 mark_handled 再判归属，
+        # 子 session 映射未建立时会把审批永久丢掉，其他 adapter 也无法处理。
+        # 怎么改：先解析 route key 并验证 prefix ownership；无法确认归属时直接返回。
+        # 目的：只有本 adapter 确认拥有的审批才进入全局去重。
+        if not conv_key:
+            logger.debug(
+                "approval_requested ignored before de-dup (unowned route): id=%s session=%s",
+                appr_id, ap_session,
+            )
+            return
+
+        # 全局去重必须发生在归属确认之后。
+        if self._approval.is_handled(appr_id):
+            return
+        self._approval.mark_handled(appr_id)
+
         if result:
             trigger_seq, trigger = result
             trigger.refresh()
@@ -883,25 +1047,12 @@ class EventRouter:
             logger.warning("workspace_root not configured, treating all approvals as requiring manual review")
             is_external = True  # 没配置 workspace_root 视为全部需要人工审批
 
-        conv_key = self._state.get_conversation_key(ap_session) or ""
-        if not conv_key and result:
-            conv_key = result[1].conversation_key or ""
-        # [2026-05-19 approval ownership fix v2]
-        # Why: multiple adapters (Discord + QQ) share the same Supervisor event stream.
-        # The v1 fix only checked if conv_key was empty, but branch sessions can inherit
-        # a conv_key from any adapter's trigger. How: also verify the conv_key prefix
-        # matches this adapter's conversation_key_prefix. Purpose: a QQ adapter with
-        # auto_approve_internal=True cannot auto-approve a Discord adapter's approval.
-        _prefix = self._config.conversation_key_prefix or ""
-        if not conv_key or (_prefix and not conv_key.startswith(_prefix + ":")):
-            logger.debug("approval_requested ignored (not owned by prefix=%s): id=%s session=%s conv_key=%s",
-                         _prefix, appr_id, ap_session, conv_key)
-            return
+        logger.info(
+            "approval_requested owned: id=%s session=%s route_conv_key=%s src_seq=%s",
+            appr_id, ap_session, conv_key, src_seq,
+        )
 
         # 决定是否自动放行
-        logger.warning("APPROVAL_DEBUG: appr_id=%s conv_key=%s is_external=%s auto_approve_internal=%s => manual=%s",
-                       appr_id, conv_key, is_external, self._config.auto_approve_internal,
-                       is_external or not self._config.auto_approve_internal)
         if is_external or not self._config.auto_approve_internal:
             # 外部操作 或 bot 未开启自动放行 → 通知适配器展示审批 UI
             try:

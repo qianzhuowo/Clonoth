@@ -342,7 +342,16 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
 
     # 获取父 session 信息
     parent_session_id = getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id
-    parent_conv_key = ls.rctx.task_context.get("conversation_key", "")
+    # [2026-05-29 方案C第一步] 为什么：conversation_key 同时承担存储身份和
+    # 路由可见性时，嵌套 dispatch 会生成多层 agent: 前缀，EventRouter 只能反解析
+    # 字符串来找父频道。怎么改：优先读取 task_context.route_conversation_key，
+    # 没有时才使用当前 task 的原 conversation_key。目的：所有嵌套子任务都保留
+    # 根父频道的原始 conversation_key，后续 SDK 可直接按结构化字段路由。
+    parent_conv_key = str(
+        ls.rctx.task_context.get("route_conversation_key")
+        or ls.rctx.task_context.get("conversation_key")
+        or ""
+    ).strip()
     parent_channel = ls.rctx.task_context.get("channel", "internal")
     target_node_id = target
 
@@ -367,6 +376,12 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         "dispatch_origin": {
             "parent_session_id": parent_session_id,
             "caller_node_id": ls.node.id,
+            # [2026-05-29 方案C第一步] 为什么：审批和子进度事件只带子 session，
+            # 旧 SDK 只能从 agent: conversation_key 反解析父频道，容易误判或丢事件。
+            # 怎么改：把父频道的原始 conversation_key 与上下文模式随 dispatch_origin
+            # 一起下发。目的：task_created 事件可直接携带路由元数据，无需字符串猜测。
+            "parent_conversation_key": parent_conv_key,
+            "context_mode": ctx_mode,
         },
         "dispatch_context_mode": ctx_mode,
     }

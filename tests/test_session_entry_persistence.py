@@ -141,6 +141,48 @@ def test_first_inbound_records_entry_node_when_session_has_none(tmp_path: Path) 
     assert raw[session_id]["entry_node_id"] == "frontend.entry"
 
 
+def test_dispatch_inbound_task_context_carries_route_metadata(tmp_path: Path) -> None:
+    """Dispatch-created task snapshots should expose structured parent route metadata."""
+    _write_runtime_config(tmp_path, entry_node_id="global.default")
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="discord", conversation_key="agent:coder:discord:parent")
+
+    with state._lock:
+        task = state._create_entry_task_for_inbound_locked(
+            inbound_seq=3,
+            session_id=session_id,
+            payload={
+                "channel": "discord",
+                "conversation_key": "agent:coder:discord:parent",
+                "text": "run delegated task",
+                "entry_node_id": "coder.node",
+                "dispatch_context_mode": "accumulate",
+                "dispatch_origin": {
+                    "parent_session_id": "parent-session",
+                    "caller_node_id": "scout.node",
+                    "parent_conversation_key": "discord:parent",
+                    "context_mode": "accumulate",
+                },
+            },
+        )
+
+    # Why: EventRouter only sees task_created snapshots, not Supervisor's live Task
+    # object after post-create mutation. How: assert route metadata is present in
+    # both task.input and the durable task_created payload. Purpose: child sessions
+    # can be mapped without reverse-parsing agent:-prefixed conversation keys.
+    assert task is not None
+    task_context = task.input["task_context"]
+    assert task.input["_dispatch_origin"]["parent_conversation_key"] == "discord:parent"
+    assert task_context["dispatch_context_mode"] == "accumulate"
+    assert task_context["parent_conversation_key"] == "discord:parent"
+    assert task_context["route_conversation_key"] == "discord:parent"
+
+    created_events = [evt for evt in state.eventlog.list_all_events() if evt.get("type") == "task_created"]
+    created_input = created_events[-1]["payload"]["input"]
+    assert created_input["_dispatch_origin"]["parent_conversation_key"] == "discord:parent"
+    assert created_input["task_context"]["route_conversation_key"] == "discord:parent"
+
+
 def test_switch_session_node_persists_and_clears_entry_node(tmp_path: Path) -> None:
     """switch_node persistence should survive restart and clear stale targets."""
     _write_runtime_config(tmp_path, entry_node_id="global.default")

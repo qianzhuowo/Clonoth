@@ -99,6 +99,41 @@ class TaskStoreMixin:
         batch_index: int = 0,
     ) -> Task:
         now = _now()
+        task_input = dict(input_data or {})
+        # [2026-05-29 方案C第一步] 为什么：task_created 事件在 Task 创建时立即
+        # 持久化，调用方如果在 _create_task_locked 返回后才补 dispatch 元数据，SDK
+        # 无法从事件 payload.input.task_context 中读取结构化路由字段。怎么改：在
+        # 创建 Task 之前就把 _dispatch_origin、dispatch_context_mode、
+        # parent_conversation_key、route_conversation_key 复制进 task_context。
+        # 目的：下游 EventRouter 可直接从 task_created 事件判断子 session 属于哪个
+        # 父频道，不再反解析 agent: 字符串。
+        dispatch_origin = task_input.get("_dispatch_origin")
+        if isinstance(dispatch_origin, dict) and dispatch_origin:
+            task_context = task_input.get("task_context")
+            if not isinstance(task_context, dict):
+                task_context = {}
+                task_input["task_context"] = task_context
+            dispatch_mode = str(
+                task_input.get("dispatch_context_mode")
+                or dispatch_origin.get("context_mode")
+                or task_context.get("dispatch_context_mode")
+                or ""
+            ).strip()
+            parent_conv_key = str(
+                dispatch_origin.get("parent_conversation_key")
+                or task_context.get("parent_conversation_key")
+                or task_context.get("route_conversation_key")
+                or ""
+            ).strip()
+            if dispatch_mode:
+                task_input.setdefault("dispatch_context_mode", dispatch_mode)
+                dispatch_origin.setdefault("context_mode", dispatch_mode)
+                task_context.setdefault("dispatch_context_mode", dispatch_mode)
+            if parent_conv_key:
+                dispatch_origin.setdefault("parent_conversation_key", parent_conv_key)
+                task_context.setdefault("parent_conversation_key", parent_conv_key)
+                task_context.setdefault("route_conversation_key", parent_conv_key)
+
         task = Task(
             task_id=str(uuid.uuid4()),
             session_id=session_id,
@@ -106,7 +141,7 @@ class TaskStoreMixin:
             kind=kind,
             node_id=node_id,
             tool_name=tool_name,
-            input=dict(input_data or {}),
+            input=task_input,
             continuation=dict(continuation or {}),
             source_inbound_seq=source_inbound_seq,
             caller_task_id=caller_task_id,
@@ -256,6 +291,21 @@ class TaskStoreMixin:
         else:
             # 查找入口节点上一轮的 context_ref，使对话上下文（含工具调用）跨轮次连续
             last_ctx_ref = self._find_last_context_ref_locked(session_id, entry_node)
+        _dispatch_origin = payload.get("dispatch_origin")
+        if not isinstance(_dispatch_origin, dict):
+            _dispatch_origin = {}
+        _dispatch_context_mode = str(payload.get("dispatch_context_mode") or "").strip()
+        _dispatch_parent_conv_key = str(_dispatch_origin.get("parent_conversation_key") or "").strip()
+        # [2026-05-29 方案C第一步] 为什么：dispatch 子任务的父频道不能再靠
+        # agent: 字符串反解析。怎么改：在入口 task input 生成前准备结构化
+        # dispatch 元数据，并把 parent_conversation_key 同步到 task_context。
+        # 目的：task_created 快照一产生就包含 SDK 路由所需字段。
+        if _dispatch_origin:
+            if _dispatch_context_mode:
+                _dispatch_origin.setdefault("context_mode", _dispatch_context_mode)
+            if _dispatch_parent_conv_key:
+                _dispatch_origin.setdefault("parent_conversation_key", _dispatch_parent_conv_key)
+
         task = self._create_task_locked(
             session_id=branch_session_id,
             session_generation=generation,
@@ -292,19 +342,27 @@ class TaskStoreMixin:
                     "is_system_task": bool(payload.get("_system_task", False)),
                     "switched_from": default_node if session_override else "",
                     "use_context": use_context,
+                    # [2026-05-29 方案C第一步] 为什么：SDK 只读取 task_created
+                    # 事件的 payload.input.task_context，不能依赖后续对 Task 的补写。
+                    # 怎么改：把 dispatch 上下文模式和父频道 route key 写入
+                    # task_context。目的：子 session 映射和审批归属判断使用结构化字段。
+                    "dispatch_context_mode": _dispatch_context_mode,
+                    "parent_conversation_key": _dispatch_parent_conv_key,
+                    "route_conversation_key": _dispatch_parent_conv_key,
                 },
+                "dispatch_context_mode": _dispatch_context_mode,
+                "_dispatch_origin": _dispatch_origin,
             },
             continuation={},
             source_inbound_seq=inbound_seq,
             caller_task_id=None,
         )
-        # [2026-05-28] dispatch_origin 透传：异步 dispatch 走 inbound 时将回调元数据写入 task.input。
-        # 为什么：task 完成后 task_router 需要知道结果应发回哪个 session。
-        # 怎么改：从 payload 读取 dispatch_origin dict，写入 task.input 供回调路由使用。
-        # 目的：task_router._resume_caller_or_output_locked 能根据 _dispatch_origin 注入结果。
-        _dispatch_origin = payload.get("dispatch_origin")
+        # [2026-05-28/2026-05-29] dispatch_origin 透传：异步 dispatch 走 inbound 时
+        # 将回调元数据写入 task.input。为什么：task 完成后 task_router 需要知道结果
+        # 应发回哪个 session，同时 task_created 事件也必须携带 route 元数据。怎么改：
+        # _create_task_locked 前已写入 _dispatch_origin，这里只补 caller_node_id 并保持
+        # 兼容。目的：回调注入与 SDK 路由读取同一份结构化元数据。
         if isinstance(_dispatch_origin, dict) and _dispatch_origin:
-            task.input["_dispatch_origin"] = _dispatch_origin
             task.input["_caller_node_id"] = str(_dispatch_origin.get("caller_node_id") or "")
         # Emit transient inbound_accepted so Bot can advance watermark
         self.eventlog.append(

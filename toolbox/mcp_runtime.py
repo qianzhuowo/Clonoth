@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import dataclasses
+import hashlib
 import json
 import os
 from contextlib import AsyncExitStack, asynccontextmanager
@@ -33,6 +36,22 @@ except Exception as e:  # pragma: no cover - depends on optional dependency at r
 
 _CONFIG_REL_PATH = "data/mcp_clients.yaml"
 _CLIENT_ID_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_MCP_IMAGE_INLINE_DATA_THRESHOLD = 10000
+_MCP_IMAGE_MIME_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+    "image/svg+xml": ".svg",
+    "image/tiff": ".tiff",
+    "image/x-icon": ".ico",
+    "image/vnd.microsoft.icon": ".ico",
+    "image/heic": ".heic",
+    "image/heif": ".heif",
+    "image/avif": ".avif",
+}
 
 
 def _ensure_sdk() -> None:
@@ -245,6 +264,114 @@ def _to_plain(obj: Any) -> Any:
     return str(obj)
 
 
+def _field(obj: Any, *names: str) -> Any:
+    """Read a field from SDK objects or already-plain dictionaries."""
+    # Why: MCP SDK content parts may be Pydantic objects, dataclasses, or plain
+    # dictionaries depending on SDK version and transport. How: try dict keys and
+    # attributes without first converting the full result. Purpose: save large
+    # image data before generic serialization can alter or drop SDK-specific
+    # fields.
+    for name in names:
+        if isinstance(obj, dict) and name in obj:
+            return obj.get(name)
+        if hasattr(obj, name):
+            return getattr(obj, name)
+    return None
+
+
+def _image_extension_from_mime(mime_type: Any) -> str:
+    """Return a safe file extension for an MCP image MIME type."""
+    # Why: saved MCP image attachments need stable names that downstream clients
+    # can open. How: normalize MIME types and use a conservative allow-list.
+    # Purpose: avoid writing ambiguous or path-like extensions from untrusted
+    # tool output.
+    mime = str(mime_type or "").split(";", 1)[0].strip().lower()
+    return _MCP_IMAGE_MIME_EXTENSIONS.get(mime, ".bin")
+
+
+def _save_large_mcp_image_part(workspace_root: Path, client_id: str, part: Any, attachments: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Save one large MCP image content part and return its text replacement."""
+    # Why: some MCP servers return multi-megabyte base64 image content, which can
+    # overflow conversation context when preserved inline. How: only intercept
+    # image parts whose encoded data is above the configured threshold, decode
+    # them, save them under data/attachments/mcp/{client_id}, and emit a short
+    # text marker. Purpose: keep the context small while preserving the generated
+    # image through the existing attachment collection pipeline.
+    if _field(part, "type") != "image":
+        return None
+
+    data = _field(part, "data")
+    if not isinstance(data, str) or len(data) <= _MCP_IMAGE_INLINE_DATA_THRESHOLD:
+        return None
+
+    try:
+        image_bytes = base64.b64decode(data, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+    safe_client_id = _normalize_client_id(client_id)
+    ext = _image_extension_from_mime(_field(part, "mimeType", "mime_type", "mime"))
+    filename = f"{hashlib.md5(image_bytes).hexdigest()[:12]}{ext}"
+    attachment_dir = workspace_root / "data" / "attachments" / "mcp" / safe_client_id
+    attachment_dir.mkdir(parents=True, exist_ok=True)
+    attachment_path = attachment_dir / filename
+    if not attachment_path.exists():
+        attachment_path.write_bytes(image_bytes)
+
+    relative_path = attachment_path.relative_to(workspace_root).as_posix()
+    attachments.append({"path": relative_path, "name": filename, "type": "image"})
+    return {
+        "type": "text",
+        "text": f"[Image saved to disk: {relative_path} ({len(image_bytes)} bytes)]",
+    }
+
+
+def _postprocess_mcp_content(workspace_root: Path, client_id: str, content: Any) -> tuple[list[Any], list[dict[str, Any]], bool]:
+    """Convert MCP content parts while spilling oversized image data to disk."""
+    # Why: call_tool must return plain JSON-compatible data, but image spilling
+    # must happen before the large base64 field is exposed to conversation
+    # history. How: walk the original content sequence, replace only qualifying
+    # image parts, and serialize every other part with _to_plain. Purpose: keep
+    # small icons and non-image content unchanged while protecting context size.
+    if not isinstance(content, (list, tuple)):
+        return [], [], False
+
+    attachments: list[dict[str, Any]] = []
+    processed: list[Any] = []
+    for part in content:
+        replacement = _save_large_mcp_image_part(workspace_root, client_id, part, attachments)
+        processed.append(replacement if replacement is not None else _to_plain(part))
+    return processed, attachments, True
+
+
+def _to_plain_mcp_result(workspace_root: Path, client_id: str, result: Any) -> tuple[Any, list[dict[str, Any]]]:
+    """Serialize an MCP tool result after replacing large image parts."""
+    # Why: the generic _to_plain helper intentionally preserves arbitrary fields,
+    # including huge image data. How: first inspect the SDK result's original
+    # content list and save large image parts, then patch the serialized result's
+    # content field with the processed list. Purpose: guarantee the final tool
+    # result contains paths instead of large inline base64 payloads.
+    processed_content, attachments, has_content = _postprocess_mcp_content(
+        workspace_root,
+        client_id,
+        _field(result, "content"),
+    )
+    plain = _to_plain(result)
+
+    if isinstance(plain, dict):
+        if has_content:
+            plain["content"] = processed_content
+        elif isinstance(plain.get("content"), list):
+            processed_content, attachments, _ = _postprocess_mcp_content(
+                workspace_root,
+                client_id,
+                plain.get("content"),
+            )
+            plain["content"] = processed_content
+
+    return plain, attachments
+
+
 def _normalize_tool_entry(tool: Any) -> dict[str, Any]:
     raw = _to_plain(tool)
     if not isinstance(raw, dict):
@@ -324,4 +451,9 @@ async def list_tools(workspace_root: Path, client_id: str) -> dict[str, Any]:
 async def call_tool(workspace_root: Path, client_id: str, tool_name: str, arguments: dict[str, Any] | None) -> dict[str, Any]:
     async with open_session(workspace_root, client_id) as session:
         res = await session.call_tool(tool_name, arguments=arguments or {})
-        return {"ok": True, "client_id": client_id, "tool_name": tool_name, "result": _to_plain(res)}
+        # Why: MCP image content can be much larger than the context budget. How:
+        # serialize the result through the MCP-aware helper that saves oversized
+        # images to disk and returns AttachmentCollector-compatible metadata.
+        # Purpose: keep tool history compact while still exposing generated files.
+        result, attachments = _to_plain_mcp_result(workspace_root, client_id, res)
+        return {"ok": True, "client_id": client_id, "tool_name": tool_name, "result": result, "attachments": attachments}

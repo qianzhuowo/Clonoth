@@ -478,7 +478,12 @@ class ToolRegistry:
                 "cancel_active_tasks",
                 "Cancel all active downstream tasks in the current session. "
                 "Use when the user's new message makes the previous task unnecessary.",
-                {"type": "object", "properties": {}, "required": []},
+                {"type": "object", "properties": {
+                    "node_id": {
+                        "type": "string",
+                        "description": "可选。只取消指定节点的活跃任务（如 scout、smith），不填则取消 session 内全部下游任务。",
+                    },
+                }, "required": []},
                 _builtins.cancel_active_tasks,
             ),
             (

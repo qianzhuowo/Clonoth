@@ -313,7 +313,7 @@ def _preempt_task_spec() -> dict:
                 "properties": {
                     "task_id": {
                         "type": "string",
-                        "description": "要打断的任务 ID（完整或前缀均可）。可从 dispatch 回调或 active_tasks 中获取。",
+                        "description": "要追加指令的任务 ID（完整或前缀均可）。可从 dispatch 回调或 active_tasks 中获取。",
                     },
                     "message": {
                         "type": "string",

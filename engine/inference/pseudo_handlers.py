@@ -137,11 +137,22 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         # 若把 finish 改写成普通 assistant 文本，会破坏下一轮历史配对。
         # 做法：与 reply、真实业务工具一样写入 content="ok" 的 tool_result，并允许影子持久化。
         # 目的：ConversationStore、snapshot、provider replay 都能看到完整 finish 工具轮。
+        result_text = str(args.get("text") or "").strip()
+        # [2026-05-29] 空串 finish 硬拒绝：模型把交付内容写在 free prose 里用户永远看不到。
+        # 强制要求 text 非空，返回错误提示让模型重试。
+        if not result_text:
+            _emit_pseudo_tool_result(
+                ls, pseudo_call,
+                '❌ REJECTED: finish() called with empty text. Your deliverable content MUST go '
+                'in the finish tool\'s `text` parameter, NOT in free prose outside tool calls. '
+                'Free prose is never delivered to the user. Put your actual answer/report/data '
+                'in text and call finish again.',
+            )
+            return None
         _emit_pseudo_tool_result(ls, pseudo_call, "ok")
 
         ctx_ref = _persist_ctx(ls, step + 1)
         summary_text = str(args.get("summary") or "").strip()
-        result_text = str(args.get("text") or "").strip()
         _selected_paths = args.get("attachment_paths")
         if isinstance(_selected_paths, list) and _selected_paths:
             final_atts = _select_attachments(

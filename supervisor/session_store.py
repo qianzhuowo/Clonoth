@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 class SessionStore:
     """管理 data/sessions.json 的读写。
 
-    线程安全：写入方法（on_session_created / on_session_reset）
+    线程安全：写入方法（on_session_created / on_session_reset / remove_session）
     由调用方在 SupervisorState._lock 内调用，无需自带锁。
     """
 
@@ -185,6 +185,18 @@ class SessionStore:
             entry["reset"] = True
             self._flush()
 
+    def remove_session(self, session_id: str) -> None:
+        """从 sessions.json 中物理删除一个 session 条目。
+
+        [AutoC 2026-05-30] Why: branch 和 fresh/fork child session 完成后只标记 reset
+        不删除，导致 sessions.json 无限膨胀（18000+ 条目）。
+        How: 从 registry 中 pop 并 flush。
+        Purpose: 立即释放已完成 branch 和已过期 child 的注册记录。
+        """
+        if session_id in self._registry:
+            self._registry.pop(session_id)
+            self._flush()
+
     def on_child_session_created(
         self,
         child_session_id: str,
@@ -213,6 +225,11 @@ class SessionStore:
             "parent_session_id": parent_session_id,
             "node_id": node_id,
             "context_key": context_key,
+            # [AutoC 2026-05-30] Why: stale cleanup must distinguish fresh/fork
+            # children from accumulate children. How: persist a placeholder here
+            # and let the caller set the concrete context_mode immediately after
+            # creation. Purpose: 24h TTL cleanup can skip accumulate sessions.
+            "context_mode": "",
             "last_active_at": now_str,
         }
         self._flush()

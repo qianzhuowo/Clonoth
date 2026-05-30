@@ -940,7 +940,10 @@ class TaskRouterMixin:
             self.session_generations.pop(_dispatch_sid, None)
             self._cancelled_sessions.discard(_dispatch_sid)
             self._session_context_usage.pop(_dispatch_sid, None)
-            self._session_store.on_session_reset(_dispatch_sid)
+            # [AutoC 2026-05-30] Why: fresh/fork dispatch session 完成后是临时
+            # 会话，不应在 sessions.json 中留下 reset=true 记录。How: 改为物理删除
+            # registry 条目。Purpose: 阻止 agent:* 派生 session 持续堆积。
+            self._session_store.remove_session(_dispatch_sid)
         except Exception as e:
             log.warning("cleanup dispatch session %s failed: %s", _dispatch_sid[:12], e)
 

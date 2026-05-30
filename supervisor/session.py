@@ -322,7 +322,10 @@ class SessionMixin:
             self.session_generations.pop(child_sid, None)
             self._cancelled_sessions.discard(child_sid)
             self._session_context_usage.pop(child_sid, None)
-            self._session_store.on_session_reset(child_sid)
+            # [AutoC 2026-05-30] Why: branch 派生 child session 在 branch merge 后
+            # 不应继续留在 sessions.json。How: 物理删除 registry 条目而不是标记 reset。
+            # Purpose: 防止临时 child 记录随 branch 清理后继续堆积。
+            self._session_store.remove_session(child_sid)
 
         # [Fork/Merge 2026-05-12] 删除 branch 前取消仍挂在该运行 session 下的派生任务。
         # 原因：异步 dispatch 可能让 root entry 已结束但 branch 下仍有 pending/running 子任务。
@@ -362,7 +365,10 @@ class SessionMixin:
                 branches.discard(branch)
             for children in self.parent_children.values():
                 children.discard(branch)
-        self._session_store.on_session_reset(branch)
+        # [AutoC 2026-05-30] Why: branch merge 完成后应立即从 sessions.json 物理删除，
+        # 而不是仅标记 reset，否则注册记录无限堆积。
+        # How: 用 remove_session 代替 on_session_reset。
+        self._session_store.remove_session(branch)
         self.eventlog.append(
             session_id=parent or branch,
             component="supervisor",
@@ -774,7 +780,11 @@ class SessionMixin:
                 self.session_generations.pop(child_sid, None)
                 self._cancelled_sessions.discard(child_sid)
                 self._session_context_usage.pop(child_sid, None)
-                self._session_store.on_session_reset(child_sid)
+                # [AutoC 2026-05-30] Why: reset 主会话时清理的是 child session，
+                # 这些临时上下文不应在 sessions.json 中保留 reset 标记。
+                # How: 对 child 使用物理删除，主 session 仍在上方保留 on_session_reset。
+                # Purpose: 清理对话时同步收缩 child registry。
+                self._session_store.remove_session(child_sid)
                 cleared_children += 1
 
             # 清理 child_session_map 中所有以 old_session_id 为 parent 的条目
@@ -810,7 +820,11 @@ class SessionMixin:
                     self.session_generations.pop(_dsid, None)
                     self._cancelled_sessions.discard(_dsid)
                     self._session_context_usage.pop(_dsid, None)
-                    self._session_store.on_session_reset(_dsid)
+                    # [AutoC 2026-05-30] Why: dispatch session 是由父会话派生的临时
+                    # child/fork 会话，重置父会话时不需要保留其 registry 行。
+                    # How: 物理删除 sessions.json 条目。
+                    # Purpose: 避免 agent:* 派生 session 在主会话 reset 后继续堆积。
+                    self._session_store.remove_session(_dsid)
                     cleared_children += 1
 
             return {"ok": True, "old_session_id": old_session_id,

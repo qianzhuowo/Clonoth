@@ -430,15 +430,15 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 self._session_store.update_last_active(existing_cid)
                 return existing_cid, False
             # 已过期或不存在：新建（过期的旧 session 留给 TTL 清理）
-            return self._create_child_session(parent_session_id, node_id, context_key), True
+            return self._create_child_session(parent_session_id, node_id, context_key, context_mode), True
 
         elif context_mode == "fresh":
             # 强制新建，旧映射更新为新 ID
-            return self._create_child_session(parent_session_id, node_id, context_key), True
+            return self._create_child_session(parent_session_id, node_id, context_key, context_mode), True
 
         elif context_mode == "fork":
             # fork 与 fresh 类似：总是新建
-            return self._create_child_session(parent_session_id, node_id, context_key), True
+            return self._create_child_session(parent_session_id, node_id, context_key, context_mode), True
 
         else:
             # 未知模式，按 accumulate 处理
@@ -448,7 +448,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             )
 
     def _create_child_session(
-        self, parent_session_id: str, node_id: str, context_key: str,
+        self, parent_session_id: str, node_id: str, context_key: str, context_mode: str,
     ) -> str:
         """生成新 child session 并持久化映射。
 
@@ -469,6 +469,12 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             node_id=node_id,
             context_key=context_key,
         )
+        # [AutoC 2026-05-30] Why: 24h TTL 清理需要知道 child session 的
+        # context_mode，才能删除 fresh/fork 并永久保留 accumulate。How: child
+        # 创建后立即补写 context_mode 到持久 registry 并落盘。Purpose: 重启后
+        # stale cleanup 仍能按模式执行正确清理。
+        self._session_store._registry[child_sid]["context_mode"] = str(context_mode or "").strip()
+        self._session_store._flush()
 
         logger.info(
             "child session created: %s (parent=%s, node=%s, key=%s)",
@@ -489,6 +495,12 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         entry = self._session_store._registry.get(child_session_id)
         if entry is None or entry.get("reset"):
             return True
+        # [AutoC 2026-05-30] Why: accumulate child session 是长期上下文，老大要求
+        # 永久保留，不能再按 24h TTL 失效。How: 在 TTL 判断前直接保留明确标记
+        # 为 accumulate 的记录。Purpose: get_or_create_child_session 不会因时间流逝
+        # 创建新的 accumulate 会话并留下旧记录。
+        if str(entry.get("context_mode") or "").strip() == "accumulate":
+            return False
         last_active_str = entry.get("last_active_at", "")
         if not last_active_str:
             return True
@@ -502,7 +514,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
     def _expire_child_session(self, child_session_id: str) -> None:
         """删除一个过期的 child session。
 
-        Child Session 隔离（Phase A）：删除 JSONL 文件、从映射表移除、标记 reset。
+        Child Session 隔离（Phase A）：删除 JSONL 文件、从映射表移除、物理删除 registry 条目。
         """
         # 1. 删除 JSONL 文件
         conv_path = self.workspace_root / "data" / "conversations" / f"{child_session_id}.jsonl"
@@ -521,10 +533,87 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if parent_sid in self.parent_children:
                 self.parent_children[parent_sid].discard(child_session_id)
 
-        # 3. 标记 session 为 reset
-        self._session_store.on_session_reset(child_session_id)
+        # [AutoC 2026-05-30] Why: fresh/fork child session 过期后应从
+        # sessions.json 物理删除。How: 删除 registry 条目而不是写 reset=true。
+        # Purpose: 让完成或过期的临时 child session 不再堆积。
+        self.sessions.pop(child_session_id, None)
+        self.session_generations.pop(child_session_id, None)
+        self._cancelled_sessions.discard(child_session_id)
+        self._session_context_usage.pop(child_session_id, None)
+        self._session_store.remove_session(child_session_id)
 
         logger.info("child session expired: %s", child_session_id)
+
+    def _cleanup_stale_sessions_locked(self) -> None:
+        """清理 sessions.json 中已无用的 branch 和 child session 记录。
+
+        [AutoC 2026-05-30] Why: 历史上 branch/child session 只标记 reset 不删除，
+        导致 sessions.json 无限膨胀。
+        How: 遍历 registry，删除所有 reset=true 的条目，以及超过 24h 无活动的
+        非 accumulate child session。
+        Purpose: 定期清理积累的历史记录。
+        """
+        from datetime import timedelta
+
+        now = datetime.now(timezone.utc)
+        stale_threshold = now - timedelta(hours=24)
+        to_remove: list[str] = []
+
+        for sid, info in list(self._session_store._registry.items()):
+            if not isinstance(info, dict):
+                continue
+            # [AutoC 2026-05-30] Why: reset=true 条目已经不会参与活跃会话恢复。
+            # How: 后台 sweep 统一物理删除历史 reset 行。Purpose: 修复旧版本遗留
+            # reset 标记长期占用 sessions.json 的问题。
+            if info.get("reset"):
+                to_remove.append(sid)
+                continue
+            # [AutoC 2026-05-30] Why: branch session 是入口执行副本，不应长期
+            # 持久化。How: 只要没有非终态 task 仍运行在该 branch，就删除 registry。
+            # Purpose: 清理历史孤儿 branch，同时避免误删仍在执行的 branch。
+            if sid.startswith("branch_"):
+                if not any(t.session_id == sid and not self._task_terminal(t) for t in self.tasks.values()):
+                    to_remove.append(sid)
+                continue
+            # [AutoC 2026-05-30] Why: fresh/fork child session 只用于一次性或
+            # 隔离上下文，24h 无活动后应释放；accumulate 是长期上下文，必须保留。
+            # How: 读取 context_mode 和 last_active_at，超过阈值才加入删除列表。
+            # Purpose: 同时满足 TTL 清理和 accumulate 永久保留规则。
+            if info.get("is_child"):
+                ctx_mode = str(info.get("context_mode") or "").strip()
+                if ctx_mode in ("fresh", "fork"):
+                    updated_str = str(
+                        info.get("last_active_at")
+                        or info.get("updated_at")
+                        or info.get("created_at")
+                        or ""
+                    )
+                    try:
+                        updated_at = datetime.fromisoformat(updated_str)
+                        if updated_at.tzinfo is None:
+                            updated_at = updated_at.replace(tzinfo=timezone.utc)
+                        if updated_at < stale_threshold:
+                            to_remove.append(sid)
+                    except Exception:
+                        pass
+
+        if to_remove:
+            for sid in to_remove:
+                self._session_store._registry.pop(sid, None)
+                self.sessions.pop(sid, None)
+                self.session_generations.pop(sid, None)
+                self._cancelled_sessions.discard(sid)
+                self._session_context_usage.pop(sid, None)
+                self._remove_child_mapping_for_session_locked(sid)
+                self.entry_branch_parents.pop(sid, None)
+                for branches in self.parent_entry_branches.values():
+                    branches.discard(sid)
+                for children in self.parent_children.values():
+                    children.discard(sid)
+            self.parent_entry_branches = {pid: branches for pid, branches in self.parent_entry_branches.items() if branches}
+            self.parent_children = {pid: children for pid, children in self.parent_children.items() if children}
+            self._session_store._flush()
+            logger.info("stale session cleanup: removed %d sessions from registry", len(to_remove))
 
     # ------------------------------------------------------------------ #
     #  审批

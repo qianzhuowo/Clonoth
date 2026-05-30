@@ -187,6 +187,12 @@ def main() -> None:
                             # zombie reaping follows the same terminal path as API reaping.
                             state._route_completed_task_locked(task)
                             _log(f"[zombie-reaper] reaped task {task.task_id[:12]} node={task.node_id}")
+                    # [AutoC 2026-05-30] Why: branch 和 fresh/fork child session
+                    # 历史上只标记 reset，不物理删除，sessions.json 会持续膨胀。
+                    # How: 复用后台 zombie reaper 的定时锁内循环，每分钟执行一次
+                    # stale registry 清理。Purpose: 旧遗留 reset 行和 24h 无活动的
+                    # fresh/fork child 会话会被自动移除，accumulate 会话保留。
+                    state._cleanup_stale_sessions_locked()
             except Exception as e:
                 _log(f"[zombie-reaper] error: {e}")
 

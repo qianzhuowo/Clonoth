@@ -948,6 +948,26 @@ async def _run_node_task(
             child_session_id=child_session_id,
         )
         write_task_record(ws_root, _record)
+        # [AutoC 2026-05-30] Why: persistent 子节点的 snip compact 从 child_session_id
+        # 加载 TaskRecord，但上面只写到了父 session 的 transcript JSONL。
+        # How: 额外写一份到 child session 的 transcript。
+        # Purpose: 轮摘要回写和 snip compact 都能通过 child_session_id 找到记录。
+        if child_session_id and child_session_id != session_id:
+            _child_record = TaskRecord(
+                task_id=task_id,
+                session_id=child_session_id,
+                node_id=node.id,
+                action=action.action,
+                first_message_id=rctx.first_shadow_message_id,
+                last_message_id=rctx.last_shadow_message_id,
+                step_count=rctx.completed_steps,
+                tool_call_count=_tool_call_count,
+                token_usage=dict(rctx.total_usage) if rctx.total_usage else {},
+                summary=action.summary or "",
+                error=action.error or "",
+                child_session_id=child_session_id,
+            )
+            write_task_record(ws_root, _child_record)
     except Exception as _tr_err:
         print(f"[engine] Failed to write task record: {_tr_err}", flush=True)
 

@@ -1,9 +1,13 @@
 """Task 路由 mixin —— 处理 task 完成后的统一分发逻辑。"""
 from __future__ import annotations
 
+import copy
 import json
 import logging
+import queue
+import threading
 import uuid
+from dataclasses import dataclass, field
 from typing import Any
 
 from clonoth_runtime import get_bool, get_int, get_str, load_runtime_config
@@ -15,19 +19,69 @@ from .types import Task, TaskKind, TaskStatus
 log = logging.getLogger(__name__)
 
 
-def _message_to_turn_summary_dict(message: Any) -> dict[str, Any]:
-    """Convert a ConversationStore message into the history shape used for summary input.
+@dataclass
+class PostCompletionWork:
+    """Frozen payload for non-critical work after a task completion is routed.
 
-    Why: control-tool cleanup operates on runtime history dicts, while the turn
-    summarizer starts from ConversationStore Message objects. How: copy role,
-    content, meta, tool_calls, and native tool-result pairing fields into the same
-    shape runner uses. Purpose: let one sanitizer protect both LLM replay and
-    system.turn_summarizer input.
+    Why: outbound_message must become visible as soon as the critical route has
+    merged branch history and appended the user reply. How: copy the completed
+    task and its task-scoped message snapshot before the supervisor lock is
+    released, then let a background worker run hooks and turn-summary creation.
+    Purpose: preserve memory extraction and turn summaries without keeping bot
+    event polling blocked behind their I/O and preprocessing.
     """
-    d: dict[str, Any] = {"role": message.role, "content": message.content or ""}
+
+    task: Task
+    route_session_id: str
+    session_generation: int
+    task_messages: list[Any] = field(default_factory=list)
+
+
+def _message_to_turn_summary_dict(message: Any) -> dict[str, Any]:
+    """Convert a task message into the history shape used for summary input.
+
+    Why: post-completion work now receives a frozen task-message snapshot from
+    the completion critical section instead of reloading ConversationStore later.
+    How: accept both Message objects and serialized dictionaries, then copy role,
+    content, metadata, tool calls, and native tool-result pairing fields into the
+    same shape runner uses. Purpose: one sanitizer protects LLM replay and
+    system.turn_summarizer input while the summary path stays I/O-free.
+    """
+    if isinstance(message, dict):
+        d: dict[str, Any] = {
+            "role": str(message.get("role") or "unknown"),
+            "content": message.get("content") or "",
+        }
+        meta: dict[str, Any] = {}
+        raw_meta = message.get("_meta") if isinstance(message.get("_meta"), dict) else message.get("meta")
+        if isinstance(raw_meta, dict):
+            meta.update(raw_meta)
+        source_task_id = str(message.get("source_task_id") or "").strip()
+        if source_task_id:
+            meta.setdefault("source_task_id", source_task_id)
+        if meta:
+            d["_meta"] = meta
+        message_type = str(message.get("message_type") or "").strip()
+        if message_type:
+            d["message_type"] = message_type
+        if isinstance(message.get("tool_calls"), list) and message.get("tool_calls"):
+            d["tool_calls"] = copy.deepcopy(message.get("tool_calls"))
+        if message.get("tool_call_id"):
+            d["tool_call_id"] = str(message.get("tool_call_id") or "")
+        if message.get("name"):
+            d["name"] = str(message.get("name") or "")
+        return d
+
+    d = {"role": getattr(message, "role", "unknown"), "content": getattr(message, "content", "") or ""}
     meta = dict(message.meta) if isinstance(getattr(message, "meta", None), dict) else {}
+    source_task_id = str(getattr(message, "source_task_id", "") or "").strip()
+    if source_task_id:
+        meta.setdefault("source_task_id", source_task_id)
     if meta:
         d["_meta"] = meta
+    message_type = str(getattr(message, "message_type", "") or "").strip()
+    if message_type:
+        d["message_type"] = message_type
     if getattr(message, "tool_calls", None):
         d["tool_calls"] = list(message.tool_calls)
     if getattr(message, "tool_call_id", ""):
@@ -84,6 +138,50 @@ class TaskRouterMixin:
     运行时 self 是 SupervisorState 实例，可以访问
     self.tasks / self._event_task_snapshot / self.append_outbound_message 等。
     """
+
+    # ------------------------------------------------------------------ #
+    #  后置工作队列
+    # ------------------------------------------------------------------ #
+
+    def _ensure_post_completion_worker(self) -> None:
+        """Lazily start the background worker that runs completion hooks.
+
+        Why: memory extraction hooks and turn-summary task creation should not
+        delay outbound_message visibility. How: create one daemon worker and a
+        queue on first use, protected by the existing supervisor lock during
+        initialization. Purpose: keep the critical completion route short without
+        dropping existing post-completion features.
+        """
+        if getattr(self, "_post_completion_worker_started", False):
+            return
+        if not hasattr(self, "_post_completion_queue"):
+            self._post_completion_queue = queue.Queue()
+        worker = threading.Thread(
+            target=self._post_completion_worker_loop,
+            daemon=True,
+            name="post-completion-worker",
+        )
+        self._post_completion_worker_started = True
+        self._post_completion_worker = worker
+        worker.start()
+
+    def _enqueue_post_completion_work(self, work: PostCompletionWork | None) -> None:
+        """Queue non-critical completion work after the caller releases _lock."""
+        if work is None:
+            return
+        self._ensure_post_completion_worker()
+        self._post_completion_queue.put(work)
+
+    def _post_completion_worker_loop(self) -> None:
+        """Drain queued post-completion work without blocking outbound polling."""
+        while True:
+            work = self._post_completion_queue.get()
+            try:
+                self._post_completion_work(work)
+            except Exception as exc:
+                log.warning("post completion work failed for task %s: %s", getattr(work.task, "task_id", "")[:12], exc)
+            finally:
+                self._post_completion_queue.task_done()
 
     # ------------------------------------------------------------------ #
     #  统一路由入口
@@ -1488,9 +1586,13 @@ class TaskRouterMixin:
         # 不对系统内部任务触发
         if task.input.get("_system_task"):
             return
-        # 子节点任务（有 caller_task_id）用完即丢，不需要轮摘要
+        # [AutoC 2026-05-30] Why: persistent 子节点（accumulate 模式）需要轮摘要来支持 snip compact。
+        # How: 仅跳过 fresh/fork 模式的一次性子节点，保留 accumulate 模式的。
+        # Purpose: scout/smith 等持久节点能正常触发轮摘要和压缩。
         if task.caller_task_id:
-            return
+            _child_ctx_mode = str(task.input.get("context_mode") or "").strip()
+            if _child_ctx_mode in ("fresh", "fork") or not _child_ctx_mode:
+                return
 
         runtime_cfg = load_runtime_config(self.workspace_root)
         if not get_bool(runtime_cfg, "engine.turn_summary.enabled", True):
@@ -1564,7 +1666,10 @@ class TaskRouterMixin:
                 "_system_task": True,
                 "_turn_summary_dispatch": True,
                 "_target_task_id": task.task_id,
-                "_target_session_id": _route_sid,
+                # [AutoC 2026-05-30] Why: persistent 子节点的 TaskRecord 存在 child_session_id 下，
+                # 轮摘要回写时需要从正确的 transcript JSONL 找到记录。
+                # How: 优先使用 child_session_id。 Purpose: snip compact 能找到摘要。
+                "_target_session_id": str(task.input.get("child_session_id") or "").strip() or _route_sid,
                 "child_session_id": _sum_child_sid,
             },
             continuation={},

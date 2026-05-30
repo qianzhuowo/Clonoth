@@ -7,7 +7,7 @@ import logging
 import threading
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -81,9 +81,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         # Why: supervisor feature side effects should be registered handlers rather
         # than hard-coded router or scheduler branches. How: create one unified
-        # HookRegistry per SupervisorState and auto-discover built-ins before event
-        # replay. Purpose: inbound replay can notify handlers without storing their
-        # mutable state on SupervisorState or using a separate supervisor registry.
+        # HookRegistry per SupervisorState and auto-discover built-ins before
+        # session-store reconciliation. Purpose: runtime hook notifications can run
+        # without storing mutable handler state on SupervisorState or using a
+        # separate supervisor registry.
         self.hook_registry = HookRegistry()
         # Why: built-in supervisor handlers now live under engine.builtin, where
         # they cannot import SupervisorState or other supervisor internals. How:
@@ -134,8 +135,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # [Fork/Merge 2026-05-17] Why: sessions.json stores entry branches as
         # child sessions with node_id="__entry_branch__", but the fast branch→parent
         # indexes are in-memory only. How: rebuild those indexes from the loaded
-        # child registry before event replay. Purpose: public APIs and async
-        # dispatch can resolve branch sessions correctly after supervisor restart.
+        # child registry before startup reconciliation. Purpose: public APIs and
+        # async dispatch can resolve branch sessions correctly after supervisor restart.
         for psid, children in self.parent_children.items():
             for child_sid in children:
                 raw = self._session_store._registry.get(child_sid)
@@ -143,16 +144,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     self.entry_branch_parents[child_sid] = psid
                     self.parent_entry_branches.setdefault(psid, set()).add(child_sid)
 
-        self.rebuild_from_events(eventlog.events)
-
-        # BUG FIX (2026-04-29): 重启后清空 session_entry_overrides。
-        # rebuild_from_events 会回放 node_switch 事件，恢复旧的入口节点覆盖。
-        # 但重启后所有任务已死，覆盖指向的节点（如 bootstrap.cmd_reviewer）
-        # 的上下文已丢失。如果不清空，用户消息会被路由到错误的节点。
-        # 例：bot_adapter 曾 switch_node 到 cmd_reviewer，但 cmd_reviewer
-        # 完成后未切回默认节点，重启后该覆盖从事件回放中恢复，导致用户
-        # 在 discord 频道发消息时被错误地路由到 cmd_reviewer。
-        self.session_entry_overrides.clear()
+        self._reconcile_after_restart()
 
     def _build_supervisor_hook_ctx(self, **extra: Any) -> dict[str, Any]:
         """Build the callback-only context passed to built-in supervisor hooks."""
@@ -255,11 +247,145 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         parts.reverse()
         return "\n\n---\n\n".join(parts)
 
+    def _reconcile_after_restart(self) -> None:
+        """启动期状态协调：清理上一进程遗留的运行期状态。
+
+        [AutoC 2026-05-30] Why: 移除 EventLog 启动回放后，需要独立的
+        启动清理逻辑替代原有的 cancel_orphaned_tasks 等依赖回放重建的机制。
+        How: 从 sessions.json 扫描并清理 orphan branch、过期 child session。
+        Purpose: 确保重启后内存状态干净，不留上一进程的运行期残余。
+        """
+        cleaned = 0
+        stale_sids: list[str] = []
+        seen_stale: set[str] = set()
+
+        def mark_stale(session_id: str) -> None:
+            """记录待清理 session，保持顺序并避免重复。"""
+            # [AutoC 2026-05-30] Why: 同一个 session 可能同时满足 reset、branch、
+            # 过期 child 等条件。How: 用 set 做去重，用 list 保留可读的处理顺序。
+            # Purpose: 清理日志和计数稳定，不重复删除同一条 sessions.json 记录。
+            sid = str(session_id or "").strip()
+            if sid and sid not in seen_stale:
+                seen_stale.add(sid)
+                stale_sids.append(sid)
+
+        # 1. 清理 sessions.json 中 reset=true 的条目。
+        for sid, entry in list(self._session_store._registry.items()):
+            if isinstance(entry, dict) and entry.get("reset"):
+                mark_stale(sid)
+
+        # 2. 清理 orphan branch session（重启后上一进程的 branch 不再有活跃任务）。
+        for sid in list(self._session_store._registry.keys()):
+            if str(sid).startswith("branch_"):
+                mark_stale(sid)
+
+        # 3. 清理过期 fresh/fork child session（24h 无活动）。
+        stale_threshold = datetime.now(timezone.utc) - timedelta(hours=24)
+        for sid, entry in list(self._session_store._registry.items()):
+            if sid in seen_stale or not isinstance(entry, dict):
+                continue
+            if not entry.get("is_child"):
+                continue
+            ctx_mode = str(entry.get("context_mode") or "").strip()
+            if ctx_mode not in ("fresh", "fork"):
+                continue
+            updated_str = (
+                entry.get("last_active_at")
+                or entry.get("updated_at")
+                or entry.get("created_at")
+                or ""
+            )
+            try:
+                updated_at = datetime.fromisoformat(str(updated_str))
+                if updated_at.tzinfo is None:
+                    updated_at = updated_at.replace(tzinfo=timezone.utc)
+                if updated_at < stale_threshold:
+                    mark_stale(sid)
+            except Exception:
+                # [AutoC 2026-05-30] Why: sessions.json 可能含有旧版本或损坏的时间字段。
+                # How: 无法解析时跳过 TTL 判定，只让明确 reset 或 branch 条件清理。
+                # Purpose: 避免启动期因为单条脏数据中断 supervisor 初始化。
+                pass
+
+        # 执行清理。
+        for sid in stale_sids:
+            # [AutoC 2026-05-30] Why: startup reconcile 不再依赖 EventLog 中的 task
+            # 快照，因此必须同步清理 session 相关内存索引、会话文件和 registry。
+            # How: 对 branch 复用已有递归清理逻辑；对普通 child/reset session 执行
+            # 轻量清理并收缩 parent/child 索引。Purpose: 重启后只保留 sessions.json
+            # 中仍可作为主状态源的有效 session。
+            if self._is_entry_branch_session_locked(sid):
+                self._cleanup_branch_locked(sid)
+                tr_path = self.workspace_root / "data" / "transcripts" / f"{sid}.jsonl"
+                if tr_path.exists():
+                    try:
+                        tr_path.unlink()
+                    except Exception:
+                        pass
+                # [AutoC 2026-05-30] Why: _cleanup_branch_locked handles branch
+                # conversation JSONL and indexes, but branch transcript files are a
+                # separate runtime artifact. How: remove the transcript here in the
+                # startup-specific reconcile path. Purpose: no branch-owned runtime
+                # residue survives a supervisor restart.
+                cleaned += 1
+                continue
+
+            self.sessions.pop(sid, None)
+            self.session_generations.pop(sid, None)
+            self._cancelled_sessions.discard(sid)
+            self._session_context_usage.pop(sid, None)
+            self._remove_child_mapping_for_session_locked(sid)
+            self.entry_branch_parents.pop(sid, None)
+            for branches in self.parent_entry_branches.values():
+                branches.discard(sid)
+            for children in self.parent_children.values():
+                children.discard(sid)
+            self.parent_entry_branches = {
+                parent_sid: branches
+                for parent_sid, branches in self.parent_entry_branches.items()
+                if branches
+            }
+            self.parent_children = {
+                parent_sid: children
+                for parent_sid, children in self.parent_children.items()
+                if children
+            }
+
+            conv_path = self.workspace_root / "data" / "conversations" / f"{sid}.jsonl"
+            if conv_path.exists():
+                try:
+                    conv_path.unlink()
+                except Exception:
+                    pass
+            tr_path = self.workspace_root / "data" / "transcripts" / f"{sid}.jsonl"
+            if tr_path.exists():
+                try:
+                    tr_path.unlink()
+                except Exception:
+                    pass
+            if self._session_store._registry.pop(sid, None) is not None:
+                cleaned += 1
+
+        if cleaned:
+            self._session_store._flush()
+            logger.info(
+                "startup reconcile: cleaned %d stale sessions (reset/orphan-branch/expired-child)",
+                cleaned,
+            )
+        else:
+            logger.info("startup reconcile: no stale sessions found")
+
     # ------------------------------------------------------------------ #
     #  事件回放
     # ------------------------------------------------------------------ #
 
     def rebuild_from_events(self, events: list[dict[str, Any]]) -> None:
+        """[DEPRECATED] 从 EventLog 事件重建内存状态。
+
+        [AutoC 2026-05-30] 此方法不再在启动路径使用。
+        EventLog 已降级为纯审计日志，启动状态完全从 sessions.json 恢复。
+        保留此方法仅供测试和一次性迁移脚本使用。
+        """
         for e in events:
             et = e.get("type")
             session_id = str(e.get("session_id") or "")

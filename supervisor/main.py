@@ -84,10 +84,11 @@ def main() -> None:
     config_store = ConfigStore(path=config_path)
     state.write_boot_event()
 
-    # ---- Cancel orphaned tasks from previous run ----
-    _orphan_count = state.cancel_orphaned_tasks()
-    if _orphan_count:
-        _log(f"[supervisor] Cancelled {_orphan_count} orphaned task(s) from previous run")
+    # [AutoC 2026-05-30] cancel_orphaned_tasks 已移除。
+    # Why: 移除 EventLog 启动回放后，self.tasks 启动时为空，旧 task 不再被恢复。
+    # How: 不再调用 cancel_orphaned_tasks，启动期清理改由 SupervisorState
+    # 初始化阶段的 _reconcile_after_restart() 负责。
+    # Purpose: 避免保留一个依赖旧回放路径且实际没有效果的启动步骤。
 
     # Check for pending restart completion → inject inbound_message (v3: self-awareness)
     _restart_pending_path = data_dir / "restart_pending.json"

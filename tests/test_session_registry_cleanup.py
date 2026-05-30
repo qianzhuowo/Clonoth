@@ -84,10 +84,12 @@ def test_cleanup_branch_physically_removes_branch_and_derived_child_entries(tmp_
     assert derived_sid not in state.sessions
 
 
-def test_cleanup_stale_sessions_removes_reset_branch_and_old_fresh_fork_but_keeps_accumulate(tmp_path: Path) -> None:
-    """The periodic sweep should delete stale transient sessions and keep accumulate children."""
-    state = _make_state(tmp_path)
-    parent = state.get_or_create_session(channel="test", conversation_key="test:stale-cleanup")
+def _seed_stale_registry(state: SupervisorState, parent: str) -> tuple[str, str, str, str]:
+    """Create stale transient session records for cleanup tests."""
+    # [AutoC 2026-05-30] Why: startup reconcile and periodic sweep must follow the
+    # same retention rule. How: share one fixture that creates reset, orphan branch,
+    # old fresh/fork, and old accumulate records. Purpose: both paths are checked
+    # against identical persistent state.
     fresh_sid, _ = state.get_or_create_child_session(parent, "fresh.node", "case", "fresh")
     fork_sid, _ = state.get_or_create_child_session(parent, "fork.node", "case", "fork")
     accumulate_sid, _ = state.get_or_create_child_session(parent, "acc.node", "case", "accumulate")
@@ -118,6 +120,14 @@ def test_cleanup_stale_sessions_removes_reset_branch_and_old_fresh_fork_but_keep
     }
     state.parent_children.setdefault(parent, set()).update({"branch_orphan"})
     state._session_store._flush()
+    return fresh_sid, fork_sid, accumulate_sid, "branch_orphan"
+
+
+def test_cleanup_stale_sessions_removes_reset_branch_and_old_fresh_fork_but_keeps_accumulate(tmp_path: Path) -> None:
+    """The periodic sweep should delete stale transient sessions and keep accumulate children."""
+    state = _make_state(tmp_path)
+    parent = state.get_or_create_session(channel="test", conversation_key="test:stale-cleanup")
+    fresh_sid, fork_sid, accumulate_sid, branch_sid = _seed_stale_registry(state, parent)
 
     with state._lock:
         state._cleanup_stale_sessions_locked()
@@ -127,8 +137,43 @@ def test_cleanup_stale_sessions_removes_reset_branch_and_old_fresh_fork_but_keep
     # children older than 24 hours are disposable. How: verify each such key is
     # physically absent. Purpose: the background sweep bounds sessions.json size.
     assert "reset_old" not in registry
-    assert "branch_orphan" not in registry
+    assert branch_sid not in registry
     assert fresh_sid not in registry
     assert fork_sid not in registry
     assert accumulate_sid in registry
     assert registry[accumulate_sid]["context_mode"] == "accumulate"
+
+
+def test_startup_reconcile_replaces_eventlog_replay_for_transient_session_cleanup(tmp_path: Path) -> None:
+    """Supervisor startup should clean transient state from sessions.json without EventLog replay."""
+    state = _make_state(tmp_path)
+    parent = state.get_or_create_session(channel="test", conversation_key="test:startup-reconcile")
+    session_from_event_only = "event-only-session"
+    state.eventlog.append(
+        session_id=session_from_event_only,
+        component="test",
+        type_="session_created",
+        payload={"channel": "test", "conversation_key": "test:event-only"},
+    )
+    fresh_sid, fork_sid, accumulate_sid, branch_sid = _seed_stale_registry(state, parent)
+    (tmp_path / "data" / "conversations").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data" / "transcripts").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "data" / "conversations" / f"{branch_sid}.jsonl").write_text("", encoding="utf-8")
+    (tmp_path / "data" / "transcripts" / f"{branch_sid}.jsonl").write_text("", encoding="utf-8")
+
+    restarted = _make_state(tmp_path)
+    registry = _registry(tmp_path)
+
+    # [AutoC 2026-05-30] Why: EventLog is now audit-only and must not restore
+    # sessions that exist only in events.jsonl. How: restart from the same
+    # sessions.json after writing an event-only session_created row. Purpose: prove
+    # startup state is sourced from sessions.json plus reconcile, not event replay.
+    assert session_from_event_only not in restarted.sessions
+    assert session_from_event_only not in restarted.conversation_map.values()
+    assert "reset_old" not in registry
+    assert branch_sid not in registry
+    assert fresh_sid not in registry
+    assert fork_sid not in registry
+    assert accumulate_sid in registry
+    assert not (tmp_path / "data" / "conversations" / f"{branch_sid}.jsonl").exists()
+    assert not (tmp_path / "data" / "transcripts" / f"{branch_sid}.jsonl").exists()

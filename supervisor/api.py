@@ -334,6 +334,7 @@ def create_app(
                     continue
                 _is_async = bool(task.input.get("_async_dispatch"))
                 _is_system = bool(task.input.get("_system_task"))
+                _is_scheduled = bool(task.input.get("schedule_id"))
                 branch_session_id = str(task.input.get("branch_session_id") or "")
                 if not branch_session_id and task.session_id != session_id:
                     branch_session_id = task.session_id
@@ -343,7 +344,7 @@ def create_app(
                     "status": task.status.value,
                     "created_at": task.created_at.isoformat() if task.created_at else "",
                     "caller_task_id": task.caller_task_id or "",
-                    "is_user_entry": bool(not task.caller_task_id and not _is_async and not _is_system),
+                    "is_user_entry": bool(not task.caller_task_id and not _is_async and not _is_system and not _is_scheduled),
                     "source_inbound_seq": task.source_inbound_seq,
                     "branch_session_id": branch_session_id,
                     "parent_session_id": str(task.input.get("parent_session_id") or (session_id if branch_session_id else "")),

@@ -276,6 +276,19 @@ class TaskRouterMixin:
 
     def _route_completed_task_locked(self, task: Task) -> None:
         """统一路由入口。根据 result.action 分发。"""
+        # [AutoC 2026-05-30] Why: child session 清理曾散落在多个 return
+        # 路径，新增路由分支时容易遗漏。How: 外层只负责 try/finally，原路由
+        # 逻辑下沉到 inner。Purpose: 所有完成路径共享一个清理出口。
+        try:
+            self._route_completed_task_inner_locked(task)
+        finally:
+            self._cleanup_task_child_session_if_needed(task)
+
+    def _route_completed_task_inner_locked(self, task: Task) -> None:
+        """执行 task 完成后的实际路由逻辑。"""
+        # [AutoC 2026-05-30] Why: _route_completed_task_locked 需要统一 finally
+        # 清理，但直接包裹原大方法会造成整体缩进变更。How: 保持原路由主体
+        # 缩进不变并移动到 inner。Purpose: 降低重构噪音，便于审查行为差异。
         # ---- 批量 task：优先走统一批量收集 ----
         if task.batch_id:
             self._try_complete_batch_locked(task)
@@ -285,16 +298,11 @@ class TaskRouterMixin:
         # ---- 压缩 dispatch 结果：compactor 子 task 完成 ----
         if self._is_compact_dispatch_result(task):
             self._apply_compact_result_locked(task)
-            # [AutoC 2026-05-30] Why: compactor/summarizer 走专用路径直接 return，
-            # 跳过了通用路径的 child session 清理，导致系统 child session 堆积。
-            # How: 在 return 前清理 child session。Purpose: 防止 sessions.json 膨胀。
-            self._expire_system_child_session(task)
             return
 
         # ---- 轮摘要 dispatch 结果：summarizer 子 task 完成 ----
         if self._is_turn_summary_result(task):
             self._apply_turn_summary_result_locked(task)
-            self._expire_system_child_session(task)
             return
 
         action = task.result or {}
@@ -684,15 +692,6 @@ class TaskRouterMixin:
                 if task.batch_id:
                     caller.input["_resume_key"] = f"batch:{task.batch_id}"
                 self._event_task_snapshot("task_resumed", caller)
-                # [2026-05-25/30] 用后即焚：非 accumulate 模式的子任务完成后删除 child conversation
-                # [AutoC 2026-05-30] Why: system.turn_summarizer/compactor 等内部节点
-                # 创建的 child session 没有设置 context_mode（为空），旧条件 == "fresh"
-                # 无法匹配，导致 sessions.json 堆积数千条系统 child session。
-                # How: 改为 != "accumulate"，空字符串/fresh/fork 都清理。
-                ctx_mode = str(task.input.get("context_mode") or "").strip()
-                child_sid = str(task.input.get("child_session_id") or "").strip()
-                if ctx_mode != "accumulate" and child_sid:
-                    self._expire_child_session(child_sid)
                 return
 
         # 没有 suspended caller
@@ -715,11 +714,6 @@ class TaskRouterMixin:
         # 旧路径（向后兼容）：异步 dispatch 子任务完成 → 注入 inbound 通知入口节点
         if task.input.get("_async_dispatch"):
             self._inject_async_dispatch_result_locked(task, fallback_result)
-            # [2026-05-25/30] 用后即焚：非 accumulate 模式异步子任务完成后也清理
-            ctx_mode = str(task.input.get("context_mode") or "").strip()
-            child_sid = str(task.input.get("child_session_id") or "").strip()
-            if ctx_mode != "accumulate" and child_sid:
-                self._expire_child_session(child_sid)
             return
 
         # 系统内部任务（如记忆提取）静默完成，不输出给用户
@@ -1041,21 +1035,39 @@ class TaskRouterMixin:
         return self._find_entry_task_by_status_locked(session_id, {TaskStatus.suspended})
 
     # ------------------------------------------------------------------ #
-    #  系统 child session 清理
+    #  child session 清理
     # ------------------------------------------------------------------ #
 
-    def _expire_system_child_session(self, task: Task) -> None:
-        """清理系统内部任务（turn_summarizer/compactor）的 child session。
+    def _cleanup_task_child_session_if_needed(self, task: Task) -> None:
+        """统一清理 task 关联的 child session（非 accumulate 模式）。
 
-        [AutoC 2026-05-30] Why: 系统内部任务走专用路径（_apply_compact_result /
-        _apply_turn_summary_result）直接 return，跳过通用路径的 child session
-        清理，导致 sessions.json 堆积数千条系统 child session。
-        How: 从 task.input 读取 child_session_id 并调用 _expire_child_session。
-        Purpose: 系统 child session 用完即弃，不应持久保留。
+        [AutoC 2026-05-30] Why: child session 清理逻辑原先散落在 10+ 个
+        return 路径中，每新增路径都要记得补清理，容易遗漏导致 sessions.json
+        堆积。How: 在 _route_completed_task_locked 的 finally 中统一调用。
+        Purpose: 单一出口，防止泄漏。
         """
         child_sid = str(task.input.get("child_session_id") or "").strip()
-        if child_sid:
-            self._expire_child_session(child_sid)
+        if not child_sid:
+            return
+
+        # [AutoC 2026-05-30] Why: action=dispatch 会把 task 改成 suspended，
+        # 该 caller 后续还要继续使用自己的 child session。How: 只处理终态
+        # task。Purpose: 避免 finally 在挂起路径误删仍活跃的 child session。
+        if not self._task_terminal(task):
+            return
+
+        # [AutoC 2026-05-30] Why: task.input 中的 context_mode 可能为空或滞后，
+        # sessions.json registry 才是 child session 的持久来源。How: 优先读取
+        # registry，缺失时才回退 task.input。Purpose: 避免误删 accumulate 会话。
+        entry = self._session_store._registry.get(child_sid)
+        registry_mode = str(entry.get("context_mode") or "").strip() if isinstance(entry, dict) else ""
+        input_mode = str(task.input.get("context_mode") or "").strip()
+        ctx_mode = registry_mode or input_mode
+
+        if ctx_mode == "accumulate":
+            return
+
+        self._expire_child_session(child_sid)
 
     # ------------------------------------------------------------------ #
     #  压缩 dispatch 结果处理

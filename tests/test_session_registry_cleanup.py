@@ -20,6 +20,7 @@ from supervisor._helpers import _now  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
+from supervisor.types import TaskKind, TaskStatus  # noqa: E402
 
 
 def _make_state(workspace: Path) -> SupervisorState:
@@ -177,3 +178,113 @@ def test_startup_reconcile_replaces_eventlog_replay_for_transient_session_cleanu
     assert accumulate_sid in registry
     assert not (tmp_path / "data" / "conversations" / f"{branch_sid}.jsonl").exists()
     assert not (tmp_path / "data" / "transcripts" / f"{branch_sid}.jsonl").exists()
+
+
+def test_route_completed_batch_task_cleans_fresh_child_session_from_finally(tmp_path: Path) -> None:
+    """A terminal batch task should clean its non-accumulate child session after routing."""
+    state = _make_state(tmp_path)
+    parent = state.get_or_create_session(channel="test", conversation_key="test:batch-child-cleanup")
+    child_sid, _ = state.get_or_create_child_session(parent, "batch.node", "case", "fresh")
+    conv_path = tmp_path / "data" / "conversations" / f"{child_sid}.jsonl"
+    conv_path.parent.mkdir(parents=True, exist_ok=True)
+    conv_path.write_text("", encoding="utf-8")
+
+    with state._lock:
+        task = state._create_task_locked(
+            session_id=parent,
+            session_generation=1,
+            kind=TaskKind.node,
+            node_id="batch.node",
+            input_data={
+                # [AutoC 2026-05-30] Why: this test covers a route that returns
+                # before the old scattered cleanup sites. How: attach a fresh
+                # child session to a completed batch child. Purpose: prove the new
+                # route-level finally cleanup catches early returns.
+                "child_session_id": child_sid,
+                "context_mode": "fresh",
+            },
+            continuation={},
+            batch_id="batch-cleanup",
+            batch_index=0,
+        )
+        task.status = TaskStatus.completed
+        task.result = {"action": "finish", "result": {"summary": "done", "text": "done"}}
+
+        state._route_completed_task_locked(task)
+
+    registry = _registry(tmp_path)
+    assert child_sid not in registry
+    assert child_sid not in state.sessions
+    assert not conv_path.exists()
+
+
+def test_route_completed_dispatch_keeps_child_session_while_task_is_suspended(tmp_path: Path) -> None:
+    """A dispatch action should not clean the caller child session while the task is suspended."""
+    state = _make_state(tmp_path)
+    parent = state.get_or_create_session(channel="test", conversation_key="test:dispatch-keeps-child")
+    child_sid, _ = state.get_or_create_child_session(parent, "caller.node", "case", "fresh")
+
+    with state._lock:
+        task = state._create_task_locked(
+            session_id=parent,
+            session_generation=1,
+            kind=TaskKind.node,
+            node_id="caller.node",
+            input_data={
+                # [AutoC 2026-05-30] Why: route-level finally runs after every
+                # action, including dispatch. How: give the caller a fresh child
+                # session and make it dispatch a subtask. Purpose: verify the
+                # helper checks terminal status before deleting reusable state.
+                "child_session_id": child_sid,
+                "context_mode": "fresh",
+            },
+            continuation={},
+        )
+        task.status = TaskStatus.completed
+        task.result = {
+            "action": "dispatch",
+            "target_node": "worker.node",
+            "dispatch_input": {"instruction": "work", "context_mode": "fresh"},
+        }
+
+        state._route_completed_task_locked(task)
+
+    registry = _registry(tmp_path)
+    assert task.status == TaskStatus.suspended
+    assert child_sid in registry
+    assert child_sid in state.child_session_map.values()
+    assert child_sid in state.parent_children[parent]
+
+
+def test_route_cleanup_prefers_registry_context_mode_over_task_input(tmp_path: Path) -> None:
+    """The cleanup helper should keep accumulate children according to the registry."""
+    state = _make_state(tmp_path)
+    parent = state.get_or_create_session(channel="test", conversation_key="test:registry-mode")
+    child_sid, _ = state.get_or_create_child_session(parent, "acc.node", "case", "accumulate")
+
+    with state._lock:
+        task = state._create_task_locked(
+            session_id=parent,
+            session_generation=1,
+            kind=TaskKind.node,
+            node_id="acc.node",
+            input_data={
+                # [AutoC 2026-05-30] Why: task.input can be stale or incomplete,
+                # while sessions.json is the durable source of the child mode. How:
+                # intentionally put a conflicting fresh mode in input. Purpose:
+                # ensure accumulate child sessions are not deleted by mistake.
+                "child_session_id": child_sid,
+                "context_mode": "fresh",
+            },
+            continuation={},
+            batch_id="batch-accumulate",
+            batch_index=0,
+        )
+        task.status = TaskStatus.completed
+        task.result = {"action": "finish", "result": {"summary": "done", "text": "done"}}
+
+        state._route_completed_task_locked(task)
+
+    registry = _registry(tmp_path)
+    assert child_sid in registry
+    assert registry[child_sid]["context_mode"] == "accumulate"

@@ -279,7 +279,11 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if str(sid).startswith("branch_"):
                 mark_stale(sid)
 
-        # 3. 清理过期 fresh/fork child session（24h 无活动）。
+        # 3. 清理非 accumulate 的 child session。
+        # [AutoC 2026-05-30] 与 _cleanup_stale_sessions_locked 保持一致：
+        #   - accumulate: 永久保留
+        #   - 无 context_mode（历史遗留）: 直接清理，不等 TTL
+        #   - fresh/fork: 24h 无活动后清理
         stale_threshold = datetime.now(timezone.utc) - timedelta(hours=24)
         for sid, entry in list(self._session_store._registry.items()):
             if sid in seen_stale or not isinstance(entry, dict):
@@ -287,8 +291,13 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             if not entry.get("is_child"):
                 continue
             ctx_mode = str(entry.get("context_mode") or "").strip()
-            if ctx_mode not in ("fresh", "fork"):
+            if ctx_mode == "accumulate":
                 continue
+            # 无 context_mode 的历史 child session 直接清理
+            if not ctx_mode:
+                mark_stale(sid)
+                continue
+            # fresh/fork: 正常 TTL 检查
             updated_str = (
                 entry.get("last_active_at")
                 or entry.get("updated_at")
@@ -302,9 +311,6 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 if updated_at < stale_threshold:
                     mark_stale(sid)
             except Exception:
-                # [AutoC 2026-05-30] Why: sessions.json 可能含有旧版本或损坏的时间字段。
-                # How: 无法解析时跳过 TTL 判定，只让明确 reset 或 branch 条件清理。
-                # Purpose: 避免启动期因为单条脏数据中断 supervisor 初始化。
                 pass
 
         # 执行清理。

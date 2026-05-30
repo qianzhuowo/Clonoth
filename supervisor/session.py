@@ -414,6 +414,14 @@ class SessionMixin:
     def _apply_session_created(self, session_id: str, payload: dict[str, Any]) -> None:
         if not session_id:
             return
+        # [AutoC 2026-05-30] Why: eventlog 重放会把已物理删除的 branch/child session
+        # 重新创建回 self.sessions，导致 sessions.json 清理无效。
+        # How: 如果 session_id 以 branch_ 或 child_ 开头，且 sessions.json 中
+        # 不存在该条目，说明已被 remove_session 物理删除，跳过重建。
+        # Purpose: 防止重启后 sessions.json 重新膨胀。
+        if (session_id.startswith("branch_") or session_id.startswith("child_")) \
+                and session_id not in self._session_store._registry:
+            return
         created_at = _now()
         existing_info = self.sessions.get(session_id)
         existing_entry_node = existing_info.entry_node_id if existing_info else ""

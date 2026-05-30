@@ -285,11 +285,16 @@ class TaskRouterMixin:
         # ---- 压缩 dispatch 结果：compactor 子 task 完成 ----
         if self._is_compact_dispatch_result(task):
             self._apply_compact_result_locked(task)
+            # [AutoC 2026-05-30] Why: compactor/summarizer 走专用路径直接 return，
+            # 跳过了通用路径的 child session 清理，导致系统 child session 堆积。
+            # How: 在 return 前清理 child session。Purpose: 防止 sessions.json 膨胀。
+            self._expire_system_child_session(task)
             return
 
         # ---- 轮摘要 dispatch 结果：summarizer 子 task 完成 ----
         if self._is_turn_summary_result(task):
             self._apply_turn_summary_result_locked(task)
+            self._expire_system_child_session(task)
             return
 
         action = task.result or {}
@@ -1034,6 +1039,23 @@ class TaskRouterMixin:
     def _find_suspended_entry_task_locked(self, session_id: str) -> Task | None:
         """在 session 中查找 suspended 状态的入口 task。"""
         return self._find_entry_task_by_status_locked(session_id, {TaskStatus.suspended})
+
+    # ------------------------------------------------------------------ #
+    #  系统 child session 清理
+    # ------------------------------------------------------------------ #
+
+    def _expire_system_child_session(self, task: Task) -> None:
+        """清理系统内部任务（turn_summarizer/compactor）的 child session。
+
+        [AutoC 2026-05-30] Why: 系统内部任务走专用路径（_apply_compact_result /
+        _apply_turn_summary_result）直接 return，跳过通用路径的 child session
+        清理，导致 sessions.json 堆积数千条系统 child session。
+        How: 从 task.input 读取 child_session_id 并调用 _expire_child_session。
+        Purpose: 系统 child session 用完即弃，不应持久保留。
+        """
+        child_sid = str(task.input.get("child_session_id") or "").strip()
+        if child_sid:
+            self._expire_child_session(child_sid)
 
     # ------------------------------------------------------------------ #
     #  压缩 dispatch 结果处理

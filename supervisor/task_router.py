@@ -679,10 +679,14 @@ class TaskRouterMixin:
                 if task.batch_id:
                     caller.input["_resume_key"] = f"batch:{task.batch_id}"
                 self._event_task_snapshot("task_resumed", caller)
-                # [2026-05-25] 用后即焚：fresh 模式的子任务完成后删除 child conversation
+                # [2026-05-25/30] 用后即焚：非 accumulate 模式的子任务完成后删除 child conversation
+                # [AutoC 2026-05-30] Why: system.turn_summarizer/compactor 等内部节点
+                # 创建的 child session 没有设置 context_mode（为空），旧条件 == "fresh"
+                # 无法匹配，导致 sessions.json 堆积数千条系统 child session。
+                # How: 改为 != "accumulate"，空字符串/fresh/fork 都清理。
                 ctx_mode = str(task.input.get("context_mode") or "").strip()
                 child_sid = str(task.input.get("child_session_id") or "").strip()
-                if ctx_mode == "fresh" and child_sid:
+                if ctx_mode != "accumulate" and child_sid:
                     self._expire_child_session(child_sid)
                 return
 
@@ -706,10 +710,10 @@ class TaskRouterMixin:
         # 旧路径（向后兼容）：异步 dispatch 子任务完成 → 注入 inbound 通知入口节点
         if task.input.get("_async_dispatch"):
             self._inject_async_dispatch_result_locked(task, fallback_result)
-            # [2026-05-25] 用后即焚：fresh 模式异步子任务完成后也清理
+            # [2026-05-25/30] 用后即焚：非 accumulate 模式异步子任务完成后也清理
             ctx_mode = str(task.input.get("context_mode") or "").strip()
             child_sid = str(task.input.get("child_session_id") or "").strip()
-            if ctx_mode == "fresh" and child_sid:
+            if ctx_mode != "accumulate" and child_sid:
                 self._expire_child_session(child_sid)
             return
 

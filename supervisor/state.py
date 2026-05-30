@@ -707,7 +707,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             # Purpose: 同时满足 TTL 清理和 accumulate 永久保留规则。
             if info.get("is_child"):
                 ctx_mode = str(info.get("context_mode") or "").strip()
-                if ctx_mode in ("fresh", "fork"):
+                # [AutoC 2026-05-30] 条件从 in ("fresh", "fork") 改为 != "accumulate"，
+                # 因为历史系统节点（turn_summarizer/compactor）创建的 child session
+                # 没有 context_mode 字段（空字符串），旧条件无法匹配，导致堆积。
+                if ctx_mode != "accumulate":
                     updated_str = str(
                         info.get("last_active_at")
                         or info.get("updated_at")

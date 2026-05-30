@@ -710,21 +710,30 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 # [AutoC 2026-05-30] 条件从 in ("fresh", "fork") 改为 != "accumulate"，
                 # 因为历史系统节点（turn_summarizer/compactor）创建的 child session
                 # 没有 context_mode 字段（空字符串），旧条件无法匹配，导致堆积。
-                if ctx_mode != "accumulate":
-                    updated_str = str(
-                        info.get("last_active_at")
-                        or info.get("updated_at")
-                        or info.get("created_at")
-                        or ""
-                    )
-                    try:
-                        updated_at = datetime.fromisoformat(updated_str)
-                        if updated_at.tzinfo is None:
-                            updated_at = updated_at.replace(tzinfo=timezone.utc)
-                        if updated_at < stale_threshold:
-                            to_remove.append(sid)
-                    except Exception:
-                        pass
+                if ctx_mode == "accumulate":
+                    continue
+                # [AutoC 2026-05-30] Why: 没有 context_mode 的历史 child session
+                # 是旧代码遗留，运行时清理对它们无效（旧 task 已消失）。
+                # How: 无 context_mode 的直接清理，不等 24h TTL。
+                # Purpose: 一次性清除历史堆积。
+                if not ctx_mode:
+                    to_remove.append(sid)
+                    continue
+                # fresh/fork: 正常 TTL 检查
+                updated_str = str(
+                    info.get("last_active_at")
+                    or info.get("updated_at")
+                    or info.get("created_at")
+                    or ""
+                )
+                try:
+                    updated_at = datetime.fromisoformat(updated_str)
+                    if updated_at.tzinfo is None:
+                        updated_at = updated_at.replace(tzinfo=timezone.utc)
+                    if updated_at < stale_threshold:
+                        to_remove.append(sid)
+                except Exception:
+                    pass
 
         if to_remove:
             for sid in to_remove:

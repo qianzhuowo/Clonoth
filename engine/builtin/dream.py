@@ -278,11 +278,16 @@ class DreamHandler:
                     signals.append(item)
 
         runtime_cfg = load_runtime_config(workspace_root)
+        # [AutoC 2026-05-31] Load hit_cache and skill list for Prune/Promote phases
+        hit_cache_json = self._load_hit_cache_json(workspace_root)
+        skill_list = self._load_skill_list(workspace_root)
         instruction = self._build_dream_instruction(
             run_id=str(uuid.uuid4()),
             now=now,
             signals=signals,
             topology_json=str(pending.get("topology_json") or "{}"),
+            hit_cache_json=hit_cache_json,
+            skill_list=skill_list,
         )
         if self._create_final_dream_task(
             ctx=ctx,
@@ -652,6 +657,68 @@ class DreamHandler:
             return False
         return now - started > timedelta(minutes=_DREAM_PENDING_TIMEOUT_MINUTES)
 
+    def _load_hit_cache_json(self, workspace_root: Path) -> str:
+        """Load hit_cache.json and return as compact JSON string.
+
+        [AutoC 2026-05-31] Why: Dream Prune phase needs hit timestamps to
+        determine which auto-source entries are expired (30d no hit).
+        How: read the JSON file, truncate to entries with hits in last 60d
+        to keep instruction bounded. Purpose: enable lifecycle management.
+        """
+        hit_path = workspace_root / "data" / "memory" / ".hit_cache.json"
+        if not hit_path.exists():
+            return "{}"
+        try:
+            data = json.loads(hit_path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return "{}"
+            # Only include entries with hits in last 60 days to bound size
+            from datetime import timedelta as _td
+            cutoff = datetime.now(timezone.utc) - _td(days=60)
+            filtered: dict[str, str] = {}
+            for eid, ts_str in data.items():
+                try:
+                    ts = datetime.fromisoformat(str(ts_str))
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=timezone.utc)
+                    if ts >= cutoff:
+                        filtered[eid] = str(ts_str)
+                except Exception:
+                    pass
+            return json.dumps(filtered, ensure_ascii=False)
+        except Exception as exc:
+            log.warning("[scheduler] dream: failed to load hit_cache: %s", exc)
+            return "{}"
+
+    def _load_skill_list(self, workspace_root: Path) -> str:
+        """Load existing skill names and descriptions.
+
+        [AutoC 2026-05-31] Why: Dream Promote phase needs to know existing
+        skills to avoid creating duplicates. How: scan skills/*/SKILL.md
+        frontmatter for name and description. Purpose: enable L1→L2 promotion.
+        """
+        skills_dir = workspace_root / "skills"
+        if not skills_dir.exists():
+            return "(no skills directory)"
+        lines: list[str] = []
+        for skill_dir in sorted(skills_dir.iterdir()):
+            skill_md = skill_dir / "SKILL.md"
+            if not skill_md.exists():
+                continue
+            name = skill_dir.name
+            # Extract description from frontmatter
+            desc = ""
+            try:
+                content = skill_md.read_text(encoding="utf-8")[:500]
+                for line in content.split("\n"):
+                    if line.strip().startswith("description:"):
+                        desc = line.split(":", 1)[1].strip().strip('"').strip("'")
+                        break
+            except Exception:
+                pass
+            lines.append(f"- {name}: {desc}")
+        return "\n".join(lines) if lines else "(no skills found)"
+
     def _build_dream_instruction(
         self,
         *,
@@ -659,6 +726,8 @@ class DreamHandler:
         now: datetime,
         signals: list[dict[str, Any]],
         topology_json: str,
+        hit_cache_json: str = "{}",
+        skill_list: str = "",
     ) -> str:
         """Assemble the final Dream task instruction from preprocessed data."""
         signals_json = json.dumps(signals, ensure_ascii=False, indent=2)
@@ -676,12 +745,24 @@ time: {now.strftime('%Y-%m-%d %H:%M UTC')}
 {topology_json}
 </keyword_topology>
 
+以下是记忆关键词命中时间记录（entry_id → 最后命中时间 ISO）：
+<hit_cache>
+{hit_cache_json}
+</hit_cache>
+
+以下是现有 skill 列表：
+<skill_list>
+{skill_list}
+</skill_list>
+
 约束：
 1. 不要调用 list_memories 全量扫描。
 2. 不要读取对话文件（tail/cat/read_file）。
-3. 只基于上面的 signals 和 topology 做操作。
+3. 只基于上面的 signals、topology、hit_cache 和 skill_list 做操作。
 4. 对 signals 中的新信息：判断是否值得保存，调用 save_memory。
 5. 对 topology 中的重复簇：判断是否需要合并/删除/更新，调用 save_memory/delete_memory。
-6. 单轮最多操作 20 条。
-7. constant=true 的记忆和 source 不是 auto 的手工记忆，保持保护不删。
-8. 完成后用 finish 报告操作摘要。"""
+6. 过期清理（Prune）：对 topology 中 source=auto 的条目，若 hit_cache 中超过 30 天未命中且 created_at 超过 30 天，审查后可用 delete_memory 清理。
+7. 提升（Promote）：对 source=auto、created_at 超过 7 天、hit_cache 中最近 7 天内仍被命中、content 长度 > 200 字的条目，检查 skill_list 是否已有同主题 skill，如有则合并，如无则用 create_or_update_skill 提升为 skill，之后 delete_memory 删除原条目。单次最多提升 3 条。
+8. 单轮最多操作 20 条（含 save/delete/create_or_update_skill）。
+9. constant=true 的记忆和 source 不是 auto 的手工记忆，保持保护不删。
+10. 完成后用 finish 报告操作摘要。"""

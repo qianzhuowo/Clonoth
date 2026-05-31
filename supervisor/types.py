@@ -143,6 +143,13 @@ class ApprovalRequestIn(BaseModel):
     session_id: str
     operation: str
     details: dict[str, Any] = Field(default_factory=dict)
+    # [AutoC 2026-05-31] Why: approval prompts now render inside the matching
+    # ToolCallCard instead of a standalone block. How: accept optional tool and
+    # execution identity fields from callers that know them. Purpose: legacy callers
+    # remain valid while new callers can anchor approvals to tool executions.
+    tool_call_id: str | None = None
+    node_id: str | None = None
+    task_id: str | None = None
 
 
 class ApprovalDecisionIn(BaseModel):
@@ -161,12 +168,27 @@ class Approval(BaseModel):
     decided_at: datetime | None = None
     decision: Literal["allow", "deny"] | None = None
     comment: str | None = None
+    # [AutoC 2026-05-31] Why: the frontend needs to merge approval state into the
+    # existing ToolExecution card. How: include the provider tool_call_id and the
+    # execution origin in the approval event payload. Purpose: approval_requested
+    # and approval_decided can update the correct tool card instead of creating an
+    # independent ApprovalBlock.
+    tool_call_id: str | None = None
+    node_id: str | None = None
+    task_id: str | None = None
 
 
 class OpRequestIn(BaseModel):
     session_id: str
     op: Literal["read_file", "write_file", "execute_command", "restart"]
     parameters: dict[str, Any] = Field(default_factory=dict)
+    # [AutoC 2026-05-31] Why: policy approvals are requested while a tool is
+    # executing. How: carry optional tool_call_id/node_id/task_id through the ops
+    # request. Purpose: create_approval can emit enough identity data for the web
+    # reducer to update ToolCallCard in place.
+    tool_call_id: str | None = None
+    node_id: str | None = None
+    task_id: str | None = None
 
 
 class OpRequestOut(BaseModel):

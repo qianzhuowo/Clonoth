@@ -903,7 +903,18 @@ def create_app(
     @app.post("/v1/approvals/request", response_model=Approval)
     async def approval_request(inp: ApprovalRequestIn) -> Approval:
         st: SupervisorState = app.state.state
-        return st.create_approval(session_id=inp.session_id, operation=inp.operation, details=inp.details)
+        # [AutoC 2026-05-31] Why: direct approval API callers may know which tool
+        # produced the request. How: forward optional identity fields accepted by
+        # ApprovalRequestIn. Purpose: both direct and policy-created approvals can
+        # render inside ToolCallCard when possible.
+        return st.create_approval(
+            session_id=inp.session_id,
+            operation=inp.operation,
+            details=inp.details,
+            tool_call_id=inp.tool_call_id,
+            node_id=inp.node_id,
+            task_id=inp.task_id,
+        )
 
     @app.get("/v1/approvals/{approval_id}", response_model=Approval)
     async def approval_get(approval_id: str) -> Approval:
@@ -923,7 +934,18 @@ def create_app(
     @app.post("/v1/ops/request", response_model=OpRequestOut)
     async def ops_request(inp: OpRequestIn) -> OpRequestOut:
         st: SupervisorState = app.state.state
-        return st.request_operation(session_id=inp.session_id, op=inp.op, parameters=inp.parameters)
+        # [AutoC 2026-05-31] Why: ops/request is the policy path used by tools.
+        # How: pass optional tool_call_id/node_id/task_id through to the supervisor
+        # state layer. Purpose: approval_requested events can update the active tool
+        # card instead of creating a detached approval card.
+        return st.request_operation(
+            session_id=inp.session_id,
+            op=inp.op,
+            parameters=inp.parameters,
+            tool_call_id=inp.tool_call_id,
+            node_id=inp.node_id,
+            task_id=inp.task_id,
+        )
 
     @app.get("/v1/admin/state", response_model=AdminStateOut)
     async def admin_state(request: Request) -> AdminStateOut:

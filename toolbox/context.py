@@ -26,6 +26,12 @@ class ToolContext:
     parent_session_id: str = ""
     conversation_key: str = ""
     approval_poll_interval_sec: float = 0.5
+    # [AutoC 2026-05-31] Why: request_guard runs inside a ToolContext after the
+    # engine has selected a concrete tool call. How: carry the active provider
+    # tool_call_id and node_id on the context. Purpose: policy approvals can be
+    # merged into the matching ToolCallCard.
+    tool_call_id: str = ""
+    node_id: str = ""
 
     def route_session_id(self) -> str:
         """Return the user-visible session for supervisor API calls."""
@@ -49,7 +55,18 @@ class ToolContext:
         route_session_id = self.route_session_id()
         r = await self.http.post(
             f"{self.supervisor_url}/v1/ops/request",
-            json={"session_id": route_session_id, "op": op, "parameters": parameters},
+            json={
+                "session_id": route_session_id,
+                "op": op,
+                "parameters": parameters,
+                # [AutoC 2026-05-31] Why: approval_requested events need the tool
+                # execution identity. How: send optional context fields only known
+                # at runtime. Purpose: the supervisor can attach approval state to
+                # the active tool card while preserving legacy empty values.
+                "tool_call_id": self.tool_call_id or "",
+                "node_id": self.node_id or getattr(self, "_node_id", "") or "",
+                "task_id": self.task_id or "",
+            },
         )
         r.raise_for_status()
         return r.json()

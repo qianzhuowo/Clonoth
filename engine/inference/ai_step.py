@@ -888,6 +888,11 @@ async def _execute_real_tools(
         # session-scoped built-ins stay attached to the durable user session.
         parent_session_id=getattr(ls.rctx, "parent_session_id", "") or "",
         conversation_key=str((getattr(ls.rctx, "task_context", None) or {}).get("conversation_key", "")).strip(),
+        # [AutoC 2026-05-31] Why: the context object is created before iterating
+        # individual real tool calls. How: initialize node_id here and set
+        # tool_call_id inside each loop iteration below. Purpose: approval requests
+        # made by built-in guards can carry the correct active tool identity.
+        node_id=ls.node.id,
     )
     # [2026-05-27 refactor] 传递通用节点上下文给插件层。
     # 为什么：插件（如 save_memory）需要读取节点级配置（如 memory_book），
@@ -917,6 +922,12 @@ async def _execute_real_tools(
             break
         _t_name = _rtc["name"]
         _t_args = _rtc["arguments"]
+        # [AutoC 2026-05-31] Why: one ToolContext instance is reused for the whole
+        # batch, but approval guards run during each individual tool execution. How:
+        # refresh the active provider tool_call_id before hooks and registry.execute.
+        # Purpose: approvals can be merged into the exact ToolCallCard for this call.
+        _tool_ctx.tool_call_id = str(_rtc.get("id") or "")
+        _tool_ctx.node_id = ls.node.id
 
         # Phase 3 Hook System：触发单个真实工具的 before_tool_call hook。
         # 原因：审批类 handler 以当前 tool_call 为粒度，不能只看整轮工具列表。

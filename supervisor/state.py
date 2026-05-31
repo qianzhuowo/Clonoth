@@ -804,9 +804,29 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             a.comment = payload.get("comment")
             a.decided_at = _now()
 
-    def create_approval(self, *, session_id: str, operation: str, details: dict[str, Any]) -> Approval:
+    def create_approval(
+        self,
+        *,
+        session_id: str,
+        operation: str,
+        details: dict[str, Any],
+        tool_call_id: str | None = None,
+        node_id: str | None = None,
+        task_id: str | None = None,
+    ) -> Approval:
         now = _now()
-        fingerprint_src = json.dumps({"operation": operation, "details": details}, sort_keys=True, ensure_ascii=False)
+        # [AutoC 2026-05-31] Why: duplicate pending approval suppression must not
+        # collapse two simultaneous calls to the same operation and path. How: add
+        # optional execution identity to the fingerprint source. Purpose: each
+        # ToolCallCard can own its own approval while legacy callers still dedupe by
+        # operation/details when no identity is available.
+        fingerprint_src = json.dumps({
+            "operation": operation,
+            "details": details,
+            "tool_call_id": tool_call_id or "",
+            "node_id": node_id or "",
+            "task_id": task_id or "",
+        }, sort_keys=True, ensure_ascii=False)
         fingerprint = hashlib.sha256(fingerprint_src.encode("utf-8")).hexdigest()[:12]
 
         approval = Approval(
@@ -820,6 +840,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             comment=None,
             requested_at=now,
             decided_at=None,
+            tool_call_id=tool_call_id,
+            node_id=node_id,
+            task_id=task_id,
         )
 
         with self._lock:
@@ -855,15 +878,41 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     "decision": decision,
                     "comment": comment,
                     "ts": a.decided_at.isoformat(),
+                    # [AutoC 2026-05-31] Why: approval_decided must find the same
+                    # ToolExecution that approval_requested updated. How: mirror
+                    # the stored execution identity into the decision event. Purpose:
+                    # the frontend does not need a separate lookup endpoint.
+                    "tool_call_id": a.tool_call_id,
+                    "node_id": a.node_id,
+                    "task_id": a.task_id,
                 },
             )
             return a
 
-    def request_operation(self, *, session_id: str, op: str, parameters: dict[str, Any]) -> OpRequestOut:
+    def request_operation(
+        self,
+        *,
+        session_id: str,
+        op: str,
+        parameters: dict[str, Any],
+        tool_call_id: str | None = None,
+        node_id: str | None = None,
+        task_id: str | None = None,
+    ) -> OpRequestOut:
         decision = self.policy.evaluate(op=op, parameters=parameters)
         if decision.safety_level == SafetyLevel.auto:
             return OpRequestOut(safety_level=SafetyLevel.auto, reason=decision.reason, approval_id=None)
-        approval = self.create_approval(session_id=session_id, operation=op, details=parameters)
+        # [AutoC 2026-05-31] Why: request_guard can now identify the active tool
+        # call. How: forward that identity to create_approval. Purpose: the emitted
+        # approval_requested event can be merged into the same ToolCallCard.
+        approval = self.create_approval(
+            session_id=session_id,
+            operation=op,
+            details=parameters,
+            tool_call_id=tool_call_id,
+            node_id=node_id,
+            task_id=task_id,
+        )
         return OpRequestOut(safety_level=SafetyLevel.approval_required, reason=decision.reason, approval_id=approval.approval_id)
 
     # ------------------------------------------------------------------ #

@@ -71,12 +71,19 @@ def test_call_tool_spills_large_mcp_image_content_to_attachment_path(tmp_path: P
     ))
 
     assert (tmp_path / expected_rel_path).read_bytes() == image_bytes
-    assert result["attachments"] == [{"path": expected_rel_path, "name": expected_name, "type": "image"}]
-    assert result["result"]["content"][1] == {
+    # [AutoC 2026-05-31] Why: MCP call_tool now follows the unified ok/data/error
+    # schema but keeps top-level attachments during migration. How: assert both the
+    # nested data.attachments contract and the temporary top-level mirror. Purpose:
+    # preserve attachment delivery while result readers move to data.result.
+    expected_attachments = [{"path": expected_rel_path, "name": expected_name, "type": "image"}]
+    assert result["attachments"] == expected_attachments
+    assert result["data"]["attachments"] == expected_attachments
+    assert result["data"]["result"] == f"before\n[Image saved to disk: {expected_rel_path} ({len(image_bytes)} bytes)]\n[image: image/png]"
+    assert result["data"]["mcp_result"]["content"][1] == {
         "type": "text",
         "text": f"[Image saved to disk: {expected_rel_path} ({len(image_bytes)} bytes)]",
     }
-    assert result["result"]["content"][2] == {
+    assert result["data"]["mcp_result"]["content"][2] == {
         "type": "image",
         "data": small_image,
         "mimeType": "image/png",

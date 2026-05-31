@@ -10,6 +10,19 @@ from typing import Any
 from ..attachments import build_multimodal_content
 
 
+def _attachments_from_payload(payload: Any) -> list[Any]:
+    # [AutoC 2026-05-31] Why: resume reconstruction can receive tool or child
+    # payloads from before and after the ok/data/error migration. How: prefer
+    # data.attachments and fall back to the legacy top-level attachments list.
+    # Purpose: keep generated files visible after a task resumes.
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    nested = data.get("attachments") if isinstance(data.get("attachments"), list) else []
+    legacy = payload.get("attachments") if isinstance(payload.get("attachments"), list) else []
+    return list(nested or legacy)
+
+
 # ---------------------------------------------------------------------------
 #  恢复消息构建（同时兼容 v1 和 v2 格式）
 # ---------------------------------------------------------------------------
@@ -33,7 +46,7 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
         result = resume_data.get("result") or {}
         summary = str(result.get("summary") or "")
         text = str(result.get("text") or "")
-        child_atts = result.get("attachments")
+        child_atts = _attachments_from_payload(result)
         lines = [f"下游节点 {from_node} 已完成。" if from_node else "下游节点已完成。"]
         if summary:
             lines.append(f"摘要：{summary}")
@@ -101,8 +114,8 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
                 _name = e.get("name", "unknown")
                 _raw = e.get("raw_inline", "")
                 msgs.append({"role": "user", "content": f'Tool result for "{_name}":\n{_raw}'})
-                atts = e.get("attachments")
-                if isinstance(atts, list):
+                atts = _attachments_from_payload(e)
+                if atts:
                     all_atts.extend(atts)
             if all_atts:
                 msgs.append({"role": "user", "content": build_multimodal_content("以上工具执行产生了以下图片结果：", all_atts)})
@@ -141,8 +154,8 @@ def _build_resume_messages(resume_data: dict[str, Any]) -> list[dict[str, Any]]:
                             lines.append(f"结果：\n{_text}")
                         msgs.append({"role": "user", "content": "\n".join(lines)})
 
-                atts = e.get("attachments")
-                if isinstance(atts, list):
+                atts = _attachments_from_payload(e)
+                if atts:
                     all_atts.extend(atts)
             if all_atts:
                 msgs.append({"role": "user", "content": build_multimodal_content("批量执行产生了以下图片结果：", all_atts)})

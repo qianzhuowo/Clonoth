@@ -13,6 +13,48 @@ from ..context import ToolContext
 from .._common import resolve_and_classify, guard_external_read
 
 
+def _list_dir_result_text(results: list[dict[str, Any]], total_files: int, total_dirs: int) -> str:
+    # [AutoC 2026-05-31] Why: list_dir now provides its readable tree directly in
+    # data.result instead of relying on engine formatter fallback. How: render each
+    # section with file and directory markers, including failures. Purpose: keep
+    # directory listings readable under the unified ok/data/error schema.
+    parts: list[str] = []
+    for section in results:
+        path = section.get("path", "?")
+        fc = section.get("fileCount", 0)
+        dc = section.get("dirCount", 0)
+        if section.get("success") is False:
+            parts.append(f"── {path} ── ERROR: {section.get('error', 'unknown')}")
+            parts.append("")
+            continue
+        parts.append(f"── {path} ── ({fc} files, {dc} dirs)")
+        for entry in section.get("entries", []):
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name", "")
+            if entry.get("type") == "directory":
+                parts.append(f"  📁 {name if str(name).endswith('/') else str(name) + '/'}")
+            else:
+                parts.append(f"  📄 {name}")
+        parts.append("")
+    parts.append(f"Total: {total_files} files, {total_dirs} dirs")
+    return "\n".join(parts)
+
+
+def _empty_error_response(message: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: early list_dir failures need data.result even when no
+    # directory entries were produced. How: create the empty structured totals and
+    # place the readable error in data.result. Purpose: keep failures compatible
+    # with the same ok/data/error contract as successful listings.
+    text = str(message)
+    return {
+        "ok": False,
+        "success": False,
+        "error": text,
+        "data": {"result": f"ERROR: {text}", "results": [], "totalFiles": 0, "totalDirs": 0, "totalPaths": 0},
+    }
+
+
 # Default directories to ignore
 _DEFAULT_IGNORE_DIRS = frozenset({".git"})
 
@@ -93,10 +135,7 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         dir_paths = [str(args.get("path", "."))]
 
     if not dir_paths:
-        return {
-            "ok": False, "success": False, "error": "no paths specified",
-            "data": {"results": [], "totalFiles": 0, "totalDirs": 0, "totalPaths": 0},
-        }
+        return _empty_error_response("no paths specified")
 
     recursive = bool(args.get("recursive", False))
     ignore_dirs = _DEFAULT_IGNORE_DIRS
@@ -117,7 +156,7 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             _reason += f" (+{len(_external_paths) - 5} more)"
         err = await guard_external_read(ctx, True, _external_paths[0], "list_dir", reason=_reason)
         if err is not None:
-            return {"ok": False, "success": False, **err, "data": {"results": [], "totalFiles": 0, "totalDirs": 0, "totalPaths": 0}}
+            return _empty_error_response(err.get("error", "denied") if isinstance(err, dict) else err)
 
     # ---- Iterate directories ----
     results: list[dict[str, Any]] = []
@@ -166,6 +205,7 @@ async def list_dir(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         "ok": all_ok,
         "success": all_ok,
         "data": {
+            "result": _list_dir_result_text(results, total_files, total_dirs),
             "results": results,
             "totalFiles": total_files,
             "totalDirs": total_dirs,

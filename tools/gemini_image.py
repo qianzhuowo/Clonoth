@@ -64,7 +64,10 @@ if __name__ == "__main__":
         sys.exit(0)
 
     def fail(error):
-        print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
+        # [AutoC 2026-05-31] Why: image generation errors must be visible through
+        # data.result as well as error. How: emit the unified failure wrapper before
+        # exiting non-zero. Purpose: let the registry preserve detailed API errors.
+        print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False))
         sys.exit(1)
 
     args = _input
@@ -257,10 +260,20 @@ if __name__ == "__main__":
     if not image_saved:
         fail(f"Gemini did not return any image. Text response: {' '.join(text_parts)[:500]}")
 
+    text = "\n".join(text_parts).strip()
+    # [AutoC 2026-05-31] Why: generated image tools now expose their primary text
+    # and attachment metadata under data, but legacy attachment collection still
+    # reads the top-level field. How: store text, attachments, and image metadata in
+    # data and mirror attachments at the top level. Purpose: migrate schema without
+    # breaking final image delivery.
     output({
         "ok": True,
-        "text": "\n".join(text_parts).strip(),
+        "data": {
+            "result": text,
+            "text": text,
+            "attachments": image_saved,
+            "image_path": image_saved[0]["path"] if image_saved else "",
+            "image_count": len(image_saved),
+        },
         "attachments": image_saved,
-        "image_path": image_saved[0]["path"] if image_saved else "",
-        "image_count": len(image_saved),
     })

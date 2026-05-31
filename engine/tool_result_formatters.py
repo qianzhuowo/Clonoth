@@ -560,30 +560,37 @@ def _mcp_content_parts_render(result: Any, ctx: ToolResultFormatContext) -> tupl
 
 def _attachment_entries(result: dict[str, Any]) -> list[str]:
     paths: list[str] = []
-    attachments = result.get("attachments")
-    if isinstance(attachments, list):
-        for attachment in attachments:
-            if isinstance(attachment, dict):
-                path = attachment.get("path")
-                if isinstance(path, str) and path:
-                    paths.append(path)
-            elif isinstance(attachment, str) and attachment:
-                paths.append(attachment)
-    for key in ("path", "image_path", "audio_path", "video_path"):
-        path = result.get(key)
-        if isinstance(path, str) and path.startswith("data/") and path not in paths:
-            paths.append(path)
+    # [AutoC 2026-05-31] Why: generated media tools are migrating attachment
+    # metadata from top-level attachments/path fields into data.attachments and
+    # data.path. How: scan the nested data dict first and then the legacy top-level
+    # fields, de-duplicating by path. Purpose: keep formatter fallback useful for
+    # partially migrated attachment results that do not yet include data.result.
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    attachment_sources = [data.get("attachments"), result.get("attachments")]
+    for attachments in attachment_sources:
+        if isinstance(attachments, list):
+            for attachment in attachments:
+                if isinstance(attachment, dict):
+                    path = attachment.get("path")
+                    if isinstance(path, str) and path and path not in paths:
+                        paths.append(path)
+                elif isinstance(attachment, str) and attachment and attachment not in paths:
+                    paths.append(attachment)
+    for source in (data, result):
+        for key in ("path", "image_path", "audio_path", "video_path"):
+            path = source.get(key) if isinstance(source, dict) else None
+            if isinstance(path, str) and path.startswith("data/") and path not in paths:
+                paths.append(path)
     return paths
 
 
 def _attachment_result_predicate(result: Any, ctx: ToolResultFormatContext) -> bool:
     if not isinstance(result, dict):
         return False
-    attachments = result.get("attachments")
-    if isinstance(attachments, list):
-        return True
-    path = result.get("path")
-    return isinstance(path, str) and path.startswith("data/")
+    # [AutoC 2026-05-31] Why: attachment fields may now be nested under data.
+    # How: reuse _attachment_entries instead of checking only top-level fields.
+    # Purpose: keep attachment-like payloads routed correctly during migration.
+    return bool(_attachment_entries(result))
 
 
 def _attachment_result_render(result: Any, ctx: ToolResultFormatContext) -> tuple[str, str] | None:
@@ -598,10 +605,14 @@ def _attachment_result_render(result: Any, ctx: ToolResultFormatContext) -> tupl
     # an optional top-level text/description/message first. Purpose: make produced
     # files visible in raw tool history without depending on each tool name.
     parts: list[str] = []
-    for key in ("text", "description", "message"):
-        value = result.get(key)
-        if isinstance(value, str) and value.strip():
-            parts.append(value.strip())
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    for source in (data, result):
+        for key in ("text", "description", "message"):
+            value = source.get(key) if isinstance(source, dict) else None
+            if isinstance(value, str) and value.strip():
+                parts.append(value.strip())
+                break
+        if parts:
             break
     parts.append("Attachments:")
     parts.extend(f"- {path}" for path in paths)

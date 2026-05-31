@@ -58,7 +58,11 @@ if __name__ == "__main__":
         sys.exit(0)
 
     def fail(error):
-        print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
+        # [AutoC 2026-05-31] Why: read_image may fail before it can return a
+        # description, but the engine still expects data.result for readable tool
+        # history. How: include ERROR text under data.result in the failure JSON.
+        # Purpose: keep vision-tool failures understandable after schema migration.
+        print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False))
         sys.exit(1)
 
     args = _input
@@ -218,9 +222,16 @@ if __name__ == "__main__":
     if not description:
         fail(f"Empty response from vision model: {json.dumps(resp_json)[:500]}")
 
+    # [AutoC 2026-05-31] Why: read_image's description is the human-readable tool
+    # result and should live at data.result. How: move description and metadata
+    # under data while keeping the same values. Purpose: conform to ok/data/error
+    # without losing model and image count metadata.
     output({
         "ok": True,
-        "description": description,
-        "model": model,
-        "images_analyzed": len(image_paths)
+        "data": {
+            "result": description,
+            "description": description,
+            "model": model,
+            "images_analyzed": len(image_paths)
+        }
     })

@@ -1028,7 +1028,17 @@ async def _run_tool_task(
             "summary": "任务已取消",
         }
 
-    tool_attachments = result.get("attachments") if isinstance(result, dict) and isinstance(result.get("attachments"), list) else []
+    # [AutoC 2026-05-31] Why: standalone tool tasks must collect files from both
+    # the new data.attachments field and the temporary top-level attachments mirror.
+    # How: prefer the nested list and fall back to the legacy top-level list.
+    # Purpose: keep generated media attached for direct tool-node execution.
+    if isinstance(result, dict):
+        result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
+        tool_attachments = result_data.get("attachments") if isinstance(result_data.get("attachments"), list) else result.get("attachments")
+        if not isinstance(tool_attachments, list):
+            tool_attachments = []
+    else:
+        tool_attachments = []
 
     # [summary-args 2026-05-19] Why: standalone tool tasks emit the same compact
     # handoff_progress row as AI-driven tools. How: pass the task arguments into

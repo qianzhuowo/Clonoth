@@ -35,10 +35,18 @@ class AttachmentCollector:
         changing final attachment behavior.
         """
         tool_result = ctx.extra.get("tool_result")
-        if not isinstance(tool_result, dict) or not isinstance(tool_result.get("attachments"), list):
+        if not isinstance(tool_result, dict):
             return None
 
-        attachments = list(tool_result["attachments"])
+        # [AutoC 2026-05-31] Why: generated media tools now place structured
+        # fields under data, including data.attachments, while older tools still
+        # expose top-level attachments. How: prefer data.attachments and fall back
+        # to the legacy top-level list. Purpose: keep final attachment delivery
+        # working during the ok/data/error response migration.
+        data = tool_result.get("data") if isinstance(tool_result.get("data"), dict) else {}
+        nested_attachments = data.get("attachments") if isinstance(data.get("attachments"), list) else []
+        legacy_attachments = tool_result.get("attachments") if isinstance(tool_result.get("attachments"), list) else []
+        attachments = list(nested_attachments or legacy_attachments)
         if not attachments:
             return None
 

@@ -24,6 +24,15 @@ def result_to_raw(
     tool_spec: Mapping[str, Any] | None = None,
 ) -> tuple[str, str]:
     """把工具结果转为 (format, raw_text)。"""
+    # [AutoC 2026-05-31] Why: tools are migrating to a unified ok/data/error
+    # response shape, where data.result is the canonical human-readable transcript.
+    # How: prefer data.result before the legacy structure-based registry. Purpose:
+    # keep model-visible tool history stable while structured fields move under data.
+    if isinstance(result, dict):
+        data = result.get("data")
+        if isinstance(data, dict) and isinstance(data.get("result"), str):
+            return "text", data["result"]
+
     # [AutoC 2026-05-31] Why: result formatting previously depended on hard-coded
     # tool-name branches, so compatible tools with the same return structure could
     # not reuse readable renderers. How: create a formatting context, route through
@@ -131,8 +140,17 @@ def summarize_result(tool_name: str, result: Any, *, args: dict | None = None) -
     if not isinstance(result, dict):
         extra = _brief_args(safe_args)
         return _summary_line(f"已获得结果: {extra}" if extra else "已获得结果")
+    # [AutoC 2026-05-31] Why: migrated tools keep their useful fields under data,
+    # while legacy callers still return top-level fields. How: normalize the nested
+    # data dict once and let every summary branch consult it before old fields.
+    # Purpose: keep progress summaries compatible through the response migration.
+    result_data = result.get("data") if isinstance(result.get("data"), dict) else {}
     if result.get("ok") is False:
-        return _summary_line(f"失败: {result.get('error', 'unknown')}")
+        # [AutoC 2026-05-31] Why: failure payloads may expose only data.result as
+        # readable history text. How: fall back from error to data.result before the
+        # generic unknown marker. Purpose: avoid opaque failure summaries.
+        err_text = result.get("error") or result_data.get("result") or "unknown"
+        return _summary_line(f"失败: {err_text}")
     if tool_name == "read_file":
         data = result.get("data")
         if isinstance(data, dict):
@@ -148,11 +166,17 @@ def summarize_result(tool_name: str, result: Any, *, args: dict | None = None) -
             return _summary_line(f"已读取 {sc} 个文件")
         return _summary_line(f"已读取 {result.get('path', '') or safe_args.get('path', '')}")
     if tool_name == "execute_command":
-        rc = result.get("returncode")
+        # [AutoC 2026-05-31] Why: execute_command now stores returncode under data.
+        # How: read data.returncode first and fall back to the legacy top-level
+        # field. Purpose: keep shell command progress summaries unchanged.
+        rc = result_data.get("returncode", result.get("returncode"))
         cmd_short = _clip_one_line(safe_args.get("command", ""), 60)
         return _summary_line(f"命令完成 (rc={rc}): {cmd_short}" if cmd_short else f"命令完成 (rc={rc})")
     if tool_name == "write_file":
-        return _summary_line(f"已写入 {result.get('path', '') or safe_args.get('path', '')}")
+        # [AutoC 2026-05-31] Why: write_file now stores path under data. How: prefer
+        # data.path while preserving legacy top-level path and argument fallback.
+        # Purpose: keep file-write progress readable through the migration.
+        return _summary_line(f"已写入 {result_data.get('path', '') or result.get('path', '') or safe_args.get('path', '')}")
     if tool_name == "search_in_files":
         q = _clip_one_line(safe_args.get("query", ""), 30)
         p = _clip_one_line(safe_args.get("path", "."), 40)

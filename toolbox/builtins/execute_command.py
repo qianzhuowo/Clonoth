@@ -11,6 +11,20 @@ from ..context import ToolContext
 from .._common import kill_process_group, request_guard, safe_subprocess_env
 
 
+def _error_response(message: Any, **extra: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: execute_command failures must remain readable after
+    # the engine starts preferring data.result. How: store the error message both in
+    # error and in data.result, with optional flags such as cancelled in data and at
+    # the top level when callers still inspect them. Purpose: keep cancellation and
+    # timeout behavior compatible with the unified ok/data/error schema.
+    text = str(message)
+    payload: dict[str, Any] = {"ok": False, "error": text, "data": {"result": f"ERROR: {text}"}}
+    if extra:
+        payload.update(extra)
+        payload["data"].update(extra)
+    return payload
+
+
 async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     command = str(args.get("command", "")).strip()
 
@@ -38,10 +52,10 @@ async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
 
     _op, err = await request_guard(ctx, "execute_command", {"command": command})
     if err is not None:
-        return err
+        return _error_response(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
     if await ctx.check_cancelled():
-        return {"ok": False, "error": "task cancelled", "cancelled": True}
+        return _error_response("task cancelled", cancelled=True)
 
     try:
         proc = await asyncio.create_subprocess_shell(
@@ -71,20 +85,26 @@ async def execute_command(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
                     await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
                 except asyncio.TimeoutError:
                     pass
-                return {"ok": False, "error": "task cancelled", "cancelled": True}
+                return _error_response("task cancelled", cancelled=True)
             if time.monotonic() - started >= timeout_sec:
                 kill_process_group(proc)
                 try:
                     await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
                 except asyncio.TimeoutError:
                     pass
-                return {"ok": False, "error": f"timeout after {timeout_sec}s"}
+                return _error_response(f"timeout after {timeout_sec}s")
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace")
         stderr_text = stderr_bytes.decode("utf-8", errors="replace")
         out = (stdout_text or "") + ("\n" + stderr_text if stderr_text else "")
         if len(out) > max_output_chars:
             out = out[:max_output_chars] + "\n...<truncated>"
-        return {"ok": True, "returncode": int(proc.returncode or 0), "output": out}
+        rc = int(proc.returncode or 0)
+        # [AutoC 2026-05-31] Why: shell return codes are command results, not tool
+        # contract failures, so non-zero rc must still return ok=true. How: put the
+        # readable transcript in data.result and keep returncode/output as nested
+        # structured fields. Purpose: conform to ok/data/error without changing
+        # execute_command's shell semantics.
+        return {"ok": True, "data": {"result": f"returncode={rc}\n{out}", "returncode": rc, "output": out}}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return _error_response(e)

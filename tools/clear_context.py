@@ -23,7 +23,12 @@ if __name__ == "__main__":
     import json, sys
     _input = json.loads(sys.stdin.read())
     def output(result): print(json.dumps(result, ensure_ascii=False)); sys.exit(0)
-    def fail(error): print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False)); sys.exit(1)
+    def fail(error):
+        # [AutoC 2026-05-31] Why: clear_context validation failures should match
+        # the unified tool response schema. How: include data.result with the error
+        # message before exiting non-zero. Purpose: keep failed context resets
+        # readable in history.
+        print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False)); sys.exit(1)
     args = _input
     import httpx
 
@@ -69,4 +74,8 @@ if __name__ == "__main__":
         results["session_reset"] = f"error: {e}"
 
     results["conversation_key"] = conversation_key
-    output(results)
+    # [AutoC 2026-05-31] Why: clear_context previously returned only top-level
+    # fields, which bypasses the new data.result contract. How: move the existing
+    # status fields under data and add a concise readable result string. Purpose:
+    # make context reset output consistent with all migrated tools.
+    output({"ok": True, "data": {"result": "Context cleared", **results}})

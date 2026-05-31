@@ -12,6 +12,25 @@ from ..context import ToolContext
 from .._common import request_guard, safe_subprocess_env
 
 
+def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: request_restart returns operational metadata and now
+    # needs a canonical readable transcript. How: place all fields under data with
+    # the result string. Purpose: keep restart output in the shared ok/data/error
+    # schema while preserving structured git data.
+    return {"ok": True, "data": {"result": result_text, **fields}}
+
+
+def _err(message: Any, **fields: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: restart and git checkpoint failures must include
+    # data.result. How: mirror optional structured fields under data and top level.
+    # Purpose: keep failure details readable and backward-tolerant.
+    text = str(message)
+    data = {"result": f"ERROR: {text}", **fields}
+    response: dict[str, Any] = {"ok": False, "error": text, "data": data}
+    response.update(fields)
+    return response
+
+
 # ---------------------------------------------------------------------------
 #  Git helpers
 # ---------------------------------------------------------------------------
@@ -167,7 +186,7 @@ async def request_restart(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         },
     )
     if err is not None:
-        return err
+        return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
     approval_id: str | None = op.get("approval_id") if op.get("safety_level") == "approval_required" else None
 
@@ -196,12 +215,12 @@ async def request_restart(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         json={"target": target, "reason": reason, "approval_id": approval_id, "session_id": ctx.route_session_id()},
     )
     if r.status_code >= 400:
-        return {"ok": False, "error": r.text, "git": git_info, "git_commit": commit_res}
+        return _err(r.text, git=git_info, git_commit=commit_res)
 
-    return {
-        "ok": True,
-        "target": target,
-        "scheduled": True,
-        "git": git_info,
-        "git_commit": commit_res,
-    }
+    return _ok(
+        f"Restart requested: {target}",
+        target=target,
+        scheduled=True,
+        git=git_info,
+        git_commit=commit_res,
+    )

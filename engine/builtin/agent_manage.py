@@ -48,6 +48,22 @@ class AgentManageHandler:
 _NODE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.\-]{0,63}$")
 
 
+def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: create_agent returns several structured paths and
+    # flags but should expose data.result as its readable transcript. How: put all
+    # previous fields under data with the summary. Purpose: align plugin tools with
+    # the unified ok/data/error response schema.
+    return {"ok": True, "data": {"result": result_text, **fields}}
+
+
+def _err(message: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: create_agent validation failures should be readable
+    # through data.result. How: wrap the error once. Purpose: avoid legacy plugin
+    # error payloads during migration.
+    text = str(message)
+    return {"ok": False, "error": text, "data": {"result": f"ERROR: {text}"}}
+
+
 # ---------------------------------------------------------------------------
 #  create_agent tool
 # ---------------------------------------------------------------------------
@@ -66,11 +82,11 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     template = str(args.get("template", "")).strip()
 
     if not name:
-        return {"ok": False, "error": "name is required"}
+        return _err("name is required")
     if not template:
-        return {"ok": False, "error": "template is required"}
+        return _err("template is required")
     if not _NODE_ID_RE.fullmatch(name):
-        return {"ok": False, "error": f"invalid node id: {name!r} — only [A-Za-z0-9][A-Za-z0-9_.\\-]{{0,63}} allowed"}
+        return _err(f"invalid node id: {name!r} — only [A-Za-z0-9][A-Za-z0-9_.\\-]{{0,63}} allowed")
 
     display_name = str(args.get("display_name", "")).strip() or name
     description = str(args.get("description", "")).strip()
@@ -85,7 +101,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     # Step 1: 检查目标节点配置是否已存在，避免误覆盖
     target_path = workspace_root / "config" / "nodes" / f"{name}.yaml"
     if target_path.exists():
-        return {"ok": False, "error": f"node config already exists: config/nodes/{name}.yaml"}
+        return _err(f"node config already exists: config/nodes/{name}.yaml")
 
     # Step 2: 查找模板 yaml（先 config/nodes/，再 engine/system_nodes/）
     # 与 engine/node.py load_node 的搜索顺序一致
@@ -93,16 +109,16 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     if not tmpl_path.exists():
         tmpl_path = workspace_root / "engine" / "system_nodes" / f"{template}.yaml"
     if not tmpl_path.exists():
-        return {"ok": False, "error": f"template not found: {template} (checked config/nodes/ and engine/system_nodes/)"}
+        return _err(f"template not found: {template} (checked config/nodes/ and engine/system_nodes/)")
 
     # Step 3: 解析模板 yaml
     try:
         tmpl_text = tmpl_path.read_text(encoding="utf-8")
         tmpl_data = yaml.safe_load(tmpl_text)
     except Exception as e:
-        return {"ok": False, "error": f"failed to parse template: {e}"}
+        return _err(f"failed to parse template: {e}")
     if not isinstance(tmpl_data, dict):
-        return {"ok": False, "error": "template is not a valid YAML dict"}
+        return _err("template is not a valid YAML dict")
 
     # Step 4: 替换核心字段
     tmpl_data["id"] = name
@@ -152,16 +168,16 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     mem_dir = workspace_root / "data" / "memory" / memory_book
     mem_dir.mkdir(parents=True, exist_ok=True)
 
-    return {
-        "ok": True,
-        "node_id": name,
-        "config_path": f"config/nodes/{name}.yaml",
-        "memory_book": memory_book,
-        "memory_dir": f"data/memory/{memory_book}/",
-        "persistent": persistent,
-        "caller_updated": caller_updated,
-        "template": template,
-    }
+    return _ok(
+        f"Agent created: {name}",
+        node_id=name,
+        config_path=f"config/nodes/{name}.yaml",
+        memory_book=memory_book,
+        memory_dir=f"data/memory/{memory_book}/",
+        persistent=persistent,
+        caller_updated=caller_updated,
+        template=template,
+    )
 
 
 # ---------------------------------------------------------------------------

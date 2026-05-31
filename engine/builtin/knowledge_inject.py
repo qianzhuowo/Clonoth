@@ -1095,6 +1095,26 @@ def build_knowledge_context(
 #  Skill CRUD tools
 # ---------------------------------------------------------------------------
 
+
+def _tool_ok(result_text: str, **fields: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: knowledge tools return paths, ids, and catalog lists
+    # that should live under data while data.result remains readable. How: use one
+    # helper for skill and memory success payloads. Purpose: keep plugin-owned tools
+    # aligned with the ok/data/error response schema.
+    return {"ok": True, "data": {"result": result_text, **fields}}
+
+
+def _tool_err(message: Any, **fields: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: knowledge-tool validation and guard failures should
+    # expose data.result. How: wrap error text and mirror optional fields under data
+    # and top level. Purpose: keep failures readable and migration-compatible.
+    text = str(message)
+    data = {"result": f"ERROR: {text}", **fields}
+    response: dict[str, Any] = {"ok": False, "error": text, "data": data}
+    response.update(fields)
+    return response
+
+
 async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Create or update a skill under skills/<name>/SKILL.md."""
     # Why: skill management tools now live beside skill loading and injection.
@@ -1132,9 +1152,9 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
             pass
 
     if not name:
-        return {"ok": False, "error": "empty skill name"}
+        return _tool_err("empty skill name")
     if not SKILL_NAME_RE.fullmatch(name):
-        return {"ok": False, "error": "invalid skill name: only [A-Za-z0-9][A-Za-z0-9_-]{0,63} is allowed"}
+        return _tool_err("invalid skill name: only [A-Za-z0-9][A-Za-z0-9_-]{0,63} is allowed")
 
     path = f"skills/{name}/SKILL.md"
     if not isinstance(content, str) or not content.strip():
@@ -1185,7 +1205,7 @@ async def create_or_update_skill(args: dict[str, Any], ctx: ToolContext) -> dict
     res = await write_file({"path": path, "content": content}, ctx)
     if not res.get("ok"):
         return res
-    return {"ok": True, "path": path, "name": name, "enabled": enabled}
+    return _tool_ok(f"Skill written: {path}", path=path, name=name, enabled=enabled)
 
 
 async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -1194,7 +1214,7 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     # filesystem scan and metadata coercion. Purpose: preserve tool output shape.
     skills_dir = ctx.workspace_root / "skills"
     if not skills_dir.exists():
-        return {"ok": True, "skills": []}
+        return _tool_ok("0 skills", skills=[])
 
     items: list[dict[str, Any]] = []
     for skill_md in sorted(skills_dir.glob("*/SKILL.md")):
@@ -1236,7 +1256,7 @@ async def list_skills(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         except Exception as e:
             items.append({"name": skill_md.parent.name, "path": skill_md.relative_to(ctx.workspace_root).as_posix(), "error": str(e)})
 
-    return {"ok": True, "skills": items}
+    return _tool_ok(f"{len(items)} skills", skills=items)
 
 
 async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -1246,22 +1266,22 @@ async def delete_skill(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     # and deletion semantics while removing the old skill-tool file.
     name = str(args.get("name", "")).strip()
     if not name:
-        return {"ok": False, "error": "empty skill name"}
+        return _tool_err("empty skill name")
     if not SKILL_NAME_RE.fullmatch(name):
-        return {"ok": False, "error": "invalid skill name"}
+        return _tool_err("invalid skill name")
 
     skill_dir = resolve_under_allowed_roots(ctx.workspace_root, f"skills/{name}")
     if not skill_dir.exists():
-        return {"ok": False, "error": f"skill not found: {name}"}
+        return _tool_err(f"skill not found: {name}")
     if not skill_dir.is_dir():
-        return {"ok": False, "error": f"not a skill directory: {name}"}
+        return _tool_err(f"not a skill directory: {name}")
 
     _op, err = await request_guard(ctx, "write_file", {"path": f"skills/{name}/SKILL.md", "delete": True})
     if err is not None:
-        return err
+        return _tool_err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
     shutil.rmtree(skill_dir)
-    return {"ok": True, "deleted": True, "name": name}
+    return _tool_ok(f"Skill deleted: {name}", deleted=True, name=name)
 
 
 # ---------------------------------------------------------------------------
@@ -1324,12 +1344,9 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     # without hard-coding it in toolbox.registry.py.
     mid = str(args.get("id") or "").strip()
     if not mid:
-        return {"ok": False, "error": "empty memory id"}
+        return _tool_err("empty memory id")
     if not _MEMORY_ID_RE.fullmatch(mid):
-        return {
-            "ok": False,
-            "error": "invalid id: only [A-Za-z0-9][A-Za-z0-9_.-]{0,127} allowed",
-        }
+        return _tool_err("invalid id: only [A-Za-z0-9][A-Za-z0-9_.-]{0,127} allowed")
 
     # [2026-05-27] memory_book namespace 支持：当节点 yaml 配置了 memory_book 时，
     # 没有显式指定 book 的 save_memory 调用将使用节点配置的默认 book 名称。
@@ -1345,11 +1362,11 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         _extra = getattr(ctx, "_node_extra", None) or {}
         book = str(_extra.get("memory_book") or "").strip() or "default"
     if not _BOOK_NAME_RE.fullmatch(book):
-        return {"ok": False, "error": "invalid book name"}
+        return _tool_err("invalid book name")
 
     content = str(args.get("content") or "").strip()
     if not content:
-        return {"ok": False, "error": "empty content"}
+        return _tool_err("empty content")
 
     raw_keywords = args.get("keywords")
     keywords: list[str] = []
@@ -1435,7 +1452,7 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     _save_book(book_path, data)
     # invalidate 时也传 memory_book，精确清除对应 namespace 的缓存
     _invalidate_cache(ctx.workspace_root, memory_book=_ns_memory_book)
-    return {"ok": True, "book": book, "id": mid, "updated": found}
+    return _tool_ok(f"Memory {'updated' if found else 'saved'}: {book}/{mid}", book=book, id=mid, updated=found)
 
 
 async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -1448,7 +1465,7 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     _ns_memory_book = str(_ns_extra.get("memory_book") or "").strip()
     mem_dir = memory_dir(ctx.workspace_root, _ns_memory_book)
     if not mem_dir.exists():
-        return {"ok": True, "entries": []}
+        return _tool_ok("0 memories", entries=[])
 
     result: list[dict[str, Any]] = []
     for yaml_path in sorted(mem_dir.glob("*.yaml")):
@@ -1474,7 +1491,7 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
         except Exception:
             continue
 
-    return {"ok": True, "entries": result}
+    return _tool_ok(f"{len(result)} memories", entries=result)
 
 
 async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -1484,7 +1501,7 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     # Purpose: avoid any tool-level behavior change during registration refactor.
     mid = str(args.get("id") or "").strip()
     if not mid:
-        return {"ok": False, "error": "empty memory id"}
+        return _tool_err("empty memory id")
 
     # [2026-05-28] namespace 隔离：使用节点 memory_book 确定存储目录。
     _ns_extra = getattr(ctx, "_node_extra", None) or {}
@@ -1492,7 +1509,7 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     book = str(args.get("book") or "default").strip()
     book_path = memory_dir(ctx.workspace_root, _ns_memory_book) / f"{book}.yaml"
     if not book_path.exists():
-        return {"ok": False, "error": f"book not found: {book}"}
+        return _tool_err(f"book not found: {book}")
 
     data = _load_book(book_path)
     entries = data.get("entries", [])
@@ -1503,7 +1520,7 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     for e in entries:
         if isinstance(e, dict) and str(e.get("id") or "").strip() == mid:
             if bool(e.get("constant", False)):
-                return {"ok": False, "error": f"cannot delete constant memory: {mid}"}
+                return _tool_err(f"cannot delete constant memory: {mid}")
             break
 
     new_entries = [
@@ -1511,7 +1528,7 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
         if not (isinstance(e, dict) and str(e.get("id") or "").strip() == mid)
     ]
     if len(new_entries) == len(entries):
-        return {"ok": False, "error": f"memory not found: {mid}"}
+        return _tool_err(f"memory not found: {mid}")
 
     data["entries"] = new_entries
     if new_entries:
@@ -1524,7 +1541,7 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
 
     # [2026-05-28] invalidate 时传 memory_book，精确清除对应 namespace 的缓存
     _invalidate_cache(ctx.workspace_root, memory_book=_ns_memory_book)
-    return {"ok": True, "book": book, "id": mid, "deleted": True}
+    return _tool_ok(f"Memory deleted: {book}/{mid}", book=book, id=mid, deleted=True)
 
 
 # ---------------------------------------------------------------------------

@@ -810,12 +810,19 @@ async def _run_async_tool(
         )
 
         attachments: list[str] = []
-        if isinstance(result, dict) and isinstance(result.get("attachments"), list):
-            for a in result["attachments"]:
-                if isinstance(a, dict) and a.get("path"):
-                    attachments.append(str(a["path"]))
-                elif isinstance(a, str):
-                    attachments.append(a)
+        if isinstance(result, dict):
+            # [AutoC 2026-05-31] Why: async media tools are moving attachment
+            # metadata under data.attachments while temporarily mirroring it at the
+            # top level. How: read the nested list first and fall back to the legacy
+            # list. Purpose: keep async callback payloads able to attach files.
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            source_attachments = data.get("attachments") if isinstance(data.get("attachments"), list) else result.get("attachments")
+            if isinstance(source_attachments, list):
+                for a in source_attachments:
+                    if isinstance(a, dict) and a.get("path"):
+                        attachments.append(str(a["path"]))
+                    elif isinstance(a, str):
+                        attachments.append(a)
 
         payload: dict = {"message": preempt_text}
         if attachments:
@@ -1362,13 +1369,27 @@ async def run_ai_node(
         collected_attachments.extend(attachments)
     if resume_data and isinstance(resume_data, dict):
         for e in (resume_data.get("tool_results") or resume_data.get("entries") or []):
-            if isinstance(e, dict) and isinstance(e.get("attachments"), list):
-                collected_attachments.extend(e["attachments"])
+            if isinstance(e, dict):
+                # [AutoC 2026-05-31] Why: resumed tool entries may carry either the
+                # old top-level attachments list or the new data.attachments list.
+                # How: inspect the nested data dict before the legacy field.
+                # Purpose: avoid dropping generated files when resuming sessions.
+                e_data = e.get("data") if isinstance(e.get("data"), dict) else {}
+                e_atts = e_data.get("attachments") if isinstance(e_data.get("attachments"), list) else e.get("attachments")
+                if isinstance(e_atts, list):
+                    collected_attachments.extend(e_atts)
         if isinstance(resume_data.get("attachments"), list):
             collected_attachments.extend(resume_data["attachments"])
         rd = resume_data.get("result")
-        if isinstance(rd, dict) and isinstance(rd.get("attachments"), list):
-            collected_attachments.extend(rd["attachments"])
+        if isinstance(rd, dict):
+            # [AutoC 2026-05-31] Why: final result payloads can also be migrated to
+            # data.attachments. How: prefer nested attachments and fall back to the
+            # old result.attachments list. Purpose: keep finish-time attachments
+            # selectable after a resume.
+            rd_data = rd.get("data") if isinstance(rd.get("data"), dict) else {}
+            rd_atts = rd_data.get("attachments") if isinstance(rd_data.get("attachments"), list) else rd.get("attachments")
+            if isinstance(rd_atts, list):
+                collected_attachments.extend(rd_atts)
 
     # ---- 恢复或新建消息历史 ----
     step_count = 0

@@ -229,6 +229,28 @@ async def _read_single_file(
 #  Main entry point
 # ---------------------------------------------------------------------------
 
+
+def _read_file_result_text(results: list[dict[str, Any]]) -> str:
+    # [AutoC 2026-05-31] Why: read_file should expose the exact readable transcript
+    # in data.result under the unified tool response schema. How: reuse the existing
+    # section header format for text, image, binary, and error entries. Purpose:
+    # keep model-visible file contents stable without relying on formatter fallback.
+    parts: list[str] = []
+    for r in results:
+        p = r.get("path", "")
+        if r.get("success") and r.get("type") == "text":
+            c = r.get("content", "")
+            if c:
+                parts.append(f"── {p} ──\n{c}")
+        elif r.get("success") and r.get("type") == "multimodal":
+            parts.append(f"── {p} ── [image: {r.get('mimeType', '?')}, {r.get('size', 0)} bytes]")
+        elif r.get("success") and r.get("type") == "binary":
+            parts.append(f"── {p} ── [binary: {r.get('size', 0)} bytes]")
+        elif not r.get("success"):
+            parts.append(f"── {p} ── ERROR: {r.get('error', 'unknown')}")
+    return "\n".join(parts) if parts else "No files read"
+
+
 async def read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     files_arg = args.get("files")
     if isinstance(files_arg, list) and files_arg:
@@ -239,7 +261,7 @@ async def read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         if not path:
             return {
                 "ok": False, "success": False, "error": "no path specified",
-                "data": {"results": [], "successCount": 0, "failCount": 0, "totalCount": 0, "multiRoot": False},
+                "data": {"result": "ERROR: no path specified", "results": [], "successCount": 0, "failCount": 0, "totalCount": 0, "multiRoot": False},
             }
         entry_dict: dict[str, Any] = {"path": path}
         if args.get("start_line") is not None:
@@ -251,7 +273,7 @@ async def read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if not file_entries:
         return {
             "ok": False, "success": False, "error": "empty files list",
-            "data": {"results": [], "successCount": 0, "failCount": 0, "totalCount": 0, "multiRoot": False},
+            "data": {"result": "ERROR: empty files list", "results": [], "successCount": 0, "failCount": 0, "totalCount": 0, "multiRoot": False},
         }
 
     results: list[dict[str, Any]] = []
@@ -277,6 +299,7 @@ async def read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         "ok": fail_count == 0,
         "success": fail_count == 0,
         "data": {
+            "result": _read_file_result_text(results),
             "results": results,
             "successCount": success_count,
             "failCount": fail_count,
@@ -287,6 +310,11 @@ async def read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if fail_count > 0:
         response["error"] = f"{fail_count} file(s) failed to read"
     if multimodal_data:
+        # [AutoC 2026-05-31] Why: attachment metadata now lives under data but must
+        # be mirrored at the top level during migration. How: write both locations
+        # with the same list. Purpose: keep existing attachment collectors working
+        # while new readers consume data.attachments.
+        response["data"]["attachments"] = multimodal_data
         response["attachments"] = multimodal_data
 
     # Backward compat: single text file → set top-level path/content

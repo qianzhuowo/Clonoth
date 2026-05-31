@@ -48,12 +48,26 @@ BRIDGE_HOST = os.environ.get("DISCORD_BRIDGE_HOST", "127.0.0.1")
 
 
 def output(result):
-    print(json.dumps(result, ensure_ascii=False, default=str))
+    # [AutoC 2026-05-31] Why: discord_manage returns arbitrary bridge-server JSON,
+    # but the engine now expects ok/data/error with data.result. How: keep the
+    # original bridge response under data.payload and derive a compact readable
+    # summary. Purpose: preserve full Discord API output while making history text
+    # uniform.
+    if isinstance(result, dict) and isinstance(result.get("result"), str):
+        result_text = result["result"]
+    elif isinstance(result, dict) and isinstance(result.get("text"), str):
+        result_text = result["text"]
+    else:
+        result_text = json.dumps(result, ensure_ascii=False, default=str)
+    print(json.dumps({"ok": True, "data": {"result": result_text, "payload": result}}, ensure_ascii=False, default=str))
     sys.exit(0)
 
 
 def fail(error):
-    print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
+    # [AutoC 2026-05-31] Why: bridge failures should include data.result like every
+    # other external tool. How: add the readable ERROR string under data. Purpose:
+    # keep validation and HTTP errors visible after schema migration.
+    print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False))
     sys.exit(1)
 
 

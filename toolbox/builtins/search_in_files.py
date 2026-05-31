@@ -74,6 +74,46 @@ def _line_col(text: str, pos: int) -> tuple[int, int]:
     return line, col
 
 
+def _error_response(message: Any, **extra: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: search and replace failures need the same readable
+    # data.result field as successful results. How: normalize the error once and
+    # copy optional metadata such as path or cancelled into data. Purpose: keep tool
+    # history readable while callers migrate to the unified ok/data/error contract.
+    text = str(message)
+    data: dict[str, Any] = {"result": f"ERROR: {text}"}
+    data.update(extra)
+    response: dict[str, Any] = {"ok": False, "success": False, "error": text, "data": data}
+    response.update(extra)
+    return response
+
+
+def _search_result_text(matches: list[dict[str, Any]], truncated: bool) -> str:
+    # [AutoC 2026-05-31] Why: data.result is now the canonical text consumed by the
+    # engine. How: render the same location, match, and context transcript that the
+    # legacy formatter generated from data.results. Purpose: keep search output
+    # readable without relying on formatter fallback.
+    lines = [f"{len(matches)} results found{' (truncated)' if truncated else ''}:"]
+    for m in matches:
+        lines.append(f"\n{m['file']}:{m['line']} | {m['match']}")
+        if m.get("context"):
+            for cl in str(m["context"]).splitlines():
+                lines.append(f"  {cl}")
+    return "\n".join(lines)
+
+
+def _replace_result_text(results: list[dict[str, Any]], files_modified: int, total_replacements: int) -> str:
+    # [AutoC 2026-05-31] Why: replace mode writes files and needs a concise readable
+    # summary under data.result. How: include aggregate counts and per-file counts.
+    # Purpose: make replacement effects visible while preserving structured fields.
+    lines = [f"{files_modified} files modified, {total_replacements} replacements"]
+    for entry in results:
+        file_path = entry.get("file")
+        replacements = entry.get("replacements")
+        if isinstance(file_path, str) and isinstance(replacements, int):
+            lines.append(f"{file_path}: {replacements} replacements")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 #  File collector
 # ---------------------------------------------------------------------------
@@ -162,9 +202,15 @@ async def _do_search(
         if truncated:
             break
 
+    # [AutoC 2026-05-31] Why: callers should no longer need formatter fallback to
+    # see readable search output. How: store the rendered transcript in data.result
+    # and keep matches/count/truncated as structured fields. Purpose: conform to the
+    # unified ok/data/error tool response shape.
     return {
+        "ok": True,
         "success": True,
         "data": {
+            "result": _search_result_text(matches, truncated),
             "results": matches,
             "count": len(matches),
             "truncated": truncated,
@@ -186,11 +232,7 @@ async def _do_replace(
         {"path": "(search_replace)", "reason": f"replace '{query}' in up to {max_files} files"},
     )
     if err is not None:
-        return {
-            "success": False,
-            "cancelled": err.get("cancelled", False),
-            "error": err.get("error", "denied"),
-        }
+        return _error_response(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
     all_matches: list[dict[str, Any]] = []
     files_modified: list[str] = []
@@ -228,18 +270,25 @@ async def _do_replace(
         if files_processed >= max_files:
             break
 
+    replace_results = [
+        {
+            "file": f,
+            "replacements": sum(1 for m in all_matches if m["file"] == f),
+        }
+        for f in files_modified
+    ]
+    # [AutoC 2026-05-31] Why: replace mode now returns a unified success payload.
+    # How: put human-readable replacement counts in data.result and preserve all
+    # structured replacement details below data. Purpose: keep both model history
+    # and downstream programmatic consumers useful.
     return {
+        "ok": True,
         "success": True,
         "cancelled": False,
         "data": {
+            "result": _replace_result_text(replace_results, len(files_modified), len(all_matches)),
             "matches": all_matches,
-            "results": [
-                {
-                    "file": f,
-                    "replacements": sum(1 for m in all_matches if m["file"] == f),
-                }
-                for f in files_modified
-            ],
+            "results": replace_results,
             "filesModified": len(files_modified),
             "totalReplacements": len(all_matches),
         },
@@ -261,7 +310,7 @@ async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     max_files = int(args.get("maxFiles") or args.get("max_files") or 50)
 
     if not query:
-        return {"success": False, "error": "empty query"}
+        return _error_response("empty query")
 
     runtime_cfg = load_runtime_config(ctx.workspace_root)
     max_file_size_bytes = get_int(
@@ -275,14 +324,14 @@ async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     try:
         root, is_ext = resolve_and_classify(ctx.workspace_root, rel_path)
     except ValueError as exc:
-        return {"success": False, "error": str(exc)}
+        return _error_response(str(exc))
     if not root.exists():
-        return {"success": False, "error": "path not found", "path": rel_path}
+        return _error_response("path not found", path=rel_path)
 
     # ---- External path approval guard ----
     err = await guard_external_read(ctx, is_ext, rel_path, "search_in_files")
     if err is not None:
-        return err
+        return _error_response(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
     # Compile regex — search: case-insensitive (gim); replace: case-sensitive (g)
     flags = re.MULTILINE
@@ -295,7 +344,7 @@ async def search_in_files(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         else:
             regex = re.compile(re.escape(query), flags)
     except re.error as e:
-        return {"success": False, "error": f"invalid regex: {e}"}
+        return _error_response(f"invalid regex: {e}")
 
     if mode == "replace":
         return await _do_replace(

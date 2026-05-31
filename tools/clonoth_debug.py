@@ -74,8 +74,30 @@ TIMEOUT_SEC = 15.0
 if __name__ == "__main__":
     import json, sys
     _input = json.loads(sys.stdin.read())
-    def output(result): print(json.dumps(result, ensure_ascii=False)); sys.exit(0)
-    def fail(error): print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False)); sys.exit(1)
+    def _readable_result(result):
+        # [AutoC 2026-05-31] Why: clonoth_debug has many action-specific payloads,
+        # but the engine now reads data.result uniformly. How: derive a concise
+        # action-aware summary while storing the original payload under data.payload.
+        # Purpose: keep debug details structured without losing readable history.
+        if isinstance(result, dict):
+            if action == "api":
+                return f"API result for {args.get('path', '')}"
+            if action == "task_events":
+                return f"{result.get('count', 0)} task events"
+            if action == "active_tasks":
+                return f"{result.get('active_count', 0)} active tasks"
+            if action == "pending_approvals":
+                return f"{result.get('pending_count', 0)} pending approvals"
+            if action == "recent_events":
+                return f"{result.get('total', 0)} recent events"
+            if action == "node_status":
+                return f"Node status: {result.get('node_id', '')}"
+            if action == "health":
+                return "Health checked"
+        return json.dumps(result, ensure_ascii=False, default=str)
+    def output(result):
+        print(json.dumps({"ok": True, "data": {"result": _readable_result(result), "payload": result}}, ensure_ascii=False)); sys.exit(0)
+    def fail(error): print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False)); sys.exit(1)
     args = _input
     import os, subprocess
     from urllib.request import Request, urlopen

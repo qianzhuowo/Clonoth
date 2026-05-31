@@ -124,6 +124,28 @@ def _find_and_replace(
 #  Main entry point
 # ---------------------------------------------------------------------------
 
+
+def _apply_diff_result_text(path: str, applied: int, failed: int) -> str:
+    # [AutoC 2026-05-31] Why: apply_diff now needs a canonical readable transcript
+    # in data.result. How: use the same compact path/applied/rejected summary that
+    # existing formatter tests expect. Purpose: keep tool history stable while the
+    # structured payload moves under data.
+    return f"apply_diff on {path}: {applied} applied, {failed} rejected"
+
+
+def _apply_diff_error_response(message: Any, path: str = "", **data_fields: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: every apply_diff failure should include ok=false and
+    # data.result, including validation and policy failures that occur before counts
+    # exist. How: normalize the error and add any known path/count details under
+    # data. Purpose: make failed diffs readable and schema-consistent.
+    text = str(message)
+    data: dict[str, Any] = {"result": f"ERROR: {text}"}
+    if path:
+        data["file"] = path
+    data.update(data_fields)
+    return {"ok": False, "success": False, "error": text, "data": data}
+
+
 async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     path_str = str(args.get("path") or "").strip()
     diffs = args.get("diffs")
@@ -132,10 +154,10 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     #  Basic validation
     # ------------------------------------------------------------------
     if not path_str:
-        return {"success": False, "error": "'path' is required."}
+        return _apply_diff_error_response("'path' is required.")
 
     if not isinstance(diffs, list) or len(diffs) == 0:
-        return {"success": False, "error": "'diffs' must be a non-empty array."}
+        return _apply_diff_error_response("'diffs' must be a non-empty array.", path_str)
 
     # ------------------------------------------------------------------
     #  Policy + approval guard (same flow as write_file)
@@ -153,20 +175,19 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if err is not None:
         cancelled = err.get("cancelled", False)
         if cancelled:
-            return {
-                "success": False,
-                "cancelled": True,
-                "error": "Diff was cancelled by user",
-                "data": {
-                    "file": path_str,
-                    "message": f"Diff for {path_str} was cancelled by user.",
-                    "status": "rejected",
-                    "diffCount": len(diffs),
-                    "appliedCount": 0,
-                    "failedCount": 0,
-                },
-            }
-        return {"success": False, "error": err.get("error", "denied")}
+            response = _apply_diff_error_response(
+                "Diff was cancelled by user",
+                path_str,
+                message=f"Diff for {path_str} was cancelled by user.",
+                status="rejected",
+                diffCount=len(diffs),
+                appliedCount=0,
+                failedCount=0,
+            )
+            response["cancelled"] = True
+            response["data"]["cancelled"] = True
+            return response
+        return _apply_diff_error_response(err.get("error", "denied"), path_str)
 
     # ------------------------------------------------------------------
     #  Resolve & read file
@@ -174,30 +195,26 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     try:
         resolved = resolve_under_allowed_roots(ctx.workspace_root, path_str)
     except ValueError as exc:
-        return {"success": False, "error": str(exc)}
+        return _apply_diff_error_response(str(exc), path_str)
 
     if not resolved.exists() or not resolved.is_file():
-        return {
-            "success": False,
-            "error": f"File not found: {path_str}",
-        }
+        return _apply_diff_error_response(f"File not found: {path_str}", path_str)
 
     file_size = resolved.stat().st_size
     if file_size > _MAX_FILE_SIZE:
-        return {
-            "success": False,
-            "error": (
-                f"File is too large ({file_size} bytes). "
-                f"Maximum editable size is {_MAX_FILE_SIZE} bytes."
-            ),
-        }
+        return _apply_diff_error_response(
+            f"File is too large ({file_size} bytes). Maximum editable size is {_MAX_FILE_SIZE} bytes.",
+            path_str,
+            fileSize=file_size,
+            maxFileSize=_MAX_FILE_SIZE,
+        )
 
     try:
         content = resolved.read_text(encoding="utf-8")
     except UnicodeDecodeError:
-        return {"success": False, "error": "File is not valid UTF-8 text."}
+        return _apply_diff_error_response("File is not valid UTF-8 text.", path_str)
     except Exception as exc:
-        return {"success": False, "error": f"Failed to read file: {exc}"}
+        return _apply_diff_error_response(f"Failed to read file: {exc}", path_str)
 
     # ------------------------------------------------------------------
     #  Apply diffs sequentially
@@ -277,18 +294,15 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     # ------------------------------------------------------------------
     if applied_count == 0:
         first_error = failed_diffs[0]["error"] if failed_diffs else "unknown"
-        return {
-            "success": False,
-            "error": f"Failed to apply any diffs: {first_error}",
-            "data": {
-                "file": path_str,
-                "message": f"Failed to apply any diffs to {path_str}.",
-                "failedDiffs": failed_diffs,
-                "appliedCount": 0,
-                "totalCount": diff_count,
-                "failedCount": failed_count,
-            },
-        }
+        return _apply_diff_error_response(
+            f"Failed to apply any diffs: {first_error}",
+            path_str,
+            message=f"Failed to apply any diffs to {path_str}.",
+            failedDiffs=failed_diffs,
+            appliedCount=0,
+            totalCount=diff_count,
+            failedCount=failed_count,
+        )
 
     # ------------------------------------------------------------------
     #  At least one diff succeeded → write result to disk
@@ -297,15 +311,12 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         resolved.parent.mkdir(parents=True, exist_ok=True)
         resolved.write_text(content, encoding="utf-8")
     except Exception as exc:
-        return {
-            "success": False,
-            "error": f"Failed to write file: {exc}",
-            "data": {
-                "file": path_str,
-                "appliedCount": applied_count,
-                "failedCount": failed_count,
-            },
-        }
+        return _apply_diff_error_response(
+            f"Failed to write file: {exc}",
+            path_str,
+            appliedCount=applied_count,
+            failedCount=failed_count,
+        )
 
     # ------------------------------------------------------------------
     #  Build response
@@ -320,6 +331,7 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         )
 
     data: dict[str, Any] = {
+        "result": _apply_diff_result_text(path_str, applied_count, failed_count),
         "file": path_str,
         "message": message,
         "status": "accepted",
@@ -330,4 +342,8 @@ async def apply_diff(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     if failed_diffs:
         data["failedDiffs"] = failed_diffs
 
-    return {"success": True, "data": data}
+    # [AutoC 2026-05-31] Why: successful apply_diff results should expose ok=true
+    # and data.result like all other tools. How: keep the legacy success flag while
+    # adding the unified ok field. Purpose: preserve compatibility and schema
+    # consistency during migration.
+    return {"ok": True, "success": True, "data": data}

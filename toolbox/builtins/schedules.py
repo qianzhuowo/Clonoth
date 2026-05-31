@@ -10,34 +10,52 @@ from .._common import request_guard
 _SCHEDULE_ID_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]{0,63}$")
 
 
+def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: schedule tools return structured management data but
+    # still need a canonical readable transcript. How: place all structured fields
+    # under data with a result summary. Purpose: align schedules with ok/data/error.
+    return {"ok": True, "data": {"result": result_text, **fields}}
+
+
+def _err(message: Any, **fields: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: schedule validation and approval failures should not
+    # return legacy ok=false shapes. How: mirror optional flags under data and top
+    # level while adding data.result. Purpose: keep scheduler failures readable.
+    text = str(message)
+    data = {"result": f"ERROR: {text}", **fields}
+    response: dict[str, Any] = {"ok": False, "error": text, "data": data}
+    response.update(fields)
+    return response
+
+
 async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Create or update a scheduled task."""
     from supervisor.scheduler import load_schedules, save_schedules
 
     sid = str(args.get("id") or "").strip()
     if not sid:
-        return {"ok": False, "error": "empty schedule id"}
+        return _err("empty schedule id")
     if not _SCHEDULE_ID_RE.fullmatch(sid):
-        return {"ok": False, "error": "invalid schedule id: only [A-Za-z_][A-Za-z0-9_-]{0,63} allowed"}
+        return _err("invalid schedule id: only [A-Za-z_][A-Za-z0-9_-]{0,63} allowed")
 
     cron_expr = str(args.get("cron") or "").strip()
     if not cron_expr:
-        return {"ok": False, "error": "empty cron expression"}
+        return _err("empty cron expression")
     parts = cron_expr.split()
     if len(parts) != 5:
-        return {"ok": False, "error": "cron must be 5 fields: minute hour day month weekday"}
+        return _err("cron must be 5 fields: minute hour day month weekday")
 
     stype = str(args.get("type") or "message").strip()
     if stype not in ("message", "script"):
-        return {"ok": False, "error": f"invalid type: {stype}, must be 'message' or 'script'"}
+        return _err(f"invalid type: {stype}, must be 'message' or 'script'")
 
     text = str(args.get("text") or "").strip()
     if stype == "message" and not text:
-        return {"ok": False, "error": "empty text (required for message type)"}
+        return _err("empty text (required for message type)")
 
     command = str(args.get("command") or "").strip()
     if stype == "script" and not command:
-        return {"ok": False, "error": "empty command (required for script type)"}
+        return _err("empty command (required for script type)")
 
     conv_key = str(args.get("conversation_key") or "").strip()
     if not conv_key:
@@ -53,7 +71,7 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
 
     _op, err = await request_guard(ctx, "write_file", {"path": "data/schedules.yaml", "schedule_id": sid})
     if err is not None:
-        return err
+        return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
     schedules = load_schedules(ctx.workspace_root)
     entry: dict[str, Any] = {
@@ -88,7 +106,7 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
         schedules.append(entry)
 
     save_schedules(ctx.workspace_root, schedules)
-    return {"ok": True, "schedule": entry, "replaced": replaced}
+    return _ok(f"Schedule {'updated' if replaced else 'created'}: {sid}", schedule=entry, replaced=replaced)
 
 
 async def list_schedules(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -96,7 +114,7 @@ async def list_schedules(args: dict[str, Any], ctx: ToolContext) -> dict[str, An
     from supervisor.scheduler import load_schedules
 
     schedules = load_schedules(ctx.workspace_root)
-    return {"ok": True, "schedules": schedules}
+    return _ok(f"{len(schedules)} schedules", schedules=schedules)
 
 
 async def delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -105,17 +123,17 @@ async def delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
 
     sid = str(args.get("id") or "").strip()
     if not sid:
-        return {"ok": False, "error": "empty schedule id"}
+        return _err("empty schedule id")
 
     _op, err = await request_guard(ctx, "write_file", {"path": "data/schedules.yaml", "delete_schedule": sid})
     if err is not None:
-        return err
+        return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
     schedules = load_schedules(ctx.workspace_root)
     before = len(schedules)
     schedules = [s for s in schedules if str(s.get("id") or "").strip() != sid]
     if len(schedules) == before:
-        return {"ok": False, "error": f"schedule not found: {sid}"}
+        return _err(f"schedule not found: {sid}")
 
     save_schedules(ctx.workspace_root, schedules)
-    return {"ok": True, "deleted": True, "id": sid}
+    return _ok(f"Schedule deleted: {sid}", deleted=True, id=sid)

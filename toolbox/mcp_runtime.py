@@ -456,4 +456,34 @@ async def call_tool(workspace_root: Path, client_id: str, tool_name: str, argume
         # images to disk and returns AttachmentCollector-compatible metadata.
         # Purpose: keep tool history compact while still exposing generated files.
         result, attachments = _to_plain_mcp_result(workspace_root, client_id, res)
-        return {"ok": True, "client_id": client_id, "tool_name": tool_name, "result": result, "attachments": attachments}
+        # [AutoC 2026-05-31] Why: MCP SDK results have provider-specific content
+        # payloads, but the engine now consumes a unified ok/data/error contract.
+        # How: flatten text, image, and resource parts into data.result while keeping
+        # the original processed MCP payload under data.mcp_result. Purpose: make MCP
+        # tool history readable and preserve structured data plus attachments.
+        result_text_parts: list[str] = []
+        if isinstance(result, dict) and isinstance(result.get("content"), list):
+            for part in result["content"]:
+                if isinstance(part, dict):
+                    if part.get("type") == "text":
+                        result_text_parts.append(str(part.get("text", "")))
+                    elif part.get("type") == "image":
+                        result_text_parts.append(f"[image: {part.get('mimeType') or part.get('mime_type') or part.get('mime') or '?'}]")
+                    elif part.get("type") == "resource":
+                        resource = part.get("resource")
+                        uri = part.get("uri") or (resource.get("uri") if isinstance(resource, dict) else None)
+                        result_text_parts.append(f"[resource: {uri or '?'}]")
+        result_text = "\n".join(result_text_parts) if result_text_parts else json.dumps(result, ensure_ascii=False, indent=2)
+        is_error = bool(result.get("isError") or result.get("is_error")) if isinstance(result, dict) else False
+        return {
+            "ok": not is_error,
+            "data": {
+                "result": result_text,
+                "mcp_result": result,
+                "client_id": client_id,
+                "tool_name": tool_name,
+                "attachments": attachments or [],
+            },
+            "error": result_text if is_error else None,
+            "attachments": attachments or [],
+        }

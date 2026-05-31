@@ -19,6 +19,86 @@ from . import mcp_runtime
 ToolFunc = Callable[[dict[str, Any], Any], Awaitable[dict[str, Any]]]
 
 
+def _json_text(value: Any) -> str:
+    # [AutoC 2026-05-31] Why: registry-level fallback wrapping needs a stable
+    # readable transcript for arbitrary legacy tool payloads. How: serialize JSON
+    # values compactly and fall back to str() if serialization fails. Purpose: let
+    # every tool result expose data.result even when the tool itself is old.
+    try:
+        return json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        return str(value)
+
+
+def _error_tool_response(message: Any, **fields: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: registry-generated failures, such as missing tools or
+    # script timeouts, bypass individual tool code. How: put the error in both error
+    # and data.result, with optional metadata under data and top level. Purpose:
+    # keep all registry-originated failures in the unified ok/data/error shape.
+    text = str(message)
+    data: dict[str, Any] = {"result": f"ERROR: {text}"}
+    data.update(fields)
+    response: dict[str, Any] = {"ok": False, "error": text, "data": data}
+    response.update(fields)
+    return response
+
+
+def _ensure_tool_response_shape(result: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: user-created external tools and older built-ins may
+    # still return legacy top-level fields. How: preserve already unified payloads,
+    # add data.result to ok=false payloads, and otherwise move legacy fields under
+    # data while mirroring attachments during migration. Purpose: enforce the new
+    # ok/data/error contract at the registry boundary without losing metadata.
+    if not isinstance(result, dict):
+        return {"ok": True, "data": {"result": str(result), "value": result}}
+
+    data = result.get("data") if isinstance(result.get("data"), dict) else None
+    if isinstance(data, dict) and isinstance(data.get("result"), str) and "ok" in result:
+        # [AutoC 2026-05-31] Why: some already-migrated tools may still provide
+        # attachments only at the top level for migration compatibility. How: add
+        # the nested data.attachments mirror when it is missing. Purpose: keep the
+        # attachment contract consistent at the registry boundary.
+        attachments = result.get("attachments")
+        if isinstance(attachments, list) and not isinstance(data.get("attachments"), list):
+            result = dict(result)
+            data = dict(data)
+            data["attachments"] = attachments
+            result["data"] = data
+        return result
+
+    ok_value = False if result.get("ok") is False else True
+    error_value = result.get("error")
+    if ok_value is False:
+        merged_data = dict(data or {})
+        if not isinstance(merged_data.get("result"), str):
+            merged_data["result"] = f"ERROR: {error_value or 'unknown'}"
+        for key, value in result.items():
+            if key not in {"ok", "data", "error"} and key not in merged_data:
+                merged_data[key] = value
+        return {"ok": False, "data": merged_data, "error": str(error_value or merged_data.get("result") or "unknown")}
+
+    merged_data = dict(data or {})
+    for key, value in result.items():
+        if key in {"ok", "data", "error"}:
+            continue
+        merged_data.setdefault(key, value)
+    if not isinstance(merged_data.get("result"), str):
+        for key in ("text", "description", "message", "output", "result", "note"):
+            value = result.get(key)
+            if isinstance(value, str):
+                merged_data["result"] = value
+                break
+    if not isinstance(merged_data.get("result"), str):
+        merged_data["result"] = _json_text({k: v for k, v in result.items() if k not in {"ok", "data", "error"}})
+
+    response = {"ok": True, "data": merged_data}
+    attachments = merged_data.get("attachments") or result.get("attachments")
+    if isinstance(attachments, list):
+        response["attachments"] = attachments
+        merged_data.setdefault("attachments", attachments)
+    return response
+
+
 def _extract_tool_spec(py: Path) -> tuple[dict[str, Any] | None, float | None]:
     """Extract tool spec from a python file via AST.
 
@@ -132,7 +212,7 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                             await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
                         except asyncio.TimeoutError:
                             pass
-                        return {"ok": False, "error": "script task cancelled", "cancelled": True}
+                        return _error_tool_response("script task cancelled", cancelled=True)
                 except Exception:
                     pass
                 if asyncio.get_running_loop().time() - started >= timeout_val:
@@ -141,26 +221,42 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                         await asyncio.wait_for(asyncio.gather(waiter, return_exceptions=True), timeout=5.0)
                     except asyncio.TimeoutError:
                         pass
-                    return {"ok": False, "error": f"script timeout after {timeout_val}s"}
+                    return _error_tool_response(f"script timeout after {timeout_val}s")
         except asyncio.TimeoutError:
             try:
                 _kill_process_group(proc)  # type: ignore[union-attr]
             except Exception:
                 pass
-            return {"ok": False, "error": f"script timeout after {timeout_val}s"}
+            return _error_tool_response(f"script timeout after {timeout_val}s")
         except Exception as e:
-            return {"ok": False, "error": f"script execution failed: {e}"}
+            return _error_tool_response(f"script execution failed: {e}")
 
         stdout_text = stdout_bytes.decode("utf-8", errors="replace").strip()
         stderr_text = stderr_bytes.decode("utf-8", errors="replace").strip()
 
         if proc.returncode != 0:
-            return {
-                "ok": False,
-                "error": f"script exited with code {proc.returncode}",
-                "stderr": stderr_text[:2000] if stderr_text else "",
-                "stdout": stdout_text[:2000] if stdout_text else "",
-            }
+            # [AutoC 2026-05-31] Why: migrated external tools may intentionally
+            # exit non-zero after printing a structured ok=false JSON payload.
+            # How: parse stdout first and preserve the tool-owned error fields,
+            # adding data.result only when the payload does not already have it.
+            # Purpose: keep failures readable without discarding specific messages.
+            try:
+                parsed = json.loads(stdout_text)
+                if isinstance(parsed, dict) and parsed.get("ok") is False:
+                    parsed_data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+                    if not isinstance(parsed_data.get("result"), str):
+                        parsed = dict(parsed)
+                        parsed_data = dict(parsed_data)
+                        parsed_data["result"] = f"ERROR: {parsed.get('error', f'script exited with code {proc.returncode}')}"
+                        parsed["data"] = parsed_data
+                    return parsed
+            except (json.JSONDecodeError, ValueError):
+                pass
+            return _error_tool_response(
+                f"script exited with code {proc.returncode}",
+                stderr=stderr_text[:2000] if stderr_text else "",
+                stdout=stdout_text[:2000] if stdout_text else "",
+            )
 
         if len(stdout_text) > max_output:
             stdout_text = stdout_text[:max_output]
@@ -168,10 +264,17 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
         try:
             result = json.loads(stdout_text)
             if isinstance(result, dict):
-                return result
-            return {"ok": True, "result": result}
+                return _ensure_tool_response_shape(result)
+            # [AutoC 2026-05-31] Why: script tools can print JSON scalars, but the
+            # engine now expects ok/data/error. How: keep the scalar under value and
+            # expose its string form as data.result. Purpose: make every successful
+            # external script output readable through the same contract.
+            return {"ok": True, "data": {"result": str(result), "value": result}}
         except json.JSONDecodeError:
-            return {"ok": True, "output": stdout_text}
+            # [AutoC 2026-05-31] Why: legacy scripts may still print plain text.
+            # How: wrap stdout as both data.result and data.output. Purpose: keep
+            # plain-text scripts usable while conforming to the unified schema.
+            return {"ok": True, "data": {"result": stdout_text, "output": stdout_text}}
 
     return _run
 
@@ -572,10 +675,10 @@ class ToolRegistry:
 
     async def execute(self, *, name: str, arguments: dict[str, Any], ctx: Any) -> dict[str, Any]:
         if name not in self._tool_funcs:
-            return {"ok": False, "error": f"tool not found: {name}"}
+            return _error_tool_response(f"tool not found: {name}")
 
         func = self._tool_funcs[name]
-        return await func(arguments, ctx)
+        return _ensure_tool_response_shape(await func(arguments, ctx))
 
     async def load_mcp_tools(self) -> int:
         """Scan enabled MCP clients and register their tools as first-class tools."""
@@ -594,7 +697,12 @@ class ToolRegistry:
 
             try:
                 result = await mcp_runtime.list_tools(self.workspace_root, cid)
-                tools = result.get("tools") if isinstance(result, dict) else []
+                # [AutoC 2026-05-31] Why: MCP list_tools may be migrated to the
+                # unified data wrapper while older code returns top-level tools.
+                # How: read data.tools first, then fall back to result.tools.
+                # Purpose: keep dynamic MCP registration working across schemas.
+                result_data = result.get("data") if isinstance(result, dict) and isinstance(result.get("data"), dict) else {}
+                tools = result_data.get("tools") if isinstance(result_data.get("tools"), list) else (result.get("tools") if isinstance(result, dict) else [])
                 if not isinstance(tools, list):
                     continue
             except Exception:
@@ -633,5 +741,5 @@ def _make_mcp_tool(workspace_root: Path, client_id: str, tool_name: str) -> Tool
         try:
             return await mcp_runtime.call_tool(workspace_root, client_id, tool_name, args)
         except Exception as e:
-            return {"ok": False, "error": str(e), "mcp_client": client_id, "mcp_tool": tool_name}
+            return _error_tool_response(str(e), mcp_client=client_id, mcp_tool=tool_name)
     return _call

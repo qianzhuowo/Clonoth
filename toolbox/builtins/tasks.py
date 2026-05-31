@@ -6,6 +6,21 @@ from typing import Any
 from ..context import ToolContext
 
 
+def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: task-management tools return supervisor payloads
+    # whose shape can vary. How: wrap them under data with a stable result string.
+    # Purpose: keep task tools in the same ok/data/error contract.
+    return {"ok": True, "data": {"result": result_text, **fields}}
+
+
+def _err(message: Any) -> dict[str, Any]:
+    # [AutoC 2026-05-31] Why: supervisor HTTP errors should expose data.result for
+    # readable history. How: normalize the error string once. Purpose: avoid legacy
+    # ok=false payloads from task tools.
+    text = str(message)
+    return {"ok": False, "error": text, "data": {"result": f"ERROR: {text}"}}
+
+
 async def cancel_active_tasks(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Cancel all active downstream tasks in the current session."""
     try:
@@ -27,15 +42,20 @@ async def cancel_active_tasks(args: dict[str, Any], ctx: ToolContext) -> dict[st
             params=params,
         )
         if r.status_code >= 400:
-            return {"ok": False, "error": r.text}
-        return r.json()
+            return _err(r.text)
+        payload = r.json()
+        return _ok("Active tasks cancelled", response=payload)
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return _err(e)
 
 
 async def list_active_tasks(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """List active tasks in the current session."""
-    return {"ok": True, "note": "活跃任务信息已在系统上下文中注入，无需额外查询。"}
+    note = "活跃任务信息已在系统上下文中注入，无需额外查询。"
+    # [AutoC 2026-05-31] Why: list_active_tasks is a lightweight informational
+    # tool but must still provide data.result. How: return the note as both result
+    # and structured note. Purpose: keep the response schema uniform.
+    return _ok(note, note=note)
 
 
 async def get_context_window(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
@@ -50,7 +70,10 @@ async def get_context_window(args: dict[str, Any], ctx: ToolContext) -> dict[str
             f"{ctx.supervisor_url}/v1/sessions/{route_session_id}/context_window",
         )
         if r.status_code >= 400:
-            return {"ok": False, "error": r.text}
-        return r.json()
+            return _err(r.text)
+        payload = r.json()
+        if isinstance(payload, dict):
+            return _ok("Context window retrieved", **payload)
+        return _ok("Context window retrieved", value=payload)
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        return _err(e)

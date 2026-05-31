@@ -170,6 +170,11 @@ class DreamHandler:
 
         session_ids = self._recent_active_session_ids(workspace_root)
         topology_json = self._build_keyword_topology_json(workspace_root)
+        # [AutoC 2026-05-31] Why: Dream extractor prompts need the same dynamic
+        # book guidance as automatic extraction. How: compute the book list once
+        # per Dream run from data/memory/*.yaml and pass it to each instruction
+        # builder. Purpose: avoid stale hard-coded book categories.
+        book_list = self._build_book_list(workspace_root)
         extractor_task_ids: list[str] = []
         extractor_node = "system.memory_extractor"
         generation_cb = ctx.get("current_session_generation")
@@ -183,7 +188,7 @@ class DreamHandler:
             except Exception:
                 session_generation = 1
             child_sid = f"child_{uuid.uuid4().hex[:12]}"
-            instruction = self._build_extractor_instruction(transcript)
+            instruction = self._build_extractor_instruction(transcript, book_list=book_list)
             try:
                 # [AutoC 2026-05-31] Why: Dream preprocessing must reuse the
                 # existing memory_extractor node without changing its system
@@ -281,6 +286,11 @@ class DreamHandler:
         # [AutoC 2026-05-31] Load hit_cache and skill list for Prune/Promote phases
         hit_cache_json = self._load_hit_cache_json(workspace_root)
         skill_list = self._load_skill_list(workspace_root)
+        # [AutoC 2026-05-31] Why: the final organizer also needs to know the
+        # current book landscape. How: rebuild the list at final task creation
+        # time so files created during preprocessing are visible. Purpose: guide
+        # save/delete decisions with live book names.
+        book_list = self._build_book_list(workspace_root)
         instruction = self._build_dream_instruction(
             run_id=str(uuid.uuid4()),
             now=now,
@@ -288,6 +298,7 @@ class DreamHandler:
             topology_json=str(pending.get("topology_json") or "{}"),
             hit_cache_json=hit_cache_json,
             skill_list=skill_list,
+            book_list=book_list,
         )
         if self._create_final_dream_task(
             ctx=ctx,
@@ -512,9 +523,19 @@ class DreamHandler:
             recent_reversed.append(item)
         return list(reversed(recent_reversed))
 
-    def _build_extractor_instruction(self, transcript: str) -> str:
+    def _build_extractor_instruction(self, transcript: str, book_list: str = "") -> str:
         """Build the one-shot instruction that turns memory_extractor into a signal emitter."""
+        # [AutoC 2026-05-31] Why: preprocessing emits candidate memory records
+        # with book names but must not rely on static categories. How: include the
+        # dynamic book list before the transcript. Purpose: make later Dream
+        # organization prefer existing books without blocking new ones.
         return f"""本次调用来自 Dream 预处理流水线。
+以下是当前 memory book 列表：
+<book_list>
+{book_list}
+</book_list>
+保存时优先使用已有 book，也可以创建新 book。
+
 禁止调用 save_memory、delete_memory、list_memories。
 只分析下方 transcript。
 最终必须调用 finish，finish 的 text 必须是纯 JSON 数组：
@@ -523,6 +544,18 @@ class DreamHandler:
 
 --- 以下是对话记录 ---
 {transcript}"""
+
+    def _build_book_list(self, workspace_root: Path) -> str:
+        """Return current memory book names from data/memory YAML files."""
+        # [AutoC 2026-05-31] Why: memory books are deployment data and can change
+        # without code changes. How: scan data/memory/*.yaml and return sorted
+        # stems, with an explicit empty-state marker. Purpose: centralize dynamic
+        # book-list formatting for Dream instructions.
+        mem_dir = workspace_root / "data" / "memory"
+        if not mem_dir.exists():
+            return "(no books found)"
+        books = sorted(p.stem for p in mem_dir.glob("*.yaml"))
+        return ", ".join(books) if books else "(no books found)"
 
     def _build_keyword_topology_json(self, workspace_root: Path) -> str:
         """Build Jaccard keyword clusters from existing memory books."""
@@ -728,6 +761,7 @@ class DreamHandler:
         topology_json: str,
         hit_cache_json: str = "{}",
         skill_list: str = "",
+        book_list: str = "",
     ) -> str:
         """Assemble the final Dream task instruction from preprocessed data."""
         signals_json = json.dumps(signals, ensure_ascii=False, indent=2)
@@ -755,6 +789,11 @@ time: {now.strftime('%Y-%m-%d %H:%M UTC')}
 {skill_list}
 </skill_list>
 
+以下是当前 memory book 列表：
+<book_list>
+{book_list}
+</book_list>
+
 约束：
 1. 不要调用 list_memories 全量扫描。
 2. 不要读取对话文件（tail/cat/read_file）。
@@ -765,4 +804,5 @@ time: {now.strftime('%Y-%m-%d %H:%M UTC')}
 7. 提升（Promote）：对 source=auto、created_at 超过 7 天、hit_cache 中最近 7 天内仍被命中、content 长度 > 200 字的条目，检查 skill_list 是否已有同主题 skill，如有则合并，如无则用 create_or_update_skill 提升为 skill，之后 delete_memory 删除原条目。单次最多提升 3 条。
 8. 单轮最多操作 20 条（含 save/delete/create_or_update_skill）。
 9. constant=true 的记忆和 source 不是 auto 的手工记忆，保持保护不删。
-10. 完成后用 finish 报告操作摘要。"""
+10. 完成后用 finish 报告操作摘要。
+11. Book 整理：检查 <book_list> 中条目数 ≤ 5 的碎片 book，将其条目用 save_memory 迁移到语义最近的大 book，然后 delete_memory 删除原条目。"""

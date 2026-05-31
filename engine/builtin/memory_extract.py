@@ -389,6 +389,22 @@ class MemoryExtractHandler:
             create_task = ctx.get("create_task")
             if not callable(create_task):
                 return
+            # [AutoC 2026-05-31] Why: the extractor prompt no longer embeds a
+            # static book taxonomy, so the task input must carry the current
+            # memory books. How: resolve workspace_root from hook context first
+            # and fall back to pending payloads, then prefix the transcript with
+            # the sorted data/memory/*.yaml stems. Purpose: prefer existing books
+            # while still allowing the extractor to create a new semantic book.
+            workspace_value = ctx.get("workspace_root") or pending_extract.get("workspace_root")
+            workspace_root = Path(workspace_value) if workspace_value is not None else None
+            mem_dir = workspace_root / "data" / "memory" if workspace_root is not None else None
+            book_names = sorted(
+                p.stem for p in mem_dir.glob("*.yaml")
+            ) if mem_dir is not None and mem_dir.exists() else []
+            book_list_header = ""
+            if book_names:
+                book_list_header = f"当前已有的 memory book 列表：{', '.join(book_names)}\n保存时优先使用已有 book，也可以创建新 book。\n\n"
+
             # [2026-04-26] child_session_id isolation prevents the system task's
             # instruction from being written into the main session JSONL history.
             child_sid = f"child_{uuid.uuid4().hex[:12]}"
@@ -398,7 +414,7 @@ class MemoryExtractHandler:
                 kind=pending_extract.get("kind") or "node",
                 node_id=extractor_node,
                 input_data={
-                    "instruction": transcript,
+                    "instruction": book_list_header + transcript,
                     "child_session_id": child_sid,
                     "_system_task": True,
                 },

@@ -45,9 +45,8 @@ prompt: |
     not the norm.
   - Use the save_memory tool to persist each memory entry.
   - "id" must be unique, descriptive, snake_case, max 128 chars.
-  - "book" groups related memories: "people" for character profiles,
-    "rules" for behavioral corrections, "changelog" for technical changes,
-    "default" for everything else.
+  - "book" groups related memories. Refer to the book list provided in the instruction below.
+    You may use an existing book or create a new one if none fits.
   - "keywords" are activation triggers — when any keyword appears in future
     user messages, this memory gets injected into context. Be generous with
     keywords: include names, terms, aliases, and /regex/i patterns.

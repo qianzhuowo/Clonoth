@@ -150,7 +150,7 @@ def main() -> None:
         from datetime import datetime, timedelta, timezone
         from .types import ApprovalStatus
         _REAP_INTERVAL = 60.0
-        _GRACE = timedelta(seconds=180)
+        _GRACE = timedelta(seconds=60)
         while True:
             time.sleep(_REAP_INTERVAL)
             try:
@@ -166,7 +166,11 @@ def main() -> None:
                         if task.status != TaskStatus.running:
                             continue
                         if not task.lease_expires_at:
-                            continue
+                            # [AutoC 2026-05-31] 兜底：running 且无 lease 超过 5 分钟视为僵尸
+                            if task.updated_at + timedelta(minutes=5) < now:
+                                pass  # fall through to reap
+                            else:
+                                continue
                         if task.lease_expires_at + _GRACE < now:
                             # [Fork/Merge 2026-05-17] Why: approvals and user-visible
                             # events may now be attached to the parent route session

@@ -346,7 +346,7 @@ class SchedulerThread:
 
                 # 回收超时的 running 状态 task（安全网，防止 worker 崩溃后 task 永久孤立）
                 _now_ts = datetime.now(timezone.utc)
-                _stale_cutoff = _now_ts - timedelta(minutes=60)
+                _stale_cutoff = _now_ts - timedelta(minutes=10)
                 _stale_ids = [
                     tid for tid, t in self._state.tasks.items()
                     if t.status == TaskStatus.running

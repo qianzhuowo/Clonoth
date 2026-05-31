@@ -14,6 +14,7 @@ from .pseudo_tools import (
     _dispatch_delegate_specs,
     _is_pseudo_tool_name,
     _finish_spec,
+    _ask_spec,
     _reply_spec,
     _compact_context_spec,
     _preempt_task_spec,
@@ -38,6 +39,7 @@ from ..protocol import (
     TaskAction,
     ACTION_DISPATCH,
     ACTION_FINISH,
+    ACTION_ASK,
     ACTION_FAIL,
     ACTION_CANCELLED,
     ACTION_PREEMPTED,
@@ -606,13 +608,17 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     #         _shadow_write(ls, _err, message_type="tool_result")
     #     return None  # 不执行任何工具，回到主循环让 AI 重试
 
-    # 处理伪工具（finish 延后到真实工具之后，确保同轮真实工具不被跳过）
-    _finish_call = None
+    # 处理伪工具（finish/ask 延后到真实工具之后，确保同轮真实工具不被跳过）
+    # [AutoC 2026-05-31] Why: ask terminates the task just like finish in Phase 0,
+    # so it must share finish's delayed execution and preempt-intercept path. How:
+    # store either terminal call in one slot and execute it after real tools.
+    # Purpose: preserve existing finish semantics while introducing action="ask".
+    _terminal_call = None
     if pseudo_calls:
         for _pc in pseudo_calls:
-            if _pc.name == "finish":
-                _finish_call = _pc
-                continue  # finish 延后执行
+            if _pc.name in ("finish", "ask"):
+                _terminal_call = _pc
+                continue  # finish/ask 延后执行
             action = await _handle_pseudo_tool(ls, _pc, step)
             if action is not None:
                 # 其他终止型伪工具（如 switch_node）仍然立刻退出。
@@ -633,18 +639,18 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
                 context_ref=ctx_ref, summary="任务被软打断，上下文已保存。",
             )
 
-    # finish 最后执行（同轮真实工具已完成）
-    if _finish_call:
+    # finish/ask 最后执行（同轮真实工具已完成）
+    if _terminal_call:
         # ---------------------------------------------------------------
-        # Preempt V3 需求2: finish 拦截
-        # 在执行 finish 之前再次检查 preempt 状态。如果有待注入的 preempt
-        # 消息（用户在 LLM 推理/工具执行期间发了新消息），拦截 finish：
-        # 不产生 TaskAction(FINISH)，改为塞一个假 tool_result 维持 native
+        # Preempt V3 需求2: finish/ask 拦截
+        # 在执行 finish/ask 之前再次检查 preempt 状态。如果有待注入的 preempt
+        # 消息（用户在 LLM 推理/工具执行期间发了新消息），拦截 finish/ask：
+        # 不产生 TaskAction(FINISH/ASK)，改为塞一个假 tool_result 维持 native
         # 模式下 tool_use/tool_result 的配对完整性（Claude API 强校验），
         # 然后让主循环继续，下一轮由 PreemptChecker 注入新用户消息。
         #
-        # 同时补全 V2 遗漏：preempt_after_step（无消息 preempt）在只有 finish
-        # 没有真工具的场景下也需要被检查，此前会跳过导致 finish 照常执行。
+        # 同时补全 V2 遗漏：preempt_after_step（无消息 preempt）在只有 finish/ask
+        # 没有真工具的场景下也需要被检查，此前会跳过导致终止工具照常执行。
         # ---------------------------------------------------------------
         if ls.preempt_inject_info is None and not ls.preempt_after_step:
             _pi_finish = await ls.rctx.check_preempted()
@@ -655,12 +661,13 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
                     ls.preempt_after_step = True
 
         if ls.preempt_inject_info is not None:
-            # 有消息的 preempt：拦截 finish，塞假 tool_result，任务继续
+            # 有消息的 preempt：拦截 finish/ask，塞假 tool_result，任务继续
             from .tool_format import ParsedToolCall as _FinishPTC
+            _terminal_name = str(getattr(_terminal_call, "name", "") or "finish").strip() or "finish"
             _finish_parsed = _FinishPTC(
-                id=getattr(_finish_call, "id", "") or "",
-                name="finish",
-                arguments=dict(_finish_call.arguments or {}),
+                id=getattr(_terminal_call, "id", "") or "",
+                name=_terminal_name,
+                arguments=dict(_terminal_call.arguments or {}),
             )
             _intercept_msg = ls.formatter.format_tool_result(
                 _finish_parsed,
@@ -668,24 +675,26 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
             )
             # [2026-05-01] 写入当前 tool_mode，避免真 native 的拦截结果被当作旧 fake-native。
             # [2026-05-07] preempt 拦截 ACK 只服务当前运行期配对。
-            # 原因：该 finish 未交付，不能让 fake-native/json 的文本结果在恢复后压制未来正常 finish。
+            # 原因：该终止工具未交付，不能让 fake-native/json 的文本结果在恢复后压制未来正常 finish/ask。
             # 做法：补齐 ephemeral、tool_call_id 和 name，让清洗函数按调用 ID 精确移除。
-            # 目的：任务继续时不会向下一轮 provider 回放被拦截的 finish。
+            # 目的：任务继续时不会向下一轮 provider 回放被拦截的终止工具。
             _intercept_msg["_ephemeral"] = True
             if _finish_parsed.id:
                 _intercept_msg.setdefault("tool_call_id", _finish_parsed.id)
-            _intercept_msg.setdefault("name", "finish")
+            _intercept_msg.setdefault("name", _terminal_name)
             set_message_meta(_intercept_msg, MessageMeta(
                 tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
                 message_type="tool_result",
-                control_tool_name="finish",
+                control_tool_name=_terminal_name,
                 control_tool_status="preempt_intercepted",
             ))
             ls.messages.append(_intercept_msg)
             # [2026-05-07] 被新用户输入拦截的 finish 未交付，不能写入长期历史。
-            # 原因：该 finish 没有产生最终交付，持久化会把未完成控制流带入下一轮。
-            # 做法：只保留运行期消息，且不调用 _shadow_write。
-            # 目的：下一轮提示由真实用户新输入驱动，而不是回放被拦截的 finish。
+            # [AutoC 2026-05-31] Why: ask has the same terminal semantics, so an
+            # intercepted ask is also not a delivered clarification request. How:
+            # keep the result only in runtime memory and do not call _shadow_write.
+            # Purpose: next prompt is driven by real user input, not by replaying an
+            # intercepted terminal tool.
             await ls.rctx.emit_event("preempt_finish_intercepted", {
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
@@ -695,13 +704,14 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         elif ls.preempt_after_step:
             # 无消息的 preempt：与真工具后的 preempt_after_step 路径对齐，
             # 保存上下文后退出任务
-            # [2026-05-01] 补写 finish 的 tool_result，确保 native 模式下
+            # [2026-05-01] 补写 finish/ask 的 tool_result，确保 native 模式下
             # functionCall/functionResponse 严格 1:1 配对（Gemini 强校验）
             from .tool_format import ParsedToolCall as _FinishPTC2
+            _terminal_name2 = str(getattr(_terminal_call, "name", "") or "finish").strip() or "finish"
             _finish_parsed2 = _FinishPTC2(
-                id=getattr(_finish_call, "id", "") or "",
-                name="finish",
-                arguments=dict(_finish_call.arguments or {}),
+                id=getattr(_terminal_call, "id", "") or "",
+                name=_terminal_name2,
+                arguments=dict(_terminal_call.arguments or {}),
             )
             _preempt_result = ls.formatter.format_tool_result(
                 _finish_parsed2, "preempted",
@@ -713,15 +723,15 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
             _preempt_result["_ephemeral"] = True
             if _finish_parsed2.id:
                 _preempt_result.setdefault("tool_call_id", _finish_parsed2.id)
-            _preempt_result.setdefault("name", "finish")
+            _preempt_result.setdefault("name", _terminal_name2)
             set_message_meta(_preempt_result, MessageMeta(
                 tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
                 message_type="tool_result",
-                control_tool_name="finish",
+                control_tool_name=_terminal_name2,
                 control_tool_status="preempted",
             ))
             ls.messages.append(_preempt_result)
-            # [2026-05-07] 无消息 preempt 也不能持久化未交付的 finish 结果。
+            # [2026-05-07] 无消息 preempt 也不能持久化未交付的 finish/ask 结果。
             # 原因：任务会带上下文退出，恢复后不应看到已经终止的工具轮。
             # 做法：只把结果留在运行期消息中，并依赖 ephemeral 过滤快照。
             # 目的：恢复后的历史保持待继续执行的状态。
@@ -731,7 +741,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
                 context_ref=ctx_ref, summary="任务被软打断，上下文已保存。",
             )
         else:
-            action = await _handle_pseudo_tool(ls, _finish_call, step)
+            action = await _handle_pseudo_tool(ls, _terminal_call, step)
             if action is not None:
                 return action
 
@@ -1262,21 +1272,21 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
 # ---------------------------------------------------------------------------
 
 async def _fire_task_end_hook_if_finish(ls: _LoopState, action: TaskAction, step_count: int) -> TaskAction:
-    """Fire on_task_end for successful finish actions and keep the action updated.
+    """Fire on_task_end for successful finish/ask actions and keep the action updated.
 
-    Why: most normal AI-node exits are produced inside finish or hybrid plaintext
-    branches before run_ai_node reaches its outer max_steps fallback. How: route
-    only ACTION_FINISH through the registered on_task_end handlers and copy the
-    snapshot context_ref back when the handler reports that persistence ran.
-    Purpose: connect ContextSnapshotSaver to the safe normal-end path without
-    changing dispatch, fail, cancel, or preempt terminal semantics yet.
+    Why: most normal AI-node exits are produced inside finish, ask, or hybrid
+    plaintext branches before run_ai_node reaches its outer max_steps fallback.
+    How: route ACTION_FINISH and ACTION_ASK through the registered on_task_end
+    handlers and copy the snapshot context_ref back when the handler reports that
+    persistence ran. Purpose: connect ContextSnapshotSaver to safe normal-end
+    paths without changing dispatch, fail, cancel, or preempt terminal semantics.
     """
-    if action.action != ACTION_FINISH:
+    if action.action not in (ACTION_FINISH, ACTION_ASK):
         return action
 
     # Phase 3 Hook System：普通完成路径也触发 on_task_end。
-    # 原因：finish 可能从多个内部 helper 提前返回，外层没有统一的“成功结束”落点。
-    # 做法：只在 ACTION_FINISH 返回前构造 HookContext，并传入 loop_state 与正确步数。
+    # 原因：finish/ask 可能从多个内部 helper 提前返回，外层没有统一的“成功结束”落点。
+    # 做法：只在 ACTION_FINISH/ACTION_ASK 返回前构造 HookContext，并传入 loop_state 与正确步数。
     # 目的：先覆盖低风险成功路径，后续再逐步迁移 fail/preempt/dispatch 的快照保存。
     _end_ctx = HookContext(
         messages=ls.messages,
@@ -1455,6 +1465,11 @@ async def run_ai_node(
         openai_tools.append(_switch_node_spec(_sw_targets, switch_info, current_node_id=node.id, current_node_name=node.name))
 
     openai_tools.append(_finish_spec())
+    # [AutoC 2026-05-31] Why: ask must be injected through the same provider tool
+    # list path as finish, including native/json formatter adaptation. How: append
+    # the ask schema immediately beside finish. Purpose: every node sees both
+    # terminal exits before workflow topology routing is implemented.
+    openai_tools.append(_ask_spec())
     openai_tools.append(_reply_spec())
     openai_tools.append(_compact_context_spec())
     openai_tools.append(_preempt_task_spec())

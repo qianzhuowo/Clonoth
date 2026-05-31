@@ -180,6 +180,41 @@ def test_startup_reconcile_replaces_eventlog_replay_for_transient_session_cleanu
     assert not (tmp_path / "data" / "transcripts" / f"{branch_sid}.jsonl").exists()
 
 
+def test_route_completed_ask_outputs_to_user_and_marks_action_type(tmp_path: Path) -> None:
+    """Phase 0 ask should route like finish while preserving action_type metadata."""
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="test", conversation_key="test:ask-route")
+
+    with state._lock:
+        task = state._create_task_locked(
+            session_id=session_id,
+            session_generation=1,
+            kind=TaskKind.node,
+            node_id="ask.node",
+            input_data={},
+            continuation={},
+            source_inbound_seq=None,
+        )
+        task.status = TaskStatus.completed
+        task.result = {"action": "ask", "result": {"summary": "need input", "text": "Which branch?"}}
+
+        state._route_completed_task_locked(task)
+
+    # [AutoC 2026-05-31] Why: Phase 0 has no topology router, so ask must not
+    # error and should use the same user-visible path as finish. How: inspect the
+    # outbound event payload. Purpose: keep future Phase 1 routing able to
+    # distinguish ask through action_type while preserving current behavior.
+    events_path = tmp_path / "data" / "events.jsonl"
+    outbound_events = [
+        json.loads(line)
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and json.loads(line).get("type") == "outbound_message"
+    ]
+    assert outbound_events[-1]["payload"]["text"] == "Which branch?"
+    assert outbound_events[-1]["payload"]["action_type"] == "ask"
+
+
+
 def test_route_completed_batch_task_cleans_fresh_child_session_from_finally(tmp_path: Path) -> None:
     """A terminal batch task should clean its non-accumulate child session after routing."""
     state = _make_state(tmp_path)

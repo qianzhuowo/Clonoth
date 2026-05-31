@@ -11,7 +11,7 @@ from typing import Any
 
 from .resume_builder import _select_attachments
 from ..compact import _format_messages_for_summary
-from ..protocol import TaskAction, ACTION_DISPATCH, ACTION_FINISH
+from ..protocol import TaskAction, ACTION_ASK, ACTION_DISPATCH, ACTION_FINISH
 from .loop_state import _LoopState, _persist_ctx, _short
 # 【Fix 3】reply 工具结果统一走 formatter.format_tool_result，需要 ParsedToolCall 构造、
 # MessageMeta 标注 message_type、MessageType 影子写入。延迟导入 _shadow_write 避免循环依赖。
@@ -129,46 +129,57 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     if _fixed_dispatch_target:
         return await _handle_pseudo_dispatch(ls, {**args, "target": _fixed_dispatch_target}, pseudo_call)
 
-    # ---- 终止型伪工具：finish / switch_node ----
+    # ---- 终止型伪工具：finish / ask / switch_node ----
 
-    if pseudo_call.name == "finish":
+    if pseudo_call.name in ("finish", "ask"):
         # [2026-05-07] 正常 finish 重新按真实 API 工具处理。
         # 原因：provider 原生工具协议要求 assistant.tool_call 后面保留普通 tool_result，
         # 若把 finish 改写成普通 assistant 文本，会破坏下一轮历史配对。
         # 做法：与 reply、真实业务工具一样写入 content="ok" 的 tool_result，并允许影子持久化。
         # 目的：ConversationStore、snapshot、provider replay 都能看到完整 finish 工具轮。
+        # [AutoC 2026-05-31] Why: ask is Phase 0's sibling terminal tool and must
+        # preserve the same provider pairing and persistence behavior. How: handle
+        # finish and ask in one branch but choose ACTION_ASK for ask. Purpose: keep
+        # later topology routing able to distinguish clarification requests.
+        terminal_name = str(pseudo_call.name or "").strip()
         result_text = str(args.get("text") or "").strip()
         # [2026-05-29] 空串 finish 硬拒绝：模型把交付内容写在 free prose 里用户永远看不到。
-        # 强制要求 text 非空，返回错误提示让模型重试。
+        # [AutoC 2026-05-31] Why: empty ask would similarly terminate without a
+        # visible question. How: reuse the non-empty text guard and tailor the
+        # rejection to the actual terminal tool name. Purpose: prevent silent
+        # terminal actions with no user/caller-visible payload.
         if not result_text:
             _emit_pseudo_tool_result(
                 ls, pseudo_call,
-                '❌ REJECTED: finish() called with empty text. Your deliverable content MUST go '
-                'in the finish tool\'s `text` parameter, NOT in free prose outside tool calls. '
-                'Free prose is never delivered to the user. Put your actual answer/report/data '
-                'in text and call finish again.',
+                f'❌ REJECTED: {terminal_name}() called with empty text. Your visible content MUST go '
+                f'in the {terminal_name} tool\'s `text` parameter, NOT in free prose outside tool calls. '
+                'Free prose is never delivered to the user. Put your actual answer/question/data '
+                f'in text and call {terminal_name} again.',
             )
             return None
         _emit_pseudo_tool_result(ls, pseudo_call, "ok")
 
         ctx_ref = _persist_ctx(ls, step + 1)
         summary_text = str(args.get("summary") or "").strip()
-        _selected_paths = args.get("attachment_paths")
-        if isinstance(_selected_paths, list) and _selected_paths:
-            final_atts = _select_attachments(
-                ls.collected_attachments, _selected_paths,
-                workspace_root=ls.rctx.workspace_root,
-                session_id=ls.rctx.session_id,
-            )
-        else:
-            final_atts = []
+        final_atts = []
+        if terminal_name == "finish":
+            _selected_paths = args.get("attachment_paths")
+            if isinstance(_selected_paths, list) and _selected_paths:
+                final_atts = _select_attachments(
+                    ls.collected_attachments, _selected_paths,
+                    workspace_root=ls.rctx.workspace_root,
+                    session_id=ls.rctx.session_id,
+                )
+        result_payload = {
+            "summary": summary_text,
+            "text": result_text,
+        }
+        if terminal_name == "finish":
+            result_payload["attachments"] = final_atts
         return TaskAction(
-            action=ACTION_FINISH, node_id=ls.node.id,
-            result={
-                "summary": summary_text,
-                "text": result_text,
-                "attachments": final_atts,
-            },
+            action=ACTION_ASK if terminal_name == "ask" else ACTION_FINISH,
+            node_id=ls.node.id,
+            result=result_payload,
             context_ref=ctx_ref,
             summary=_short(summary_text or result_text, 240),
         )

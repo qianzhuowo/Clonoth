@@ -673,6 +673,7 @@ class SessionMixin:
         attachments: list[dict[str, Any]] | None = None,
         source_inbound_seq: int | None = None,
         node_id: str | None = None,
+        action_type: str | None = None,
     ) -> dict[str, Any]:
         text_clean = str(text or "").strip()
         # [Fix] 当 source_inbound_seq 存在时，允许空文本通过。
@@ -712,6 +713,13 @@ class SessionMixin:
                 payload["source_inbound_seq"] = src_seq
             if node_id:
                 payload["node_id"] = node_id
+            if action_type:
+                # [AutoC 2026-05-31] Why: Phase 0 routes ask through the same
+                # outbound path as finish, but Phase 1 needs to distinguish the
+                # originating terminal action. How: optionally persist action_type
+                # on outbound payloads. Purpose: add metadata without changing
+                # existing callers that do not pass it.
+                payload["action_type"] = str(action_type).strip()
 
             evt = self.eventlog.append(
                 session_id=session_id,

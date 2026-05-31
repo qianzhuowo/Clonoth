@@ -14,7 +14,12 @@ if TYPE_CHECKING:
 #  v3 伪工具名称
 # ---------------------------------------------------------------------------
 
-_PSEUDO_TOOL_NAMES = frozenset({"finish", "reply", "switch_node", "compact_context", "preempt_task"})
+# [AutoC 2026-05-31] Why: ask is introduced as a terminal pseudo tool so
+# nodes can explicitly request upstream clarification before workflow topology
+# routing exists. How: include ask in the static pseudo-tool set next to finish.
+# Purpose: route ask through pseudo_handlers instead of rejecting it as an
+# unauthorized real tool.
+_PSEUDO_TOOL_NAMES = frozenset({"finish", "ask", "reply", "switch_node", "compact_context", "preempt_task"})
 
 # [2026-05-04] Dynamic delegate dispatch tools use a stable prefix plus target id.
 # Why: the removed aggregate dispatch tools hid delegate choices behind one
@@ -74,7 +79,11 @@ def _dispatch_target_from_tool_name(tool_name: str) -> str:
 # 原因：finish 只表示“结束当前任务并提交结果”，不是可长期回放的业务工具。
 # 做法：把控制流工具名集中声明，供运行期、存储层和 L2 历史构造层共用。
 # 目的：普通工具仍保留 provider 所需配对，finish 不再污染长期历史。
-CONTROL_TOOL_NAMES = frozenset({"finish"})
+# [AutoC 2026-05-31] Why: ask has the same terminal control-flow shape as
+# finish in Phase 0. How: classify both names as control tools for shared history
+# repair and future routing helpers. Purpose: keep control-flow bookkeeping
+# consistent when ask appears in stored tool turns.
+CONTROL_TOOL_NAMES = frozenset({"finish", "ask"})
 
 
 def _is_control_tool_name(name: str) -> bool:
@@ -219,6 +228,52 @@ def _finish_spec() -> dict:
             },
         },
     }
+
+
+def _ask_spec() -> dict:
+    """Build the ask pseudo-tool spec.
+
+    [AutoC 2026-05-31] Why: Phase 0 needs an explicit ask exit even though the
+    supervisor still routes it like finish. How: expose a finish-shaped terminal
+    tool without attachments and with clarification-oriented text. Purpose: let
+    nodes signal “need more input” now, while preserving action="ask" for Phase 1
+    topology routing.
+    """
+    return {
+        "type": "function",
+        "function": {
+            "name": "ask",
+            "description": (
+                "Ask the upstream (caller or user) for additional information or clarification. "
+                "This terminates the current task, similar to finish, but signals that you need "
+                "more input before you can complete your work.\n\n"
+                "Use cases:\n"
+                "- You need clarification on requirements before proceeding.\n"
+                "- You've hit a blocker and need the caller's decision.\n"
+                "- You want to confirm your approach before investing effort.\n\n"
+                "The upstream will see your question and can respond, which will create a new "
+                "task for you to continue working.\n\n"
+                "Parameters:\n"
+                "- text: Your specific question or request for information.\n"
+                "- summary: Brief summary (optional) for the upstream node."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "Your question or request for additional information.",
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Brief summary for the upstream node.",
+                    },
+                },
+                "required": ["text"],
+            },
+        },
+    }
+
 
 
 def _reply_spec() -> dict:

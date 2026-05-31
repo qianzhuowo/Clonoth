@@ -572,11 +572,18 @@ class TaskRouterMixin:
 
     def _route_finish_locked(self, task: Task, action: dict[str, Any]) -> None:
         result = action.get("result") if isinstance(action.get("result"), dict) else {}
+        action_type = str(action.get("action") or "finish").strip() or "finish"
         self._resume_caller_or_output_locked(task, {
             "type": "child_result",
             "child_node_id": str(task.node_id or task.tool_name or ""),
             "result": result,
-        }, result)
+            # [AutoC 2026-05-31] Why: Phase 0 routes ask like finish, but the
+            # downstream resume payload must retain the original terminal action
+            # for Phase 1 topology routing. How: add action_type metadata while
+            # leaving the result payload unchanged. Purpose: callers can tell ask
+            # from finish without a separate route implementation yet.
+            "action_type": action_type,
+        }, result, action_type=action_type)
 
 
     def _route_fail_locked(self, task: Task, action: dict[str, Any]) -> None:
@@ -585,7 +592,7 @@ class TaskRouterMixin:
             "type": "child_failed",
             "child_node_id": str(task.node_id or task.tool_name or ""),
             "error": error,
-        }, {"text": f"[错误] {error}"})
+        }, {"text": f"[错误] {error}"}, action_type="fail")
 
     # ------------------------------------------------------------------ #
     #  统一批量收集
@@ -672,7 +679,12 @@ class TaskRouterMixin:
     # ------------------------------------------------------------------ #
 
     def _resume_caller_or_output_locked(
-        self, task: Task, resume_data: dict[str, Any], fallback_result: dict[str, Any],
+        self,
+        task: Task,
+        resume_data: dict[str, Any],
+        fallback_result: dict[str, Any],
+        *,
+        action_type: str = "",
     ) -> None:
         """尝试恢复 caller 节点。如果没有 caller，把 fallback_result 输出给用户。"""
         # 优先尝试直接唤醒 suspended 的 caller
@@ -687,6 +699,13 @@ class TaskRouterMixin:
                 caller.updated_at = _now()
                 # 注入 resume_data 到 caller 的 input 中
                 caller.input["resume_data"] = resume_data
+                if action_type:
+                    # [AutoC 2026-05-31] Why: ask and finish currently resume the
+                    # caller through the same code path. How: copy action_type into
+                    # resume_data for callers and also into input for cheap
+                    # supervisor inspection. Purpose: preserve ask identity for
+                    # upcoming topology routing without changing the payload shape.
+                    caller.input["_last_child_action_type"] = str(action_type).strip()
                 caller.input["context_ref"] = str(caller.result.get("context_ref") or caller.input.get("context_ref") or "")
                 # 标记防重复恢复
                 if task.batch_id:
@@ -729,6 +748,7 @@ class TaskRouterMixin:
             session_id=self._route_session_id_for_task_locked(task), text=text,
             attachments=atts, source_inbound_seq=task.source_inbound_seq,
             node_id=task.node_id,
+            action_type=action_type,
         )
 
 

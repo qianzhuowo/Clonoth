@@ -1634,9 +1634,10 @@ async def run_ai_node(
         if not resp.tool_calls:
             _parsed = formatter.parse_tool_calls(resp)
             if _parsed:
+                _clean_text = formatter.get_plain_text(resp)
                 resp = ProviderResponse(
                     ok=True,
-                    text=formatter.get_plain_text(resp),
+                    text=_clean_text,
                     tool_calls=[
                         ToolCall(id=p.id, name=p.name, arguments=p.arguments)
                         for p in _parsed
@@ -1646,6 +1647,18 @@ async def run_ai_node(
                     status_code=resp.status_code,
                     usage=resp.usage,
                 )
+                # [stream-clean 2026-05-31] Why: JSON tool mode mixes protocol
+                # markers (<<<TOOL_CALL>>>) into stream_delta output. The markers
+                # are needed for parse_tool_calls but should not remain visible
+                # in the frontend. How: after parsing, emit the cleaned plain text
+                # so the frontend can replace dirty stream blocks. Purpose: the
+                # user sees only the final authoritative text, not raw protocol.
+                if _clean_text and _clean_text.strip() and ls.use_stream:
+                    await ls.rctx.emit_event("stream_text_final", {
+                        "node_id": ls.node.id,
+                        "task_id": ls.rctx.task_id,
+                        "text": _clean_text,
+                    })
 
         if resp.tool_calls:
             action = await _handle_tool_calls(ls, resp, step)

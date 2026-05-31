@@ -1145,6 +1145,14 @@ async def _execute_real_tools(
     if _tool_entries:
         for _entry in _tool_entries:
             _result_body = _entry["raw_inline"]
+            # [AutoC 2026-05-31] Why: MCP/tools 返回值无大小限制，几 MB 的 base64 或日志
+            # 全量塞进上下文导致 context_length_exceeded。
+            # How: 超过阈值时截断并附提示。
+            # Purpose: 防止单个 tool result 炸掉上下文。
+            _MAX_TOOL_RESULT_CHARS = 32000
+            if isinstance(_result_body, str) and len(_result_body) > _MAX_TOOL_RESULT_CHARS:
+                _original_len = len(_result_body)
+                _result_body = _result_body[:_MAX_TOOL_RESULT_CHARS] + f"\n\n...[truncated, showing {_MAX_TOOL_RESULT_CHARS:,} of {_original_len:,} chars. Use more specific parameters to get the full content.]"
             # [2026-04-17] 截断机制已移除，不再追加 truncated 提示
             # [2026-05-01] 真实工具结果统一走 formatter.format_tool_result。
             # 原因：真 native 需要 role=tool + tool_call_id，而旧代码在这里手写 user 文本，

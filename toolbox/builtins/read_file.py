@@ -194,6 +194,17 @@ async def _read_single_file(
     else:
         e = total_lines
 
+    # [AutoC 2026-05-31] Why: 不指定行范围时大文件（如 1700 行的 task_router.py）
+    # 全量返回 ~50KB，反复读取会快速耗尽上下文。
+    # How: 未指定范围且超过阈值时自动截断并提示。
+    # Purpose: 引导模型用 startLine/endLine 精确读取。
+    _MAX_LINES_NO_RANGE = 500
+    if not isinstance(start_line, int) and not isinstance(end_line, int) and total_lines > _MAX_LINES_NO_RANGE:
+        e = _MAX_LINES_NO_RANGE
+        _auto_truncated = True
+    else:
+        _auto_truncated = False
+
     sliced = lines[s:e]
     width = max(4, len(str(e)))
     numbered = "\n".join([f"{i + s + 1:>{width}} | {ln}" for i, ln in enumerate(sliced)])
@@ -206,6 +217,11 @@ async def _read_single_file(
         result["totalLines"] = total_lines
         result["startLine"] = s + 1
         result["endLine"] = e
+    if _auto_truncated:
+        result["truncated"] = True
+        result["totalLines"] = total_lines
+        result["shownLines"] = _MAX_LINES_NO_RANGE
+        result["hint"] = f"File has {total_lines} lines but only first {_MAX_LINES_NO_RANGE} are shown. Use startLine/endLine to read specific sections."
     return result, None
 
 

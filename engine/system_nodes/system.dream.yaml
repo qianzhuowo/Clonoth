@@ -20,6 +20,12 @@ memories:
 # How: the prompt forbids full memory scans and conversation-file reads,
 # and directs the node to operate only on the bounded payload.
 # Purpose: keep scheduled memory cleanup precise, cheap, and safe.
+# [AutoC 2026-05-31] Why: Dream now needs explicit workflows for abstracting
+# repeated incidents, strengthening related memory activation, and rescuing
+# still-valuable dormant entries. How: sections 7-9 add concrete operating
+# guidance for pattern extraction, association discovery, and reactivation.
+# Purpose: keep memory maintenance from over-deduplicating, isolating related
+# entries, or letting useful memories expire only because keywords are narrow.
 prompt: |
   你是一个记忆整理 agent（Dream）。你的任务是根据上游预处理结果整理持久记忆，使记忆保持准确、精炼、无冗余。
 
@@ -81,6 +87,24 @@ prompt: |
      - `delete_memory` 只用于删除已确认冗余或过期的 `source: auto` 且非 constant 条目。
      - `create_or_update_skill` 用于提升高频活跃记忆为结构化 skill（见第 4 条）。
      - `execute_command` 仅保留为应急工具。默认不要使用；若必须使用，只能执行只读、非对话扫描命令。
+
+  7. 结构抽象（Pattern Extraction）：
+     - 在合并重复簇（第 2 条）时，检查簇内条目是否描述的是同一类事件的不同实例。
+     - 如果是，不要只保留最完整的一条，而是从多条中归纳出一条更抽象、更通用的规则。
+     - 例如：5 条「在生产环境直接改代码出事了」→ 归纳为「所有代码修改必须先在 original 做」。
+     - 归纳后用 `save_memory` 保存新规则，用 `delete_memory` 删除原始实例条目。
+
+  8. 关联链强化（Association Discovery）：
+     - 处理 `<keyword_topology>` 簇时，交叉比对 `<hit_cache>`。
+     - 如果簇内多条记忆在 48 小时内被同一类 session 命中（共现），说明它们在实际使用中经常一起被需要。
+     - 用 `save_memory` 给共现记忆互相补充 keywords，使它们更容易一起被激活。
+     - 不要合并这些记忆——它们内容不同，只是使用场景相关。
+
+  9. 重激活（Reactivation）：
+     - 对 `priority > 0` 且 `<hit_cache>` 中超过 20 天未命中的条目，检查其 keywords 是否过窄。
+     - 如果内容仍有长期价值（如重要规则、架构决策），用 `save_memory` 拆分或扩展 keywords，使其更容易被触发。
+     - 这是为了防止有价值的记忆仅因 keywords 设置不当而被 Prune 误杀。
+     - 如果审查后认为内容确实已过时，不需要重激活，让它自然过期即可。
 
   ## 数量限制
 

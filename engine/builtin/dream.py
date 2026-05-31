@@ -765,6 +765,12 @@ class DreamHandler:
     ) -> str:
         """Assemble the final Dream task instruction from preprocessed data."""
         signals_json = json.dumps(signals, ensure_ascii=False, indent=2)
+        # [AutoC 2026-05-31] Why: Dream should preserve reusable lessons,
+        # related-memory activation, and valuable-but-dormant memories during
+        # scheduled cleanup. How: include pattern extraction, association
+        # discovery, and reactivation constraints in every generated Dream task.
+        # Purpose: prevent memory organization from collapsing recurring
+        # incidents into one concrete record or pruning useful rules too early.
         return f"""[auto_dream]
 run_id: {run_id}
 time: {now.strftime('%Y-%m-%d %H:%M UTC')}
@@ -805,4 +811,7 @@ time: {now.strftime('%Y-%m-%d %H:%M UTC')}
 8. 单轮最多操作 20 条（含 save/delete/create_or_update_skill）。
 9. constant=true 的记忆和 source 不是 auto 的手工记忆，保持保护不删。
 10. 完成后用 finish 报告操作摘要。
-11. Book 整理：检查 <book_list> 中条目数 ≤ 5 的碎片 book，将其条目用 save_memory 迁移到语义最近的大 book，然后 delete_memory 删除原条目。"""
+11. Book 整理：检查 <book_list> 中条目数 ≤ 5 的碎片 book，将其条目用 save_memory 迁移到语义最近的大 book，然后 delete_memory 删除原条目。
+12. 结构抽象（Pattern Extraction）：合并重复簇（约束5）时，不要只保留最完整的一条——如果簇内多条记忆描述的是同一类事件的不同实例（如 5 条都是「在生产环境直接改代码出事」的记录），应从中归纳出一条更抽象的规则（如「所有代码修改必须先在 original 做」），而非简单保留其中一条。
+13. 关联链强化（Association Discovery）：处理 topology 簇时，交叉比对 <hit_cache>。如果簇内多条记忆在 48h 内被同一类 session 命中（共现），说明它们在实际使用中经常一起被需要。用 save_memory 给它们互相补充 keywords，使它们更容易一起被激活。
+14. 重激活（Reactivation）：对 priority > 0 且 <hit_cache> 中超过 20 天未命中（快过期但还没到 30 天删除线）的条目，审查其 keywords 是否过窄导致命中率低。如果内容仍有价值，用 save_memory 拆分或优化 keywords 使其更容易被触发，而非坐等过期删除。"""

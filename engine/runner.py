@@ -1035,7 +1035,12 @@ async def _run_tool_task(
     # summarize_result(). Purpose: make tool-node logs include the command, query,
     # or other key parameters without changing the surrounding message format.
     summary = summarize_result(tool_name, result, args=arguments)
-    fmt, raw = result_to_raw(tool_name, result)
+    # [AutoC 2026-05-31] Why: standalone tool execution should preserve the same
+    # result_format metadata path used by AI-driven tool calls. How: fetch the
+    # registry spec for the executed tool and pass it to result_to_raw(). Purpose:
+    # keep result rendering consistent across runner entry points.
+    tool_spec = registry.get_spec(tool_name)
+    fmt, raw = result_to_raw(tool_name, result, tool_spec=tool_spec)
     # [2026-04-17] 移除工具结果截断机制：不再对 raw 做 max_inline 截断和 artifact 写入，
     # 直接将完整结果传递给下游，避免信息丢失。
     raw_inline = raw

@@ -787,7 +787,13 @@ async def _run_async_tool(
         # tool arguments into summarize_result(). Purpose: keep async summaries as
         # informative as synchronous handoff_progress rows.
         _summary = summarize_result(tool_name, result, args=tool_args)
-        _fmt, raw = result_to_raw(tool_name, result)
+        # [AutoC 2026-05-31] Why: result_to_raw() can now honor a tool spec's
+        # optional result_format before structural fallback. How: fetch the spec
+        # from the same registry that executed the async tool and pass it as a
+        # keyword-only argument. Purpose: let async tools use the same automatic
+        # result routing as synchronous tool calls.
+        _tool_spec = registry.get_spec(tool_name)
+        _fmt, raw = result_to_raw(tool_name, result, tool_spec=_tool_spec)
 
         _async_tool_tasks[async_tool_id] = {
             "tool_name": tool_name,
@@ -1075,7 +1081,13 @@ async def _execute_real_tools(
         # Purpose: show commands, queries, and target paths without changing the
         # event payload shape.
         _t_summary = summarize_result(_t_name, _t_result, args=_t_args)
-        _t_fmt, _t_raw = result_to_raw(_t_name, _t_result)
+        # [AutoC 2026-05-31] Why: structural result routing also supports an
+        # optional spec-level result_format override. How: read the spec from the
+        # active registry immediately after execution and pass it to result_to_raw.
+        # Purpose: keep external and built-in synchronous tool results formatted by
+        # metadata or by structure without hard-coded tool-name checks.
+        _t_spec = ls.registry.get_spec(_t_name)
+        _t_fmt, _t_raw = result_to_raw(_t_name, _t_result, tool_spec=_t_spec)
         # [2026-04-17] 移除工具结果截断机制：不再截断、不再写 artifact，直接传完整结果。
         _t_raw_inline = _t_raw
 

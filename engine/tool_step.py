@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+from .tool_result_formatters import (
+    ToolResultFormatContext,
+    format_tool_result_by_structure,
+    json_fallback,
+)
+
 
 
 def _sanitize(s: str) -> str:
@@ -11,39 +17,24 @@ def _sanitize(s: str) -> str:
 
 
 
-def result_to_raw(tool_name: str, result: Any) -> tuple[str, str]:
+def result_to_raw(
+    tool_name: str,
+    result: Any,
+    *,
+    tool_spec: Mapping[str, Any] | None = None,
+) -> tuple[str, str]:
     """把工具结果转为 (format, raw_text)。"""
-    if tool_name == "read_file" and isinstance(result, dict):
-        # New batch format: data.results
-        data = result.get("data")
-        if isinstance(data, dict) and isinstance(data.get("results"), list):
-            parts: list[str] = []
-            for r in data["results"]:
-                if not isinstance(r, dict):
-                    continue
-                p = r.get("path", "")
-                if r.get("success") and r.get("type") == "text":
-                    c = r.get("content", "")
-                    if c:
-                        parts.append(f"── {p} ──\n{c}")
-                elif r.get("success") and r.get("type") == "multimodal":
-                    parts.append(f"── {p} ── [image: {r.get('mimeType', '?')}, {r.get('size', 0)} bytes]")
-                elif r.get("success") and r.get("type") == "binary":
-                    parts.append(f"── {p} ── [binary: {r.get('size', 0)} bytes]")
-                elif not r.get("success"):
-                    parts.append(f"── {p} ── ERROR: {r.get('error', 'unknown')}")
-            if parts:
-                return "text", "\n".join(parts)
-        # Legacy single-file format
-        c = result.get("content")
-        if isinstance(c, str) and c.strip():
-            return "text", c
-    if isinstance(result, dict) and "returncode" in result and isinstance(result.get("output"), str):
-        return "text", f"returncode={result.get('returncode')}\n{result.get('output', '')}"
-    try:
-        return "json", json.dumps(result, ensure_ascii=False, indent=2)
-    except Exception:
-        return "json", str(result)
+    # [AutoC 2026-05-31] Why: result formatting previously depended on hard-coded
+    # tool-name branches, so compatible tools with the same return structure could
+    # not reuse readable renderers. How: create a formatting context, route through
+    # the structure-based formatter registry, and use the preserved JSON fallback
+    # only when no formatter matches. Purpose: keep the old public signature while
+    # allowing tool_spec to opt into explicit result_format routing.
+    ctx = ToolResultFormatContext(tool_name=tool_name, tool_spec=tool_spec)
+    formatted = format_tool_result_by_structure(result, ctx)
+    if formatted is not None:
+        return formatted
+    return json_fallback(result)
 
 
 def _one_line_text(value: Any) -> str:

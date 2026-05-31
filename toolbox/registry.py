@@ -542,12 +542,21 @@ class ToolRegistry:
             if not isinstance(input_schema, dict):
                 input_schema = {"type": "object", "properties": {}, "required": []}
 
-            self._tool_specs[name] = {
+            # [AutoC 2026-05-31] Why: external tools may declare SPEC.result_format
+            # so result_to_raw() can route by an explicit formatter id before
+            # falling back to structural predicates. How: copy the literal field
+            # into the registered spec when it is a non-empty string. Purpose: keep
+            # tool metadata available without changing any tool return payload.
+            registered_spec = {
                 "name": name,
                 "description": description,
                 "input_schema": input_schema,
                 "async_mode": bool(spec.get("async_mode", False)),
             }
+            result_format = spec.get("result_format")
+            if isinstance(result_format, str) and result_format.strip():
+                registered_spec["result_format"] = result_format.strip()
+            self._tool_specs[name] = registered_spec
             self._tool_funcs[name] = _make_script_tool(
                 script_path=py.resolve(), timeout_sec=timeout_sec,
             )

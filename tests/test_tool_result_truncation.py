@@ -160,7 +160,11 @@ def test_read_file_explicit_range_is_not_auto_truncated(tmp_path: Path) -> None:
 def test_execute_real_tools_truncates_large_string_result_for_messages_and_store(tmp_path: Path, monkeypatch: Any) -> None:
     """String tool results over 32,000 chars should be clipped before message storage."""
     monkeypatch.setattr(ai_step_module, "hook_registry", HookRegistry())
-    monkeypatch.setattr(ai_step_module, "result_to_raw", lambda tool_name, result: ("text", "x" * 33010))
+    # [AutoC 2026-05-31] Why: result_to_raw now accepts optional tool_spec in
+    # production. How: keep this monkeypatch compatible with the expanded
+    # signature. Purpose: this truncation test remains focused on message storage,
+    # not formatter routing.
+    monkeypatch.setattr(ai_step_module, "result_to_raw", lambda tool_name, result, **kwargs: ("text", "x" * 33010))
 
     async def _run() -> tuple[str, str]:
         ls, http, store = await _make_loop_state(tmp_path)
@@ -187,7 +191,11 @@ def test_execute_real_tools_does_not_truncate_non_string_result_body(tmp_path: P
     """Structured raw result bodies should pass through the new guard unchanged."""
     raw_body = {"payload": "x" * 33010}
     monkeypatch.setattr(ai_step_module, "hook_registry", HookRegistry())
-    monkeypatch.setattr(ai_step_module, "result_to_raw", lambda tool_name, result: ("json", raw_body))
+    # [AutoC 2026-05-31] Why: result_to_raw now accepts optional tool_spec in
+    # production. How: keep this monkeypatch compatible with the expanded
+    # signature. Purpose: this test remains focused on preserving structured raw
+    # bodies, not formatter routing.
+    monkeypatch.setattr(ai_step_module, "result_to_raw", lambda tool_name, result, **kwargs: ("json", raw_body))
 
     async def _run() -> Any:
         ls, http, _store = await _make_loop_state(tmp_path)

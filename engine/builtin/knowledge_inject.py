@@ -1398,6 +1398,13 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     data = _load_book(book_path)
     data.setdefault("book", book)
 
+    # [AutoC 2026-05-31] Why: save_memory 之前不写 created_at 和 source，
+    # 导致 dream 的过期/清理逻辑无法判断条目年龄和来源。
+    # How: 新建时写入 created_at + source；更新时保留原 created_at，刷新 updated_at。
+    # Purpose: dream Phase 4 过期判断和 source 保护逻辑能正常工作。
+    from datetime import datetime, timezone
+    _now_iso = datetime.now(timezone.utc).isoformat()
+
     new_entry: dict[str, Any] = {
         "id": mid,
         "content": content,
@@ -1412,10 +1419,17 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     found = False
     for i, e in enumerate(entries):
         if isinstance(e, dict) and str(e.get("id") or "").strip() == mid:
+            # 更新：保留原 created_at 和 source，刷新 updated_at
+            new_entry["created_at"] = str(e.get("created_at") or "").strip() or _now_iso
+            new_entry["source"] = str(e.get("source") or "").strip()
+            new_entry["updated_at"] = _now_iso
             entries[i] = new_entry
             found = True
             break
     if not found:
+        # 新建：写入 created_at，source 由调用方决定（memory_extract 会补 auto）
+        new_entry["created_at"] = _now_iso
+        new_entry["updated_at"] = _now_iso
         entries.append(new_entry)
 
     _save_book(book_path, data)

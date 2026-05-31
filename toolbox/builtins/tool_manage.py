@@ -97,8 +97,16 @@ async def create_or_update_tool(args: dict[str, Any], ctx: ToolContext) -> dict[
 
 
 async def reload_tools(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Reload tools/ directory and MCP tools.
+
+    [AutoC 2026-05-31] Why: MCP tools were only loaded at engine startup,
+    requiring a full restart after adding/modifying MCP clients.
+    How: reload_tools now also calls load_mcp_tools() after reloading
+    local tools. Purpose: hot-reload MCP tool changes without restart.
+    """
     try:
         count = ctx.registry.reload()
-        return {"ok": True, "tools": count}
+        mcp_count = await ctx.registry.load_mcp_tools()
+        return {"ok": True, "tools": count, "mcp_tools": mcp_count}
     except Exception as e:
         return {"ok": False, "error": str(e)}

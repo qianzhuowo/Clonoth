@@ -413,7 +413,7 @@ class ToolRegistry:
             ),
             (
                 "reload_tools",
-                "Reload tools/ directory.",
+                "Reload tools/ directory and MCP tools.",
                 {"type": "object", "properties": {}, "required": []},
                 _builtins.reload_tools,
             ),

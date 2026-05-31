@@ -160,9 +160,33 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             "format_transcript": self._format_transcript_for_extract_callback,
             "current_session_generation": lambda sid: self._current_session_generation_locked(sid),
             "session_count": lambda: len(self.sessions),
+            "task_snapshots": self._task_snapshots_from_hook_locked,
         }
         ctx.update(extra)
         return ctx
+
+    def _task_snapshots_from_hook_locked(self, task_ids: list[str]) -> dict[str, dict[str, str]]:
+        """Return safe task status/result snapshots for built-in hook handlers."""
+        # [AutoC 2026-05-31] Why: built-in handlers such as Dream need to poll
+        # child task completion without importing SupervisorState or receiving
+        # mutable Task objects. How: expose only status, result text, and error
+        # strings through the hook context. Purpose: keep the capability generic
+        # and avoid adding feature-specific branches to the core router.
+        result: dict[str, dict[str, str]] = {}
+        for tid in task_ids:
+            task_id = str(tid or "")
+            task = self.tasks.get(task_id)
+            if task is None:
+                result[task_id] = {"status": "missing", "result_text": "", "error": ""}
+                continue
+            task_result = task.result or {}
+            inner = task_result.get("result", {}) if isinstance(task_result.get("result"), dict) else {}
+            result[task_id] = {
+                "status": task.status.value if hasattr(task.status, "value") else str(task.status),
+                "result_text": str(inner.get("text") or task_result.get("text") or ""),
+                "error": str(task_result.get("error") or ""),
+            }
+        return result
 
     def _create_task_from_hook_locked(self, **kwargs: Any) -> Task:
         """Create a task for a built-in hook using callback-friendly arguments."""

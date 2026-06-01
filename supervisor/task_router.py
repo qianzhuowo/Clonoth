@@ -738,6 +738,8 @@ class TaskRouterMixin:
         # 系统内部任务（如记忆提取）静默完成，不输出给用户
         if task.input.get("_system_task"):
             return
+        if not isinstance(fallback_result, dict):
+            fallback_result = {}
         text = str(fallback_result.get("text") or fallback_result.get("summary") or "").strip()
         atts = fallback_result.get("attachments") if isinstance(fallback_result.get("attachments"), list) else None
         # [Fix] finish(text="") 空文本时也产出 outbound_message 事件。

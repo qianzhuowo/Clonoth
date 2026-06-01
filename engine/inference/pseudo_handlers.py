@@ -181,7 +181,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             node_id=ls.node.id,
             result=result_payload,
             context_ref=ctx_ref,
-            summary=_short(summary_text or result_text, 240),
+            summary=_short(summary_text, 240) if summary_text else "",
         )
 
     # switch_node 也需要 ctx_ref，单独计算

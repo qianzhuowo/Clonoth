@@ -512,6 +512,9 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         has_reasoning=bool(resp.reasoning),
         inline_data=resp.inline_data or [],
         usage=dict(ls.last_usage) if ls.last_usage else {},
+        # [thinking-time 2026-06-01] Persist precise reasoning timing from stream.
+        reasoning_started_at=getattr(ls, '_reasoning_started_iso', '') or '',
+        reasoning_ended_at=getattr(ls, '_reasoning_ended_iso', '') or '',
     )
     set_message_meta(_assistant_msg, _tc_meta)
     # [2026-05-07] Store reasoning_content at top level for API round-trip.

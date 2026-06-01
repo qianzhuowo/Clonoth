@@ -64,6 +64,12 @@ class MessageMeta:
     # LLM 响应的 token usage，仅 assistant 消息有值
     # {"prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
 
+    # [thinking-time 2026-06-01] Precise thinking timing for web frontend.
+    # reasoning_started_at: first thinking token wall-clock ISO timestamp.
+    # reasoning_ended_at: first text token (= thinking end) ISO timestamp.
+    reasoning_started_at: str = ""
+    reasoning_ended_at: str = ""
+
     def to_dict(self) -> dict[str, Any]:
         """序列化为可 JSON 持久化的 dict。省略空值/默认值字段以节省空间。
 
@@ -96,6 +102,10 @@ class MessageMeta:
             d["inline_data"] = self.inline_data
         if self.usage:
             d["usage"] = self.usage
+        if self.reasoning_started_at:
+            d["reasoning_started_at"] = self.reasoning_started_at
+        if self.reasoning_ended_at:
+            d["reasoning_ended_at"] = self.reasoning_ended_at
         return d
 
     @classmethod
@@ -137,6 +147,8 @@ class MessageMeta:
             has_reasoning=has_reasoning,
             inline_data=list(data.get("inline_data") or []),
             usage=dict(data.get("usage") or {}),
+            reasoning_started_at=str(data.get("reasoning_started_at") or ""),
+            reasoning_ended_at=str(data.get("reasoning_ended_at") or ""),
         )
 
 

@@ -283,6 +283,17 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                             ls.preempt_after_step = True
             await text_buf.flush()
             await think_buf.flush()
+            # [thinking-time 2026-06-01] Record precise reasoning timing on LoopState.
+            # reasoning_started = first thinking token; reasoning_ended = first text token
+            # (thinking always precedes text in all providers).
+            if think_buf.flushed_any:
+                ls._reasoning_started_iso = think_buf.first_push_iso
+                if text_buf.first_push_at is not None:
+                    ls._reasoning_ended_iso = text_buf.first_push_iso
+                else:
+                    # No text output — thinking lasted until stream end
+                    import datetime as _dt_rc
+                    ls._reasoning_ended_iso = _dt_rc.datetime.now(_dt_rc.timezone.utc).isoformat()
             if text_buf.flushed_any or think_buf.flushed_any:
                 # [refactor 2026-04-18] has_thinking → has_reasoning 事件字段对齐
                 await ls.rctx.emit_event("stream_end", {

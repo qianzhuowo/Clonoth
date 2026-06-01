@@ -911,6 +911,13 @@ class SessionMixin:
                 reasoning = msg.meta.get("reasoning", "")
                 if reasoning:
                     entry["thinking"] = reasoning
+                # [thinking-time 2026-06-01] Pass precise reasoning timing to frontend.
+                _rs = msg.meta.get("reasoning_started_at")
+                _re = msg.meta.get("reasoning_ended_at")
+                if _rs:
+                    entry["reasoning_started_at"] = _rs
+                if _re:
+                    entry["reasoning_ended_at"] = _re
             # Tool calls (assistant requesting tools)
             if msg.tool_calls:
                 entry["tool_calls"] = msg.tool_calls

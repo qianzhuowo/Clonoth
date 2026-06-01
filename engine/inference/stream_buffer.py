@@ -19,8 +19,15 @@ class _StreamBuffer:
         self._buf: list[str] = []
         self._last_flush = time.monotonic()
         self.flushed_any = False
+        # [thinking-time 2026-06-01] Record wall-clock time of first token arrival
+        # for precise thinking duration calculation.
+        self.first_push_at: float | None = None  # time.monotonic()
+        self._first_push_wall: float | None = None  # time.time()
 
     async def push(self, chunk: str) -> None:
+        if self.first_push_at is None:
+            self.first_push_at = time.monotonic()
+            self._first_push_wall = time.time()
         self._buf.append(chunk)
         now = time.monotonic()
         buf_len = sum(len(s) for s in self._buf)
@@ -31,6 +38,16 @@ class _StreamBuffer:
     def is_empty(self) -> bool:
         """缓冲区是否为空（无待 flush 内容）。"""
         return not self._buf
+
+    @property
+    def first_push_iso(self) -> str | None:
+        """首次 push 的 wall-clock 时间，ISO 8601 UTC 格式。"""
+        if self._first_push_wall is None:
+            return None
+        import datetime
+        return datetime.datetime.fromtimestamp(
+            self._first_push_wall, tz=datetime.timezone.utc
+        ).isoformat()
 
     async def flush(self) -> None:
         if not self._buf:

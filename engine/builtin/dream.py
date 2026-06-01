@@ -25,6 +25,11 @@ _MAX_DREAM_SESSIONS = 5
 _DREAM_TRANSCRIPT_MAX_CHARS = 12000
 _DREAM_PENDING_TIMEOUT_MINUTES = 15
 _TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "missing"}
+# [AutoC 2026-06-01] Why: the final Dream node no longer has shell
+# access to update scheduler state itself. How: centralize the lock note
+# beside the polling constants. Purpose: keep the generated .dream-lock
+# format stable and avoid scattering literal strings across the handler.
+_DREAM_LOCK_NOTE = "Dream cycle completed via automated pipeline"
 
 
 # Why: the built-in loader discovers handlers from per-file metadata.
@@ -110,10 +115,11 @@ class DreamHandler:
         # last fired minute on the handler. Purpose: remove dream-specific fields
         # from SchedulerThread while preserving behavior.
         self._last_dream_fired: str = ""
-        # [AutoC 2026-05-31] Why: Dream now waits for memory_extractor tasks
-        # before creating the final organizer task. How: store the in-flight
-        # preprocessor task ids and topology payload in handler memory only.
-        # Purpose: keep the scheduler/core generic and avoid intermediate files.
+        # [AutoC 2026-06-01] Why: Dream now waits for memory_extractor
+        # tasks and then for the final organizer task. How: store the
+        # extractor ids, topology payload, and final dream_task_id in handler
+        # memory only. Purpose: update .dream-lock after success without
+        # reintroducing execute_command access to the Dream node.
         self._dream_pending: dict[str, Any] | None = None
 
     def on_tick(self, ctx: dict[str, Any]) -> None:
@@ -131,9 +137,10 @@ class DreamHandler:
             now = now.replace(tzinfo=timezone.utc)
         now_key = str(ctx.get("now_key") or now.strftime("%Y-%m-%d %H:%M"))
 
-        # [AutoC 2026-05-31] Why: extractor completion can happen after the cron
-        # minute has passed. How: pending runs are polled before cron checks.
-        # Purpose: a Dream run finishes as soon as its preprocessing data is ready.
+        # [AutoC 2026-06-01] Why: pending completion can happen after the cron
+        # minute has passed, and pending now covers both extractor tasks and the
+        # final Dream task. How: poll the pipeline before cron checks. Purpose:
+        # finish a Dream run and update .dream-lock as soon as the task is ready.
         if self._dream_pending is not None:
             self._poll_and_create_dream(ctx=ctx, workspace_root=workspace_root, now=now)
             return
@@ -240,22 +247,39 @@ class DreamHandler:
         workspace_root: Path,
         now: datetime,
     ) -> None:
-        """Poll extractor snapshots and create the final Dream task when ready."""
+        """Poll Dream pipeline snapshots and advance the run."""
         pending = self._dream_pending
         if pending is None:
             return
+
+        task_snapshots = ctx.get("task_snapshots")
+        if not callable(task_snapshots):
+            log.warning("[scheduler] dream pipeline cannot poll tasks: missing task_snapshots callback")
+            self._dream_pending = None
+            return
+
+        dream_task_id = str(pending.get("dream_task_id") or "").strip()
+        if dream_task_id:
+            # [AutoC 2026-06-01] Why: after the final Dream task is created,
+            # extractor polling is already complete and only the organizer result
+            # matters. How: branch on dream_task_id and poll that single task.
+            # Purpose: write .dream-lock only after the actual Dream cycle has
+            # completed successfully.
+            self._poll_final_dream_task(
+                task_snapshots=task_snapshots,
+                workspace_root=workspace_root,
+                now=now,
+                pending=pending,
+                dream_task_id=dream_task_id,
+            )
+            return
+
         if self._pending_expired(pending, now=now):
             log.warning("[scheduler] dream preprocessing expired from %s; dropping pending run", pending.get("now_key"))
             self._dream_pending = None
             return
 
         task_ids = [str(tid) for tid in pending.get("extractor_task_ids", []) if str(tid).strip()]
-        task_snapshots = ctx.get("task_snapshots")
-        if not callable(task_snapshots):
-            log.warning("[scheduler] dream preprocessing cannot poll tasks: missing task_snapshots callback")
-            self._dream_pending = None
-            return
-
         snapshots = task_snapshots(task_ids)
         if not isinstance(snapshots, dict):
             return
@@ -300,17 +324,24 @@ class DreamHandler:
             skill_list=skill_list,
             book_list=book_list,
         )
-        if self._create_final_dream_task(
+        dream_task_id = self._create_final_dream_task(
             ctx=ctx,
             runtime_cfg=runtime_cfg,
             now=now,
             instruction=instruction,
-        ):
-            self._dream_pending = None
+        )
+        if dream_task_id:
+            # [AutoC 2026-06-01] Why: clearing pending here loses the only link
+            # between this scheduler run and the final Dream task. How: retain the
+            # pending payload and add the final task id plus creation time. Purpose:
+            # a later tick can detect successful completion and write .dream-lock.
+            pending["dream_task_id"] = dream_task_id
+            pending["dream_created_at"] = now.astimezone().isoformat(timespec="seconds")
             log.info(
-                "[scheduler] dream task created after preprocessing extractors=%d signals=%d",
+                "[scheduler] dream task created after preprocessing extractors=%d signals=%d task=%s",
                 len(task_ids),
                 len(signals),
+                dream_task_id[:8],
             )
 
     def _create_final_dream_task(
@@ -320,22 +351,21 @@ class DreamHandler:
         runtime_cfg: dict[str, Any],
         now: datetime,
         instruction: str,
-    ) -> bool:
-        """Create the final system.dream task from prepared instruction data."""
+    ) -> str:
+        """Create the final system.dream task and return its task id."""
         create_task = ctx.get("create_task")
         if not callable(create_task):
-            return False
+            return ""
         node_id = get_str(runtime_cfg, "memory.dream.node_id", "system.dream").strip()
         conv_key = get_str(runtime_cfg, "memory.dream.conversation_key", "system:dream").strip()
         channel = conv_key.split(":", 1)[0] if ":" in conv_key else "system"
         msg_id = f"dream:{uuid.uuid4()}"
         try:
-            # [AutoC 2026-05-31] Why: the final Dream node must receive all
-            # preprocessed data in its instruction and not read intermediate
-            # files. How: create the system task directly through the generic
-            # hook callback with context disabled. Purpose: keep scheduler/core
-            # behavior generic and make the Dream task deterministic.
-            create_task(
+            # [AutoC 2026-06-01] Why: the scheduler must later know which final
+            # Dream task finished. How: keep using the generic create_task hook but
+            # capture the returned Task object's task_id. Purpose: make lock-file
+            # updates depend on actual task completion rather than task creation.
+            task = create_task(
                 channel=channel,
                 conversation_key=conv_key,
                 kind="node",
@@ -359,9 +389,72 @@ class DreamHandler:
                 source_inbound_seq=None,
                 caller_task_id=None,
             )
-            return True
+            task_id = str(getattr(task, "task_id", "") or "").strip()
+            if not task_id:
+                log.warning("[scheduler] dream inject returned task without task_id")
+                return ""
+            return task_id
         except Exception as exc:
             log.warning("[scheduler] dream inject failed: %s", exc)
+            return ""
+
+    def _poll_final_dream_task(
+        self,
+        *,
+        task_snapshots: Any,
+        workspace_root: Path,
+        now: datetime,
+        pending: dict[str, Any],
+        dream_task_id: str,
+    ) -> None:
+        """Poll the final Dream task and write the lock after success."""
+        snapshots = task_snapshots([dream_task_id])
+        if not isinstance(snapshots, dict):
+            return
+        snapshot = snapshots.get(dream_task_id, {})
+        status = str(snapshot.get("status") or "").strip()
+        if status not in _TERMINAL_TASK_STATUSES:
+            return
+
+        if status == "completed":
+            if not self._write_dream_lock(workspace_root=workspace_root, completed_at=now):
+                return
+            log.info(
+                "[scheduler] dream task completed; lock updated task=%s created_at=%s",
+                dream_task_id[:8],
+                pending.get("dream_created_at"),
+            )
+        else:
+            # [AutoC 2026-06-01] Why: failed, cancelled, or missing final Dream
+            # tasks must not mark the cycle as successful. How: clear the pending
+            # run without writing .dream-lock. Purpose: allow a future cron fire to
+            # retry while preserving the lock as the last known successful run.
+            log.warning("[scheduler] dream task ended without lock update task=%s status=%s", dream_task_id[:8], status)
+        self._dream_pending = None
+
+    def _write_dream_lock(self, *, workspace_root: Path, completed_at: datetime) -> bool:
+        """Write data/memory/.dream-lock for a successful Dream cycle."""
+        try:
+            # [AutoC 2026-06-01] Why: the final Dream prompt cannot use
+            # execute_command, but existing scheduling state expects this lock file.
+            # How: write a small JSON document from the supervisor hook after the
+            # final task reaches completed. Purpose: keep Dream completion durable
+            # without giving the Dream node shell access.
+            if completed_at.tzinfo is None:
+                completed_at = completed_at.replace(tzinfo=timezone.utc)
+            mem_dir = workspace_root / "data" / "memory"
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "last_run": completed_at.astimezone().isoformat(timespec="seconds"),
+                "note": _DREAM_LOCK_NOTE,
+            }
+            (mem_dir / ".dream-lock").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            return True
+        except Exception as exc:
+            log.warning("[scheduler] dream lock update failed: %s", exc)
             return False
 
     def _recent_active_session_ids(self, workspace_root: Path) -> list[str]:

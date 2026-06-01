@@ -380,25 +380,41 @@ def _strip_trailing_pseudo_call(history: list[dict[str, Any]]) -> list[dict[str,
 
 
 def _strip_images_from_content(content: list[dict[str, Any]]) -> str:
-    """Strip image_url parts from multimodal content, return plain text with placeholder.
+    """Strip image_url parts from multimodal content, return plain text with references.
 
     Historical images should not be re-sent every turn as base64 (expensive and redundant).
     Current turn's images are passed separately via the attachments mechanism.
     """
     text_parts: list[str] = []
-    had_images = False
+    image_refs: list[str] = []
     for part in content:
         if not isinstance(part, dict):
             continue
         if part.get("type") == "image_url":
-            had_images = True
+            url = ""
+            image_url = part.get("image_url")
+            if isinstance(image_url, dict):
+                url = str(image_url.get("url", ""))
+            elif isinstance(image_url, str):
+                url = image_url
+
+            # Why: the old generic marker hid the saved attachment path, so later
+            # tasks could not reopen historical images. How: keep file:// paths as
+            # lightweight text references while replacing non-file payloads with an
+            # inline marker. Purpose: avoid re-sending image bytes but preserve a
+            # read_file-compatible path when one exists.
+            if url.startswith("file://"):
+                image_refs.append(f"[图片: {url[7:]}]")
+            else:
+                image_refs.append("[图片: <inline>]")
         elif part.get("type") == "text":
             t = str(part.get("text", "")).strip()
             if t:
                 text_parts.append(t)
     text = "\n".join(text_parts)
-    if had_images:
-        text = f"{text}\n[图片附件已省略]" if text else "[图片附件已省略]"
+    if image_refs:
+        refs = "\n".join(image_refs)
+        text = f"{text}\n{refs}" if text else refs
     return text
 
 

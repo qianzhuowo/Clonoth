@@ -17,14 +17,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from engine.conversation_store import ConversationStore, Message, MessageType  # noqa: E402
 from engine.inference.ai_step import _shadow_write  # noqa: E402
-from engine.runner import _message_to_history_dict  # noqa: E402
+from engine.runner import _message_to_history_dict, _strip_images_from_content  # noqa: E402
 
 
 def _image_content() -> list[dict[str, object]]:
     """Build a minimal multimodal content list used by all regression cases."""
     return [
         {"type": "text", "text": "please inspect this image"},
-        {"type": "image_url", "image_url": {"url": "file:///tmp/example.png"}},
+        {"type": "image_url", "image_url": {"url": "file://data/attachments/example.png"}},
     ]
 
 
@@ -43,8 +43,34 @@ def test_message_to_history_dict_keeps_current_task_images_and_strips_others() -
 
     assert same_task["content"] == _image_content()
     assert same_task["_meta"]["source_task_id"] == "task-a"
-    assert other_task["content"] == "please inspect this image\n[图片附件已省略]"
-    assert default_call["content"] == "please inspect this image\n[图片附件已省略]"
+    # Why: cross-task image bytes are still stripped, but the local file path is
+    # retained. How: assert the placeholder contains the read_file-compatible
+    # path instead of the old generic marker. Purpose: allow later tasks to reopen
+    # historical attachments without re-sending image data every turn.
+    assert other_task["content"] == "please inspect this image\n[图片: data/attachments/example.png]"
+    assert default_call["content"] == "please inspect this image\n[图片: data/attachments/example.png]"
+
+
+def test_strip_images_from_content_keeps_file_paths_and_marks_inline_images() -> None:
+    """Historical image stripping records file paths and inline image markers."""
+    content = [
+        {"type": "text", "text": "first"},
+        {"type": "image_url", "image_url": {"url": "file://data/attachments/a.png"}},
+        {"type": "image_url", "image_url": "file://data/attachments/b.png"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        {"type": "text", "text": "second"},
+    ]
+
+    # Why: the runner must remove historical image payloads while preserving the
+    # location of file-backed attachments. How: cover dict and string image_url
+    # shapes plus an inline data URL fallback. Purpose: future model turns can use
+    # read_file for saved attachments and still avoid leaking inline payloads.
+    assert _strip_images_from_content(content) == (
+        "first\nsecond\n"
+        "[图片: data/attachments/a.png]\n"
+        "[图片: data/attachments/b.png]\n"
+        "[图片: <inline>]"
+    )
 
 
 def test_conversation_store_round_trips_multimodal_content(tmp_path: Path) -> None:

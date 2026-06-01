@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -40,10 +41,15 @@ class Message:
     # 原因：真 native formatter 会生成 role=tool 消息；存储层必须原样保存，
     # 目的：下一轮恢复历史时仍能满足原生工具调用的 tool_call_id 配对要求。
     role: str                        # user / assistant / system / tool
-    content: str                     # 消息文本内容
+    # [AutoC 2026-06-01] Why: task-local image retention requires persisted
+    # user messages to keep provider-style multimodal blocks. How: allow either
+    # plain text or a list of content-part dictionaries. Purpose: JSONL history
+    # can round-trip images for the active task while runner strips them for
+    # cross-task reloads.
+    content: str | list[dict[str, Any]]  # 消息文本内容或多模态内容块
     message_type: str = ""           # MessageType 常量，细分类型
     created_at: str = ""             # ISO 8601 时间戳
-    meta: dict = field(default_factory=dict)  # 元数据（provider, tool_mode 等），用 dict 存储不依赖 MessageMeta 类
+    meta: dict[str, Any] = field(default_factory=dict)  # 元数据（provider, tool_mode 等），用 dict 存储不依赖 MessageMeta 类
     source_node_id: str = ""         # 产生该消息的节点 ID
     source_task_id: str = ""         # 产生该消息的 task ID
     ephemeral: bool = False          # 临时消息（dynamic context 等），不持久化到 store
@@ -54,9 +60,13 @@ class Message:
     tool_call_id: str = ""           # role=tool 消息关联的 assistant.tool_calls[].id
     name: str = ""                   # role=tool 消息关联的工具名
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, Any]:
         """序列化为存储格式。仅包含非空字段以减小 JSONL 体积。"""
-        d: dict = {"id": self.id, "role": self.role, "content": self.content}
+        # [AutoC 2026-06-01] Why: list content is already JSON-serializable and
+        # must not be coerced to text before storage. How: assign self.content
+        # unchanged to the dict. Purpose: from_dict can restore multimodal user
+        # input for same-task history reconstruction.
+        d: dict[str, Any] = {"id": self.id, "role": self.role, "content": self.content}
         if self.message_type:
             d["message_type"] = self.message_type
         if self.created_at:
@@ -85,6 +95,11 @@ class Message:
         return cls(
             id=data.get("id", ""),
             role=data.get("role", "user"),
+            # [AutoC 2026-06-01] Why: stored multimodal content must survive a
+            # JSONL reload. How: pass through str or list content unchanged;
+            # invalid/missing content still falls back to an empty string via
+            # data.get. Purpose: Message remains compatible with legacy text
+            # records and new attachment records.
             content=data.get("content", ""),
             message_type=data.get("message_type", ""),
             created_at=data.get("created_at", ""),

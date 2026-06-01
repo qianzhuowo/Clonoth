@@ -156,12 +156,26 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
             from engine.conversation_store import Message, MessageType
 
             target_session = getattr(ls.rctx, "child_session_id", "") or ls.rctx.session_id
+            # [AutoC 2026-06-01] Why: preempt messages with attachments were
+            # appended to the live prompt as multimodal content but persisted as
+            # plain text, so a resume inside the same task lost the image. How:
+            # build the same multimodal content for ConversationStore when
+            # attachments are present. Purpose: injected user input follows the
+            # same task-local image retention rule as initial task input.
+            if new_attachments:
+                persisted_content = build_multimodal_content(
+                    new_instruction,
+                    new_attachments,
+                    workspace_root=ls.rctx.workspace_root,
+                )
+            else:
+                persisted_content = new_instruction
             store.append(
                 target_session,
                 Message(
                     id=str(uuid4()),
                     role="user",
-                    content=new_instruction,
+                    content=persisted_content,
                     message_type=MessageType.USER_INPUT,
                     created_at=datetime.now(timezone.utc).isoformat(),
                     meta={"attachments": list(new_attachments)} if new_attachments else {},

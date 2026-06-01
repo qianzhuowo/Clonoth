@@ -26,6 +26,7 @@ from toolbox.context import ToolContext
 from toolbox.registry import ToolRegistry
 
 from .inference import run_ai_node
+from .attachments import build_multimodal_content
 from .context import RunContext
 from .model import resolve_provider
 from .context_store import load_context_snapshot
@@ -287,17 +288,21 @@ def _find_pseudo_history_marker(content: str) -> tuple[str, int]:
     return tail[:separator_pos], pos
 
 
-def _message_to_history_dict(msg: Message) -> dict[str, Any]:
+def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict[str, Any]:
     """将 ConversationStore 的 Message 转为 runner 期望的 history dict 格式。
 
     Child Session 隔离（Phase B）：从 child session JSONL 加载的 Message 对象
     需要转为与 snapshot messages 相同的 dict 格式，供 ai_step 的消息组装使用。
     """
     d: dict[str, Any] = {"role": msg.role, "content": msg.content}
-    # [缺陷修复] ConversationStore 加载的历史消息可能包含多模态 content（list 类型），
-    # 其中的 file:// 图片引用在 24h 后会因 data_cleanup 清理附件文件而失效。
-    # 与旧的 _fetch_history 路径保持一致，在加载时就剥离图片引用为纯文本占位符。
-    if isinstance(d["content"], list):
+    # [AutoC 2026-06-01] Why: stripping every historical image made later LLM
+    # steps in the same task lose the user's image input. How: keep multimodal
+    # list content when source_task_id matches the active task, but preserve the
+    # old all-strip behavior for callers that do not pass current_task_id. Purpose:
+    # task-local history keeps locked user input while cross-task history stays
+    # compact and safe against stale file:// attachment references.
+    msg_task_id = str(msg.source_task_id or "")
+    if isinstance(d["content"], list) and (not current_task_id or msg_task_id != current_task_id):
         d["content"] = _strip_images_from_content(d["content"])
     _meta = dict(msg.meta) if msg.meta else {}
     # P6 Snip Compact: 将 source_task_id 透传到 _meta，供 snip_history 按 task 过滤
@@ -809,7 +814,7 @@ async def _run_node_task(
         if not is_resume:
             # 从子 session 的 JSONL 加载历史，过滤 system 消息（子节点重建自己的 system prompt）
             stored = _conv_store.load(child_session_id)
-            history = [_message_to_history_dict(m) for m in stored if m.role != "system"]
+            history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
             # [2026-05-07] 子会话恢复时先清理 finish 控制流历史。
             # 原因：system.compactor 等 child session 可能已有旧 finish tool_call/tool_result 污染。
             # 做法：在进入提示组装前去掉控制流配对，再保留旧 fake-native 尾部兼容清理。
@@ -828,7 +833,7 @@ async def _run_node_task(
         # 此时 context_ref 为空，ai_step 会走 assemble_initial_messages，需要 history 不为空。
         if use_context:
             stored = _conv_store.load(session_id)
-            history = [_message_to_history_dict(m) for m in stored if m.role != "system"]
+            history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
             # 剥离尾部伪工具（finish/dispatch 等），同 child session 路径处理
             # [2026-05-07] 先执行结构化控制流清理，覆盖 true native 中非文本化的 finish 记录。
             # 原因：旧 _strip_trailing_pseudo_call 只能处理 fake-native 文本 marker。
@@ -934,13 +939,23 @@ async def _run_node_task(
     # 下 caller task 被 supervisor 重新唤醒，input.instruction 仍是原先的用户指令，
     # 此指令已在首次进入时写过 JSONL，这里不应再写一次。
     # 只在非 resume 场景追加 user_input 消息。
-    if instruction and _conv_store and not is_resume:
+    if (instruction or input_attachments) and _conv_store and not is_resume:
         from datetime import datetime, timezone
         _target_sid = child_session_id or session_id
+        # [AutoC 2026-06-01] Why: persisting only plain instruction text lost
+        # image attachments before the next step could reload ConversationStore.
+        # How: when attachments are present, build the same multimodal content
+        # that message assembly sends to the provider; otherwise keep the legacy
+        # string content. Purpose: user image input remains available inside the
+        # current task and can still be stripped when another task reloads it.
+        if input_attachments:
+            _user_content = build_multimodal_content(instruction, input_attachments, workspace_root=ws_root)
+        else:
+            _user_content = instruction
         _user_msg = Message(
             id=str(uuid.uuid4()),
             role="user",
-            content=instruction,
+            content=_user_content,
             message_type=MessageType.USER_INPUT,
             created_at=datetime.now(timezone.utc).isoformat(),
             source_node_id=node.id,

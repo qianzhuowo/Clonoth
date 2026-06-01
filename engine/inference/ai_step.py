@@ -159,10 +159,18 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
         from uuid import uuid4
         from datetime import datetime, timezone
         msg_id = str(uuid4())
+        # [AutoC 2026-06-01] Why: converting non-string content with str()
+        # destroyed multimodal user image blocks before same-task history reload.
+        # How: pass provider-style list content through unchanged and only fall
+        # back to text for other unexpected content shapes. Purpose: shadow
+        # writes can preserve images for the active task while keeping legacy
+        # string behavior for ordinary messages.
+        _raw_content = msg_dict.get('content', '')
+        _content = _raw_content if isinstance(_raw_content, (str, list)) else str(_raw_content)
         msg = Message(
             id=msg_id,
             role=msg_dict.get('role', 'user'),
-            content=msg_dict.get('content', '') if isinstance(msg_dict.get('content'), str) else str(msg_dict.get('content', '')),
+            content=_content,
             message_type=message_type,
             created_at=datetime.now(timezone.utc).isoformat(),
             meta=msg_dict.get('_meta', {}),

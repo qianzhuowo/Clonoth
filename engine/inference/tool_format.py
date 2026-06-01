@@ -688,9 +688,9 @@ class JsonToolFormatter(ToolFormatter):
             "[SYSTEM] Your response was rejected because you did not use the finish tool. "
             "Plain text output is NOT accepted. You MUST use the tool call format below:\n"
             "<<<TOOL_CALL>>>\n"
-            '{"name": "finish", "arguments": {"text": "your response here"}}\n'
+            '{"name": "finish", "arguments": {"text": "<YOUR_ACTUAL_RESPONSE>"}}\n'
             "<<<END_TOOL_CALL>>>\n\n"
-            "If you need more information from the user, put your question in the text parameter."
+            "Replace <YOUR_ACTUAL_RESPONSE> with your real answer. Do NOT output the placeholder literally."
         )
 
 

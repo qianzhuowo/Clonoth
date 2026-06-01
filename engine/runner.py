@@ -73,6 +73,23 @@ def _provider_init_kwargs(
     }
 
 
+def _merge_provider_options(global_options: dict[str, Any], node_options: dict[str, Any]) -> dict[str, Any]:
+    """Merge global and node provider options, with node values taking priority."""
+    # [AutoC 2026-06-01] Why: provider-wide defaults belong in runtime.yaml, but
+    # individual nodes still need to override a nested option such as reasoning
+    # effort. How: recursively copy dict values from the global layer, then overlay
+    # node-level provider_options. Purpose: pass one complete provider_options dict
+    # to provider adapters without mutating runtime or node configuration objects.
+    merged: dict[str, Any] = dict(global_options or {})
+    for key, value in (node_options or {}).items():
+        base_value = merged.get(key)
+        if isinstance(base_value, dict) and isinstance(value, dict):
+            merged[key] = _merge_provider_options(base_value, value)
+        else:
+            merged[key] = value
+    return merged
+
+
 def _instantiate_provider(provider_cls: type, init_kwargs: dict[str, Any]) -> Any:
     """Instantiate a provider, passing only kwargs its constructor accepts."""
     # [provider-registry 2026-05-03] Provider 构造函数目前不完全一致。
@@ -833,7 +850,19 @@ async def _run_node_task(
     entry_node_id = get_str(runtime_cfg, "shell.entry_node_id", "bootstrap.shell_orchestrator").strip()
 
     rp = resolve_provider(ws_root, node, default_model)
-    _po = getattr(node, 'provider_options', {}) or {}
+    provider_cfg = (runtime_cfg.get("providers") or {}).get(rp.provider_type or "openai")
+    global_provider_options = provider_cfg.get("options") if isinstance(provider_cfg, dict) else {}
+    if not isinstance(global_provider_options, dict):
+        global_provider_options = {}
+    node_provider_options = getattr(node, "provider_options", {}) or {}
+    if not isinstance(node_provider_options, dict):
+        node_provider_options = {}
+    _po = _merge_provider_options(global_provider_options, node_provider_options)
+    # [AutoC 2026-06-01] Why: runtime.yaml now supports provider-wide options, but
+    # node YAML must remain the most specific layer. How: read
+    # providers.<provider_type>.options and merge it with node.provider_options.
+    # Purpose: providers receive global defaults unless a node overrides them.
+    #
     # [provider-registry 2026-05-03] Provider 创建改为 registry 查找。
     # 原因：旧 if-elif 每新增 provider 都要改 runner；做法：按 rp.provider_type 找类并传统一 kwargs；
     # 目的：保持现有四个 provider 行为不变，同时让 providers/*.py 插件可自动接入。

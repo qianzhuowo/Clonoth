@@ -41,6 +41,12 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
     "providers": {
         "openai": {
             "timeout_sec": 60.0,
+            # [AutoC 2026-06-01] Why: provider_options previously existed only on
+            # node YAML, so provider-wide defaults had no documented global home.
+            # How: add an empty options dict under the OpenAI provider defaults.
+            # Purpose: runner can merge providers.<type>.options with node-level
+            # provider_options while keeping old runtime.yaml files compatible.
+            "options": {},
         }
     },
     "meta": {

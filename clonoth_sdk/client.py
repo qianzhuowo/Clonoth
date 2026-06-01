@@ -434,6 +434,35 @@ class ClonothClient:
         resp.raise_for_status()
         return resp.json()
 
+    # ---- Session Provider Override ----
+
+    async def get_session_provider_override(self, session_id: str) -> dict[str, Any]:
+        """查询 session 的 provider 覆写配置。"""
+        resp = await self._http().get(
+            f"{self._base_url}/v1/sessions/{session_id}/provider_override",
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def set_session_provider_override(
+        self, session_id: str, override: dict[str, Any],
+    ) -> dict[str, Any]:
+        """设置 session 的 provider 覆写配置。"""
+        resp = await self._http().put(
+            f"{self._base_url}/v1/sessions/{session_id}/provider_override",
+            json=override,
+        )
+        resp.raise_for_status()
+        return resp.json()
+
+    async def clear_session_provider_override(self, session_id: str) -> dict[str, Any]:
+        """清除 session 的 provider 覆写配置。"""
+        resp = await self._http().delete(
+            f"{self._base_url}/v1/sessions/{session_id}/provider_override",
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     async def restart(
         self,
         target: str,

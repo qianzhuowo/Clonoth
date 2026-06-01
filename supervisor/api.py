@@ -746,6 +746,23 @@ def create_app(
         results.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
         return results[:limit]
 
+    @app.post("/v1/sessions/get_or_create")
+    async def get_or_create_session(
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        """Get or create a session by channel + conversation_key. No task created."""
+        st: SupervisorState = app.state.state
+        channel = str(body.get("channel") or "").strip()
+        conv_key = str(body.get("conversation_key") or "").strip()
+        if not conv_key:
+            raise HTTPException(status_code=400, detail="conversation_key is required")
+        if not channel:
+            channel = conv_key.split(":", 1)[0] if ":" in conv_key else "unknown"
+        with st._lock:
+            session_id = st.get_or_create_session(channel=channel, conversation_key=conv_key)
+        return {"session_id": session_id, "conversation_key": conv_key}
+
     @app.delete("/v1/sessions/{session_id}")
     async def delete_session(session_id: str) -> dict[str, Any]:
         """Delete a session and its conversation store."""

@@ -886,6 +886,47 @@ def create_app(
         st: SupervisorState = app.state.state
         return st.get_session_active_node(session_id)
 
+    @app.get("/v1/sessions/{session_id}/provider_override")
+    async def session_provider_override_get(session_id: str, request: Request) -> dict[str, Any]:
+        """查询 session 级 provider 覆盖配置。"""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        result = st.get_session_provider_override(session_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return result
+
+    @app.put("/v1/sessions/{session_id}/provider_override")
+    async def session_provider_override_put(
+        session_id: str,
+        request: Request,
+        body: dict[str, Any] = Body(...),
+    ) -> dict[str, Any]:
+        """设置 session 级 provider 覆盖配置。"""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        # [AutoC 2026-06-01] Why: provider overrides are intentionally generic
+        # JSON dictionaries, but the endpoint must reject non-object bodies before
+        # they reach SessionInfo. How: FastAPI parses the body and this guard keeps
+        # only dict values. Purpose: provider adapters can add fields later while
+        # malformed requests get a clear 400 response.
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="provider_override must be a JSON object")
+        result = st.set_session_provider_override(session_id, body)
+        if result is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return result
+
+    @app.delete("/v1/sessions/{session_id}/provider_override")
+    async def session_provider_override_delete(session_id: str, request: Request) -> dict[str, Any]:
+        """清除 session 级 provider 覆盖配置。"""
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        result = st.clear_session_provider_override(session_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        return result
+
     @app.get("/v1/sessions/{session_id}/context_window")
     async def session_context_window(session_id: str) -> dict[str, Any]:
         """获取 session 当前上下文窗口的 token 用量信息。"""

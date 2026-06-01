@@ -440,6 +440,11 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                             conversation_key=conv,
                             created_at=_now(),
                             updated_at=_now(),
+                            # [AutoC 2026-06-01] Why: event replay may synthesize
+                            # a SessionInfo for old logs that never had a stored
+                            # provider override. How: leave the new field at its
+                            # empty default. Purpose: rebuild compatibility stays
+                            # explicit while the dataclass grows a new field.
                         )
                 self._apply_inbound_message(seq=seq, session_id=session_id, payload=payload)
             elif et == "inbound_processed":
@@ -528,6 +533,63 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 "target_node_id": target or default_node,
                 "is_override": bool(target),
             }
+
+    def get_session_provider_override(self, session_id: str) -> dict[str, Any] | None:
+        """读取 session 级 provider 覆盖配置。"""
+        sid = (session_id or "").strip()
+        with self._lock:
+            # [AutoC 2026-06-01] Why: engine tasks may run on entry branches while
+            # the durable provider override is attached to the parent session. How:
+            # normalize a possible branch id before reading SessionInfo. Purpose:
+            # all runtime tasks see the same session-scoped provider choice.
+            route_sid = self._route_session_id_for_session_locked(sid)
+            info = self.sessions.get(route_sid)
+            if info is None:
+                return None
+            return dict(info.provider_override or {})
+
+    def set_session_provider_override(self, session_id: str, provider_override: dict[str, Any]) -> dict[str, Any] | None:
+        """设置 session 级 provider 覆盖配置并持久化。"""
+        sid = (session_id or "").strip()
+        clean = dict(provider_override or {}) if isinstance(provider_override, dict) else {}
+        with self._lock:
+            route_sid = self._route_session_id_for_session_locked(sid)
+            info = self.sessions.get(route_sid)
+            if info is None:
+                return None
+            # [AutoC 2026-06-01] Why: the API accepts arbitrary JSON dicts for
+            # provider adapters and future fields. How: copy the dict into
+            # SessionInfo and mirror it to sessions.json through SessionStore.
+            # Purpose: runtime provider overrides are durable without constraining
+            # future provider-specific configuration keys.
+            info.provider_override = clean
+            self._session_store.update_provider_override(route_sid, clean)
+            self.eventlog.append(
+                session_id=route_sid,
+                component="supervisor",
+                type_="provider_override_updated",
+                # [AutoC 2026-06-01] Why: provider_override may contain api_key or
+                # provider-specific secret fields. How: audit only safe summary
+                # metadata and the field names, never the raw dict. Purpose:
+                # updates remain observable without leaking credentials to
+                # data/events.jsonl.
+                payload={
+                    "provider": str(clean.get("provider") or clean.get("provider_type") or ""),
+                    "model": str(clean.get("model") or ""),
+                    "keys": sorted(str(k) for k in clean.keys()),
+                    "api_key_present": bool(clean.get("api_key")),
+                    "requested_session_id": sid,
+                    "ts": _now().isoformat(),
+                },
+            )
+            return dict(clean)
+
+    def clear_session_provider_override(self, session_id: str) -> dict[str, Any] | None:
+        """清除 session 级 provider 覆盖配置并持久化。"""
+        # [AutoC 2026-06-01] Why: DELETE should share the same persistence and
+        # event path as PUT. How: delegate to the setter with an empty dict.
+        # Purpose: the in-memory session and sessions.json are cleared together.
+        return self.set_session_provider_override(session_id, {})
 
     def get_session_active_node(self, session_id: str) -> dict[str, Any]:
         """获取 session 当前实际使用的入口节点。

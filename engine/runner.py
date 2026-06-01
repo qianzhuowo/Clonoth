@@ -429,6 +429,30 @@ async def _fetch_history(rctx: RunContext, limit: int = 40) -> list[dict[str, An
     return []
 
 
+async def _fetch_session_provider_override(
+    http: httpx.AsyncClient,
+    supervisor_url: str,
+    session_id: str,
+) -> dict[str, Any]:
+    """Fetch the session-scoped provider override from supervisor."""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return {}
+    try:
+        # [AutoC 2026-06-01] Why: provider selection is now session-scoped in
+        # supervisor state, while engine workers only receive task snapshots. How:
+        # query the admin-protected provider_override endpoint with the same HTTP
+        # client that already carries the supervisor admin token. Purpose: each
+        # node task resolves provider settings from the current durable session.
+        r = await http.get(f"{supervisor_url.rstrip('/')}/v1/sessions/{sid}/provider_override")
+        if r.status_code == 200:
+            data = r.json()
+            return dict(data) if isinstance(data, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
 async def _register_engine(
     http: httpx.AsyncClient,
     supervisor_url: str,
@@ -849,7 +873,8 @@ async def _run_node_task(
     sw_info = _discover_switchable_nodes(ws_root, node.id)
     entry_node_id = get_str(runtime_cfg, "shell.entry_node_id", "bootstrap.shell_orchestrator").strip()
 
-    rp = resolve_provider(ws_root, node, default_model)
+    session_provider_override = await _fetch_session_provider_override(http, sup_url, parent_session_id or session_id)
+    rp = resolve_provider(ws_root, node, default_model, session_override=session_provider_override)
     provider_cfg = (runtime_cfg.get("providers") or {}).get(rp.provider_type or "openai")
     global_provider_options = provider_cfg.get("options") if isinstance(provider_cfg, dict) else {}
     if not isinstance(global_provider_options, dict):

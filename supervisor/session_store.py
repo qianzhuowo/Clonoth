@@ -131,6 +131,11 @@ class SessionStore:
                     # Purpose: schema extension remains backward compatible while
                     # still restoring per-session routing when the field exists.
                     entry_node_id=str(entry.get("entry_node_id") or ""),
+                    # [AutoC 2026-06-01] Why: provider_override is a new optional
+                    # sessions.json field. How: accept only dict values and copy
+                    # them into SessionInfo. Purpose: old rows load as empty
+                    # overrides and malformed rows cannot leak non-dict data.
+                    provider_override=dict(entry.get("provider_override") or {}) if isinstance(entry.get("provider_override"), dict) else {},
                 )
                 sessions[info.session_id] = info
                 if info.conversation_key:
@@ -163,8 +168,24 @@ class SessionStore:
             # beside the existing metadata. Purpose: restart recovery can route
             # inbound callbacks without relying on volatile supervisor memory.
             "entry_node_id": info.entry_node_id,
+            # [AutoC 2026-06-01] Why: session-scoped provider selection must
+            # survive supervisor restart. How: serialize the SessionInfo override
+            # dict beside other session metadata. Purpose: engine can recover the
+            # same provider/model choice through the supervisor API after restart.
+            "provider_override": dict(info.provider_override or {}),
         }
         self._flush()
+
+    def update_provider_override(self, session_id: str, provider_override: dict[str, Any]) -> None:
+        """更新 session 的 provider_override 并落盘。"""
+        entry = self._registry.get(session_id)
+        if entry is not None:
+            # [AutoC 2026-06-01] Why: provider_override changes are requested after
+            # session creation through admin APIs. How: replace only this field in
+            # the in-memory registry and flush atomically. Purpose: preserve all
+            # other session metadata while making the override durable.
+            entry["provider_override"] = dict(provider_override or {})
+            self._flush()
 
     def update_entry_node(self, session_id: str, entry_node_id: str) -> None:
         """更新 session 的入口节点并落盘。"""

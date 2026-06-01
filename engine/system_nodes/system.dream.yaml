@@ -2,7 +2,7 @@ id: system.dream
 type: ai
 name: "记忆整理节点"
 description: "定期检查和整理持久记忆：合并重复、修正过时、删除冗余、过期清理、提升高频记忆为 skill。系统内部节点，对用户不可见。"
-model: $ENV{MEMORY_EXTRACT_MODEL}
+model: $ENV{DREAM_MODEL}
 tool_access:
   mode: allowlist
   allow:

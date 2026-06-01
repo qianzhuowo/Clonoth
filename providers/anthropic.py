@@ -419,7 +419,7 @@ class AnthropicProvider(BaseProvider):
         messages: list[dict],
         tools: list[dict] | None = None,
         temperature: float | None = None,
-        max_tokens: int = 16384,
+        max_tokens: int = 64000,
         stream: bool = False,
         **kwargs: Any,
     ) -> dict:

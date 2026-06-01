@@ -1224,9 +1224,16 @@ async def _execute_real_tools(
             # Phase 1: 影子写入 tool_result 消息到 ConversationStore
             _shadow_write(ls, _tool_msg, MessageType.TOOL_RESULT)
         if _tool_atts:
-            ls.messages.append({"role": "user", "content": build_multimodal_content(
+            # [AutoC 2026-06-01] Why: tool-generated image attachments were only
+            # appended to runtime memory, so a later task could not reload them
+            # from ConversationStore. How: keep the exact multimodal message in
+            # a variable, append it, then shadow-write it. Purpose: persist tool
+            # image results across task boundaries without changing prompt text.
+            _tool_att_msg = {"role": "user", "content": build_multimodal_content(
                 "以上工具执行产生了以下图片结果：", _tool_atts, workspace_root=ls.rctx.workspace_root,
-            )})
+            )}
+            ls.messages.append(_tool_att_msg)
+            _shadow_write(ls, _tool_att_msg, message_type="tool_result_attachment")
 
     return None
 

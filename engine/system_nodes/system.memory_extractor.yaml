@@ -56,7 +56,8 @@ prompt: |
   - If a memory with the same id likely exists, use the same id to update it.
   - Max 5 memories per extraction.
 
-  After saving (or if nothing to save), use finish to complete.
+  After saving (or if nothing to save), call finish to complete.
+  **finish MUST be called ALONE in a separate turn. Never call finish together with save_memory in the same response.** Correct flow: call all save_memory first → wait for results → then call finish alone in the next turn.
   If nothing is worth saving, finish with text "无需保存".
 
   以下是需要分析的对话记录：

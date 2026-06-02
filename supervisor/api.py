@@ -11,7 +11,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import Body, FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import Body, FastAPI, File, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import Response
 
@@ -166,6 +166,36 @@ def create_app(
             payload={"ts": _now().isoformat()},
         )
         return ConfigReloadOut(ok=True, config=out)
+
+    @app.post("/v1/attachments/upload")
+    async def upload_attachment(
+        file: UploadFile = File(...),
+        conversation_key: str = Query("default"),
+    ) -> dict[str, Any]:
+        """Upload a file attachment. Returns path relative to workspace root."""
+        st: SupervisorState = app.state.state
+        safe_key = conversation_key.replace(":", "_").replace("/", "_").replace("..", "_")
+        att_dir = st.workspace_root / "data" / "attachments" / safe_key
+        att_dir.mkdir(parents=True, exist_ok=True)
+
+        ext = Path(file.filename or "file").suffix or ""
+        unique_name = f"{int(time.time())}_{os.urandom(6).hex()}{ext}"
+        save_path = att_dir / unique_name
+
+        content = await file.read()
+        if len(content) > 50 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="File too large (max 50MB)")
+        save_path.write_bytes(content)
+
+        rel_path = str(save_path.relative_to(st.workspace_root))
+        mime_type = file.content_type or "application/octet-stream"
+        return {
+            "path": rel_path,
+            "name": file.filename or unique_name,
+            "size": len(content),
+            "mime_type": mime_type,
+            "type": "image" if mime_type.startswith("image/") else "file",
+        }
 
     @app.post("/v1/inbound", response_model=InboundMessageOut)
     async def inbound(msg: InboundMessageIn) -> InboundMessageOut:

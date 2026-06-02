@@ -1,0 +1,96 @@
+// [2026-05-16] Login gate — admin token required before entering the app.
+import { useEffect, useState } from 'react';
+
+import { checkAdminAuth, getNodes } from '../../api/supervisorClient';
+import { useSettingsStore } from '../../store/settingsStore';
+import { Button } from '../common';
+
+export const LoginPage = () => {
+  const { adminToken, setAdminToken, setAuthenticated, setAvailableNodes, setEntryNodeId, entryNodeId } = useSettingsStore();
+  const [tokenInput, setTokenInput] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [autoVerifying, setAutoVerifying] = useState(!!adminToken);
+
+  const loadNodes = async (token: string) => {
+    try {
+      const nodes = await getNodes(token);
+      const aiNodes = nodes.filter((n: any) => n.type === 'ai' && !n.id.startsWith('system.'));
+      setAvailableNodes(aiNodes);
+      // If user hasn't picked a node yet, or picked a system node (stale), use the first available
+      const savedNode = localStorage.getItem('clonoth_entry_node') || '';
+      const savedNodeValid = aiNodes.some((n: any) => n.id === savedNode);
+      if ((!savedNode || !savedNodeValid) && aiNodes.length > 0) {
+        setEntryNodeId(aiNodes[0].id);
+      }
+    } catch { /* ignore */ }
+  };
+
+  // Auto-verify saved token on mount
+  useEffect(() => {
+    if (!adminToken) { setAutoVerifying(false); return; }
+    checkAdminAuth(adminToken).then(async ok => {
+      if (ok) {
+        setAuthenticated(true);
+        await loadNodes(adminToken);
+      } else {
+        setAdminToken(null);
+      }
+      setAutoVerifying(false);
+    });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleLogin = async () => {
+    setError('');
+    const token = tokenInput.trim();
+    if (!token) { setError('请输入令牌'); return; }
+    setLoading(true);
+    const ok = await checkAdminAuth(token);
+    setLoading(false);
+    if (ok) {
+      setAdminToken(token);
+      setAuthenticated(true);
+      await loadNodes(token);
+    } else {
+      setError('令牌无效');
+    }
+  };
+
+  if (autoVerifying) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-[var(--duties-bg)] text-[var(--duties-text)]">
+        <div className="text-center">
+          <p className="font-mono text-sm text-[var(--duties-tertiary)]">正在验证会话…</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-screen items-center justify-center bg-[var(--duties-bg)] text-[var(--duties-text)]">
+      <div className="w-full max-w-80 px-4">
+        <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-6">
+          <p className="font-mono text-[0.6rem] uppercase tracking-[0.22em] text-[var(--duties-tertiary)]">Clonoth</p>
+          <h1 className="mt-2 font-mono text-xl font-semibold tracking-[-0.04em]">Clonoth 网页端</h1>
+          <p className="mt-2 text-xs text-[var(--duties-secondary)]">请输入管理员令牌以继续</p>
+          <input
+            autoFocus
+            className="mt-4 w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+            onChange={e => setTokenInput(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && handleLogin()}
+            placeholder="管理员令牌"
+            type="password"
+            value={tokenInput}
+          />
+          {error && <p className="mt-2 text-xs text-red-500">{error}</p>}
+          <Button className="mt-4 w-full" disabled={loading} onClick={handleLogin} variant="primary">
+            {loading ? '正在验证…' : '登录'}
+          </Button>
+        </div>
+        <p className="mt-3 text-center font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
+          调度器网页界面
+        </p>
+      </div>
+    </div>
+  );
+};

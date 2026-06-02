@@ -1,0 +1,114 @@
+// [2026-05-16] Full app: login gate and chat layout.
+// [2026-05-31] Step 3 switches MainApp to the reducer-backed V2 chat path.
+// Why: the new message model owns streaming, tools, and event history in one store.
+// How: use ChatInput, MessageListV2, and EventLogPanel through viewRegistry. Purpose:
+// leave old files available as fallback while the active application uses V2 data.
+// [2026-06-01] MainApp now selects shell content through viewRegistry.
+// Why: settings mode replaces the left and center columns and should not be encoded
+// as App-level modal/right-panel conditionals. How: build one AppViewContext, choose
+// viewRegistry[viewMode], and pass the resolved slots to AppLayout. Purpose: App.tsx
+// remains a small composition root instead of a business-routing file.
+import { useEffect } from 'react';
+
+import { checkHealth, resetConversation } from './api/supervisorClient';
+import { LoginPage } from './components/auth/LoginPage';
+import { AppLayout } from './components/layout';
+import { useChatV2 } from './hooks/useChatV2';
+import { useChatStoreV2 } from './store/chatStoreV2';
+import { useSettingsStore } from './store/settingsStore';
+import { useViewStore } from './store/viewStore';
+import type { Attachment } from './types';
+import { viewRegistry, type AppViewContext } from './views/viewRegistry';
+
+const MainApp = () => {
+  const {
+    conversations, activeConversationId, activeConversation, messages, isGenerating,
+    selectConversation, createConversation, deleteConversation, sendMessage, cancelCurrentTask,
+  } = useChatV2();
+  // [2026-05-31] MessageListV2 needs the normalized tool table beside ordered
+  // messages. Why: tool blocks store stable tool ids, not full tool objects. How:
+  // subscribe to toolExecutionsById directly from chatStoreV2. Purpose: preserve the
+  // reducer-owned data model without reintroducing legacy streamPreview state.
+  const toolsById = useChatStoreV2((state) => state.toolExecutionsById);
+  const { activeNodeId, entryNodeId } = useSettingsStore();
+  const viewMode = useViewStore(state => state.viewMode);
+  const activeSessionId = activeConversation?.sessionId || '';
+  // [2026-06-01] Why: the fallback title is visible in the chat header before a
+  // conversation is selected. How: translate only the display fallback. Purpose:
+  // stored conversation titles and IDs remain unchanged while empty-state UI is Chinese.
+  const activeTitle = activeConversation?.title || '未选择对话';
+
+  // [2026-05-31] Startup loading now belongs to chatStoreV2. Why: the V2 store
+  // hydrates ConversationMeta and structured history through reducer-shaped data.
+  // How: call loadStartup once from the store singleton. Purpose: avoid mounting the
+  // legacy startup loader and its old message accumulator.
+  useEffect(() => {
+    useChatStoreV2.getState().loadStartup();
+  }, []);
+
+  // [2026-06-01] Health check runs at App level so every registered view can show
+  // the same connection status. Why: settings mode no longer mounts the legacy
+  // SettingsPanel. How: update settingsStore.isConnected on an interval. Purpose:
+  // Sidebar and SettingsSidebar share a current Supervisor health indicator.
+  const { setConnected } = useSettingsStore();
+  useEffect(() => {
+    const check = async () => {
+      try {
+        await checkHealth();
+        setConnected(true);
+      } catch {
+        setConnected(false);
+      }
+    };
+    check();
+    const iv = setInterval(check, 10000);
+    return () => clearInterval(iv);
+  }, [setConnected]);
+
+  const handleSend = async (text: string, attachments?: Attachment[]) => {
+    const nodeId = activeNodeId || entryNodeId || undefined;
+    await sendMessage(text, attachments, nodeId);
+  };
+
+  const handleReset = async () => {
+    if (!activeConversationId) return;
+    const convKey = `web:${activeConversationId}`;
+    try { await resetConversation(convKey); } catch { /* ignore reset failures in the shell */ }
+  };
+
+  const view = viewRegistry[viewMode];
+  const viewContext: AppViewContext = {
+    sessionId: activeSessionId,
+    title: activeTitle,
+    conversations,
+    activeConversationId,
+    messages,
+    toolsById,
+    isGenerating,
+    onCreateConversation: createConversation,
+    onSelectConversation: selectConversation,
+    onDeleteConversation: deleteConversation,
+    onSendMessage: handleSend,
+    onCancel: cancelCurrentTask,
+    onReset: handleReset,
+  };
+
+  return (
+    <AppLayout
+      composer={view.composer?.(viewContext)}
+      header={view.header(viewContext)}
+      logPanel={view.rightBottom?.(viewContext)}
+      rightPanel={view.rightTop?.(viewContext)}
+      sidebar={view.sidebar(viewContext)}
+    >
+      {view.main(viewContext)}
+    </AppLayout>
+  );
+};
+
+const App = () => {
+  const { isAuthenticated } = useSettingsStore();
+  return isAuthenticated ? <MainApp /> : <LoginPage />;
+};
+
+export default App;

@@ -412,10 +412,11 @@ describe('chatStore', () => {
   });
 
   it('hydrates dispatch result inbound history as a system card instead of a user message', async () => {
-    // [2026-06-03] Why: supervisor injects completed async dispatch results as
-    // inbound text, but those records are not human input. How: hydrate the known
-    // dispatch-result prefix as a system message. Purpose: refresh no longer shows
-    // old child-node callbacks under the label "你".
+    // [2026-06-03] Why: supervisor now marks child-task callbacks with the
+    // structured dispatch_result message_type, so the frontend must not depend on
+    // localized notification text. How: hydrate a dispatch_result row whose id has no
+    // special prefix. Purpose: refresh renders backend-marked callbacks as system
+    // notices without carrying the old Chinese-prefix heuristic forward.
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/v1/sessions?channel=web')) {
@@ -423,7 +424,7 @@ describe('chatStore', () => {
       }
       if (url.includes('/v1/sessions/sess-dispatch/history')) {
         return jsonResponse([
-          { id: 'u-dispatch', role: 'user', content: '[异步子任务完成] smith 委派的 scout 已完成。\n摘要：done', message_type: 'user_input', created_at: '2026-06-03T12:00:10.000Z' },
+          { id: 'u-dispatch', role: 'user', content: '[异步子任务完成] smith 委派的 scout 已完成。\n摘要：done', message_type: 'dispatch_result', created_at: '2026-06-03T12:00:10.000Z' },
         ]);
       }
       return jsonResponse([]);
@@ -434,6 +435,32 @@ describe('chatStore', () => {
     await waitFor(() => expect(selectMessages(useChatStore.getState(), 'conv-dispatch')).toHaveLength(1));
     const [message] = selectMessages(useChatStore.getState(), 'conv-dispatch');
     expect(message.role).toBe('system');
+    expect(message.blocks[0]).toMatchObject({ kind: 'text', text: expect.stringContaining('[异步子任务完成]') });
+  });
+
+  it('does not classify localized dispatch-looking text as a dispatch result', async () => {
+    // [2026-06-03] Why: presentation text can change by language and should not be a
+    // data contract. How: hydrate a normal user_input row that happens to begin with
+    // the old Chinese dispatch notice. Purpose: prevent future regressions from
+    // reintroducing frontend text-prefix matching.
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/sessions?channel=web')) {
+        return jsonResponse([{ session_id: 'sess-dispatch-text', conversation_key: 'web:conv-dispatch-text', channel: 'web', created_at: '2026-06-03T12:00:00.000Z', updated_at: '2026-06-03T12:01:00.000Z' }]);
+      }
+      if (url.includes('/v1/sessions/sess-dispatch-text/history')) {
+        return jsonResponse([
+          { id: 'u-dispatch-text', role: 'user', content: '[异步子任务完成] this is ordinary user text', message_type: 'user_input', created_at: '2026-06-03T12:00:10.000Z' },
+        ]);
+      }
+      return jsonResponse([]);
+    }));
+
+    useChatStore.getState().loadStartup();
+
+    await waitFor(() => expect(selectMessages(useChatStore.getState(), 'conv-dispatch-text')).toHaveLength(1));
+    const [message] = selectMessages(useChatStore.getState(), 'conv-dispatch-text');
+    expect(message.role).toBe('user');
     expect(message.blocks[0]).toMatchObject({ kind: 'text', text: expect.stringContaining('[异步子任务完成]') });
   });
 

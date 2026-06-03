@@ -232,6 +232,9 @@ function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConver
 
 function normalizeConversationKey(value: string): string {
   if (!value) return '';
+  // [AutoC 2026-06-03] Why: web:{conversationId} is the backend routing key
+  // contract, not display text. How: strip only the protocol prefix before using the
+  // id in frontend maps. Purpose: keep protocol parsing explicit and centralized.
   return value.startsWith('web:') ? value.slice(4) : value;
 }
 
@@ -246,6 +249,9 @@ function isEntryBranchSessionId(sessionId: string): boolean {
 function titleFromSession(conversationKey: string, sessionId: string): string {
   const normalized = normalizeConversationKey(conversationKey);
   if (normalized && normalized !== sessionId) return normalized.length > 30 ? `${normalized.slice(0, 30)}…` : normalized;
+  // [AutoC 2026-06-03] Why: discord:{id} is a backend channel key prefix. How:
+  // parse that protocol marker only for fallback labels, never localized message
+  // content. Purpose: retained string matching remains tied to structured metadata.
   if (conversationKey.startsWith('discord:')) return `Discord ${conversationKey.slice(8)}`;
   return sessionId ? `网页 ${sessionId.slice(0, 8)}` : '新对话';
 }
@@ -372,17 +378,15 @@ function mergeChildNodesFromSessionChildren(
   return changed ? next : state.childNodes;
 }
 
-function isDispatchResultHistoryMessage(message: StructuredMessage, text: string): boolean {
-  // [2026-06-03] Why: async dispatch callbacks are injected as inbound messages so
-  // backend execution can resume, but they are not human-authored user input. How:
-  // detect both the current visible prefix and future structured message types. Purpose:
-  // refresh renders these rows as system notices instead of showing them under "你".
+function isDispatchResultHistoryMessage(message: StructuredMessage, _text: string): boolean {
+  // [AutoC 2026-06-03] Why: dispatch-result recognition belongs to backend-owned
+  // structured metadata, not localized notification text. How: check the new
+  // message_type contract, with only async_dispatch: as a legacy protocol-id fallback
+  // for stored rows created before message_type existed. Purpose: remove brittle
+  // frontend text and dispatch_origin id heuristics while preserving old history.
   const messageType = getStringValue(message.message_type);
-  return text.trimStart().startsWith('[异步子任务完成]')
-    || messageType === 'dispatch_result'
-    || messageType === 'async_dispatch_result'
-    || message.id.startsWith('dispatch_origin:')
-    || message.id.startsWith('async_dispatch_result:');
+  return messageType === 'dispatch_result'
+    || message.id.startsWith('async_dispatch:');
 }
 
 function shouldPreserveConversationMessagesDuringHistoryLoad(
@@ -600,6 +604,9 @@ function getStructuredAgentRouteConversationKey(payload: Record<string, unknown>
     getStringValue(payload.parent_conversation_key),
   ];
 
+  // [AutoC 2026-06-03] Why: these candidates are backend route metadata fields.
+  // How: accept only the web:{conversationId} protocol form and ignore display text.
+  // Purpose: child-event routing stays protocol-driven after removing text hacks.
   return candidates.find((candidate) => candidate.startsWith('web:')) || '';
 }
 
@@ -633,6 +640,10 @@ function resolveEventConversationId(state: ChatStoreState, event: SupervisorEven
   // parent web conversation carried by branch task events.
   const payload = getEventPayload(event);
   const conversationKey = getEventConversationKey(payload);
+  // [AutoC 2026-06-03] Why: conversation_key prefixes are supervisor protocol
+  // markers. How: route web:* directly, route agent:* only through structured parent
+  // metadata, and reject other channels here. Purpose: retained prefix checks do not
+  // depend on localized UI text.
   if (conversationKey.startsWith('web:')) {
     return normalizeConversationKey(conversationKey);
   }
@@ -1338,6 +1349,9 @@ function hydrateStructuredHistory(
       if (!existingMessage) continue;
       existingMessageIds.add(existingMessage.id);
       for (const eventId of existingMessage.eventIds || []) {
+        // [AutoC 2026-06-03] Why: history:{sessionId}:{rowId} is the store's own
+        // source-id namespace. How: compare only that generated protocol prefix.
+        // Purpose: dedupe history rows without inspecting user-visible content.
         if (eventId.startsWith(`history:${sessionId}:`)) existingSourceIds.add(eventId);
       }
       const signature = createHistoryContentSignature(existingMessage.role, getMessageTextForHistoryDedupe(existingMessage));

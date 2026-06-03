@@ -821,6 +821,11 @@ class TaskRouterMixin:
             "conversation_key": conv_key,
             "message_id": msg_id,
             "text": notify_text,
+            # [AutoC 2026-06-03] Why: web history must not identify dispatch
+            # callbacks by localized notification text. How: mark supervisor-injected
+            # callback inbounds with a structured message_type. Purpose: frontend and
+            # future clients can render dispatch results from backend-owned metadata.
+            "message_type": "dispatch_result",
         }
         if result_atts:
             payload["attachments"] = result_atts
@@ -913,6 +918,11 @@ class TaskRouterMixin:
             "conversation_key": conv_key,
             "message_id": msg_id,
             "text": notify_text,
+            # [AutoC 2026-06-03] Why: dispatch_origin callbacks are the same
+            # backend-injected result class as legacy async dispatch callbacks. How:
+            # emit the shared dispatch_result message_type on the inbound payload.
+            # Purpose: clients use one structured contract instead of id or text hacks.
+            "message_type": "dispatch_result",
         }
         if result_atts:
             payload["attachments"] = result_atts

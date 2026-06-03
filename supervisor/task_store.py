@@ -652,6 +652,12 @@ class TaskStoreMixin:
                 return False
             lease_val = max(10.0, min(lease_sec, 600.0))
             task.lease_expires_at = _now() + timedelta(seconds=lease_val)
+            # [AutoC 2026-06-03] Why: during tool execution no stream_delta events
+            # are emitted, so updated_at goes stale even though the worker is alive.
+            # How: piggyback on the 60s heartbeat to refresh updated_at.
+            # Purpose: tool-execution phases are implicitly exempt from the stale
+            # reaper while still catching truly dead workers (no heartbeat = crash).
+            task.updated_at = _now()
             return True
 
     # ---- task 队列（公开方法） ----

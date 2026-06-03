@@ -179,6 +179,18 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
         return {"ok": True}
 
     # ----- Runtime config -----
+    # ----- Config (data/config.yaml) -----
+    @router.get("/config/raw")
+    def get_config_raw() -> dict[str, str]:
+        p = workspace_root / "data" / "config.yaml"
+        return _read_text(p)
+
+    @router.put("/config/raw")
+    def update_config_raw(payload: RawContent) -> dict[str, Any]:
+        p = workspace_root / "data" / "config.yaml"
+        return _write_text(p, payload.content)
+
+    # ----- Runtime -----
     @router.get("/runtime/raw")
     def get_runtime() -> dict[str, str]:
         p = workspace_root / "config" / "runtime.yaml"

@@ -71,55 +71,46 @@ export async function postInbound(params: {
   return resp.json();
 }
 
-// ── Events polling ──
-
-export async function pollEvents(sessionId: string, afterSeq = 0): Promise<SupervisorEvent[]> {
-  try {
-    const resp = await fetch(`${API}/sessions/${sessionId}/events?after_seq=${afterSeq}`);
-    if (!resp.ok) return [];
-    return resp.json();
-  } catch {
-    return [];
-  }
-}
-
 // ── WebSocket events ──
 
-// [2026-05-17] Phase 3 replaces active chat polling with one session WebSocket.
-// These module-level handles make every new connection close the old one first,
-// which prevents duplicated event delivery after the user sends another message.
-let _ws: WebSocket | null = null;
-let _wsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let _wsReconnectDelay = 1000;
+// [2026-06-03] Global Supervisor WebSocket replaces per-session polling.
+// Why: a browser tab can display several web sessions while more than one task is
+// running, so closing or replacing the socket per active session loses events from
+// the other sessions. How: keep one long-lived /v1/ws connection and let the store
+// route each SupervisorEvent by event.session_id. Purpose: realtime delivery no
+// longer depends on the fragile in-memory polling buffer or on the selected chat.
+let _globalWs: WebSocket | null = null;
+let _globalWsReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let _globalWsReconnectDelay = 1000;
 
-export function connectSessionWS(
-  sessionId: string,
+export function connectGlobalWS(
   lastSeq: number,
   onEvent: (event: SupervisorEvent) => void,
   onOpen?: () => void,
   onDisconnect?: () => void,
 ): void {
-  // [2026-05-17] The caller owns the latest sequence value. We still disconnect
-  // here so reconnect attempts and conversation switches never leave stale sockets
-  // pushing events into the current store state.
-  disconnectSessionWS();
+  // [2026-06-03] Why: loadStartup and sendMessage can both request realtime setup.
+  // How: do not open a second socket while one is CONNECTING or OPEN. Purpose:
+  // global event delivery stays single-copy while the connection remains long-lived.
+  const readyState = _globalWs?.readyState;
+  if (readyState === 0 || readyState === 1) {
+    return;
+  }
+
+  disconnectGlobalWS();
 
   const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${wsProtocol}//${window.location.host}/v1/sessions/${sessionId}/ws`;
+  const wsUrl = `${wsProtocol}//${window.location.host}/v1/ws`;
   const ws = new WebSocket(wsUrl);
-  _ws = ws;
+  _globalWs = ws;
 
   ws.onopen = () => {
-    // [2026-05-17] The first client message is the catch-up cursor required by
-    // Supervisor. Resetting the delay here makes later disconnect recovery start
-    // from the smallest backoff again after a successful connection.
-    _wsReconnectDelay = 1000;
-    ws.send(JSON.stringify({ last_seq: lastSeq }));
-    // [2026-06-01] Notify stores when the socket is actually open.
-    // Why: waiting for the first non-ping event can leave the UI reporting a stale
-    // disconnected or connecting state even though the transport is ready. How: call
-    // this optional callback immediately after the catch-up cursor is sent. Purpose:
-    // connection indicators reflect socket readiness, not event arrival timing.
+    // [2026-06-03] Why: /v1/ws uses a global sequence cursor, unlike the old
+    // per-session endpoint. How: send the latest known EventLog seq across all
+    // sessions once the socket opens. Purpose: reconnect catch-up covers every
+    // session without session event polling.
+    _globalWsReconnectDelay = 1000;
+    ws.send(JSON.stringify({ last_seq: Math.max(0, lastSeq || 0) }));
     onOpen?.();
   };
 
@@ -129,38 +120,63 @@ export function connectSessionWS(
       if (data.type === 'ping') return;
       onEvent(data as SupervisorEvent);
     } catch {
-      // [2026-05-17] Invalid frames are ignored because the event stream is
-      // append-only and a malformed frame should not break future valid frames.
+      // [2026-06-03] Why: the global stream is append-only and should tolerate
+      // malformed frames. How: ignore the bad frame only. Purpose: one malformed
+      // payload cannot stop future session events.
     }
   };
 
   ws.onclose = () => {
-    _ws = null;
+    if (_globalWs === ws) _globalWs = null;
     onDisconnect?.();
-    // [2026-05-17] Keep the backoff state in this client even though chatStore
-    // decides whether to reconnect. The timer is intentionally a no-op marker so
-    // disconnectSessionWS can cancel pending close state before a new socket opens.
-    _wsReconnectTimer = setTimeout(() => {}, _wsReconnectDelay);
-    _wsReconnectDelay = Math.min(_wsReconnectDelay * 2, 30000);
+    _globalWsReconnectTimer = setTimeout(() => {}, _globalWsReconnectDelay);
+    _globalWsReconnectDelay = Math.min(_globalWsReconnectDelay * 2, 30000);
   };
 
   ws.onerror = () => {
-    // [2026-05-17] Closing on errors funnels all cleanup through onclose, so the
-    // store has one recovery path for network errors and normal disconnects.
+    // [2026-06-03] Why: network errors should share the same cleanup and reconnect
+    // callback as normal disconnects. How: close the socket and let onclose run.
+    // Purpose: the store has one recovery path for long-lived global realtime.
     ws.close();
   };
 }
 
-export function disconnectSessionWS(): void {
-  // [2026-05-17] This cleanup is called from stopPolling and before every new
-  // connection. Clearing both the backoff timer and onclose handler prevents a
-  // manual stop from scheduling another reconnect.
-  if (_wsReconnectTimer) { clearTimeout(_wsReconnectTimer); _wsReconnectTimer = null; }
-  if (_ws) {
-    _ws.onclose = null;
-    _ws.close();
-    _ws = null;
+export function disconnectGlobalWS(): void {
+  // [2026-06-03] Why: resetState and tests still need an explicit cleanup point.
+  // How: clear the pending reconnect marker and close only the global socket.
+  // Purpose: ordinary task completion never calls this, but full teardown remains safe.
+  if (_globalWsReconnectTimer) { clearTimeout(_globalWsReconnectTimer); _globalWsReconnectTimer = null; }
+  if (_globalWs) {
+    _globalWs.onclose = null;
+    _globalWs.close();
+    _globalWs = null;
   }
+}
+
+export function connectSessionWS(
+  sessionId: string,
+  lastSeq: number,
+  onEvent: (event: SupervisorEvent) => void,
+  onOpen?: () => void,
+  onDisconnect?: () => void,
+): void {
+  // [2026-06-03] Compatibility wrapper. Why: the legacy chatStore still imports the
+  // old per-session helper. How: route it through the global WebSocket and filter by
+  // session id at the client boundary. Purpose: avoid keeping two WebSocket designs
+  // while chatStoreV2 has moved to all-session realtime delivery.
+  connectGlobalWS(
+    lastSeq,
+    (event) => { if (event.session_id === sessionId) onEvent(event); },
+    onOpen,
+    onDisconnect,
+  );
+}
+
+export function disconnectSessionWS(): void {
+  // [2026-06-03] Compatibility wrapper. Why: existing legacy call sites still call
+  // disconnectSessionWS during teardown. How: delegate to the global cleanup helper.
+  // Purpose: reset paths remain functional without reintroducing per-session sockets.
+  disconnectGlobalWS();
 }
 
 // ── Health ──
@@ -295,6 +311,14 @@ export async function checkAdminAuth(token: string): Promise<boolean> {
 export async function getNodes(token: string): Promise<AdminNode[]> {
   const resp = await apiFetch('/admin/config/nodes', { headers: authHeaders(token) });
   return resp.json();
+}
+
+export function getConfigRaw(token: string): Promise<string> {
+  return readRawConfig('/admin/config/config/raw', token);
+}
+
+export function updateConfigRaw(token: string, yaml: string): Promise<any> {
+  return writeRawConfig('/admin/config/config/raw', token, yaml);
 }
 
 export function getRuntimeRaw(token: string): Promise<string> {
@@ -688,4 +712,3 @@ export async function getSessionHistory(sessionId: string, limit = 200): Promise
 // ── Legacy compat exports ──
 
 export const sendInbound = postInbound;
-export const getEvents = pollEvents;

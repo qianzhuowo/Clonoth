@@ -68,12 +68,15 @@ def strip_protocol_markers(text: str) -> str:
 
 
 class EventRouter:
-    """事件轮询主循环 + 协议状态管理 + 适配器分发。
+    """WebSocket 事件消费主循环 + 协议状态管理 + 适配器分发。
 
-    替代 bot_adapter.py _outbound_poller()。
-    轮询 Supervisor 事件流，处理协议状态（trigger 匹配、session 映射、
-    watermark 推进、审批去重），然后通过 AdapterCallbacks 通知适配器
-    执行平台操作（发送消息、刷新 typing、编辑进度日志等）。
+    [2026-06-03] WS-only mode. HTTP poll fallback has been removed.
+    /v1/events is now purely a log/audit endpoint.
+
+    通过全局 WebSocket /v1/ws 消费实时事件，处理协议状态（trigger 匹配、
+    session 映射、watermark 推进、审批去重），然后通过 AdapterCallbacks
+    通知适配器执行平台操作（发送消息、刷新 typing、编辑进度日志等）。
+    断线时指数退避重连（2s → 4s → ... → 30s cap），永不降级。
 
     双层钩子架构：
       Layer 1 — on_raw_event hook：适配器注册的原始事件拦截器，
@@ -90,31 +93,9 @@ class EventRouter:
         await router.run()
     """
 
-    # 事件类型过滤列表，传给 Supervisor GET /v1/events 的 types 参数。
-    # 与 bot_adapter.py _outbound_poller() 中的过滤列表一致。
-    # 2026-04-17: 追加 compact_start/compact_done/compact_failed，
-    # 使 _handle_compact 处理器能接收到这些事件。
-    # [SDK WS 2026-05-19] Why: WS mode receives all event types, but HTTP poll
-    # fallback still relies on this explicit whitelist. How: include the new
-    # tool streaming, stream lifecycle, and approval decision rows. Purpose:
-    # fallback preserves the same adapter-visible raw-event surface as WS mode.
-    _EVENT_TYPES = (
-        "inbound_message,outbound_message,intermediate_reply,"
-        "handoff_progress,stream_delta,approval_requested,"
-        "task_created,task_completed,task_cancelled,"
-        "node_started,node_completed,cancel_requested,"
-        "context_reset,inbound_accepted,task_preempted,"
-        "compact_start,compact_done,compact_failed,snip_compact,"
-        "tool_call_start,tool_call_end,tool_call_delta,"
-        "stream_end,approval_decided,engine_registered"
-    )
-
-    # [SDK WS 2026-05-19] Why: transient websocket failures should not push the
-    # SDK straight back to polling. How: retry WS a small fixed number of times,
-    # with the requested 2-second delay, before entering the legacy poll loop.
-    # Purpose: prefer realtime delivery without sacrificing existing fallback.
-    _WS_MAX_RETRIES_BEFORE_POLL = 3
-    _WS_RETRY_DELAY = 2.0
+    # [2026-06-03] WS is the sole transport. No HTTP poll fallback.
+    _WS_RETRY_DELAY = 2.0        # initial retry delay (seconds)
+    _WS_MAX_RETRY_DELAY = 30.0   # exponential backoff cap
     _WS_SWEEP_INTERVAL = 3.0
 
     def __init__(
@@ -126,7 +107,7 @@ class EventRouter:
         *,
         approval_tracker: ApprovalTracker | None = None,
         entry_node_id: str = "",
-        poll_interval: float = 3.0,
+        poll_interval: float = 3.0,  # deprecated, kept for backward compat
     ):
         """
         Args:
@@ -136,7 +117,7 @@ class EventRouter:
             config: Bot 配置。
             approval_tracker: 审批去重追踪器（可选，默认新建）。
             entry_node_id: 入口节点 ID（可选，默认取 config.entry_node_id）。
-            poll_interval: 轮询间隔秒数（默认 3.0）。
+            poll_interval: [deprecated] 已废弃，仅保留签名向后兼容。
         """
         self._client = client
         self._state = state
@@ -144,9 +125,7 @@ class EventRouter:
         self._config = config
         self._approval = approval_tracker or ApprovalTracker()
         self._entry_node_id = entry_node_id or config.entry_node_id
-        self._poll_interval = poll_interval
         self._after_seq = 0
-        self._caught_up = False
         self._running = False
         # [2026-05-29 restart detection fix] Why: request_restart(target=engine)
         # actually triggers a FULL restart (supervisor+engine), wiping supervisor's
@@ -185,51 +164,27 @@ class EventRouter:
         return self._after_seq
 
     async def run(self) -> None:
-        """事件主循环。优先消费全局 WS；连续失败后降级到 HTTP poll。"""
+        """事件主循环。纯 WS，断线指数退避重连，永不降级 HTTP poll。"""
         self._running = True
-        await self._init_seq()
-        logger.info("EventRouter started, after_seq=%d", self._after_seq)
+        logger.info("EventRouter started (WS-only mode)")
 
-        ws_failures = 0
+        retry_delay = self._WS_RETRY_DELAY
         while self._running:
             try:
-                # [SDK WS 2026-05-19] Why: adapters should receive realtime event
-                # rows without waiting for the poll interval. How: run the global
-                # websocket consumer first and let it raise on disconnect. Purpose:
-                # keep WS as the default transport while preserving the old loop.
                 await self._run_ws()
-                ws_failures = 0
+                retry_delay = self._WS_RETRY_DELAY  # reset on clean close
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 if not self._running:
                     break
-                ws_failures += 1
-                if ws_failures >= self._WS_MAX_RETRIES_BEFORE_POLL:
-                    logger.warning(
-                        "WS connection failed %d times: %s; falling back to HTTP poll",
-                        ws_failures,
-                        e,
-                        exc_info=True,
-                    )
-                    try:
-                        await self._run_poll()
-                    except asyncio.CancelledError:
-                        # Why: cancellation can arrive after WS has already
-                        # downgraded to the fallback loop. How: convert it to the
-                        # same clean stop path used above. Purpose: preserve the
-                        # previous run() cancellation behavior and final log line.
-                        break
-                    break
                 logger.warning(
-                    "WS connection failed (%d/%d): %s; retrying in %.1fs",
-                    ws_failures,
-                    self._WS_MAX_RETRIES_BEFORE_POLL,
-                    e,
-                    self._WS_RETRY_DELAY,
+                    "WS connection failed: %s; retrying in %.1fs",
+                    e, retry_delay,
                     exc_info=True,
                 )
-                await asyncio.sleep(self._WS_RETRY_DELAY)
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, self._WS_MAX_RETRY_DELAY)
 
         logger.info("EventRouter stopped")
 
@@ -261,37 +216,6 @@ class EventRouter:
             with contextlib.suppress(asyncio.CancelledError):
                 await sweep_task
 
-    async def _run_poll(self) -> None:
-        """HTTP poll fallback loop，保留旧版 EventRouter 的完整行为。"""
-        logger.info("EventRouter HTTP poll fallback started, after_seq=%d", self._after_seq)
-        while self._running:
-            try:
-                await asyncio.sleep(self._poll_interval)
-                events = await self._client.poll_events(
-                    after_seq=self._after_seq,
-                    types=self._EVENT_TYPES,
-                )
-
-                # 首批事件快进：如果 _init_seq 失败（_caught_up=False），
-                # 跳过首批事件直接推进游标到最新，避免处理历史积压。
-                if not self._caught_up and events:
-                    self._after_seq = max(e.seq for e in events)
-                    self._caught_up = True
-                    logger.info("Fast-forward to seq=%d", self._after_seq)
-                    continue
-
-                await self._cleanup_stale_triggers()
-                await self._dispatch_events(events)
-                await self._refresh_active_states()
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                # Why: fallback must be as resilient as the previous all-poll
-                # router. How: keep logging and sleeping on transient failures.
-                # Purpose: introducing WS cannot make the legacy path brittle.
-                logger.error("Poll error: %s", e, exc_info=True)
-                await asyncio.sleep(5)
 
     async def _run_ws_sweep_loop(self) -> None:
         """WS 模式的定时 sweep；每 3 秒刷新 typing 和进度状态。"""
@@ -315,12 +239,6 @@ class EventRouter:
                 await self._cb.delete_status_message(trigger)
             except Exception:
                 pass
-
-    async def _dispatch_events(self, events: list[Event]) -> None:
-        """按 seq 推进游标并逐条分发事件。"""
-        for event in events:
-            self._after_seq = max(self._after_seq, event.seq)
-            await self._dispatch(event)
 
     async def _refresh_active_states(self) -> None:
         """刷新所有活跃 trigger 和子任务进度显示。"""
@@ -348,32 +266,8 @@ class EventRouter:
                 pass
 
     # ------------------------------------------------------------------
-    #  初始化与分发
+    #  分发
     # ------------------------------------------------------------------
-
-    async def _init_seq(self) -> None:
-        """启动时初始化事件流游标。
-
-        用 limit=5000 大步翻页追到事件流末尾，使后续轮询只处理新事件。
-        不对历史事件做任何 dispatch，仅记录最新 seq。
-        启动时连接可能暂不可用，最多重试 10 次（每次间隔 2 秒）。
-        """
-        for attempt in range(10):
-            try:
-                seq = 0
-                while True:
-                    events = await self._client.poll_events(after_seq=seq, limit=5000)
-                    if not events:
-                        break
-                    seq = max(e.seq for e in events)
-                self._after_seq = seq
-                self._caught_up = True
-                logger.info("_init_seq: caught up to seq=%d", self._after_seq)
-                return
-            except Exception as e:
-                logger.warning("_init_seq attempt %d failed: %s", attempt + 1, e)
-                await asyncio.sleep(2)
-        logger.warning("_init_seq: all attempts failed, will fast-forward from seq=0")
 
     async def _dispatch(self, event: Event) -> None:
         """将单个事件路由到 Layer 1 钩子，然后到协议处理器。"""

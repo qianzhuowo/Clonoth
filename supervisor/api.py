@@ -37,6 +37,9 @@ from .types import (
     OpenAIConfigPublic,
     OpenAIConfigSecret,
     OpenAIConfigUpdateIn,
+    ProviderUpdateIn,
+    ActiveProviderIn,
+    FallbacksUpdateIn,
     OpRequestIn,
     OpRequestOut,
     OutboundMessageIn,
@@ -166,6 +169,46 @@ def create_app(
             payload={"ts": _now().isoformat()},
         )
         return ConfigReloadOut(ok=True, config=out)
+
+    # ================================================================
+    #  Multi-provider config API
+    # ================================================================
+
+    @app.get("/v1/config/providers")
+    async def get_providers(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        cs: ConfigStore = app.state.config_store
+        return cs.get_providers_public()
+
+    @app.put("/v1/config/providers/{name}")
+    async def upsert_provider(name: str, body: ProviderUpdateIn, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        cs: ConfigStore = app.state.config_store
+        return cs.upsert_provider(name, base_url=body.base_url, api_key=body.api_key, model=body.model)
+
+    @app.delete("/v1/config/providers/{name}")
+    async def delete_provider(name: str, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        cs: ConfigStore = app.state.config_store
+        try:
+            return cs.delete_provider(name)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.put("/v1/config/active-provider")
+    async def set_active_provider(body: ActiveProviderIn, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        cs: ConfigStore = app.state.config_store
+        try:
+            return cs.set_active_provider(body.provider)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.put("/v1/config/fallbacks")
+    async def update_fallbacks(body: FallbacksUpdateIn, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        cs: ConfigStore = app.state.config_store
+        return cs.update_fallbacks(body.fallbacks)
 
     @app.post("/v1/attachments/upload")
     async def upload_attachment(

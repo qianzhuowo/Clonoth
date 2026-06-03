@@ -51,7 +51,7 @@ class ConfigStore:
 
     def __init__(self, *, path: Path):
         self.path = path
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._config: AppConfigSecret = AppConfigSecret()
         self._extra_keys: dict[str, Any] = {}  # preserve unknown top-level keys
 

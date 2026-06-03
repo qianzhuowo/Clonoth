@@ -256,6 +256,38 @@ class AppConfigPublic(BaseModel):
     openai: OpenAIConfigPublic
 
 
+class ProviderConfigPublic(BaseModel):
+    """单个渠道的公开配置（api_key 脱敏）"""
+    base_url: str = ""
+    model: str = ""
+    api_key_present: bool = False
+    api_key_redacted: str = ""
+
+
+class ProvidersResponse(BaseModel):
+    """所有渠道配置响应"""
+    active_provider: str = "openai"
+    providers: dict[str, ProviderConfigPublic] = Field(default_factory=dict)
+    fallbacks: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ProviderUpdateIn(BaseModel):
+    """更新渠道请求（部分更新）"""
+    base_url: str | None = None
+    api_key: str | None = None
+    model: str | None = None
+
+
+class ActiveProviderIn(BaseModel):
+    """切换活跃渠道"""
+    provider: str
+
+
+class FallbacksUpdateIn(BaseModel):
+    """更新 fallback 链"""
+    fallbacks: list[dict[str, Any]]
+
+
 class ConfigReloadOut(BaseModel):
     ok: bool = True
     config: AppConfigPublic

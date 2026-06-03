@@ -321,6 +321,68 @@ export function updateConfigRaw(token: string, yaml: string): Promise<any> {
   return writeRawConfig('/admin/config/config/raw', token, yaml);
 }
 
+// ── Multi-provider config ──
+
+export interface ProviderConfigPublic {
+  base_url: string;
+  model: string;
+  api_key_present: boolean;
+  api_key_redacted: string;
+}
+
+export interface ProvidersResponse {
+  active_provider: string;
+  providers: Record<string, ProviderConfigPublic>;
+  fallbacks: Array<Record<string, any>>;
+}
+
+export async function getProviders(token: string): Promise<ProvidersResponse> {
+  const resp = await apiFetch('/config/providers', { headers: authHeaders(token) });
+  return resp.json();
+}
+
+export async function upsertProvider(
+  token: string,
+  name: string,
+  data: { base_url?: string; api_key?: string; model?: string },
+): Promise<ProvidersResponse> {
+  const resp = await apiFetch(`/config/providers/${encodeURIComponent(name)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify(data),
+  });
+  return resp.json();
+}
+
+export async function deleteProvider(token: string, name: string): Promise<ProvidersResponse> {
+  const resp = await apiFetch(`/config/providers/${encodeURIComponent(name)}`, {
+    method: 'DELETE',
+    headers: authHeaders(token),
+  });
+  return resp.json();
+}
+
+export async function setActiveProvider(token: string, provider: string): Promise<ProvidersResponse> {
+  const resp = await apiFetch('/config/active-provider', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify({ provider }),
+  });
+  return resp.json();
+}
+
+export async function updateFallbacks(
+  token: string,
+  fallbacks: Array<Record<string, any>>,
+): Promise<ProvidersResponse> {
+  const resp = await apiFetch('/config/fallbacks', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify({ fallbacks }),
+  });
+  return resp.json();
+}
+
 export function getRuntimeRaw(token: string): Promise<string> {
   return readRawConfig('/admin/config/runtime/raw', token);
 }

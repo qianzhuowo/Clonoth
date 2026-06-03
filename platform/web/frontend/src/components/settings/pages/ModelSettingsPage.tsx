@@ -1,235 +1,292 @@
-// [2026-06-03] Model & Provider settings — config.yaml editor + reload/restart.
+// [2026-06-03] Model & Provider settings — dynamic multi-provider editor.
 import { useEffect, useState } from 'react';
 
 import {
-  getConfigRaw,
-  getModelConfig,
+  type ProviderConfigPublic,
+  type ProvidersResponse,
+  deleteProvider,
+  getProviders,
   reloadConfig,
-  restartEngine,
-  updateConfigRaw,
-  updateModelConfig,
+  setActiveProvider,
+  upsertProvider,
 } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
-import { Button, YamlEditor } from '../../common';
+import { Button } from '../../common';
 
-interface ModelEditState {
-  model: string;
+interface ProviderEditState {
   base_url: string;
+  model: string;
   api_key: string;
 }
 
+const emptyEdit = (): ProviderEditState => ({ base_url: '', model: '', api_key: '' });
+
 export const ModelSettingsPage = () => {
-  const {
-    adminToken,
-    isAuthenticated,
-    modelConfig,
-    setGlobalConfig,
-    setModelConfig,
-  } = useSettingsStore();
-  const [modelEdit, setModelEdit] = useState<ModelEditState>({ model: '', base_url: '', api_key: '' });
-  const [modelSaving, setModelSaving] = useState(false);
-  const [modelMsg, setModelMsg] = useState('');
+  const { adminToken, isAuthenticated } = useSettingsStore();
 
-  // config.yaml raw editor
-  const [configRaw, setConfigRaw] = useState('');
-  const [configMsg, setConfigMsg] = useState('');
-  const [configLoading, setConfigLoading] = useState(false);
+  const [data, setData] = useState<ProvidersResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [msg, setMsg] = useState('');
 
-  // action states
-  const [reloading, setReloading] = useState(false);
-  const [reloadMsg, setReloadMsg] = useState('');
-  const [restarting, setRestarting] = useState(false);
-  const [restartMsg, setRestartMsg] = useState('');
+  // per-provider edit states, keyed by provider name
+  const [edits, setEdits] = useState<Record<string, ProviderEditState>>({});
+  const [savingKey, setSavingKey] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!modelConfig) return;
-    setModelEdit({ model: modelConfig.model || '', base_url: modelConfig.base_url || '', api_key: '' });
-  }, [modelConfig?.base_url, modelConfig?.model]);
+  // new provider form
+  const [newName, setNewName] = useState('');
+  const [addingNew, setAddingNew] = useState(false);
 
-  const loadConfigRaw = async () => {
+  const load = async () => {
     if (!adminToken || !isAuthenticated) return;
-    setConfigLoading(true);
-    setConfigMsg('');
+    setLoading(true);
+    setMsg('');
     try {
-      const raw = await getConfigRaw(adminToken);
-      setConfigRaw(raw);
-      setConfigMsg('已加载');
-    } catch (error) {
-      setConfigMsg(error instanceof Error ? error.message : '加载失败');
+      const resp = await getProviders(adminToken);
+      setData(resp);
+      // init edit states from loaded data
+      const e: Record<string, ProviderEditState> = {};
+      for (const [name, cfg] of Object.entries(resp.providers)) {
+        e[name] = { base_url: cfg.base_url, model: cfg.model, api_key: '' };
+      }
+      setEdits(e);
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : '加载失败');
     } finally {
-      setConfigLoading(false);
+      setLoading(false);
     }
   };
 
   useEffect(() => {
-    if (!adminToken || !isAuthenticated) return;
-    getModelConfig(adminToken)
-      .then(cfg => {
-        setModelConfig(cfg);
-        setGlobalConfig(cfg.model || '', cfg.base_url || '');
-      })
-      .catch(() => {});
-    void loadConfigRaw();
-  }, [adminToken, isAuthenticated, setGlobalConfig, setModelConfig]);
+    void load();
+  }, [adminToken, isAuthenticated]);
 
-  const handleModelSave = async () => {
+  const applyResponse = (resp: ProvidersResponse) => {
+    setData(resp);
+    const e: Record<string, ProviderEditState> = {};
+    for (const [name, cfg] of Object.entries(resp.providers)) {
+      e[name] = { base_url: cfg.base_url, model: cfg.model, api_key: '' };
+    }
+    setEdits(e);
+  };
+
+  const handleSave = async (name: string) => {
     if (!adminToken) return;
-    setModelSaving(true);
-    setModelMsg('');
+    const edit = edits[name];
+    if (!edit) return;
+    setSavingKey(name);
+    setMsg('');
     try {
       const params: Record<string, string> = {};
-      if (modelEdit.model) params.model = modelEdit.model;
-      if (modelEdit.base_url) params.base_url = modelEdit.base_url;
-      if (modelEdit.api_key) params.api_key = modelEdit.api_key;
-      await updateModelConfig(adminToken, params);
-      const cfg = await getModelConfig(adminToken);
-      setModelConfig(cfg);
-      setGlobalConfig(cfg.model || '', cfg.base_url || '');
-      setModelEdit({ model: cfg.model || '', base_url: cfg.base_url || '', api_key: '' });
-      setModelMsg('已保存');
+      if (edit.base_url) params.base_url = edit.base_url;
+      if (edit.model) params.model = edit.model;
+      if (edit.api_key) params.api_key = edit.api_key;
+      const resp = await upsertProvider(adminToken, name, params);
+      applyResponse(resp);
+      setMsg(`${name} 已保存`);
     } catch (err) {
-      setModelMsg(err instanceof Error ? err.message : '失败');
+      setMsg(err instanceof Error ? err.message : '保存失败');
     } finally {
-      setModelSaving(false);
+      setSavingKey(null);
     }
   };
 
-  const handleConfigSave = async () => {
+  const handleSetActive = async (name: string) => {
     if (!adminToken) return;
-    if (!configRaw.trim()) {
-      setConfigMsg('内容为空');
-      return;
-    }
-    setConfigLoading(true);
-    setConfigMsg('');
+    setMsg('');
     try {
-      await updateConfigRaw(adminToken, configRaw);
-      setConfigMsg('已保存，点击「重载配置」使其生效');
-    } catch (error) {
-      setConfigMsg(error instanceof Error ? error.message : '保存失败');
+      const resp = await setActiveProvider(adminToken, name);
+      applyResponse(resp);
+      setMsg(`已切换到 ${name}`);
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : '切换失败');
+    }
+  };
+
+  const handleDelete = async (name: string) => {
+    if (!adminToken) return;
+    if (!window.confirm(`确定要删除渠道 "${name}"？`)) return;
+    setMsg('');
+    try {
+      const resp = await deleteProvider(adminToken, name);
+      applyResponse(resp);
+      setMsg(`${name} 已删除`);
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : '删除失败');
+    }
+  };
+
+  const handleAddProvider = async () => {
+    if (!adminToken || !newName.trim()) return;
+    const name = newName.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+    setAddingNew(true);
+    setMsg('');
+    try {
+      const resp = await upsertProvider(adminToken, name, {});
+      applyResponse(resp);
+      setNewName('');
+      setMsg(`渠道 ${name} 已添加`);
+    } catch (err) {
+      setMsg(err instanceof Error ? err.message : '添加失败');
     } finally {
-      setConfigLoading(false);
+      setAddingNew(false);
     }
   };
 
   const handleReload = async () => {
     if (!adminToken) return;
-    setReloading(true);
-    setReloadMsg('');
+    setMsg('');
     try {
       await reloadConfig(adminToken);
-      // refresh model display
-      const cfg = await getModelConfig(adminToken);
-      setModelConfig(cfg);
-      setGlobalConfig(cfg.model || '', cfg.base_url || '');
-      setModelEdit({ model: cfg.model || '', base_url: cfg.base_url || '', api_key: '' });
-      setReloadMsg('✅ 配置已重载');
+      await load();
+      setMsg('✅ 配置已重载');
     } catch (err) {
-      setReloadMsg(err instanceof Error ? err.message : '重载失败');
-    } finally {
-      setReloading(false);
+      setMsg(err instanceof Error ? err.message : '重载失败');
     }
   };
 
-  const handleRestart = async () => {
-    if (!adminToken) return;
-    if (!window.confirm('确定要重启引擎吗？正在运行的任务可能会中断。')) return;
-    setRestarting(true);
-    setRestartMsg('');
-    try {
-      await restartEngine(adminToken);
-      setRestartMsg('✅ 已触发引擎重启');
-    } catch (err) {
-      setRestartMsg(err instanceof Error ? err.message : '重启失败');
-    } finally {
-      setRestarting(false);
-    }
+  const updateEdit = (name: string, field: keyof ProviderEditState, value: string) => {
+    setEdits(prev => ({ ...prev, [name]: { ...prev[name], [field]: value } }));
   };
+
+  const providerNames = data ? Object.keys(data.providers) : [];
 
   return (
     <section className="mx-auto flex h-full max-w-4xl flex-col gap-5 overflow-y-auto p-4 sm:p-6">
       <div>
         <p className="font-mono text-[0.6rem] uppercase tracking-[0.22em] text-[var(--duties-tertiary)]">设置</p>
-        <h2 className="mt-1 font-mono text-xl font-semibold tracking-[-0.04em]">模型</h2>
-        <p className="mt-2 max-w-2xl text-sm text-[var(--duties-secondary)]">管理全局默认模型和 Provider 渠道配置（config.yaml）。</p>
+        <h2 className="mt-1 font-mono text-xl font-semibold tracking-[-0.04em]">模型与渠道</h2>
+        <p className="mt-2 max-w-2xl text-sm text-[var(--duties-secondary)]">
+          管理 LLM Provider 渠道配置。当前活跃渠道会被标记。
+        </p>
       </div>
 
       {!isAuthenticated ? (
         <div className="border border-[var(--duties-border)] p-4 text-sm text-[var(--duties-secondary)]">
           修改模型设置前需要完成管理员令牌认证。
         </div>
+      ) : loading && !data ? (
+        <div className="p-4 text-sm text-[var(--duties-secondary)]">加载中...</div>
       ) : (
         <>
-          {/* Quick edit for active provider */}
-          <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-            <p className="mb-3 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">当前活跃渠道（快捷编辑）</p>
-            <label className="mb-1 block text-xs text-[var(--duties-secondary)]">模型</label>
-            <input
-              className="mb-3 w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-              onChange={e => setModelEdit(p => ({ ...p, model: e.target.value }))}
-              value={modelEdit.model}
-            />
-            <label className="mb-1 block text-xs text-[var(--duties-secondary)]">基础 URL</label>
-            <input
-              className="mb-3 w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-              onChange={e => setModelEdit(p => ({ ...p, base_url: e.target.value }))}
-              value={modelEdit.base_url}
-            />
-            <label className="mb-1 block text-xs text-[var(--duties-secondary)]">API 密钥 {modelConfig?.api_key_present ? '（已设置）' : '（未设置）'}</label>
-            <input
-              className="mb-3 w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-              onChange={e => setModelEdit(p => ({ ...p, api_key: e.target.value }))}
-              placeholder="留空以保留当前值"
-              type="password"
-              value={modelEdit.api_key}
-            />
-            {modelMsg && <p className="mb-3 text-xs text-[var(--duties-tertiary)]">{modelMsg}</p>}
-            <Button disabled={modelSaving} onClick={handleModelSave} variant="primary">
-              {modelSaving ? '保存中...' : '保存'}
-            </Button>
+          {/* Status bar */}
+          {msg && (
+            <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] px-4 py-2 text-xs text-[var(--duties-tertiary)]">
+              {msg}
+            </div>
+          )}
+
+          {/* Provider cards */}
+          {providerNames.map(name => {
+            const cfg = data!.providers[name];
+            const edit = edits[name] || emptyEdit();
+            const isActive = data!.active_provider === name;
+            const isSaving = savingKey === name;
+
+            return (
+              <div
+                key={name}
+                className={`border bg-[var(--duties-panel)] p-4 ${
+                  isActive
+                    ? 'border-[var(--duties-text)]'
+                    : 'border-[var(--duties-border)]'
+                }`}
+              >
+                <div className="mb-3 flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <p className="font-mono text-sm font-semibold text-[var(--duties-text)]">{name}</p>
+                    {isActive && (
+                      <span className="rounded bg-[var(--duties-text)] px-1.5 py-0.5 text-[0.6rem] font-bold text-[var(--duties-bg)]">
+                        ACTIVE
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {!isActive && (
+                      <button
+                        className="text-xs text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)]"
+                        onClick={() => handleSetActive(name)}
+                      >
+                        设为活跃
+                      </button>
+                    )}
+                    {!isActive && (
+                      <button
+                        className="text-xs text-red-400 underline hover:text-red-300"
+                        onClick={() => handleDelete(name)}
+                      >
+                        删除
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                <label className="mb-1 block text-xs text-[var(--duties-secondary)]">模型</label>
+                <input
+                  className="mb-3 w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+                  onChange={e => updateEdit(name, 'model', e.target.value)}
+                  value={edit.model}
+                />
+                <label className="mb-1 block text-xs text-[var(--duties-secondary)]">基础 URL</label>
+                <input
+                  className="mb-3 w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+                  onChange={e => updateEdit(name, 'base_url', e.target.value)}
+                  value={edit.base_url}
+                />
+                <label className="mb-1 block text-xs text-[var(--duties-secondary)]">
+                  API 密钥 {cfg?.api_key_present ? `（已设置: ${cfg.api_key_redacted}）` : '（未设置）'}
+                </label>
+                <input
+                  className="mb-3 w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+                  onChange={e => updateEdit(name, 'api_key', e.target.value)}
+                  placeholder="留空以保留当前值"
+                  type="password"
+                  value={edit.api_key}
+                />
+                <Button disabled={isSaving} onClick={() => handleSave(name)} variant="primary">
+                  {isSaving ? '保存中...' : '保存'}
+                </Button>
+              </div>
+            );
+          })}
+
+          {/* Add new provider */}
+          <div className="border border-dashed border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
+            <p className="mb-3 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">添加渠道</p>
+            <div className="flex items-center gap-3">
+              <input
+                className="flex-1 border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+                onChange={e => setNewName(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && handleAddProvider()}
+                placeholder="渠道名称（如 anthropic, deepseek, custom）"
+                value={newName}
+              />
+              <Button disabled={addingNew || !newName.trim()} onClick={handleAddProvider} variant="primary">
+                {addingNew ? '添加中...' : '添加'}
+              </Button>
+            </div>
           </div>
 
-          {/* Full config.yaml editor */}
-          <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-            <p className="mb-3 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">渠道配置（config.yaml）</p>
-            <p className="mb-3 text-xs leading-5 text-[var(--duties-secondary)]">
-              编辑完整的 config.yaml，包括多渠道 Provider、fallback 链等。保存后需点击「重载配置」使变更生效。
-            </p>
-            <YamlEditor
-              height="16rem"
-              onChange={setConfigRaw}
-              placeholder={'version: 1\nprovider: openai\nopenai:\n  base_url: https://...\n  api_key: sk-...\n  model: gpt-4o\ndeepseek:\n  base_url: https://api.deepseek.com\n  api_key: sk-...\n  model: deepseek-chat\nfallbacks:\n- provider: deepseek'}
-              value={configRaw}
-            />
-            <div className="mt-3 flex flex-wrap items-center gap-3">
-              <Button disabled={configLoading} onClick={loadConfigRaw}>
-                {configLoading ? '处理中...' : '重新加载'}
-              </Button>
-              <Button disabled={configLoading || !configRaw.trim()} onClick={handleConfigSave} variant="primary">
-                {configLoading ? '处理中...' : '保存'}
-              </Button>
-              {configMsg && <p className="text-xs text-[var(--duties-tertiary)]">{configMsg}</p>}
+          {/* Fallback display */}
+          {data && data.fallbacks.length > 0 && (
+            <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
+              <p className="mb-2 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">Fallback 链</p>
+              <div className="flex flex-wrap gap-2">
+                {data.fallbacks.map((fb, i) => (
+                  <span
+                    key={i}
+                    className="border border-[var(--duties-border)] px-2 py-1 font-mono text-xs text-[var(--duties-secondary)]"
+                  >
+                    {i + 1}. {fb.provider || JSON.stringify(fb)}
+                  </span>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
 
-          {/* Actions: reload + restart */}
-          <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-            <p className="mb-3 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">操作</p>
-            <div className="flex flex-wrap items-center gap-3">
-              <Button disabled={reloading} onClick={handleReload}>
-                {reloading ? '重载中...' : '🔄 重载配置'}
-              </Button>
-              <Button disabled={restarting} onClick={handleRestart} variant="danger">
-                {restarting ? '重启中...' : '⚡ 重启引擎'}
-              </Button>
-            </div>
-            <div className="mt-2 flex flex-wrap items-center gap-4">
-              {reloadMsg && <p className="text-xs text-[var(--duties-tertiary)]">{reloadMsg}</p>}
-              {restartMsg && <p className="text-xs text-[var(--duties-tertiary)]">{restartMsg}</p>}
-            </div>
-            <p className="mt-2 text-xs leading-5 text-[var(--duties-secondary)]">
-              重载配置：重新读取 config.yaml，不中断服务。重启引擎：完整重启后端引擎进程，运行中的任务可能中断。
-            </p>
+          {/* Reload */}
+          <div className="flex items-center gap-3">
+            <Button onClick={handleReload}>🔄 重载配置</Button>
+            <p className="text-xs text-[var(--duties-secondary)]">重新读取 config.yaml，不中断服务</p>
           </div>
         </>
       )}

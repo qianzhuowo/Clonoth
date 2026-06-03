@@ -446,7 +446,6 @@ class SessionMixin:
         si = self.sessions.get(session_id)
         if si is not None:
             si.updated_at = _now()
-            self._persist_session(si)
         if seq not in self._inbound_events:
             self._inbound_events[seq] = {"session_id": session_id, "payload": payload}
             self._inbound_order.append(seq)
@@ -485,12 +484,13 @@ class SessionMixin:
             inbound_seq = 0
         # [2026-06-03] Why: bump session.updated_at on outbound (reply/finish) so a
         # conversation that just produced a response also rises in the recency-sorted
-        # sidebar. How: refresh updated_at + persist before recording reply routing.
-        # Purpose: both user input and assistant output count as recent activity.
+        # sidebar. How: refresh updated_at in memory (no persist call — SupervisorState
+        # has no _persist_session; the session store serializes updated_at elsewhere).
+        # Purpose: both user input and assistant output count as recent activity
+        # without throwing AttributeError on every inbound/outbound.
         si = self.sessions.get(session_id)
         if si is not None:
             si.updated_at = _now()
-            self._persist_session(si)
         if inbound_seq > 0 and inbound_seq not in self._inbound_routed:
             self._inbound_routed[inbound_seq] = {
                 "action": "reply",

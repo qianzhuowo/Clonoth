@@ -120,7 +120,7 @@ export const AppLayout = ({ sidebar, header, composer, logPanel, rightPanel, chi
             )}
           </div>
         </div>
-        <section className="min-h-0 flex-1 overflow-hidden">{children}</section>
+        <section className="relative min-h-0 flex-1 overflow-hidden">{children}</section>
         {composer && (
           <div className="flex-shrink-0 border-t border-[var(--duties-border)] bg-[var(--duties-bg)]">{composer}</div>
         )}

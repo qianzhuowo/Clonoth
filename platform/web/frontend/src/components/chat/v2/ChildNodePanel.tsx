@@ -51,7 +51,7 @@ const ChildNodeRow = ({ child, now }: { child: ChildNodeState; now: number }) =>
   return (
     <button
       aria-label={`打开子节点 ${child.nodeId}`}
-      className="flex w-full items-center gap-2 border-b border-[var(--duties-border)] px-3 py-2 text-left transition-colors last:border-b-0 hover:bg-[var(--duties-muted)]"
+      className="flex w-full items-center gap-1.5 border-b border-[var(--duties-border)] px-2 py-1.5 text-left transition-colors last:border-b-0 hover:bg-[var(--duties-muted)]"
       onClick={() => {
         // [2026-06-03] Keep click behavior intentionally non-navigating for Phase 2.
         // Why: child-session chat streams require backend APIs planned for Phase 3.
@@ -106,11 +106,11 @@ export const ChildNodePanel = ({ conversationId }: ChildNodePanelProps) => {
   if (!hasActiveChildNodes || childNodes.length === 0) return null;
 
   return (
-    <div className="fixed right-4 top-20 z-40 w-56 rounded-lg border border-[var(--duties-border)] bg-[var(--duties-surface)] shadow-lg">
-      <div className="border-b border-[var(--duties-border)] px-3 py-2">
-        <span className="font-mono text-xs font-semibold">子节点</span>
+    <div className="absolute right-2 top-2 z-30 w-44 rounded-md border border-[var(--duties-border)] bg-[var(--duties-surface)] shadow-md">
+      <div className="border-b border-[var(--duties-border)] px-2 py-1.5">
+        <span className="font-mono text-[0.65rem] font-semibold">子节点</span>
       </div>
-      <div className="max-h-64 overflow-y-auto">
+      <div className="max-h-48 overflow-y-auto">
         {childNodes.map((child) => (
           <ChildNodeRow child={child} key={child.sessionId} now={now} />
         ))}

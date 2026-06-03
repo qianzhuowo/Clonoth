@@ -55,7 +55,7 @@ function getBlocksContainerClassName(message: WsMessage): string {
   // without relying on block-level delivery styling.
   if (message.role !== 'assistant') return 'space-y-2';
   if (message.completionType === 'reply') return 'space-y-2 border-l-2 border-blue-400 pl-3';
-  if (message.completionType === 'finish') return 'space-y-2 border-l-2 border-green-400 pl-3';
+  if (message.completionType === 'finish' && message.status !== 'failed') return 'space-y-2 border-l-2 border-green-400 pl-3';
   return 'space-y-2';
 }
 

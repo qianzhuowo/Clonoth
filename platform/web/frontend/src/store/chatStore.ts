@@ -810,10 +810,21 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
         const reducerEvent = createReducerEventForConversation(event, payload, conversationId, isAgentChildRoute);
         const routedState = seedConversationRouteForEvent(state, event, conversationId);
         const childNodes = updateChildNodesByEvent(routedState, event, conversationId);
-        // [2026-06-03] Why: WebSocket delivery and catch-up use the same
-        // SupervisorEvent shape, but now arrive from the all-session endpoint. How:
-        // route first, replay through the pure reducer, then mirror sidebar metadata.
-        // Purpose: concurrent sessions update independently without per-session WS.
+
+        // [2026-06-03] Why: child-agent events (agent:*) routed to a parent conversation
+        // must NOT be rendered as chat messages in the parent's message list. Their
+        // inbound/outbound would otherwise appear as "你" messages or assistant cards
+        // mixed into the parent stream. How: skip the reducer and conversation sync for
+        // agent child routes; only update childNodes state tracking. Purpose: child
+        // activity is shown in the Sidebar tree and ChildNodePanel, not in the chat flow.
+        if (isAgentChildRoute) {
+          return {
+            ...routedState,
+            childNodes,
+            connectionStatus: 'open' as const,
+          };
+        }
+
         const reducedState = reduceChatEvent(routedState, reducerEvent);
         const conversations = syncConversationsAfterEvent(state.conversations, reducedState, reducerEvent, conversationId);
         const generatingBySession = updateGeneratingByEvent({ ...state, conversations }, reducerEvent, conversationId);

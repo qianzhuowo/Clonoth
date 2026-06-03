@@ -184,3 +184,100 @@ class ConfigStore:
                 api_key=redacted,
             )
             return AppConfigPublic(version=cfg.version, provider=cfg.provider, openai=openai_pub)
+
+    # ================================================================
+    #  Multi-provider CRUD (operates on raw YAML dict)
+    # ================================================================
+
+    _META_KEYS = frozenset({"version", "provider", "fallbacks"})
+
+    def _load_raw(self) -> dict[str, Any]:
+        """Load raw YAML dict from disk."""
+        return self._load_yaml_dict() or {"version": 1, "provider": "openai"}
+
+    def _save_raw(self, data: dict[str, Any]) -> None:
+        """Write raw dict to YAML file."""
+        text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
+        self.path.write_text(text, encoding="utf-8")
+
+    def _is_provider_block(self, val: Any) -> bool:
+        return isinstance(val, dict) and any(k in val for k in ("base_url", "api_key", "model"))
+
+    def get_providers_public(self) -> dict[str, Any]:
+        """Return all providers with redacted api_keys, plus active_provider and fallbacks."""
+        with self._lock:
+            data = self._load_raw()
+            active = data.get("provider", "openai")
+            fallbacks = data.get("fallbacks", []) or []
+
+            providers: dict[str, dict[str, Any]] = {}
+            for key, val in data.items():
+                if key in self._META_KEYS:
+                    continue
+                if self._is_provider_block(val):
+                    raw_key = _resolve_env_value(val.get("api_key", ""))
+                    present, redacted = _redact_api_key(raw_key)
+                    providers[key] = {
+                        "base_url": _resolve_env_value(val.get("base_url", "")),
+                        "model": _resolve_env_value(val.get("model", "")),
+                        "api_key_present": present,
+                        "api_key_redacted": redacted,
+                    }
+
+            return {
+                "active_provider": active,
+                "providers": providers,
+                "fallbacks": fallbacks,
+            }
+
+    def upsert_provider(self, name: str, *, base_url: str | None = None,
+                        api_key: str | None = None, model: str | None = None) -> dict[str, Any]:
+        """Create or update a provider entry."""
+        with self._lock:
+            data = self._load_raw()
+            if name not in data or not isinstance(data.get(name), dict):
+                data[name] = {}
+            if base_url is not None:
+                data[name]["base_url"] = base_url.strip()
+            if api_key is not None:
+                data[name]["api_key"] = api_key.strip()
+            if model is not None:
+                data[name]["model"] = model.strip()
+            self._save_raw(data)
+            self.reload()
+            return self.get_providers_public()
+
+    def set_active_provider(self, name: str) -> dict[str, Any]:
+        """Switch the active provider."""
+        with self._lock:
+            data = self._load_raw()
+            if name not in data or not self._is_provider_block(data.get(name)):
+                raise ValueError(f"Provider '{name}' not found in config")
+            data["provider"] = name
+            self._save_raw(data)
+            self.reload()
+            return self.get_providers_public()
+
+    def update_fallbacks(self, fallbacks: list[dict[str, Any]]) -> dict[str, Any]:
+        """Replace the fallback chain."""
+        with self._lock:
+            data = self._load_raw()
+            data["fallbacks"] = fallbacks
+            self._save_raw(data)
+            self.reload()
+            return self.get_providers_public()
+
+    def delete_provider(self, name: str) -> dict[str, Any]:
+        """Delete a provider entry."""
+        with self._lock:
+            data = self._load_raw()
+            if name not in data:
+                return self.get_providers_public()
+            if data.get("provider") == name:
+                raise ValueError(f"Cannot delete active provider '{name}'; switch to another first")
+            del data[name]
+            fb = data.get("fallbacks", []) or []
+            data["fallbacks"] = [f for f in fb if f.get("provider") != name]
+            self._save_raw(data)
+            self.reload()
+            return self.get_providers_public()

@@ -3,10 +3,12 @@
 // Conversation objects. Why: chatStore keeps message bodies normalized outside the
 // sidebar list. How: render title, session preview, and updated time without reading a
 // messages array. Purpose: let App switch stores without changing sidebar behavior.
-import type { ConversationMeta } from '../../store/chatStore';
+import { useMemo } from 'react';
+
+import { useChatStore, type ChildNodeState, type ConversationMeta } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
-import { Button, Icon } from '../common';
+import { Button, getChildNodeStatusLabel, Icon, StatusDot } from '../common';
 
 interface SidebarProps {
   conversations: ConversationMeta[];
@@ -14,17 +16,47 @@ interface SidebarProps {
   onCreateConversation: () => void;
   onSelectConversation: (conversationId: string) => void;
   onDeleteConversation: (conversationId: string) => void;
+  childNodesByConversation?: Record<string, ChildNodeState[]>;
 }
 
 const formatTime = (isoDate: string) =>
   new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(new Date(isoDate));
 
+function groupChildNodesByConversation(
+  childNodes: Readonly<Record<string, ChildNodeState>>,
+  conversations: ConversationMeta[],
+): Record<string, ChildNodeState[]> {
+  // [2026-06-03] Sidebar receives a flat normalized childNodes map from chatStore.
+  // Why: hooks cannot be called inside conversations.map for each row. How: group the
+  // map once per render and sort each child list by startedAt. Purpose: each parent
+  // conversation can render a stable tree without violating React hook rules.
+  const knownConversationIds = new Set(conversations.map((conversation) => conversation.id));
+  const grouped: Record<string, ChildNodeState[]> = {};
+
+  Object.values(childNodes).forEach((child) => {
+    if (!knownConversationIds.has(child.parentConversationId)) return;
+    grouped[child.parentConversationId] = [...(grouped[child.parentConversationId] || []), child];
+  });
+
+  Object.values(grouped).forEach((children) => {
+    children.sort((a, b) => (a.startedAt || '').localeCompare(b.startedAt || ''));
+  });
+
+  return grouped;
+}
+
 export const Sidebar = ({
   conversations, activeConversationId,
   onCreateConversation, onSelectConversation, onDeleteConversation,
+  childNodesByConversation: providedChildNodesByConversation,
 }: SidebarProps) => {
   const isConnected = useSettingsStore(state => state.isConnected);
   const openSettings = useViewStore(state => state.openSettings);
+  const childNodeMap = useChatStore(state => state.childNodes);
+  const groupedChildNodes = useMemo(
+    () => providedChildNodesByConversation || groupChildNodesByConversation(childNodeMap, conversations),
+    [childNodeMap, conversations, providedChildNodesByConversation],
+  );
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -45,6 +77,7 @@ export const Sidebar = ({
         )}
         {conversations.map((conv) => {
           const isActive = conv.id === activeConversationId;
+          const childNodes = groupedChildNodes[conv.id] || [];
           return (
             <div
               className={`group relative border-b border-[var(--duties-border)] transition-colors hover:bg-[var(--duties-accent)] ${
@@ -77,6 +110,36 @@ export const Sidebar = ({
               >
                 <Icon name="delete" size={15} />
               </button>
+              {childNodes.length > 0 && childNodes.map((child) => (
+                <div
+                  className="ml-3 border-l border-[var(--duties-border)] pl-6"
+                  key={child.sessionId}
+                >
+                  <button
+                    aria-label={`子节点 ${child.nodeId}`}
+                    className="block w-full p-2 text-left text-[0.65rem] text-[var(--duties-secondary)] transition-colors hover:bg-[var(--duties-muted)]"
+                    type="button"
+                  >
+                    {/* [2026-06-03] Render child sessions as passive tree rows.
+                        Why: Phase 2 only visualizes child-node activity and Phase 3
+                        will add real child-session navigation. How: show the shared
+                        status dot, node id, and start time without wiring selection.
+                        Purpose: users can see delegated work without changing chats. */}
+                    <span className="flex items-center gap-1.5">
+                      <StatusDot
+                        label={`子节点 ${child.nodeId} 状态：${getChildNodeStatusLabel(child.status)}`}
+                        status={child.status}
+                      />
+                      <span className="font-mono font-medium">{child.nodeId}</span>
+                    </span>
+                    {child.startedAt && (
+                      <span className="mt-0.5 block text-[var(--duties-tertiary)]">
+                        {formatTime(child.startedAt)}
+                      </span>
+                    )}
+                  </button>
+                </div>
+              ))}
             </div>
           );
         })}

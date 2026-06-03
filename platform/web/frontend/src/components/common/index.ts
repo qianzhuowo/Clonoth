@@ -5,6 +5,12 @@
 export { Button } from './Button';
 export { Icon } from './Icon';
 
+// [2026-06-03] Export the shared child-node status indicator.
+// Why: Sidebar and ChildNodePanel both render child lifecycle state. How: expose the
+// dot and label helper through the existing common barrel. Purpose: child-node UI
+// keeps one color and label mapping across the application.
+export { StatusDot, getChildNodeStatusLabel } from './StatusDot';
+
 // [2026-06-02] Export the raw settings editor from the common barrel.
 // Why: System, Agents, Tools, Skills, MCP, Automation, and Advanced pages all need
 // the same textarea editor. How: re-export the component and its lightweight YAML

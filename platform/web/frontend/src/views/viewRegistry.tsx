@@ -6,7 +6,7 @@
 import type { ReactNode } from 'react';
 
 import { ChatInput } from '../components/chat';
-import { MessageListV2 } from '../components/chat/v2';
+import { ChildNodePanel, MessageListV2 } from '../components/chat/v2';
 import { SystemDashboard } from '../components/dashboard/SystemDashboard';
 import { Header, Sidebar } from '../components/layout';
 import { EventLogPanel } from '../components/log';
@@ -70,7 +70,17 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
         title={ctx.title}
       />
     ),
-    main: (ctx) => <MessageListV2 messages={ctx.messages} toolsById={ctx.toolsById} />,
+    main: (ctx) => (
+      <>
+        <MessageListV2 messages={ctx.messages} toolsById={ctx.toolsById} />
+        {/* [2026-06-03] Mount child-node activity beside the active chat stream.
+            Why: Phase 2 asks for a right-side floating panel without changing the
+            backend or child-session navigation. How: pass only the active parent
+            conversation id and let ChildNodePanel read chatStore. Purpose: the panel
+            appears when active delegated work exists and remains absent otherwise. */}
+        {ctx.activeConversationId && <ChildNodePanel conversationId={ctx.activeConversationId} />}
+      </>
+    ),
     composer: (ctx) => <ChatInput disabled={ctx.isGenerating} onSend={ctx.onSendMessage} />,
     // [2026-06-01] Keep the chat right rail focused on system status.
     // Why: the session editor now opens from Header as an overlay modal. How:

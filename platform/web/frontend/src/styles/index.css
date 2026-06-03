@@ -7,6 +7,11 @@
 :root {
   --duties-bg: #f1f0ee;
   --duties-panel: #e8e7e5;
+  /* [2026-06-03] Add a surface token for floating child-node panels.
+     Why: Phase 2 panel markup uses bg-[var(--duties-surface)] while the theme only
+     had page and panel tokens. How: alias the new token to the existing panel color.
+     Purpose: the panel receives an explicit background without changing the palette. */
+  --duties-surface: var(--duties-panel);
   --duties-muted: #dddcda;
   --duties-text: #252525;
   --duties-secondary: #4a4a4a;

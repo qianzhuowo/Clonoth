@@ -30,13 +30,20 @@ const MainApp = () => {
   // subscribe to toolExecutionsById directly from chatStore. Purpose: preserve the
   // reducer-owned data model without reintroducing legacy streamPreview state.
   const toolsById = useChatStore((state) => state.toolExecutionsById);
+  const viewingChildSessionId = useChatStore((state) => state.viewingChildSessionId);
+  const childNodes = useChatStore((state) => state.childNodes);
+  const exitChildSession = useChatStore((state) => state.exitChildSession);
   const { activeNodeId, entryNodeId } = useSettingsStore();
   const viewMode = useViewStore(state => state.viewMode);
-  const activeSessionId = activeConversation?.sessionId || '';
-  // [2026-06-01] Why: the fallback title is visible in the chat header before a
-  // conversation is selected. How: translate only the display fallback. Purpose:
-  // stored conversation titles and IDs remain unchanged while empty-state UI is Chinese.
-  const activeTitle = activeConversation?.title || '未选择对话';
+  const viewingChildNode = viewingChildSessionId ? childNodes[viewingChildSessionId] : undefined;
+  const activeSessionId = viewingChildSessionId || activeConversation?.sessionId || '';
+  // [2026-06-03] Why: child-session navigation renders a different chat stream while
+  // the parent conversation remains selected. How: replace the header title with a
+  // child label when viewingChildSessionId is set. Purpose: users can see they are
+  // inspecting a child node and can return to the parent.
+  const activeTitle = viewingChildSessionId
+    ? `子节点: ${viewingChildNode?.nodeId || viewingChildSessionId}`
+    : activeConversation?.title || '未选择对话';
 
   // [2026-05-31] Startup loading now belongs to chatStore. Why: the canonical store
   // hydrates ConversationMeta and structured history through reducer-shaped data.
@@ -85,6 +92,9 @@ const MainApp = () => {
     messages,
     toolsById,
     isGenerating,
+    viewingChildSessionId,
+    viewingChildNodeId: viewingChildNode?.nodeId,
+    onExitChildSession: exitChildSession,
     onCreateConversation: createConversation,
     onSelectConversation: selectConversation,
     onDeleteConversation: deleteConversation,

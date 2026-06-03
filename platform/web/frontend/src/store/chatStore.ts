@@ -11,10 +11,12 @@ import {
   decideApproval,
   deleteSession,
 
+  getSessionChildren,
   getSessionHistory,
   listSessions,
   postInbound,
   uploadAttachment,
+  type ChildSessionInfo,
   type StructuredMessage,
 } from '../api/supervisorClient';
 import type { SupervisorEvent } from '../types/chat';
@@ -64,6 +66,8 @@ export interface ChatStoreState extends ChatState {
   connectionStatus: ConnectionStatus;
   generatingBySession: Readonly<Record<string, boolean>>;
   childNodes: Readonly<Record<string, ChildNodeState>>;
+  viewingChildSessionId: string | null;
+  childSessionMessages: Readonly<Record<string, WsMessage[]>>;
 
   selectConversation: (id: string) => void;
   selectChildNodes: (conversationId: string) => ChildNodeState[];
@@ -74,6 +78,8 @@ export interface ChatStoreState extends ChatState {
   sendMessage: (text: string, attachments?: any[], entryNodeId?: string) => Promise<void>;
   cancelCurrentTask: () => Promise<void>;
   resetState: () => void;
+  viewChildSession: (sessionId: string) => void;
+  exitChildSession: () => void;
   loadStartup: () => void;
 }
 
@@ -204,7 +210,7 @@ function createConversationMeta(id = createConversationId(), sessionId = ''): Co
   return { id, sessionId, title: '新对话', updatedAt: timestamp };
 }
 
-function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'generatingBySession' | 'childNodes'> {
+function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'generatingBySession' | 'childNodes' | 'viewingChildSessionId' | 'childSessionMessages'> {
   return {
     conversations: [],
     activeConversationId: null,
@@ -215,6 +221,12 @@ function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConver
     // of reducer ChatState. How: initialize it beside other store-owned maps.
     // Purpose: resetState and startup create a clean child session tracker.
     childNodes: {},
+    // [2026-06-03] Why: Phase 3 can temporarily show a child session's independent
+    // chat stream while the parent conversation remains selected. How: keep the
+    // viewed child id and normalized message cache outside reducer ChatState. Purpose:
+    // switching in and out of child streams does not mutate the sidebar conversation.
+    viewingChildSessionId: null,
+    childSessionMessages: {},
   };
 }
 
@@ -299,6 +311,78 @@ function sortConversationsByRecency(conversations: readonly ConversationMeta[]):
   // sorted once on initial load and again after each task terminal event, matching the
   // recency the user expects without reordering on every streaming delta.
   return [...conversations].sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+}
+
+function getChildConversationId(sessionId: string): string {
+  // [2026-06-03] Why: child session messages must use the same normalized reducer
+  // tables without becoming sidebar conversations. How: namespace their internal
+  // conversation id with a child: prefix. Purpose: MessageList can render child
+  // streams while ConversationMeta remains parent-only.
+  return `child:${sessionId}`;
+}
+
+function selectOrderedMessagesFromState(state: ChatState, conversationId: string): WsMessage[] {
+  // [2026-06-03] Why: chatStore needs the same ordered message array that React
+  // selectors derive, but importing eventSelectors would create a broader dependency.
+  // How: read the reducer order table directly and drop missing ids defensively.
+  // Purpose: childSessionMessages caches render-ready arrays after history or WS replay.
+  return (state.messageOrderByConversation[conversationId] || [])
+    .map((messageId) => state.messagesById[messageId])
+    .filter((message): message is WsMessage => Boolean(message));
+}
+
+function normalizeChildNodeStatus(status: string | undefined): ChildNodeStatus {
+  // [2026-06-03] Why: backend task status names and restored child rows may differ
+  // from the compact frontend badge vocabulary. How: preserve supported terminal and
+  // approval states, and treat every active or unknown state as running. Purpose:
+  // child status rebuilds remain stable across supervisor versions.
+  if (status === 'awaiting_approval' || status === 'completed' || status === 'failed' || status === 'cancelled') return status;
+  return 'running';
+}
+
+function mergeChildNodesFromSessionChildren(
+  state: ChatStoreState,
+  conversationId: string,
+  children: readonly ChildSessionInfo[],
+): Readonly<Record<string, ChildNodeState>> {
+  // [2026-06-03] Why: browser refresh loses childNodes but the supervisor registry
+  // still knows child sessions. How: merge registry rows into the normalized child map
+  // while preserving fresher WebSocket timestamps already present in memory. Purpose:
+  // history loading rebuilds child panels without erasing live status updates.
+  if (children.length === 0) return state.childNodes;
+
+  let changed = false;
+  const next = { ...state.childNodes };
+  for (const child of children) {
+    const sessionId = getStringValue(child.session_id);
+    if (!sessionId) continue;
+    const previous = next[sessionId];
+    next[sessionId] = {
+      sessionId,
+      nodeId: getStringValue(child.node_id) || previous?.nodeId || 'unknown',
+      parentConversationId: conversationId,
+      status: normalizeChildNodeStatus(getStringValue(child.status)),
+      taskId: getStringValue(child.task_id) || previous?.taskId,
+      startedAt: previous?.startedAt || getStringValue(child.started_at) || getStringValue(child.updated_at),
+      completedAt: getStringValue(child.completed_at) || previous?.completedAt,
+    };
+    changed = true;
+  }
+
+  return changed ? next : state.childNodes;
+}
+
+function isDispatchResultHistoryMessage(message: StructuredMessage, text: string): boolean {
+  // [2026-06-03] Why: async dispatch callbacks are injected as inbound messages so
+  // backend execution can resume, but they are not human-authored user input. How:
+  // detect both the current visible prefix and future structured message types. Purpose:
+  // refresh renders these rows as system notices instead of showing them under "你".
+  const messageType = getStringValue(message.message_type);
+  return text.trimStart().startsWith('[异步子任务完成]')
+    || messageType === 'dispatch_result'
+    || messageType === 'async_dispatch_result'
+    || message.id.startsWith('dispatch_origin:')
+    || message.id.startsWith('async_dispatch_result:');
 }
 
 function shouldPreserveConversationMessagesDuringHistoryLoad(
@@ -591,11 +675,14 @@ function collectEventRouteSessionIds(event: SupervisorEvent, payload: Record<str
     getStringValue(payload.parent_session_id),
     getStringValue(payload.branch_session_id),
     getStringValue(payload.runtime_session_id),
+    getStringValue(payload.child_session_id),
     getStringValue(input.parent_session_id),
     getStringValue(input.branch_session_id),
+    getStringValue(input.child_session_id),
     getStringValue(taskContext.session_id),
     getStringValue(taskContext.parent_session_id),
     getStringValue(taskContext.branch_session_id),
+    getStringValue(taskContext.child_session_id),
     getStringValue(payloadDispatchOrigin.parent_session_id),
     getStringValue(inputDispatchOrigin.parent_session_id),
   ];
@@ -642,11 +729,17 @@ function getChildNodeIdFromAgentConversationKey(conversationKey: string): string
 }
 
 function getChildNodeSessionId(event: SupervisorEvent, payload: Record<string, unknown>): string {
-  // [2026-06-03] Why: most child lifecycle events use event.session_id, but some
-  // snapshots also mirror the runtime id in payload.session_id. How: prefer the
-  // explicit payload session and fall back to the event envelope. Purpose: the
-  // childNodes map is keyed by the most specific child session id available.
-  return getStringValue(payload.session_id) || event.session_id;
+  // [2026-06-03] Why: task snapshots run on a branch or parent runtime session while
+  // the actual child chat history is stored under input.child_session_id. How: prefer
+  // child_session_id from every documented payload location before falling back to the
+  // event runtime id. Purpose: childNodes keys match the session id users can open.
+  const input = getNestedRecord(payload, 'input');
+  const taskContext = getNestedRecord(input, 'task_context');
+  return getStringValue(payload.child_session_id)
+    || getStringValue(input.child_session_id)
+    || getStringValue(taskContext.child_session_id)
+    || getStringValue(payload.session_id)
+    || event.session_id;
 }
 
 function getChildNodeId(payload: Record<string, unknown>, previous?: ChildNodeState): string {
@@ -717,6 +810,63 @@ function createReducerEventForConversation(
       conversation_key: `web:${conversationId}`,
       child_conversation_key: getEventConversationKey(payload),
     },
+  };
+}
+
+function createReducerEventForChildSession(
+  event: SupervisorEvent,
+  payload: Record<string, unknown>,
+  childSessionId: string,
+): SupervisorEvent {
+  const childConversationId = getChildConversationId(childSessionId);
+  // [2026-06-03] Why: parent-routed agent events are hidden from the parent chat, but
+  // must be replayed when the user is viewing the child stream. How: clone the event
+  // with a child-namespaced conversation_key and a distinct event id. Purpose: the
+  // reducer can build child messages without colliding with the parent audit event.
+  return {
+    ...event,
+    event_id: `${event.event_id || `${event.session_id}:${event.seq}:${event.type}`}:child-view:${childSessionId}`,
+    payload: {
+      ...event.payload,
+      conversation_key: `web:${childConversationId}`,
+      child_conversation_key: getEventConversationKey(payload),
+      child_session_id: childSessionId,
+    },
+  };
+}
+
+function appendAgentRouteEventLog(
+  state: ChatStoreState,
+  event: SupervisorEvent,
+  conversationId: string,
+): ChatStoreState {
+  const eventId = event.event_id || `${event.session_id}:${event.seq}:${event.type}`;
+  if (state.processedEventIds[eventId]) return state;
+  // [2026-06-03] Why: routed child events should remain visible in the event log, but
+  // reducing them normally would render child chat cards in the parent conversation.
+  // How: stamp a minimal audit row and processed marker without applying message
+  // reducers. Purpose: parent event logs stay useful while parent messages stay clean.
+  return {
+    ...state,
+    processedEventIds: { ...state.processedEventIds, [eventId]: true },
+    lastSeqBySession: {
+      ...state.lastSeqBySession,
+      [event.session_id]: Math.max(state.lastSeqBySession[event.session_id] || 0, event.seq || 0),
+    },
+    eventLog: [
+      ...state.eventLog,
+      {
+        id: `log:${eventId}`,
+        eventId,
+        seq: event.seq,
+        ts: event.ts,
+        sessionId: event.session_id,
+        conversationId,
+        type: event.type,
+        component: event.component,
+        payload: event.payload || {},
+      },
+    ].slice(-3000),
   };
 }
 
@@ -814,13 +964,32 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
         // [2026-06-03] Why: child-agent events (agent:*) routed to a parent conversation
         // must NOT be rendered as chat messages in the parent's message list. Their
         // inbound/outbound would otherwise appear as "你" messages or assistant cards
-        // mixed into the parent stream. How: skip the reducer and conversation sync for
-        // agent child routes; only update childNodes state tracking. Purpose: child
-        // activity is shown in the Sidebar tree and ChildNodePanel, not in the chat flow.
+        // mixed into the parent stream. How: keep an audit log for the parent and, only
+        // when the user is viewing that child session, replay a cloned event into the
+        // child message cache. Purpose: parent chat stays clean while child navigation
+        // still receives live streaming updates.
         if (isAgentChildRoute) {
+          const childSessionId = getChildNodeSessionId(event, payload);
+          let nextState = appendAgentRouteEventLog({ ...routedState, childNodes }, event, conversationId);
+          if (childSessionId && state.viewingChildSessionId === childSessionId) {
+            const childConversationId = getChildConversationId(childSessionId);
+            const childEvent = createReducerEventForChildSession(event, payload, childSessionId);
+            const reducedChildState = reduceChatEvent(nextState, childEvent);
+            nextState = {
+              ...(reducedChildState as ChatStoreState),
+              // [2026-06-03] Why: child-view reducer replay may map a branch runtime
+              // session to child:*, but parent routing should keep using the route map
+              // built above. How: restore the parent route table after extracting child
+              // messages. Purpose: later branch events cannot escape parent routing.
+              conversationIdsBySession: nextState.conversationIdsBySession,
+              childSessionMessages: {
+                ...nextState.childSessionMessages,
+                [childSessionId]: selectOrderedMessagesFromState(reducedChildState, childConversationId),
+              },
+            };
+          }
           return {
-            ...routedState,
-            childNodes,
+            ...nextState,
             connectionStatus: 'open' as const,
           };
         }
@@ -1309,16 +1478,20 @@ function hydrateStructuredHistory(
       const messageId = `message:${conversationId}:history:${message.id || `user-${nextState.messageOrderByConversation[conversationId]?.length || 0}`}`;
       const historyEventId = getHistoryEventId(sessionId, message.id, messageId);
       const text = stringifyContent(message.content);
-      if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, 'user', text)) continue;
+      const hydratedRole: WsMessage['role'] = isDispatchResultHistoryMessage(message, text) ? 'system' : 'user';
+      if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, hydratedRole, text)) continue;
       const wsMessage: WsMessage = {
         id: messageId,
         conversationId,
         sessionId,
-        role: 'user',
+        role: hydratedRole,
         status: 'completed',
         createdAt,
         updatedAt: createdAt,
         source: { nodeId: message.source_node_id || undefined },
+        // [2026-06-03] Why: dispatch-result inbound rows are control notifications,
+        // not human input. How: they keep their text block but use a system message
+        // role computed above. Purpose: refreshed history no longer labels them as "你".
         blocks: [createTextBlock(`${messageId}|block:text:history`, createdAt, text)],
         eventIds: [historyEventId],
         hydratedFromHistory: true,
@@ -1382,9 +1555,13 @@ async function loadSessionHistoryIntoStore(conversationId: string, sessionId: st
   // persistent JSONL. Purpose: final cards use backend-authoritative history while
   // WebSocket sequence cursors remain transport bookkeeping only.
   let history: StructuredMessage[] = [];
+  let children: ChildSessionInfo[] = [];
 
   try {
-    history = await getSessionHistory(sessionId, 200);
+    [history, children] = await Promise.all([
+      getSessionHistory(sessionId, 200),
+      getSessionChildren(sessionId),
+    ]);
   } catch {
     return;
   }
@@ -1394,13 +1571,41 @@ async function loadSessionHistoryIntoStore(conversationId: string, sessionId: st
     const hydrated = history.length > 0
       ? hydrateStructuredHistory(state, sessionId, conversationId, history, preserveExistingMessages)
       : state;
+    const hydratedStore = hydrated as ChatStoreState;
+    const childNodes = mergeChildNodesFromSessionChildren(hydratedStore, conversationId, children);
     return {
       ...hydrated,
+      childNodes,
       conversations: upsertConversationMeta(state.conversations, {
         id: conversationId,
         sessionId,
         updatedAt: new Date().toISOString(),
       }),
+    };
+  });
+}
+
+async function loadChildSessionHistoryIntoStore(sessionId: string, set: StoreSetter) {
+  let history: StructuredMessage[] = [];
+  try {
+    history = await getSessionHistory(sessionId, 200);
+  } catch {
+    return;
+  }
+
+  set((state) => {
+    const conversationId = getChildConversationId(sessionId);
+    // [2026-06-03] Why: child sessions reuse the same persisted history format as
+    // parent sessions. How: hydrate into a child-namespaced conversation id and then
+    // cache the ordered messages under the real child session id. Purpose: MessageList
+    // can switch to childSessionMessages without adding a second renderer.
+    const hydrated = hydrateStructuredHistory(state, sessionId, conversationId, history, false);
+    return {
+      ...hydrated,
+      childSessionMessages: {
+        ...state.childSessionMessages,
+        [sessionId]: selectOrderedMessagesFromState(hydrated, conversationId),
+      },
     };
   });
 }
@@ -1500,6 +1705,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       // user switches chats. Purpose: switching away from a running session does not
       // incorrectly disable another conversation.
       activeConversationId: id,
+      viewingChildSessionId: null,
       isGenerating: target?.sessionId ? Boolean(state.generatingBySession[target.sessionId]) : false,
     }));
     if (target?.sessionId) {
@@ -1526,11 +1732,31 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     return selectHasActiveChildNodesFromState(get(), conversationId);
   },
 
+  viewChildSession: (sessionId) => {
+    const trimmed = sessionId.trim();
+    if (!trimmed) return;
+    // [2026-06-03] Why: child session navigation is a view switch, not a new sidebar
+    // conversation selection. How: store the viewed child id and asynchronously hydrate
+    // its own history into childSessionMessages. Purpose: users can inspect child chat
+    // streams and return to the parent without losing the active parent conversation.
+    set({ viewingChildSessionId: trimmed });
+    void loadChildSessionHistoryIntoStore(trimmed, set);
+  },
+
+  exitChildSession: () => {
+    // [2026-06-03] Why: returning from child view should reveal the still-selected
+    // parent conversation. How: clear only the view marker and leave message caches in
+    // place. Purpose: reopening the same child can reuse cached messages while history
+    // refreshes in the background on the next view action.
+    set({ viewingChildSessionId: null });
+  },
+
   createConversation: () => {
     const conversation = createConversationMeta();
     set((state) => ({
       conversations: [conversation, ...state.conversations],
       activeConversationId: conversation.id,
+      viewingChildSessionId: null,
     }));
     return conversation.id;
   },
@@ -1568,6 +1794,9 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         conversationIdsBySession,
         conversations,
         activeConversationId,
+        viewingChildSessionId: state.viewingChildSessionId && childNodes[state.viewingChildSessionId]
+          ? state.viewingChildSessionId
+          : null,
         generatingBySession,
         childNodes,
         // [2026-06-03] Why: generation is tracked per session now. How: after a

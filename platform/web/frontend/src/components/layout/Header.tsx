@@ -17,9 +17,11 @@ interface HeaderProps {
   onCancel?: () => void;
   onReset?: () => void;
   onTitleChange?: (newTitle: string) => void;
+  viewingChildNodeId?: string;
+  onExitChildSession?: () => void;
 }
 
-export const Header = ({ title, sessionId, isGenerating, onCancel, onReset, onTitleChange }: HeaderProps) => {
+export const Header = ({ title, sessionId, isGenerating, onCancel, onReset, onTitleChange, viewingChildNodeId, onExitChildSession }: HeaderProps) => {
   const {
     adminToken, availableNodes, activeNodeId, entryNodeId, globalModel, sessionProviderOverride,
     setActiveNode, setGlobalConfig, setAvailableNodes,
@@ -84,10 +86,14 @@ export const Header = ({ title, sessionId, isGenerating, onCancel, onReset, onTi
       <div className="mx-auto flex max-w-3xl items-center justify-between gap-2">
         {/* Left: title + badges */}
         <div className="min-w-0 flex-1">
+          {/* [2026-06-03] Why: the child-view title is derived from childNodes and
+              should not edit the parent conversation title. How: disable the title
+              click affordance while viewingChildNodeId is present. Purpose: the
+              title editor remains scoped to parent conversations only. */}
           <h2
-            className={`truncate font-mono text-sm font-semibold tracking-[-0.03em]${onTitleChange ? ' cursor-pointer transition-colors hover:text-[var(--duties-text)]' : ''}`}
-            onClick={onTitleChange ? () => openSessionConfigModal('title') : undefined}
-            title={onTitleChange ? '点击编辑标题' : undefined}
+            className={`truncate font-mono text-sm font-semibold tracking-[-0.03em]${onTitleChange && !viewingChildNodeId ? ' cursor-pointer transition-colors hover:text-[var(--duties-text)]' : ''}`}
+            onClick={onTitleChange && !viewingChildNodeId ? () => openSessionConfigModal('title') : undefined}
+            title={onTitleChange && !viewingChildNodeId ? '点击编辑标题' : undefined}
           >
             {title}
           </h2>
@@ -118,6 +124,15 @@ export const Header = ({ title, sessionId, isGenerating, onCancel, onReset, onTi
 
         {/* Right: action buttons */}
         <div className="flex items-center gap-2">
+          {viewingChildNodeId && onExitChildSession && (
+            <Button className="h-7 px-2 text-[0.6rem]" onClick={onExitChildSession} variant="ghost">
+              {/* [2026-06-03] Why: child-session view temporarily replaces the parent
+                  message list. How: show an explicit return action in the header.
+                  Purpose: users can leave the child stream without selecting the parent
+                  conversation again from the sidebar. */}
+              <Icon name="arrow_back" size={14} /> 返回父会话
+            </Button>
+          )}
           {isGenerating && onCancel && (
             <Button className="h-7 px-2 text-[0.6rem]" onClick={onCancel} variant="ghost">
               <Icon name="cancel" size={14} /> 取消

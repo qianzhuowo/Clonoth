@@ -53,6 +53,7 @@ export const Sidebar = ({
   const isConnected = useSettingsStore(state => state.isConnected);
   const openSettings = useViewStore(state => state.openSettings);
   const childNodeMap = useChatStore(state => state.childNodes);
+  const viewChildSession = useChatStore(state => state.viewChildSession);
   const groupedChildNodes = useMemo(
     () => providedChildNodesByConversation || groupChildNodesByConversation(childNodeMap, conversations),
     [childNodeMap, conversations, providedChildNodesByConversation],
@@ -118,13 +119,21 @@ export const Sidebar = ({
                   <button
                     aria-label={`子节点 ${child.nodeId}`}
                     className="block w-full p-2 text-left text-[0.65rem] text-[var(--duties-secondary)] transition-colors hover:bg-[var(--duties-muted)]"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      // [2026-06-03] Why: the sidebar child row should open the same
+                      // child stream as the floating panel. How: call the store-level
+                      // navigation action with the child session id. Purpose: users can
+                      // inspect delegated work directly from the conversation tree.
+                      viewChildSession(child.sessionId);
+                    }}
                     type="button"
                   >
-                    {/* [2026-06-03] Render child sessions as passive tree rows.
-                        Why: Phase 2 only visualizes child-node activity and Phase 3
-                        will add real child-session navigation. How: show the shared
-                        status dot, node id, and start time without wiring selection.
-                        Purpose: users can see delegated work without changing chats. */}
+                    {/* [2026-06-03] Render child sessions as navigable tree rows.
+                        Why: Phase 3 adds child-session chat streams. How: keep the
+                        shared status dot, node id, and start time while wiring the row
+                        to chatStore.viewChildSession. Purpose: users can see and open
+                        delegated work without creating a separate sidebar conversation. */}
                     <span className="flex items-center gap-1.5">
                       <StatusDot
                         label={`子节点 ${child.nodeId} 状态：${getChildNodeStatusLabel(child.status)}`}

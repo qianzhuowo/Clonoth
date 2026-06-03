@@ -622,6 +622,103 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
     #  Child Session 隔离（Phase A + B）
     # ------------------------------------------------------------------ #
 
+    def session_children(self, *, session_id: str) -> list[dict[str, Any]]:
+        """Return non-branch child sessions that belong to a parent session.
+
+        [2026-06-03] Why: the web frontend cannot rebuild childNodes from
+        ConversationStore history alone after a browser refresh. How: read the
+        durable sessions.json child registry, walk active entry branches, and enrich
+        each child row with the latest matching task status. Purpose: the frontend can
+        restore child-session navigation without replaying old WebSocket events.
+        """
+        parent = str(session_id or "").strip()
+        if not parent:
+            return []
+
+        def _task_sort_key(task: Task) -> datetime:
+            return task.updated_at or task.created_at or _now()
+
+        def _frontend_status(task_status: str) -> str:
+            # [2026-06-03] Why: Supervisor task states are more granular than the web
+            # child-node badge states. How: collapse pending/running/suspended-like
+            # states into "running" and preserve terminal states. Purpose: the API
+            # returns the same small status vocabulary the frontend already renders.
+            if task_status in {"completed", "failed", "cancelled"}:
+                return task_status
+            if task_status == "awaiting_approval":
+                return "awaiting_approval"
+            return "running"
+
+        with self._lock:
+            registry = getattr(self._session_store, "_registry", {})
+            child_ids: set[str] = set()
+            branch_ids: set[str] = set()
+            stack = [parent]
+            visited: set[str] = set()
+
+            while stack:
+                current_parent = stack.pop()
+                if current_parent in visited:
+                    continue
+                visited.add(current_parent)
+                for child_sid in self.parent_children.get(current_parent, set()):
+                    raw = registry.get(child_sid) if isinstance(registry, dict) else None
+                    if not isinstance(raw, dict) or raw.get("reset"):
+                        continue
+                    if str(raw.get("node_id") or "") == "__entry_branch__" or child_sid.startswith("branch_"):
+                        branch_ids.add(child_sid)
+                        stack.append(child_sid)
+                        continue
+                    child_ids.add(child_sid)
+
+            for (child_parent, _node_id, _ctx_key), child_sid in self.child_session_map.items():
+                if child_parent == parent or child_parent in branch_ids:
+                    raw = registry.get(child_sid) if isinstance(registry, dict) else None
+                    if isinstance(raw, dict) and not raw.get("reset"):
+                        child_ids.add(child_sid)
+
+            rows: list[dict[str, Any]] = []
+            for child_sid in sorted(child_ids):
+                raw = registry.get(child_sid) if isinstance(registry, dict) else None
+                if not isinstance(raw, dict) or raw.get("reset"):
+                    continue
+                node_id = str(raw.get("node_id") or "")
+                context_key = str(raw.get("context_key") or "")
+                if not node_id:
+                    for (child_parent, mapped_node, mapped_key), mapped_sid in self.child_session_map.items():
+                        if mapped_sid == child_sid:
+                            node_id = mapped_node
+                            context_key = context_key or mapped_key
+                            break
+
+                related_tasks = [
+                    task for task in self.tasks.values()
+                    if str(task.input.get("child_session_id") or "").strip() == child_sid
+                    or task.session_id == child_sid
+                ]
+                latest_task = max(related_tasks, key=_task_sort_key) if related_tasks else None
+                task_status = latest_task.status.value if latest_task is not None else "running"
+                started_at = latest_task.created_at.isoformat() if latest_task and latest_task.created_at else str(raw.get("created_at") or "")
+                updated_at = latest_task.updated_at.isoformat() if latest_task and latest_task.updated_at else str(raw.get("last_active_at") or raw.get("created_at") or "")
+                terminal = task_status in {"completed", "failed", "cancelled"}
+
+                rows.append({
+                    "session_id": child_sid,
+                    "parent_session_id": str(raw.get("parent_session_id") or ""),
+                    "route_parent_session_id": parent,
+                    "node_id": node_id or "unknown",
+                    "context_key": context_key,
+                    "context_mode": str(raw.get("context_mode") or ""),
+                    "status": _frontend_status(task_status),
+                    "task_id": latest_task.task_id if latest_task is not None else "",
+                    "started_at": started_at,
+                    "updated_at": updated_at,
+                    "completed_at": updated_at if terminal else "",
+                })
+
+            rows.sort(key=lambda item: str(item.get("started_at") or ""))
+            return rows
+
     def get_or_create_child_session(
         self,
         parent_session_id: str,

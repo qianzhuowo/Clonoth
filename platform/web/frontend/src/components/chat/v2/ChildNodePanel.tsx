@@ -47,17 +47,18 @@ function formatRuntime(startedAt: string | undefined, now: number): string | nul
 const ChildNodeRow = ({ child, now }: { child: ChildNodeState; now: number }) => {
   const runtime = formatRuntime(child.startedAt, now);
   const statusLabel = getChildNodeStatusLabel(child.status);
+  const viewChildSession = useChatStore(state => state.viewChildSession);
 
   return (
     <button
       aria-label={`打开子节点 ${child.nodeId}`}
       className="flex w-full items-center gap-1.5 border-b border-[var(--duties-border)] px-2 py-1.5 text-left transition-colors last:border-b-0 hover:bg-[var(--duties-muted)]"
       onClick={() => {
-        // [2026-06-03] Keep click behavior intentionally non-navigating for Phase 2.
-        // Why: child-session chat streams require backend APIs planned for Phase 3.
-        // How: log the selected child payload for development inspection only.
-        // Purpose: the row is ready for a future handler without changing sessions now.
-        console.log('child node clicked', child);
+        // [2026-06-03] Why: Phase 3 needs the floating child row to open the child's
+        // own ConversationStore stream. How: delegate to chatStore.viewChildSession,
+        // which switches the view and hydrates history. Purpose: this panel becomes a
+        // navigation entry instead of a development-only placeholder.
+        viewChildSession(child.sessionId);
       }}
       type="button"
     >

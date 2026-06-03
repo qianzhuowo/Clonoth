@@ -80,8 +80,12 @@ describe('child node UI', () => {
     expect(screen.getByLabelText('子节点 scout 状态：运行中')).toHaveClass('bg-green-500', 'animate-pulse');
   });
 
-  it('shows the current conversation child nodes in a floating panel with live runtime labels', () => {
-    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => undefined);
+  it('shows the current conversation child nodes in a floating panel with live runtime labels and opens child session view', () => {
+    // [2026-06-03] Why: Phase 3 turns the Phase 2 passive row into real navigation.
+    // How: mock the child history endpoint and assert the store enters child-session
+    // view after clicking a panel row. Purpose: future changes cannot regress the
+    // child chat stream entry point back to a console-only placeholder.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })));
     seedChildNodes([
       {
         sessionId: 'child-session-1',
@@ -116,7 +120,35 @@ describe('child node UI', () => {
     expect(screen.queryByText('other')).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: /打开子节点 scout/i }));
-    expect(logSpy).toHaveBeenCalledWith('child node clicked', expect.objectContaining({ sessionId: 'child-session-1' }));
+    expect(useChatStore.getState().viewingChildSessionId).toBe('child-session-1');
+  });
+
+  it('opens child session view from the Sidebar child row', () => {
+    // [2026-06-03] Why: the left conversation tree is the second Phase 3 navigation
+    // entry. How: render a child row and click it with a mocked history response.
+    // Purpose: the sidebar and floating panel share the same store-backed navigation.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } })));
+    seedChildNodes([{
+      sessionId: 'child-session-1',
+      nodeId: 'scout',
+      parentConversationId: 'conv-1',
+      status: 'running',
+      startedAt: '2026-06-03T12:00:00.000Z',
+    }]);
+
+    render(
+      <Sidebar
+        activeConversationId="conv-1"
+        conversations={[conversation]}
+        onCreateConversation={() => undefined}
+        onDeleteConversation={() => undefined}
+        onSelectConversation={() => undefined}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: '子节点 scout' }));
+
+    expect(useChatStore.getState().viewingChildSessionId).toBe('child-session-1');
   });
 
   it('does not render the floating panel when the conversation has no child nodes', () => {

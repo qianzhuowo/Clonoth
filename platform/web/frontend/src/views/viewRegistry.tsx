@@ -27,6 +27,9 @@ export interface AppViewContext {
   messages: WsMessage[];
   toolsById: Record<string, ToolExecution>;
   isGenerating: boolean;
+  viewingChildSessionId?: string | null;
+  viewingChildNodeId?: string;
+  onExitChildSession?: () => void;
   onCreateConversation: () => void;
   onSelectConversation: (conversationId: string) => void;
   onDeleteConversation: (conversationId: string) => void;
@@ -61,13 +64,19 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
       />
     ),
     header: (ctx) => (
+      // [2026-06-03] Why: Header only needs to know whether child view is active to
+      // show the return action and disable title editing. How: pass the child node id
+      // when known, otherwise fall back to the child session id. Purpose: return-to-
+      // parent remains available even before child metadata has loaded.
       <Header
         isGenerating={ctx.isGenerating}
         onCancel={ctx.onCancel}
         onReset={ctx.onReset}
+        onExitChildSession={ctx.onExitChildSession}
         onTitleChange={ctx.onTitleChange}
         sessionId={safeSessionId(ctx.sessionId)}
         title={ctx.title}
+        viewingChildNodeId={ctx.viewingChildNodeId || ctx.viewingChildSessionId || undefined}
       />
     ),
     main: (ctx) => (
@@ -78,10 +87,21 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
             backend or child-session navigation. How: pass only the active parent
             conversation id and let ChildNodePanel read chatStore. Purpose: the panel
             appears when active delegated work exists and remains absent otherwise. */}
-        {ctx.activeConversationId && <ChildNodePanel conversationId={ctx.activeConversationId} />}
+        {ctx.activeConversationId && !ctx.viewingChildSessionId && <ChildNodePanel conversationId={ctx.activeConversationId} />}
       </>
     ),
-    composer: (ctx) => <ChatInput disabled={ctx.isGenerating} onSend={ctx.onSendMessage} />,
+    composer: (ctx) => (
+      <>
+        {/* [2026-06-03] Why: child-session view is an inspection view, while sending
+            still targets the selected parent conversation. How: disable the composer
+            whenever a child stream is open. Purpose: users cannot accidentally submit a
+            parent message while looking at child history. */}
+        <ChatInput
+          disabled={ctx.isGenerating || Boolean(ctx.viewingChildSessionId)}
+          onSend={ctx.onSendMessage}
+        />
+      </>
+    ),
     // [2026-06-01] Keep the chat right rail focused on system status.
     // Why: the session editor now opens from Header as an overlay modal. How:
     // render SystemDashboard in the upper right slot for every chat view. Purpose:

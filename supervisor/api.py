@@ -876,6 +876,16 @@ def create_app(
         st: SupervisorState = app.state.state
         return st.session_history_structured(session_id=session_id, limit=limit)
 
+    @app.get("/v1/sessions/{session_id}/children")
+    async def session_children(session_id: str) -> list[dict[str, Any]]:
+        """Child sessions for a parent session, used by the web frontend refresh path."""
+        # [2026-06-03] Why: frontend childNodes is memory-only and cannot be rebuilt
+        # from /history. How: expose the supervisor's durable child-session registry
+        # through a small read-only endpoint. Purpose: page refresh restores child
+        # status rows and can navigate to each child session's own /history stream.
+        st: SupervisorState = app.state.state
+        return st.session_children(session_id=session_id)
+
     @app.post("/v1/sessions/{session_id}/cancel")
     async def session_cancel(session_id: str) -> dict[str, Any]:
         st: SupervisorState = app.state.state

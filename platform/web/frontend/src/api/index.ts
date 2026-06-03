@@ -10,6 +10,11 @@ export {
   getAdminState,
   checkAdminAuth,
   getNodes,
+  // [2026-06-03] Re-export child-session registry reads. Why: feature code should
+  // not need to know the concrete supervisorClient file path when using API helpers.
+  // How: surface getSessionChildren through the existing API barrel. Purpose: Phase 3
+  // child navigation can share the same import style as other session APIs.
+  getSessionChildren,
   // [2026-06-01] Why: client settings can import API helpers through the public
   // barrel as other frontend code does. How: re-export the dynamic tool-name API
   // beside the existing admin config helpers. Purpose: future settings code does
@@ -21,4 +26,4 @@ export {
   cancelActiveTasks,
   resetConversation,
 } from './supervisorClient';
-export type { AdminState, HealthState } from './supervisorClient';
+export type { AdminState, ChildSessionInfo, HealthState } from './supervisorClient';

@@ -317,6 +317,41 @@ describe('chatStore', () => {
     expect(state.eventLog.find((entry) => entry.eventId === 'chat-ev-20')?.conversationId).toBe('conv-parent');
   });
 
+  it('rebuilds child node state from the session children endpoint during startup', async () => {
+    // [2026-06-03] Why: childNodes is browser memory and disappears on refresh.
+    // How: startup now asks the backend for child sessions after parent history is
+    // loaded. Purpose: the sidebar and child panel can recover delegated work without
+    // replaying old WebSocket events.
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/sessions?channel=web')) {
+        return jsonResponse([{ session_id: 'sess-parent', conversation_key: 'web:conv-parent', channel: 'web', created_at: '2026-06-03T12:00:00.000Z', updated_at: '2026-06-03T12:01:00.000Z' }]);
+      }
+      if (url.includes('/v1/sessions/sess-parent/children')) {
+        return jsonResponse([{
+          session_id: 'child-smith',
+          parent_session_id: 'sess-parent',
+          node_id: 'smith',
+          status: 'running',
+          task_id: 'task-child',
+          started_at: '2026-06-03T12:00:20.000Z',
+        }]);
+      }
+      return jsonResponse([]);
+    }));
+
+    useChatStore.getState().loadStartup();
+
+    await waitFor(() => expect(useChatStore.getState().selectChildNodes('conv-parent')).toHaveLength(1));
+    expect(useChatStore.getState().selectChildNodes('conv-parent')[0]).toMatchObject({
+      sessionId: 'child-smith',
+      nodeId: 'smith',
+      parentConversationId: 'conv-parent',
+      status: 'running',
+      taskId: 'task-child',
+    });
+  });
+
   it('tracks child node task status and exposes child node selectors', async () => {
     // [2026-06-03] Why: UI work in the next phase needs data-layer child session
     // status without rendering components here. How: replay routed child lifecycle
@@ -374,6 +409,99 @@ describe('chatStore', () => {
     ws.receive(supervisorEvent(33, 'task_completed', childPayload, 'child-smith'));
     expect(useChatStore.getState().selectHasActiveChildNodes('conv-parent')).toBe(false);
     expect(useChatStore.getState().selectChildNodes('conv-parent')[0]?.status).toBe('completed');
+  });
+
+  it('hydrates dispatch result inbound history as a system card instead of a user message', async () => {
+    // [2026-06-03] Why: supervisor injects completed async dispatch results as
+    // inbound text, but those records are not human input. How: hydrate the known
+    // dispatch-result prefix as a system message. Purpose: refresh no longer shows
+    // old child-node callbacks under the label "你".
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/sessions?channel=web')) {
+        return jsonResponse([{ session_id: 'sess-dispatch', conversation_key: 'web:conv-dispatch', channel: 'web', created_at: '2026-06-03T12:00:00.000Z', updated_at: '2026-06-03T12:01:00.000Z' }]);
+      }
+      if (url.includes('/v1/sessions/sess-dispatch/history')) {
+        return jsonResponse([
+          { id: 'u-dispatch', role: 'user', content: '[异步子任务完成] smith 委派的 scout 已完成。\n摘要：done', message_type: 'user_input', created_at: '2026-06-03T12:00:10.000Z' },
+        ]);
+      }
+      return jsonResponse([]);
+    }));
+
+    useChatStore.getState().loadStartup();
+
+    await waitFor(() => expect(selectMessages(useChatStore.getState(), 'conv-dispatch')).toHaveLength(1));
+    const [message] = selectMessages(useChatStore.getState(), 'conv-dispatch');
+    expect(message.role).toBe('system');
+    expect(message.blocks[0]).toMatchObject({ kind: 'text', text: expect.stringContaining('[异步子任务完成]') });
+  });
+
+  it('loads child session history when entering child session view', async () => {
+    // [2026-06-03] Why: Phase 3 child navigation renders the child session's own
+    // ConversationStore history in the main chat area. How: viewChildSession fetches
+    // the existing history endpoint and caches normalized messages by child session id.
+    // Purpose: clicking a child node opens its independent chat stream.
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      const url = String(input);
+      if (url.includes('/v1/sessions/child-smith/history')) {
+        return jsonResponse([
+          { id: 'u-child', role: 'user', content: 'child input', message_type: 'user_input', created_at: '2026-06-03T12:00:20.000Z' },
+          { id: 'a-child', role: 'assistant', content: 'child output', message_type: 'assistant', created_at: '2026-06-03T12:00:30.000Z' },
+        ]);
+      }
+      return jsonResponse([]);
+    }));
+
+    useChatStore.getState().viewChildSession('child-smith');
+
+    expect(useChatStore.getState().viewingChildSessionId).toBe('child-smith');
+    await waitFor(() => expect(useChatStore.getState().childSessionMessages['child-smith']).toHaveLength(2));
+    expect(useChatStore.getState().childSessionMessages['child-smith'][1].blocks[0]).toMatchObject({ kind: 'text', text: 'child output' });
+  });
+
+  it('renders realtime routed child events into the active child session view', async () => {
+    // [2026-06-03] Why: child-agent websocket events are intentionally hidden from
+    // the parent chat, but the same events should be visible while the user is looking
+    // at that child session. How: keep parent routing for childNodes while replaying a
+    // child-view event copy into childSessionMessages. Purpose: live child streaming
+    // continues after entering the child chat stream.
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).includes('/history')) return jsonResponse([]);
+      return jsonResponse([]);
+    }));
+    useChatStore.setState((state) => ({
+      ...state,
+      conversations: [{ id: 'conv-parent', sessionId: 'sess-parent', title: 'Parent', updatedAt: '2026-05-31T03:00:00.000Z' }],
+      activeConversationId: 'conv-parent',
+      viewingChildSessionId: 'child-smith',
+      conversationIdsBySession: { ...state.conversationIdsBySession, 'sess-parent': 'conv-parent' },
+      connectionStatus: 'idle',
+    }));
+
+    useChatStore.getState().loadStartup();
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.instances[0];
+    ws.open();
+    ws.receive(supervisorEvent(34, 'stream_delta', {
+      task_id: 'task-child',
+      type: 'text',
+      content: 'child live text',
+      input: {
+        child_session_id: 'child-smith',
+        entry_node_id: 'smith',
+        task_context: {
+          conversation_key: 'agent:smith:web:conv-parent',
+          route_conversation_key: 'web:conv-parent',
+          node_id: 'smith',
+        },
+        _dispatch_origin: { parent_session_id: 'sess-parent', parent_conversation_key: 'web:conv-parent' },
+      },
+    }, 'branch_1'));
+
+    const parentMessages = selectMessages(useChatStore.getState(), 'conv-parent');
+    expect(parentMessages).toHaveLength(0);
+    expect(useChatStore.getState().childSessionMessages['child-smith']?.[0]?.blocks[0]).toMatchObject({ kind: 'text', text: 'child live text' });
   });
 
   it('loads server sessions and keeps a historical finish call separate from prior tool-only work', async () => {
@@ -604,7 +732,12 @@ describe('chatStore', () => {
     // the conversation. How: this regression fixture returns persisted rows that
     // mirror existing live messages. Purpose: selecting back into a running session
     // must not show both delivery=stream and delivery=history copies.
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // [2026-06-03] Why: history loading now also asks the child-session registry to
+    // rebuild childNodes after refresh. How: assert the specific history endpoint was
+    // still called exactly once and allow the additional /children request. Purpose:
+    // this duplicate-history regression test remains focused on message dedupe.
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('/v1/sessions/sess-dupe/history'))).toHaveLength(1);
+    expect(fetchMock.mock.calls.filter(([input]) => String(input).includes('/v1/sessions/sess-dupe/children'))).toHaveLength(1);
     const messages = selectMessages(useChatStore.getState(), 'conv-dupe');
     expect(messages).toHaveLength(2);
     expect(messages.map((message) => message.id)).toEqual([liveUser.id, liveAssistant.id]);

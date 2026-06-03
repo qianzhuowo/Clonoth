@@ -35,12 +35,24 @@ export const useChat = () => {
         sendMessage: state.sendMessage,
         cancelCurrentTask: state.cancelCurrentTask,
         resetState: state.resetState,
+        viewChildSession: state.viewChildSession,
+        exitChildSession: state.exitChildSession,
+        viewingChildSessionId: state.viewingChildSessionId,
         loadStartup: state.loadStartup,
       };
     }),
   );
   const messages = useChatStore(
-    useShallow((state) => (state.activeConversationId ? selectMessages(state, state.activeConversationId) : EMPTY_MESSAGES)),
+    useShallow((state) => {
+      // [2026-06-03] Why: Phase 3 can replace the parent timeline with a child
+      // session's independent stream. How: prefer the cached child messages while a
+      // child is being viewed, otherwise keep the existing active parent selector.
+      // Purpose: MessageListV2 does not need to know whether it renders parent or child.
+      if (state.viewingChildSessionId) {
+        return state.childSessionMessages[state.viewingChildSessionId] || EMPTY_MESSAGES;
+      }
+      return state.activeConversationId ? selectMessages(state, state.activeConversationId) : EMPTY_MESSAGES;
+    }),
   );
 
   return { ...base, messages };

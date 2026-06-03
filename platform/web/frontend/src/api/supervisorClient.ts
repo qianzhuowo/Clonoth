@@ -763,9 +763,40 @@ export interface StructuredMessage {
   reasoning_ended_at?: string;
 }
 
+export interface ChildSessionInfo {
+  // [2026-06-03] Why: child session rows come from sessions.json, not chat history.
+  // How: mirror the backend's snake_case response so chatStore can normalize it into
+  // ChildNodeState. Purpose: refresh can restore child-node status and navigation.
+  session_id: string;
+  parent_session_id?: string;
+  route_parent_session_id?: string;
+  node_id?: string;
+  context_key?: string;
+  context_mode?: string;
+  status?: string;
+  task_id?: string;
+  started_at?: string;
+  updated_at?: string;
+  completed_at?: string;
+}
+
 export async function getSessionHistory(sessionId: string, limit = 200): Promise<StructuredMessage[]> {
   try {
     const resp = await fetch(`${API}/sessions/${sessionId}/history?limit=${limit}`);
+    if (!resp.ok) return [];
+    return resp.json();
+  } catch {
+    return [];
+  }
+}
+
+export async function getSessionChildren(sessionId: string): Promise<ChildSessionInfo[]> {
+  try {
+    // [2026-06-03] Why: child-session metadata is stored in the supervisor registry,
+    // while /history only returns messages. How: call the dedicated read-only endpoint
+    // and tolerate missing older backends by returning an empty array. Purpose: the web
+    // app can be deployed independently while still restoring childNodes when possible.
+    const resp = await fetch(`${API}/sessions/${sessionId}/children`);
     if (!resp.ok) return [];
     return resp.json();
   } catch {

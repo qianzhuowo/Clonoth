@@ -42,14 +42,32 @@ export interface ConversationMeta {
 
 export type ConnectionStatus = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
 
+export type ChildNodeStatus = 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'cancelled';
+
+export interface ChildNodeState {
+  // [2026-06-03] Why: dispatched child agents run in independent Supervisor sessions.
+  // How: keep the runtime session id as the stable map key and visible identifier.
+  // Purpose: later UI phases can group scout/smith activity under the parent chat.
+  sessionId: string;
+  nodeId: string;
+  parentConversationId: string;
+  status: ChildNodeStatus;
+  taskId?: string;
+  startedAt?: string;
+  completedAt?: string;
+}
+
 export interface ChatStoreState extends ChatState {
   conversations: ConversationMeta[];
   activeConversationId: string | null;
   isGenerating: boolean;
   connectionStatus: ConnectionStatus;
   generatingBySession: Readonly<Record<string, boolean>>;
+  childNodes: Readonly<Record<string, ChildNodeState>>;
 
   selectConversation: (id: string) => void;
+  selectChildNodes: (conversationId: string) => ChildNodeState[];
+  selectHasActiveChildNodes: (conversationId: string) => boolean;
   createConversation: () => string;
   deleteConversation: (id: string) => void;
   renameConversation: (id: string, newTitle: string) => void;
@@ -87,6 +105,19 @@ type HistoryToolCall = {
 const CONTROL_TOOL_NAMES = new Set(['finish', 'reply', 'switch_node', 'ask']);
 const INTERNAL_USER_MESSAGE_TYPES = new Set(['tool_result', 'system', 'summary']);
 const TERMINAL_TASK_EVENTS = new Set(['task_completed', 'task_cancelled', 'task_failed']);
+const CHILD_NODE_ACTIVE_STATUSES = new Set<ChildNodeStatus>(['running', 'awaiting_approval']);
+const CHILD_NODE_STATUS_BY_EVENT: Readonly<Record<string, ChildNodeStatus | undefined>> = {
+  // [2026-06-03] Why: child-agent lifecycle events arrive on the global websocket
+  // before any UI tree exists. How: translate the small event vocabulary into a
+  // stable data-layer status. Purpose: later renderers can read one normalized state.
+  task_created: 'running',
+  task_started: 'running',
+  approval_requested: 'awaiting_approval',
+  approval_decided: 'running',
+  task_completed: 'completed',
+  task_failed: 'failed',
+  task_cancelled: 'cancelled',
+};
 const LS_KEY_TITLES = 'clonoth_conversation_titles';
 const LS_KEY_AUTO_APPROVED = 'clonoth_auto_approved_ids';
 
@@ -173,13 +204,17 @@ function createConversationMeta(id = createConversationId(), sessionId = ''): Co
   return { id, sessionId, title: '新对话', updatedAt: timestamp };
 }
 
-function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'generatingBySession'> {
+function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'generatingBySession' | 'childNodes'> {
   return {
     conversations: [],
     activeConversationId: null,
     isGenerating: false,
     connectionStatus: 'idle',
     generatingBySession: {},
+    // [2026-06-03] Why: child-node state is frontend-only routing metadata, not part
+    // of reducer ChatState. How: initialize it beside other store-owned maps.
+    // Purpose: resetState and startup create a clean child session tracker.
+    childNodes: {},
   };
 }
 
@@ -454,6 +489,58 @@ function findConversationIdBySession(state: ChatStoreState, sessionId: string): 
     || '';
 }
 
+function resolveWebConversationKeyToId(state: ChatStoreState, conversationKey: string): string {
+  // [2026-06-03] Why: SDK route metadata uses web:{conversationId}, while this store
+  // indexes conversations by the bare conversation id. How: accept only web keys,
+  // strip the prefix, and prefer an existing sidebar row when present. Purpose:
+  // agent child sessions can route to the parent chat without inventing a new map.
+  if (!conversationKey.startsWith('web:')) return '';
+  const normalized = normalizeConversationKey(conversationKey);
+  return state.conversations.find((conversation) => conversation.id === normalized)?.id || normalized;
+}
+
+function getStructuredAgentRouteConversationKey(payload: Record<string, unknown>): string {
+  // [2026-06-03] Why: dispatch child sessions store their own agent: conversation
+  // key, but routing metadata preserves the visible parent web conversation. How:
+  // read the same structured fallback order requested for the web frontend.
+  // Purpose: frontend routing matches the SDK router without parsing agent strings.
+  const input = getNestedRecord(payload, 'input');
+  const taskContext = getNestedRecord(input, 'task_context');
+  const inputDispatchOrigin = getNestedRecord(input, '_dispatch_origin');
+  const payloadDispatchOrigin = getNestedRecord(payload, 'dispatch_origin');
+  const candidates = [
+    getStringValue(taskContext.route_conversation_key),
+    getStringValue(inputDispatchOrigin.parent_conversation_key),
+    getStringValue(payloadDispatchOrigin.parent_conversation_key),
+    getStringValue(payload.route_conversation_key),
+    getStringValue(payload.parent_conversation_key),
+  ];
+
+  return candidates.find((candidate) => candidate.startsWith('web:')) || '';
+}
+
+function resolveAgentRouteConversationId(state: ChatStoreState, payload: Record<string, unknown>): string {
+  // [2026-06-03] Why: resolveEventConversationId used to drop agent:* keys before
+  // checking route_conversation_key. How: isolate the child-agent fallback so both
+  // routing and child-state tracking share the same decision. Purpose: one rule
+  // determines whether a child event belongs to a visible parent conversation.
+  return resolveWebConversationKeyToId(state, getStructuredAgentRouteConversationKey(payload));
+}
+
+function isAgentEventRoutedToConversation(
+  state: ChatStoreState,
+  payload: Record<string, unknown>,
+  conversationId: string,
+): boolean {
+  // [2026-06-03] Why: child status updates must only run for events that were routed
+  // through the agent fallback, not ordinary branch or parent-session events. How:
+  // require an agent conversation key and a web parent route that resolves to the
+  // current conversation. Purpose: unrelated websocket traffic cannot alter childNodes.
+  return getEventConversationKey(payload).startsWith('agent:')
+    && Boolean(conversationId)
+    && resolveAgentRouteConversationId(state, payload) === conversationId;
+}
+
 function resolveEventConversationId(state: ChatStoreState, event: SupervisorEvent): string {
   // [2026-06-03] Why: /v1/ws emits every Supervisor session, including Discord and
   // internal branch sessions. How: prefer explicit web conversation metadata, then
@@ -462,8 +549,15 @@ function resolveEventConversationId(state: ChatStoreState, event: SupervisorEven
   // parent web conversation carried by branch task events.
   const payload = getEventPayload(event);
   const conversationKey = getEventConversationKey(payload);
-  if (conversationKey) {
-    return conversationKey.startsWith('web:') ? normalizeConversationKey(conversationKey) : '';
+  if (conversationKey.startsWith('web:')) {
+    return normalizeConversationKey(conversationKey);
+  }
+  if (conversationKey && !conversationKey.startsWith('agent:')) {
+    return '';
+  }
+  if (conversationKey.startsWith('agent:')) {
+    const routedConversationId = resolveAgentRouteConversationId(state, payload);
+    if (routedConversationId) return routedConversationId;
   }
 
   const sourceInboundSeq = getEventSourceInboundSeq(payload);
@@ -482,6 +576,33 @@ function resolveEventConversationId(state: ChatStoreState, event: SupervisorEven
   return findConversationIdBySession(state, getEventBranchSessionId(payload));
 }
 
+function collectEventRouteSessionIds(event: SupervisorEvent, payload: Record<string, unknown>): string[] {
+  // [2026-06-03] Why: child dispatch events can identify the same runtime through
+  // event, payload, input, task_context, and dispatch_origin fields. How: collect
+  // every documented location once. Purpose: approvals and later lifecycle events
+  // can resolve back to the parent conversation even if they only carry a child id.
+  const input = getNestedRecord(payload, 'input');
+  const taskContext = getNestedRecord(input, 'task_context');
+  const payloadDispatchOrigin = getNestedRecord(payload, 'dispatch_origin');
+  const inputDispatchOrigin = getNestedRecord(input, '_dispatch_origin');
+  const routeSessionIds = [
+    event.session_id,
+    getStringValue(payload.session_id),
+    getStringValue(payload.parent_session_id),
+    getStringValue(payload.branch_session_id),
+    getStringValue(payload.runtime_session_id),
+    getStringValue(input.parent_session_id),
+    getStringValue(input.branch_session_id),
+    getStringValue(taskContext.session_id),
+    getStringValue(taskContext.parent_session_id),
+    getStringValue(taskContext.branch_session_id),
+    getStringValue(payloadDispatchOrigin.parent_session_id),
+    getStringValue(inputDispatchOrigin.parent_session_id),
+  ];
+
+  return routeSessionIds.filter((sessionId, index, all) => sessionId && all.indexOf(sessionId) === index);
+}
+
 function seedConversationRouteForEvent(
   state: ChatStoreState,
   event: SupervisorEvent,
@@ -495,12 +616,7 @@ function seedConversationRouteForEvent(
   if (!conversationId) return state;
 
   const payload = getEventPayload(event);
-  const routeSessionIds = [
-    event.session_id,
-    getEventParentSessionId(payload),
-    getEventBranchSessionId(payload),
-    getStringValue(payload.runtime_session_id),
-  ].filter((sessionId, index, all) => sessionId && all.indexOf(sessionId) === index);
+  const routeSessionIds = collectEventRouteSessionIds(event, payload);
 
   const conversationIdsBySession = { ...state.conversationIdsBySession };
   let changed = false;
@@ -512,6 +628,113 @@ function seedConversationRouteForEvent(
   }
 
   return changed ? { ...state, conversationIdsBySession } : state;
+}
+
+function getChildNodeIdFromAgentConversationKey(conversationKey: string): string {
+  // [2026-06-03] Why: older child events may omit input.entry_node_id and
+  // task_context.node_id while still carrying agent:{node_id}:... storage keys.
+  // How: parse only the bounded prefix segment as a last-resort fallback. Purpose:
+  // childNodes remains useful for legacy routed events without backend changes.
+  if (!conversationKey.startsWith('agent:')) return '';
+  const rest = conversationKey.slice('agent:'.length);
+  const separator = rest.indexOf(':');
+  return separator > 0 ? rest.slice(0, separator) : '';
+}
+
+function getChildNodeSessionId(event: SupervisorEvent, payload: Record<string, unknown>): string {
+  // [2026-06-03] Why: most child lifecycle events use event.session_id, but some
+  // snapshots also mirror the runtime id in payload.session_id. How: prefer the
+  // explicit payload session and fall back to the event envelope. Purpose: the
+  // childNodes map is keyed by the most specific child session id available.
+  return getStringValue(payload.session_id) || event.session_id;
+}
+
+function getChildNodeId(payload: Record<string, unknown>, previous?: ChildNodeState): string {
+  // [2026-06-03] Why: node identity is stored inside the dispatch input, not on a
+  // dedicated child-state event. How: read the documented fields first, then keep an
+  // existing value or parse agent:{node_id}:... as compatibility. Purpose: status
+  // updates do not lose the scout/smith label after the first event.
+  const input = getNestedRecord(payload, 'input');
+  const taskContext = getNestedRecord(input, 'task_context');
+  const conversationKey = getEventConversationKey(payload);
+  return getStringValue(input.entry_node_id)
+    || getStringValue(taskContext.node_id)
+    || previous?.nodeId
+    || getChildNodeIdFromAgentConversationKey(conversationKey)
+    || 'unknown';
+}
+
+function updateChildNodesByEvent(
+  state: ChatStoreState,
+  event: SupervisorEvent,
+  conversationId: string,
+): Readonly<Record<string, ChildNodeState>> {
+  // [2026-06-03] Why: Phase 1 needs data-layer child-session status before adding
+  // sidebar or floating UI. How: only update childNodes for events proven to have
+  // routed from an agent:* key to a web:* parent through structured metadata.
+  // Purpose: parent conversations can expose child-agent activity without backend work.
+  const payload = getEventPayload(event);
+  if (!isAgentEventRoutedToConversation(state, payload, conversationId)) return state.childNodes;
+
+  const status = CHILD_NODE_STATUS_BY_EVENT[event.type];
+  if (!status) return state.childNodes;
+
+  const sessionId = getChildNodeSessionId(event, payload);
+  if (!sessionId) return state.childNodes;
+
+  const previous = state.childNodes[sessionId];
+  const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+  return {
+    ...state.childNodes,
+    [sessionId]: {
+      sessionId,
+      nodeId: getChildNodeId(payload, previous),
+      parentConversationId: conversationId,
+      status,
+      taskId: getStringValue(payload.task_id) || previous?.taskId,
+      startedAt: previous?.startedAt || event.ts,
+      completedAt: isTerminal ? event.ts : previous?.completedAt,
+    },
+  };
+}
+
+function createReducerEventForConversation(
+  event: SupervisorEvent,
+  payload: Record<string, unknown>,
+  conversationId: string,
+  isAgentChildRoute: boolean,
+): SupervisorEvent {
+  // [2026-06-03] Why: eventReducer intentionally has no agent-route fallback and
+  // prefers payload.conversation_key when present. How: for routed child events only,
+  // pass a shallow event copy whose visible conversation_key is the resolved web
+  // parent while preserving the raw child key. Purpose: keep eventReducer unchanged
+  // and prevent agent:* conversation ids from polluting normalized chat state.
+  if (!isAgentChildRoute) return event;
+  return {
+    ...event,
+    payload: {
+      ...event.payload,
+      conversation_key: `web:${conversationId}`,
+      child_conversation_key: getEventConversationKey(payload),
+    },
+  };
+}
+
+function selectChildNodesFromState(state: ChatStoreState, conversationId: string): ChildNodeState[] {
+  // [2026-06-03] Why: childNodes is keyed by session for efficient updates, while UI
+  // consumers need conversation-grouped lists. How: filter by parentConversationId and
+  // keep a deterministic startedAt order. Purpose: sidebar or status components can
+  // render stable child-node groups without duplicating filtering logic.
+  return Object.values(state.childNodes)
+    .filter((child) => child.parentConversationId === conversationId)
+    .sort((a, b) => (a.startedAt || '').localeCompare(b.startedAt || ''));
+}
+
+function selectHasActiveChildNodesFromState(state: ChatStoreState, conversationId: string): boolean {
+  // [2026-06-03] Why: callers often only need to know whether a parent chat has
+  // active child work. How: reuse the grouped selector and check normalized active
+  // statuses. Purpose: components avoid hard-coding lifecycle status names.
+  return selectChildNodesFromState(state, conversationId).some((child) => CHILD_NODE_ACTIVE_STATUSES.has(child.status));
 }
 
 function getAffectedSessionIds(state: ChatStoreState, event: SupervisorEvent, conversationId: string): string[] {
@@ -582,14 +805,18 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
           return { connectionStatus: 'open' };
         }
 
+        const payload = getEventPayload(event);
+        const isAgentChildRoute = isAgentEventRoutedToConversation(state, payload, conversationId);
+        const reducerEvent = createReducerEventForConversation(event, payload, conversationId, isAgentChildRoute);
         const routedState = seedConversationRouteForEvent(state, event, conversationId);
+        const childNodes = updateChildNodesByEvent(routedState, event, conversationId);
         // [2026-06-03] Why: WebSocket delivery and catch-up use the same
         // SupervisorEvent shape, but now arrive from the all-session endpoint. How:
         // route first, replay through the pure reducer, then mirror sidebar metadata.
         // Purpose: concurrent sessions update independently without per-session WS.
-        const reducedState = reduceChatEvent(routedState, event);
-        const conversations = syncConversationsAfterEvent(state.conversations, reducedState, event, conversationId);
-        const generatingBySession = updateGeneratingByEvent({ ...state, conversations }, event, conversationId);
+        const reducedState = reduceChatEvent(routedState, reducerEvent);
+        const conversations = syncConversationsAfterEvent(state.conversations, reducedState, reducerEvent, conversationId);
+        const generatingBySession = updateGeneratingByEvent({ ...state, conversations }, reducerEvent, conversationId);
         const isGenerating = isConversationGenerating(
           conversations,
           state.activeConversationId,
@@ -608,6 +835,7 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
           ...reducedState,
           conversations,
           generatingBySession,
+          childNodes,
           connectionStatus: 'open',
           isGenerating,
         };
@@ -1273,6 +1501,20 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     }
   },
 
+  selectChildNodes: (conversationId) => {
+    // [2026-06-03] Why: components should not know that childNodes is keyed by
+    // session id. How: expose a store selector that delegates to the shared helper.
+    // Purpose: later UI work can read grouped child state without duplicating logic.
+    return selectChildNodesFromState(get(), conversationId);
+  },
+
+  selectHasActiveChildNodes: (conversationId) => {
+    // [2026-06-03] Why: active-child checks will be used by badges and controls.
+    // How: expose a boolean selector over normalized child statuses. Purpose:
+    // consumers do not hard-code running or awaiting_approval status names.
+    return selectHasActiveChildNodesFromState(get(), conversationId);
+  },
+
   createConversation: () => {
     const conversation = createConversationMeta();
     set((state) => ({
@@ -1292,8 +1534,19 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
       const conversations = state.conversations.filter((item) => item.id !== id);
       const activeConversationId = state.activeConversationId === id ? conversations[0]?.id || null : state.activeConversationId;
       const nextChatState = removeConversationMessages(state, id);
-      const conversationIdsBySession = { ...nextChatState.conversationIdsBySession };
-      if (conversation?.sessionId) delete conversationIdsBySession[conversation.sessionId];
+      const conversationIdsBySession = Object.fromEntries(
+        // [2026-06-03] Why: child and branch sessions can be registered to the same
+        // parent conversation. How: remove every session route whose value is the
+        // deleted conversation id. Purpose: later global events cannot revive a
+        // deleted parent conversation through stale child-session mappings.
+        Object.entries(nextChatState.conversationIdsBySession).filter(([, conversationId]) => conversationId !== id),
+      );
+      const childNodes = Object.fromEntries(
+        // [2026-06-03] Why: childNodes is keyed independently from conversations.
+        // How: drop entries grouped under the deleted parent conversation. Purpose:
+        // selectors cannot report stale scout/smith work after a chat is removed.
+        Object.entries(state.childNodes).filter(([, child]) => child.parentConversationId !== id),
+      );
 
       const generatingBySession = conversation?.sessionId
         ? { ...state.generatingBySession, [conversation.sessionId]: false }
@@ -1305,6 +1558,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
         conversations,
         activeConversationId,
         generatingBySession,
+        childNodes,
         // [2026-06-03] Why: generation is tracked per session now. How: after a
         // deletion chooses a new active conversation, derive the composer lock from
         // that conversation's session flag. Purpose: deleting a running or old chat

@@ -3,7 +3,7 @@
 // hook and its public types. Purpose: barrel imports cannot resolve duplicate
 // chat store symbols after the mechanical rename.
 export { useChatStore } from './chatStore';
-export type { ChatStoreState, ConversationMeta, ConnectionStatus } from './chatStore';
+export type { ChatStoreState, ChildNodeState, ChildNodeStatus, ConversationMeta, ConnectionStatus } from './chatStore';
 export { useClientPrefsStore, shouldAutoApproveTool } from './clientPrefsStore';
 export type { ClientPrefs, TitleGenerationMode } from './clientPrefsStore';
 export { useSettingsStore } from './settingsStore';

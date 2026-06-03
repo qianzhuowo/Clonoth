@@ -790,6 +790,18 @@ def create_app(
             st.record_outbound_message_event(evt)
         if ev.type == "context_usage":
             st.update_context_usage(session_id, dict(ev.payload or {}))
+        # [AutoC 2026-06-03] Why: scheduler stale-task reaper checks task.updated_at
+        # but the engine heartbeat (renew_lease) only refreshes lease_expires_at,
+        # causing live tasks to be falsely reaped after 10 min of no state mutation.
+        # How: extract task_id from event payload and touch updated_at on running
+        # tasks. Purpose: any engine activity (stream_delta, tool events, replies)
+        # resets the stale timer so only truly dead tasks get reaped.
+        _evt_task_id = str((ev.payload or {}).get("task_id") or "").strip()
+        if _evt_task_id:
+            with st._lock:
+                _evt_task = st.tasks.get(_evt_task_id)
+                if _evt_task is not None and _evt_task.status == TaskStatus.running:
+                    _evt_task.updated_at = datetime.now(timezone.utc)
         return {"ok": True}
 
     @app.get("/v1/sessions")

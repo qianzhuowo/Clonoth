@@ -89,13 +89,28 @@ def _parse_ws_initial_last_seq(message: str) -> int:
         return 0
 
 
+_WS_MAX_EVENT_BYTES = 65_536  # 64 KiB soft cap for individual WS events
+
+
 async def _send_ws_json(websocket: WebSocket, payload: dict[str, Any]) -> None:
-    """Send one JSON object over a WebSocket as UTF-8 text."""
+    """Send one JSON object over a WebSocket as UTF-8 text.
+
+    [2026-06-03] Why: tool_call_end events from read_file can exceed 100 KiB,
+    causing browsers to close the socket with code 1009 (Message Too Big).
+    How: pre-serialize, check size, and truncate large result payloads before
+    sending. Purpose: keep the WS stream alive for all clients."""
     # [WS events 2026-05-17] Why: EventLog payloads are plain dicts but may later
     # contain values FastAPI's send_json cannot serialize by default. How: use the
     # same explicit json.dumps path for events and ping frames. Purpose: make the
     # wire shape predictable and resilient to harmless non-string values.
-    await websocket.send_text(json.dumps(payload, ensure_ascii=False, default=str))
+    text = json.dumps(payload, ensure_ascii=False, default=str)
+    if len(text) > _WS_MAX_EVENT_BYTES:
+        # Truncate the result field in tool_call_end events to stay under the cap.
+        inner = payload.get("payload")
+        if isinstance(inner, dict) and "result" in inner:
+            inner["result"] = str(inner["result"])[:2000] + "... [truncated for WS]"
+            text = json.dumps(payload, ensure_ascii=False, default=str)
+    await websocket.send_text(text)
 
 
 def create_app(
@@ -650,6 +665,9 @@ def create_app(
                 receive_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await receive_task
+            elif receive_task is not None and receive_task.done():
+                with contextlib.suppress(Exception):
+                    receive_task.result()
             st.eventlog.unsubscribe(session_id, queue)
 
     @app.websocket("/v1/ws")
@@ -739,6 +757,13 @@ def create_app(
                 receive_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await receive_task
+            elif receive_task is not None and receive_task.done():
+                # [2026-06-03] Why: a finished receive_task whose exception was never
+                # retrieved causes 'Task exception was never retrieved' warnings.
+                # How: consume the result/exception so Python GC does not warn.
+                # Purpose: clean shutdown of the global WS without log noise.
+                with contextlib.suppress(Exception):
+                    receive_task.result()
             st.eventlog.unsubscribe_global(queue)
 
     @app.get("/v1/events", response_model=list[Event])

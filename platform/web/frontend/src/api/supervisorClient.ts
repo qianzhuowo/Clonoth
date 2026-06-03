@@ -334,6 +334,7 @@ export interface ProvidersResponse {
   active_provider: string;
   providers: Record<string, ProviderConfigPublic>;
   fallbacks: Array<Record<string, any>>;
+  registered: string[];
 }
 
 export async function getProviders(token: string): Promise<ProvidersResponse> {

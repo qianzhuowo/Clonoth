@@ -32,7 +32,7 @@ export const ModelSettingsPage = () => {
   const [edits, setEdits] = useState<Record<string, ProviderEditState>>({});
   const [savingKey, setSavingKey] = useState<string | null>(null);
 
-  // new provider form
+  // new provider: select from registered list
   const [newName, setNewName] = useState('');
   const [addingNew, setAddingNew] = useState(false);
 
@@ -116,8 +116,8 @@ export const ModelSettingsPage = () => {
   };
 
   const handleAddProvider = async () => {
-    if (!adminToken || !newName.trim()) return;
-    const name = newName.trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_');
+    if (!adminToken || !newName) return;
+    const name = newName;
     setAddingNew(true);
     setMsg('');
     try {
@@ -249,22 +249,31 @@ export const ModelSettingsPage = () => {
             );
           })}
 
-          {/* Add new provider */}
-          <div className="border border-dashed border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-            <p className="mb-3 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">添加渠道</p>
-            <div className="flex items-center gap-3">
-              <input
-                className="flex-1 border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-                onChange={e => setNewName(e.target.value)}
-                onKeyDown={e => e.key === 'Enter' && handleAddProvider()}
-                placeholder="渠道名称（如 anthropic, deepseek, custom）"
-                value={newName}
-              />
-              <Button disabled={addingNew || !newName.trim()} onClick={handleAddProvider} variant="primary">
-                {addingNew ? '添加中...' : '添加'}
-              </Button>
-            </div>
-          </div>
+          {/* Add new provider from registered list */}
+          {(() => {
+            const available = (data?.registered || []).filter(r => !providerNames.includes(r));
+            if (available.length === 0) return null;
+            return (
+              <div className="border border-dashed border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
+                <p className="mb-3 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">添加渠道</p>
+                <div className="flex items-center gap-3">
+                  <select
+                    className="flex-1 border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
+                    onChange={e => setNewName(e.target.value)}
+                    value={newName}
+                  >
+                    <option value="">选择渠道类型...</option>
+                    {available.map(name => (
+                      <option key={name} value={name}>{name}</option>
+                    ))}
+                  </select>
+                  <Button disabled={addingNew || !newName} onClick={handleAddProvider} variant="primary">
+                    {addingNew ? '添加中...' : '添加'}
+                  </Button>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Fallback display */}
           {data && data.fallbacks.length > 0 && (

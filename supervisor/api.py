@@ -178,11 +178,17 @@ def create_app(
     async def get_providers(request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
-        return cs.get_providers_public()
+        from providers import registry as provider_registry
+        result = cs.get_providers_public()
+        result["registered"] = provider_registry.list()
+        return result
 
     @app.put("/v1/config/providers/{name}")
     async def upsert_provider(name: str, body: ProviderUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
+        from providers import registry as provider_registry
+        if name not in provider_registry.list():
+            raise HTTPException(status_code=400, detail=f"Unknown provider '{name}'. Available: {provider_registry.list()}")
         cs: ConfigStore = app.state.config_store
         return cs.upsert_provider(name, base_url=body.base_url, api_key=body.api_key, model=body.model)
 

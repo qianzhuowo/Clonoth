@@ -940,6 +940,12 @@ class SessionMixin:
                 "message_type": msg.message_type,
                 "created_at": msg.created_at,
                 "source_node_id": msg.source_node_id,
+                # [AutoC 2026-06-03] Why: source_task_id is useful for auditing
+                # hydrated callback rows and remains harmless for ordinary history.
+                # How: include the existing ConversationStore field in the structured
+                # history response. Purpose: frontend message sources can preserve
+                # task metadata after refresh.
+                "source_task_id": msg.source_task_id,
             }
             # Extract thinking/reasoning from meta
             if isinstance(msg.meta, dict):
@@ -953,6 +959,19 @@ class SessionMixin:
                     entry["reasoning_started_at"] = _rs
                 if _re:
                     entry["reasoning_ended_at"] = _re
+                # [AutoC 2026-06-03] Why: dispatch callback rows store their child
+                # navigation target in Message.meta. How: expose only the selected
+                # structured keys needed by the web client. Purpose: refreshed history
+                # can render the child-session jump button without parsing text.
+                _child_sid = str(msg.meta.get("child_session_id") or "").strip()
+                if _child_sid:
+                    entry["child_session_id"] = _child_sid
+                _dispatch_tid = str(msg.meta.get("dispatch_task_id") or "").strip()
+                if _dispatch_tid:
+                    entry["dispatch_task_id"] = _dispatch_tid
+                _dispatch_node_id = str(msg.meta.get("dispatch_node_id") or "").strip()
+                if _dispatch_node_id:
+                    entry["dispatch_node_id"] = _dispatch_node_id
             # Tool calls (assistant requesting tools)
             if msg.tool_calls:
                 entry["tool_calls"] = msg.tool_calls

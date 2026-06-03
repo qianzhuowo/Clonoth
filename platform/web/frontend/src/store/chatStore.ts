@@ -1492,7 +1492,12 @@ function hydrateStructuredHistory(
       const messageId = `message:${conversationId}:history:${message.id || `user-${nextState.messageOrderByConversation[conversationId]?.length || 0}`}`;
       const historyEventId = getHistoryEventId(sessionId, message.id, messageId);
       const text = stringifyContent(message.content);
-      const hydratedRole: WsMessage['role'] = isDispatchResultHistoryMessage(message, text) ? 'system' : 'user';
+      // [AutoC 2026-06-03] Why: dispatch-result history rows are backend callback
+      // notifications rather than generic system notices. How: map the structured
+      // message_type to the dedicated dispatch_callback role. Purpose: refreshed
+      // history uses the same label, purple styling, and child-session action as live
+      // WebSocket delivery.
+      const hydratedRole: WsMessage['role'] = isDispatchResultHistoryMessage(message, text) ? 'dispatch_callback' : 'user';
       if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, hydratedRole, text)) continue;
       const wsMessage: WsMessage = {
         id: messageId,
@@ -1502,10 +1507,19 @@ function hydrateStructuredHistory(
         status: 'completed',
         createdAt,
         updatedAt: createdAt,
-        source: { nodeId: message.source_node_id || undefined },
+        source: {
+          nodeId: message.dispatch_node_id || message.source_node_id || undefined,
+          taskId: message.dispatch_task_id || message.source_task_id || undefined,
+          // [AutoC 2026-06-03] Why: the dispatch callback button needs a stable
+          // child-session target after refresh. How: read child_session_id from the
+          // structured history row emitted by the backend. Purpose: the renderer does
+          // not need to infer the child session from localized text or child-node names.
+          childSessionId: message.child_session_id || undefined,
+        },
         // [2026-06-03] Why: dispatch-result inbound rows are control notifications,
-        // not human input. How: they keep their text block but use a system message
-        // role computed above. Purpose: refreshed history no longer labels them as "你".
+        // not human input. How: they keep their text block but use the structured
+        // callback role computed above. Purpose: refreshed history no longer labels
+        // them as "你" or as a generic system notice.
         blocks: [createTextBlock(`${messageId}|block:text:history`, createdAt, text)],
         eventIds: [historyEventId],
         hydratedFromHistory: true,

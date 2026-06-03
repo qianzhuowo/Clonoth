@@ -968,12 +968,30 @@ async def _run_node_task(
             _user_content = build_multimodal_content(instruction, input_attachments, workspace_root=ws_root)
         else:
             _user_content = instruction
+        # [AutoC 2026-06-03] Why: supervisor-injected callback inbounds carry
+        # message_type and child-session metadata that would be lost if every user row
+        # were persisted as plain user_input. How: read the task_store inbound_* copy
+        # and write selected values to ConversationStore message_type/meta. Purpose:
+        # refreshed web history renders dispatch callbacks with the same role and jump
+        # target as realtime WebSocket delivery.
+        _inbound_message_type = str(input_data.get("inbound_message_type") or "").strip()
+        _inbound_meta: dict[str, Any] = {}
+        _inbound_child_session_id = str(input_data.get("inbound_child_session_id") or "").strip()
+        if _inbound_child_session_id:
+            _inbound_meta["child_session_id"] = _inbound_child_session_id
+        _inbound_task_id = str(input_data.get("inbound_task_id") or "").strip()
+        if _inbound_task_id:
+            _inbound_meta["dispatch_task_id"] = _inbound_task_id
+        _inbound_node_id = str(input_data.get("inbound_node_id") or "").strip()
+        if _inbound_node_id:
+            _inbound_meta["dispatch_node_id"] = _inbound_node_id
         _user_msg = Message(
             id=str(uuid.uuid4()),
             role="user",
             content=_user_content,
-            message_type=MessageType.USER_INPUT,
+            message_type=_inbound_message_type or MessageType.USER_INPUT,
             created_at=datetime.now(timezone.utc).isoformat(),
+            meta=_inbound_meta,
             source_node_id=node.id,
             source_task_id=task_id,
         )

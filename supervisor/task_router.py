@@ -772,6 +772,11 @@ class TaskRouterMixin:
         result_text = str(fallback_result.get("text") or "").strip()
         result_summary = str(fallback_result.get("summary") or "").strip()
         caller_node = str(task.input.get("_caller_node_id") or "").strip()
+        # [AutoC 2026-06-03] Why: the web callback card needs a stable target for
+        # child-session navigation. How: read the child session created for the
+        # completed dispatch task from task.input. Purpose: clients do not need to
+        # infer the child transcript from localized notification text.
+        child_session_id = str(task.input.get("child_session_id") or "").strip()
 
         notify_parts: list[str] = [f"[异步子任务完成] 节点 {task.node_id} 已完成。"]
         if caller_node:
@@ -821,12 +826,24 @@ class TaskRouterMixin:
             "conversation_key": conv_key,
             "message_id": msg_id,
             "text": notify_text,
+            # [AutoC 2026-06-03] Why: dispatch callbacks need structured metadata
+            # for frontend rendering and child-session navigation. How: include the
+            # completed child task id and node id in the inbound payload. Purpose:
+            # realtime clients can style and audit the callback without text parsing.
+            "task_id": task.task_id,
+            "node_id": task.node_id,
             # [AutoC 2026-06-03] Why: web history must not identify dispatch
             # callbacks by localized notification text. How: mark supervisor-injected
             # callback inbounds with a structured message_type. Purpose: frontend and
             # future clients can render dispatch results from backend-owned metadata.
             "message_type": "dispatch_result",
         }
+        if child_session_id:
+            # [AutoC 2026-06-03] Why: the child-session id is optional for old or
+            # compact callbacks, but when present it is the canonical jump target.
+            # How: attach it as a structured inbound field. Purpose: frontend buttons
+            # can open the exact child transcript without scanning childNodes by name.
+            payload["child_session_id"] = child_session_id
         if result_atts:
             payload["attachments"] = result_atts
 
@@ -866,6 +883,11 @@ class TaskRouterMixin:
         origin = task.input.get("_dispatch_origin") or {}
         target_session_id = str(origin.get("parent_session_id") or "").strip()
         caller_node = str(origin.get("caller_node_id") or "").strip()
+        # [AutoC 2026-06-03] Why: dispatch_origin callbacks use the same visible
+        # callback card as legacy async dispatch. How: keep the child session id from
+        # the completed child task input. Purpose: both callback paths support the
+        # same structured web jump button.
+        child_session_id = str(task.input.get("child_session_id") or "").strip()
 
         if not target_session_id:
             log.warning(
@@ -918,12 +940,24 @@ class TaskRouterMixin:
             "conversation_key": conv_key,
             "message_id": msg_id,
             "text": notify_text,
+            # [AutoC 2026-06-03] Why: dispatch_origin callbacks need the same
+            # structured metadata as legacy async callbacks. How: include the
+            # completed child task id and node id in the inbound payload. Purpose:
+            # realtime clients can render callback cards and audit their source.
+            "task_id": task.task_id,
+            "node_id": task.node_id,
             # [AutoC 2026-06-03] Why: dispatch_origin callbacks are the same
             # backend-injected result class as legacy async dispatch callbacks. How:
             # emit the shared dispatch_result message_type on the inbound payload.
             # Purpose: clients use one structured contract instead of id or text hacks.
             "message_type": "dispatch_result",
         }
+        if child_session_id:
+            # [AutoC 2026-06-03] Why: child-session navigation must work for the
+            # dispatch_origin path as well. How: attach the structured session id
+            # whenever the finished child task has one. Purpose: the frontend avoids
+            # fallback parsing or childNodes reverse lookup.
+            payload["child_session_id"] = child_session_id
         if result_atts:
             payload["attachments"] = result_atts
 

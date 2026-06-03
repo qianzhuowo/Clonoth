@@ -188,6 +188,12 @@ function applyInboundMessage(state: ChatState, event: SupervisorEvent): ChatStat
   const text = getString(payload.text);
   const attachments = getAttachments(payload.attachments);
   const now = event.ts;
+  // [AutoC 2026-06-03] Why: supervisor-injected dispatch results arrive as
+  // inbound_message events but are not human-authored user input. How: derive the
+  // normalized role from the backend message_type contract before creating or
+  // merging the message. Purpose: live callbacks render the same way as hydrated
+  // history rows.
+  const role = getInboundMessageRole(payload);
   const existing = state.messagesById[messageId];
   const textBlock = createTextBlock({
     id: `${messageId}|block:text:${getEventId(event)}`,
@@ -196,11 +202,24 @@ function applyInboundMessage(state: ChatState, event: SupervisorEvent): ChatStat
     delivery: 'final',
     streaming: false,
   });
-  const source: MessageSource = { inboundSeq };
+  const source: MessageSource = {
+    inboundSeq,
+    // [AutoC 2026-06-03] Why: dispatch-result cards need structured metadata for
+    // navigation and audit, while ordinary inbound messages should remain unchanged.
+    // How: copy optional backend fields into MessageSource only when present.
+    // Purpose: the renderer can open the child session without parsing message text.
+    taskId: getString(payload.task_id) || undefined,
+    nodeId: getString(payload.node_id) || undefined,
+    nodeName: getString(payload.node_name) || undefined,
+    branchSessionId: getString(payload.branch_session_id) || undefined,
+    parentSessionId: getString(payload.parent_session_id) || undefined,
+    childSessionId: getString(payload.child_session_id) || undefined,
+  };
 
   const message: WsMessage = existing
     ? {
         ...existing,
+        role,
         status: 'completed',
         updatedAt: now,
         source: mergeSource(existing.source, source),
@@ -212,7 +231,7 @@ function applyInboundMessage(state: ChatState, event: SupervisorEvent): ChatStat
         id: messageId,
         conversationId,
         sessionId: event.session_id,
-        role: 'user',
+        role,
         status: 'completed',
         createdAt: now,
         updatedAt: now,
@@ -1228,6 +1247,14 @@ function getConversationId(state: ChatState, event: SupervisorEvent): string {
   return state.conversationIdsBySession[event.session_id] || event.session_id;
 }
 
+function getInboundMessageRole(payload: EventPayload): WsMessage['role'] {
+  // [AutoC 2026-06-03] Why: inbound_message is also used for backend-injected
+  // dispatch callbacks. How: trust the structured message_type emitted by the
+  // supervisor. Purpose: reducer output no longer labels child-task callbacks as
+  // ordinary user messages during realtime WebSocket delivery.
+  return getString(payload.message_type) === 'dispatch_result' ? 'dispatch_callback' : 'user';
+}
+
 function buildMessageSource(state: ChatState, event: SupervisorEvent): MessageSource {
   const payload = getPayload(event);
   const taskId = getString(payload.task_id);
@@ -1242,6 +1269,10 @@ function buildMessageSource(state: ChatState, event: SupervisorEvent): MessageSo
     nodeName: getString(payload.node_name) || nodeInfo?.nodeName,
     branchSessionId: getString(payload.branch_session_id) || (input ? getString(input.branch_session_id) : ''),
     parentSessionId: getString(payload.parent_session_id) || (input ? getString(input.parent_session_id) : ''),
+    // [AutoC 2026-06-03] Why: downstream task events can also carry child session
+    // metadata. How: preserve it in the shared source builder. Purpose: any card
+    // anchored to those events can keep the same structured navigation target.
+    childSessionId: getString(payload.child_session_id) || (input ? getString(input.child_session_id) : ''),
   };
 }
 
@@ -1268,6 +1299,10 @@ function mergeSource(current: MessageSource, patch: MessageSource): MessageSourc
     nodeName: patch.nodeName || current.nodeName,
     branchSessionId: patch.branchSessionId || current.branchSessionId,
     parentSessionId: patch.parentSessionId || current.parentSessionId,
+    // [AutoC 2026-06-03] Why: message sources are merged across related events.
+    // How: carry forward an existing child session id unless a newer patch supplies
+    // one. Purpose: dispatch callback navigation survives later message updates.
+    childSessionId: patch.childSessionId || current.childSessionId,
   };
 }
 

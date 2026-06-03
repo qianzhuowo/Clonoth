@@ -1,5 +1,8 @@
 // [2026-05-16] Full type definitions for Clonoth Web frontend
-export type MessageRole = 'user' | 'assistant' | 'system';
+// [AutoC 2026-06-03] Why: legacy chat types share the MessageRole union with the
+// v2 renderer during migration. How: include dispatch_callback here as well as in
+// types/message.ts. Purpose: older imports do not reject the new callback role.
+export type MessageRole = 'user' | 'assistant' | 'system' | 'dispatch_callback';
 
 export interface Attachment {
   name: string;

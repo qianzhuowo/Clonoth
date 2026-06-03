@@ -6,7 +6,11 @@
 // chat.ts file yet. Purpose: Step 1 can run beside the current store until later
 // steps switch the rendering path over to this model.
 
-export type MessageRole = 'user' | 'assistant' | 'system';
+// [AutoC 2026-06-03] Why: dispatch-result callbacks are neither human input nor
+// generic system notices. How: add a dedicated render role while preserving the
+// existing user/assistant/system roles. Purpose: history and live callbacks can use
+// their own label, color, and child-session navigation affordance.
+export type MessageRole = 'user' | 'assistant' | 'system' | 'dispatch_callback';
 
 export interface Attachment {
   name: string;
@@ -128,6 +132,11 @@ export interface MessageSource {
   nodeName?: string;
   branchSessionId?: string;
   parentSessionId?: string;
+  // [AutoC 2026-06-03] Why: dispatch-result cards need to open the child chat that
+  // produced the callback. How: store the backend-provided child session id on the
+  // normalized message source. Purpose: MessageCard can render a structured jump
+  // button without parsing localized callback text.
+  childSessionId?: string;
 }
 
 export interface WsMessage {

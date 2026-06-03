@@ -4,12 +4,20 @@
 // assert the visible contract for streaming text, hidden tools, and list scrolling.
 // Purpose: keep the new unified MessageCard safe to adopt in a later integration step.
 import { fireEvent, render, screen } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { MessageCard, MessageListV2, ToolCallCard } from '../components/chat/v2';
+import { useChatStore } from '../store/chatStore';
 import type { ToolExecution, WsMessage } from '../types/message';
 
 const now = '2026-05-31T03:10:00.000Z';
+
+afterEach(() => {
+  // [AutoC 2026-06-03] Why: the dispatch callback button test spies on a global
+  // zustand action. How: restore all vi mocks after each case. Purpose: later
+  // rendering tests call the real store actions if they need them.
+  vi.restoreAllMocks();
+});
 
 function baseMessage(overrides: Partial<WsMessage> = {}): WsMessage {
   return {
@@ -154,6 +162,40 @@ describe('MessageCard v2', () => {
     // assistant finish border.
     expect(container.querySelector('.space-y-2')).not.toHaveClass('border-l-2');
     expect(screen.getByText('user text').closest('.markdown-body')).not.toHaveClass('border-l-2');
+  });
+
+  it('renders dispatch callback label and opens the structured child session target', () => {
+    // [AutoC 2026-06-03] Why: dispatch callbacks need a direct way to inspect the
+    // child-node transcript. How: render a dispatch_callback message with
+    // source.childSessionId and click the visible action. Purpose: MessageCard uses
+    // structured metadata instead of parsing the callback body.
+    const viewSpy = vi.spyOn(useChatStore.getState(), 'viewChildSession').mockImplementation(() => undefined);
+
+    render(
+      <MessageCard
+        message={baseMessage({
+          role: 'dispatch_callback',
+          status: 'completed',
+          source: { childSessionId: 'child-scout' },
+          blocks: [{
+            id: 'block-dispatch-callback',
+            kind: 'text',
+            text: '[异步子任务完成] parent 委派的 scout 已完成。\n结果：done',
+            delivery: 'final',
+            streaming: false,
+            createdAt: now,
+            updatedAt: now,
+            eventIds: ['ev-dispatch-callback'],
+          }],
+        })}
+        toolsById={{}}
+      />,
+    );
+
+    expect(screen.getByText('子节点回调')).toBeInTheDocument();
+    expect(screen.getByText(/结果：done/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /查看子节点详情/ }));
+    expect(viewSpy).toHaveBeenCalledWith('child-scout');
   });
 
   it('renders visible tools but omits hidden successful control tools', () => {

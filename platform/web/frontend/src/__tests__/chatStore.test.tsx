@@ -411,12 +411,13 @@ describe('chatStore', () => {
     expect(useChatStore.getState().selectChildNodes('conv-parent')[0]?.status).toBe('completed');
   });
 
-  it('hydrates dispatch result inbound history as a system card instead of a user message', async () => {
+  it('hydrates dispatch result inbound history as a dispatch callback card instead of a user message', async () => {
     // [2026-06-03] Why: supervisor now marks child-task callbacks with the
     // structured dispatch_result message_type, so the frontend must not depend on
     // localized notification text. How: hydrate a dispatch_result row whose id has no
-    // special prefix. Purpose: refresh renders backend-marked callbacks as system
-    // notices without carrying the old Chinese-prefix heuristic forward.
+    // special prefix and includes child_session_id. Purpose: refresh renders
+    // backend-marked callbacks with the dedicated role and child-session target
+    // without carrying the old Chinese-prefix heuristic forward.
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/v1/sessions?channel=web')) {
@@ -424,7 +425,7 @@ describe('chatStore', () => {
       }
       if (url.includes('/v1/sessions/sess-dispatch/history')) {
         return jsonResponse([
-          { id: 'u-dispatch', role: 'user', content: '[异步子任务完成] smith 委派的 scout 已完成。\n摘要：done', message_type: 'dispatch_result', created_at: '2026-06-03T12:00:10.000Z' },
+          { id: 'u-dispatch', role: 'user', content: '[异步子任务完成] smith 委派的 scout 已完成。\n摘要：done', message_type: 'dispatch_result', child_session_id: 'child-scout', created_at: '2026-06-03T12:00:10.000Z' },
         ]);
       }
       return jsonResponse([]);
@@ -434,7 +435,8 @@ describe('chatStore', () => {
 
     await waitFor(() => expect(selectMessages(useChatStore.getState(), 'conv-dispatch')).toHaveLength(1));
     const [message] = selectMessages(useChatStore.getState(), 'conv-dispatch');
-    expect(message.role).toBe('system');
+    expect(message.role).toBe('dispatch_callback');
+    expect(message.source.childSessionId).toBe('child-scout');
     expect(message.blocks[0]).toMatchObject({ kind: 'text', text: expect.stringContaining('[异步子任务完成]') });
   });
 

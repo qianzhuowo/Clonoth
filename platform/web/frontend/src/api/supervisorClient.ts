@@ -752,6 +752,14 @@ export interface StructuredMessage {
   message_type?: string;
   created_at?: string;
   source_node_id?: string;
+  // [AutoC 2026-06-03] Why: dispatch-result history rows need the same structured
+  // child navigation metadata as realtime WebSocket payloads. How: expose the
+  // selected backend metadata fields returned by /history. Purpose: the UI can show
+  // a child-session jump button after page refresh without parsing callback text.
+  source_task_id?: string;
+  child_session_id?: string;
+  dispatch_task_id?: string;
+  dispatch_node_id?: string;
   thinking?: string;
   // Clonoth format: {id, name, arguments(object)}
   tool_calls?: Array<{ id?: string; name: string; arguments?: Record<string, unknown> }>;

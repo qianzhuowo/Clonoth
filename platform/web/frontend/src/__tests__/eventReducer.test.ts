@@ -42,6 +42,26 @@ describe('eventReducer', () => {
     expect(messages[0].blocks[0]).toMatchObject({ kind: 'text', text: 'hello', delivery: 'final' });
   });
 
+  it('creates a dispatch callback message from realtime dispatch_result inbound metadata', () => {
+    // [AutoC 2026-06-03] Why: dispatch callbacks arrive through the same
+    // inbound_message reducer path as real user messages. How: provide the backend
+    // message_type and child_session_id fields in the event payload. Purpose: live
+    // WebSocket rendering matches refreshed history and keeps the child jump target.
+    const state = reduceSupervisorEvent(createInitialChatState(), event(2, 'inbound_message', {
+      conversation_key: 'web:conv-dispatch-live',
+      text: '[异步子任务完成] parent 委派的 scout 已完成。',
+      message_type: 'dispatch_result',
+      task_id: 'task-child',
+      node_id: 'scout',
+      child_session_id: 'child-scout',
+    }));
+
+    const messages = selectMessages(state, 'conv-dispatch-live');
+    expect(messages).toHaveLength(1);
+    expect(messages[0]).toMatchObject({ role: 'dispatch_callback', status: 'completed' });
+    expect(messages[0].source).toMatchObject({ taskId: 'task-child', nodeId: 'scout', childSessionId: 'child-scout' });
+  });
+
   it('merges stream, tool lifecycle, final outbound text, and hides successful control tools', () => {
     const events = [
       event(1, 'inbound_message', { conversation_key: 'web:conv-2', text: 'run uname' }),

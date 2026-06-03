@@ -4,6 +4,7 @@
 // rendering, and attachments from WsMessage only. Purpose: make active and historical
 // messages follow the same UI contract before the app is rewired to v2.
 import type { Attachment, MessageRole, MessageStatus, TextBlock, ToolExecution, WsMessage } from '../../../types/message';
+import { useChatStore } from '../../../store/chatStore';
 import { Icon } from '../../common';
 import { RenderBlockView } from './RenderBlockView';
 
@@ -16,6 +17,10 @@ const ROLE_LABELS: Record<MessageRole, string> = {
   user: '你',
   assistant: '助手',
   system: '系统',
+  // [AutoC 2026-06-03] Why: child-task callbacks should not inherit the orange
+  // generic system label. How: give the dedicated role its own visible label.
+  // Purpose: users can distinguish a child-node result from ordinary system notices.
+  dispatch_callback: '子节点回调',
 };
 
 const ROLE_STYLES: Record<MessageRole, { row: string; label: string }> = {
@@ -30,6 +35,13 @@ const ROLE_STYLES: Record<MessageRole, { row: string; label: string }> = {
   system: {
     row: 'bg-orange-50/60',
     label: 'text-orange-600',
+  },
+  // [AutoC 2026-06-03] Why: dispatch callbacks need a visual lane separate from
+  // user, assistant, and system cards. How: apply a subtle purple row and label.
+  // Purpose: the callback remains fully expanded while being easy to scan.
+  dispatch_callback: {
+    row: 'bg-purple-50/40',
+    label: 'text-purple-600',
   },
 };
 
@@ -94,6 +106,11 @@ export const MessageCard = ({ message, toolsById }: MessageCardProps) => {
   const active = isActiveStatus(message.status);
   const blocksContainerClassName = getBlocksContainerClassName(message);
   const attachments = message.attachments ?? [];
+  // [AutoC 2026-06-03] Why: only dispatch callback cards can navigate to child
+  // sessions. How: read the backend-provided source.childSessionId and leave normal
+  // messages without an action. Purpose: navigation stays structured and does not
+  // parse the callback text.
+  const childSessionId = message.role === 'dispatch_callback' ? message.source.childSessionId?.trim() || '' : '';
 
   return (
     <article className={`border-b border-[var(--duties-border)] px-3 py-3 sm:px-4 ${roleStyle.row}`}>
@@ -136,6 +153,19 @@ export const MessageCard = ({ message, toolsById }: MessageCardProps) => {
               <RenderBlockView key={block.id} block={block} toolsById={toolsById} />
             ))}
         </div>
+
+        {childSessionId && (
+          <button
+            className="mt-1 text-xs font-mono text-purple-600 underline hover:text-purple-800"
+            onClick={() => useChatStore.getState().viewChildSession(childSessionId)}
+          >
+            {/* [AutoC 2026-06-03] Why: dispatch_result payloads now carry the child
+                session id. How: call the store's child-session view action directly
+                with that id. Purpose: users can inspect the child node transcript
+                without relying on the sidebar or text parsing. */}
+            查看子节点详情 →
+          </button>
+        )}
 
         {attachments.length > 0 && (
           <footer className="mt-2 flex flex-wrap gap-2">

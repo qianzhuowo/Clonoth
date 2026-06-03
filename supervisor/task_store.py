@@ -296,6 +296,24 @@ class TaskStoreMixin:
             _dispatch_origin = {}
         _dispatch_context_mode = str(payload.get("dispatch_context_mode") or "").strip()
         _dispatch_parent_conv_key = str(_dispatch_origin.get("parent_conversation_key") or "").strip()
+        # [AutoC 2026-06-03] Why: inbound payload metadata is otherwise lost before
+        # runner writes the user row into ConversationStore. How: copy only selected
+        # structured fields under inbound_* names so they cannot be confused with the
+        # task's own child_session_id routing fields. Purpose: dispatch_result history
+        # rows can keep message_type and child-session navigation metadata.
+        inbound_metadata: dict[str, Any] = {}
+        _inbound_message_type = str(payload.get("message_type") or "").strip()
+        if _inbound_message_type:
+            inbound_metadata["inbound_message_type"] = _inbound_message_type
+        _inbound_child_session_id = str(payload.get("child_session_id") or "").strip()
+        if _inbound_child_session_id:
+            inbound_metadata["inbound_child_session_id"] = _inbound_child_session_id
+        _inbound_task_id = str(payload.get("task_id") or "").strip()
+        if _inbound_task_id:
+            inbound_metadata["inbound_task_id"] = _inbound_task_id
+        _inbound_node_id = str(payload.get("node_id") or "").strip()
+        if _inbound_node_id:
+            inbound_metadata["inbound_node_id"] = _inbound_node_id
         # [2026-05-29 方案C第一步] 为什么：dispatch 子任务的父频道不能再靠
         # agent: 字符串反解析。怎么改：在入口 task input 生成前准备结构化
         # dispatch 元数据，并把 parent_conversation_key 同步到 task_context。
@@ -353,6 +371,7 @@ class TaskStoreMixin:
                 },
                 "dispatch_context_mode": _dispatch_context_mode,
                 "_dispatch_origin": _dispatch_origin,
+                **inbound_metadata,
             },
             continuation={},
             source_inbound_seq=inbound_seq,

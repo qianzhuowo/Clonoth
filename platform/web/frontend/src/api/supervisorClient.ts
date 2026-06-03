@@ -180,9 +180,6 @@ export function disconnectSessionWS(): void {
   disconnectGlobalWS();
 }
 
-// ── Events ──
-
-/** Fetch the latest global event seq from the backend (1 lightweight GET). */
 // ── Health ──
 
 export interface HealthState {

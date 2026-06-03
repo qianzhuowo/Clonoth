@@ -195,8 +195,8 @@ class ClonothClient:
     async def ws_connect(self, last_seq: int = 0) -> AsyncGenerator[dict[str, Any], None]:
         """连接全局 WebSocket 事件流，逐条 yield 解析后的事件字典。
 
-        对应 WS /v1/ws。调用方先发送 {"last_seq": N}，Supervisor 会 replay
-        游标之后的持久事件，然后继续推送所有 session 的新事件。
+        对应 WS /v1/ws。调用方发送 {"last_seq": N} 作为协议兼容帧，
+        Supervisor 不再 replay 历史事件，仅推送连接后的实时事件。
         """
         # [SDK WS 2026-05-19] Why: EventRouter needs lower-latency delivery than
         # HTTP polling while keeping /v1/events as fallback. How: derive /v1/ws
@@ -497,6 +497,40 @@ class ClonothClient:
         if resp.status_code < 400:
             return bool(resp.json().get("scheduled", False))
         return False
+
+    # ================================================================
+    #  Attachments — 文件上传
+    # ================================================================
+
+    async def upload_attachment(
+        self,
+        file_bytes: bytes,
+        filename: str,
+        *,
+        conversation_key: str = "default",
+        content_type: str | None = None,
+    ) -> dict[str, Any]:
+        """上传附件到 Supervisor，返回服务端路径等信息。
+
+        对应 POST /v1/attachments/upload。
+
+        Args:
+            file_bytes: 文件二进制内容
+            filename: 文件名（含扩展名）
+            conversation_key: 附件归属的对话标识
+            content_type: MIME 类型，不传则由服务端推断
+
+        Returns:
+            包含 path, name, size, mime_type, type 的字典
+        """
+        files = {"file": (filename, file_bytes, content_type or "application/octet-stream")}
+        resp = await self._http().post(
+            f"{self._base_url}/v1/attachments/upload",
+            params={"conversation_key": conversation_key},
+            files=files,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     # ================================================================
     #  Lifecycle — 资源管理

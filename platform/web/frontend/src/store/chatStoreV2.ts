@@ -383,14 +383,6 @@ function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: StoreGette
 
 const ACTIVE_TASK_EVENTS = new Set(['task_created', 'task_started', 'task_requeued', 'task_resumed', 'task_suspended']);
 
-function getMaxKnownSeq(state: ChatStoreV2State): number {
-  // [2026-06-03] Why: /v1/ws replays by global EventLog seq, while ChatState stores
-  // last seq per session. How: reconnect from the largest known session cursor.
-  // Purpose: global reconnects catch up from durable history without adding a second
-  // cursor table to the render state.
-  return Math.max(0, ...Object.values(state.lastSeqBySession));
-}
-
 function getStringValue(value: unknown): string {
   return typeof value === 'string' ? value : value === undefined || value === null ? '' : String(value);
 }

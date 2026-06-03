@@ -65,29 +65,9 @@ def _now() -> datetime:
 # the EventLog schema.
 _WS_HEARTBEAT_SEC = 30.0
 
-# [WS events 2026-05-17] Why: clients may optionally send {"last_seq": n}
-# immediately after connect, but old clients may send nothing. How: wait briefly
-# for that first message and then default to zero. Purpose: support both replayed
-# and fresh streams without blocking connection setup forever.
+# [2026-06-03] Why: clients may send an optional initial message for backward
+# compat; the server consumes and ignores it. How: brief timeout, then proceed.
 _WS_INITIAL_MESSAGE_TIMEOUT_SEC = 0.5
-
-
-def _parse_ws_initial_last_seq(message: str) -> int:
-    """Parse the optional initial WebSocket message into a non-negative seq."""
-    # [WS events 2026-05-17] Why: the WebSocket handshake is intentionally loose
-    # to keep compatibility with simple clients. How: malformed JSON or invalid
-    # values fall back to zero. Purpose: clients can connect without a setup frame.
-    try:
-        data = json.loads(message or "{}")
-    except Exception:
-        return 0
-    if not isinstance(data, dict):
-        return 0
-    try:
-        return max(0, int(data.get("last_seq") or 0))
-    except Exception:
-        return 0
-
 
 _WS_MAX_EVENT_BYTES = 65_536  # 64 KiB soft cap for individual WS events
 

@@ -766,6 +766,19 @@ def create_app(
                     receive_task.result()
             st.eventlog.unsubscribe_global(queue)
 
+    @app.get("/v1/events/latest_seq")
+    async def latest_event_seq() -> dict:
+        """Return the seq of the most recent event in the global EventLog.
+
+        [2026-06-03] Why: the web frontend needs to know the current max seq
+        before opening a WS catch-up so it can distinguish historical events
+        from live ones (e.g. to skip auto-approving old approval_requested).
+        How: O(1) lookup on the ring buffer tail. Purpose: one lightweight GET
+        replaces fetching and discarding a full event list."""
+        st: SupervisorState = app.state.state
+        last = st.eventlog.last_event()
+        return {"seq": int(last.get("seq", 0)) if last else 0}
+
     @app.get("/v1/events", response_model=list[Event])
     async def global_events(
         after_seq: int = Query(0, ge=0),

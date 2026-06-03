@@ -129,7 +129,8 @@ export function connectGlobalWS(
   ws.onclose = () => {
     if (_globalWs === ws) _globalWs = null;
     onDisconnect?.();
-    _globalWsReconnectTimer = setTimeout(() => {}, _globalWsReconnectDelay);
+    // [2026-06-03] Reconnect is handled by the store's onDisconnect callback
+    // (startGlobalWebSocket). The transport layer only tracks backoff delay.
     _globalWsReconnectDelay = Math.min(_globalWsReconnectDelay * 2, 30000);
   };
 
@@ -177,6 +178,18 @@ export function disconnectSessionWS(): void {
   // disconnectSessionWS during teardown. How: delegate to the global cleanup helper.
   // Purpose: reset paths remain functional without reintroducing per-session sockets.
   disconnectGlobalWS();
+}
+
+// ── Events ──
+
+/** Fetch the latest global event seq from the backend (1 lightweight GET). */
+export async function fetchLatestSeq(): Promise<number> {
+  try {
+    const resp = await apiFetch('/events/latest_seq');
+    const data: { seq?: number } = await resp.json();
+    if (typeof data.seq === 'number') return data.seq;
+  } catch { /* startup tolerance: if this fails, fall through to 0 */ }
+  return 0;
 }
 
 // ── Health ──

@@ -5,14 +5,14 @@
 // let the new message model run beside the old store until the UI migration is done.
 import { create } from 'zustand';
 
-import { connectSessionWS, disconnectSessionWS } from '../api';
+import { connectGlobalWS, disconnectGlobalWS } from '../api';
 import {
   cancelActiveTasks,
   decideApproval,
   deleteSession,
+  fetchLatestSeq,
   getSessionHistory,
   listSessions,
-  pollEvents,
   postInbound,
   uploadAttachment,
   type StructuredMessage,
@@ -47,10 +47,12 @@ export interface ChatStoreV2State extends ChatState {
   activeConversationId: string | null;
   isGenerating: boolean;
   connectionStatus: ConnectionStatus;
+  generatingBySession: Readonly<Record<string, boolean>>;
 
   selectConversation: (id: string) => void;
   createConversation: () => string;
   deleteConversation: (id: string) => void;
+  renameConversation: (id: string, newTitle: string) => void;
   sendMessage: (text: string, attachments?: any[], entryNodeId?: string) => Promise<void>;
   cancelCurrentTask: () => Promise<void>;
   resetState: () => void;
@@ -85,30 +87,77 @@ type HistoryToolCall = {
 const CONTROL_TOOL_NAMES = new Set(['finish', 'reply', 'switch_node', 'ask']);
 const INTERNAL_USER_MESSAGE_TYPES = new Set(['tool_result', 'system', 'summary']);
 const TERMINAL_TASK_EVENTS = new Set(['task_completed', 'task_cancelled', 'task_failed']);
-const FINAL_RESPONSE_EVENTS = new Set(['outbound_message', ...TERMINAL_TASK_EVENTS]);
+const LS_KEY_TITLES = 'clonoth_conversation_titles';
+const LS_KEY_AUTO_APPROVED = 'clonoth_auto_approved_ids';
 
 let startupLoaded = false;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let activeWsSessionId: string | null = null;
-const autoApprovedApprovalIds = new Set<string>();
+const autoApprovedApprovalIds = loadAutoApproved();
+
+function loadTitleCache(): Record<string, string> {
+  // [2026-06-02] Why: backend session metadata does not carry frontend-generated
+  // first-message titles. How: read a small browser-local title map defensively.
+  // Purpose: refreshing the page can restore readable conversation titles.
+  try {
+    const raw = localStorage.getItem(LS_KEY_TITLES);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function saveTitleCache(titles: Record<string, string>) {
+  // [2026-06-02] Why: conversation titles should survive refreshes but not grow
+  // without bound. How: keep insertion order and persist only the newest 100 values.
+  // Purpose: localStorage remains small while recent sidebar titles are retained.
+  try {
+    const entries = Object.entries(titles);
+    const trimmed = entries.length > 100 ? Object.fromEntries(entries.slice(-100)) : titles;
+    localStorage.setItem(LS_KEY_TITLES, JSON.stringify(trimmed));
+  } catch {}
+}
+
+function loadAutoApproved(): Set<string> {
+  // [2026-06-02] Why: automatically submitted approval ids must not reset on browser
+  // refresh. How: parse the localStorage array into the same Set used at runtime.
+  // Purpose: the client does not resubmit or re-show controls for already handled ids.
+  try {
+    const raw = localStorage.getItem(LS_KEY_AUTO_APPROVED);
+    return raw ? new Set(JSON.parse(raw)) : new Set();
+  } catch {
+    return new Set();
+  }
+}
+
+function saveAutoApproved(ids: Set<string>) {
+  // [2026-06-02] Why: approval ids are browser-local bookkeeping and can accumulate.
+  // How: serialize the Set as an array and retain only the newest 200 entries.
+  // Purpose: refresh persistence stays bounded without changing backend approval data.
+  try {
+    const arr = [...ids];
+    const trimmed = arr.length > 200 ? arr.slice(-200) : arr;
+    localStorage.setItem(LS_KEY_AUTO_APPROVED, JSON.stringify(trimmed));
+  } catch {}
+}
 
 function clearReconnectTimer() {
-  // Why: reconnect timers are module-level so they survive Zustand state updates.
-  // How: every explicit stop clears the pending timeout before closing the socket.
-  // Purpose: stale timers cannot reopen a WebSocket after cancel, reset, or switch.
+  // [2026-06-03] Why: global WebSocket reconnect timers are module-level so they
+  // survive Zustand state updates. How: clear the pending retry before an explicit
+  // full teardown or a fresh connection attempt. Purpose: resetState cannot leave a
+  // stale timer that silently opens another all-session socket.
   if (reconnectTimer) {
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
   }
 }
 
-function stopRealtimeConnection() {
-  // Why: connectSessionWS owns one browser WebSocket at a time. How: share a single
-  // cleanup point with the new store's reconnect timer. Purpose: preserve the old
-  // transport behavior while removing the legacy processEvent accumulator.
+function stopGlobalRealtimeConnection() {
+  // [2026-06-03] Why: task completion, cancellation, and conversation switching must
+  // not close realtime delivery anymore. How: reserve this cleanup for full store
+  // reset and test teardown only. Purpose: the long-lived /v1/ws stream continues
+  // receiving events for every web session during normal chat lifecycle changes.
   clearReconnectTimer();
-  activeWsSessionId = null;
-  disconnectSessionWS();
+  disconnectGlobalWS();
 }
 
 function createConversationId(): string {
@@ -124,18 +173,27 @@ function createConversationMeta(id = createConversationId(), sessionId = ''): Co
   return { id, sessionId, title: '新对话', updatedAt: timestamp };
 }
 
-function createStoreBase(): Pick<ChatStoreV2State, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus'> {
+function createStoreBase(): Pick<ChatStoreV2State, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'generatingBySession'> {
   return {
     conversations: [],
     activeConversationId: null,
     isGenerating: false,
     connectionStatus: 'idle',
+    generatingBySession: {},
   };
 }
 
 function normalizeConversationKey(value: string): string {
   if (!value) return '';
   return value.startsWith('web:') ? value.slice(4) : value;
+}
+
+function isEntryBranchSessionId(sessionId: string): boolean {
+  // [2026-06-03] Why: entry branches are temporary runtime sessions and must not
+  // become user-facing conversations. How: recognize the supervisor's branch_*
+  // ids, plus the older branch-* fixture spelling. Purpose: startup and routing can
+  // keep branch traffic attached to the durable parent web session.
+  return /^branch[_-]/.test(sessionId.trim());
 }
 
 function titleFromSession(conversationKey: string, sessionId: string): string {
@@ -169,6 +227,15 @@ function upsertConversationMeta(
   const existing = conversations.find((conversation) => conversation.id === patch.id);
   const timestamp = patch.updatedAt || new Date().toISOString();
 
+  if (patch.title && patch.title !== '新对话' && patch.title !== 'New conversation') {
+    // [2026-06-02] Why: title upserts are the single path for generated sidebar
+    // titles. How: mirror non-default titles into the browser-local cache. Purpose:
+    // startup can restore them even when Zustand memory was cleared by refresh.
+    const cache = loadTitleCache();
+    cache[patch.id] = patch.title;
+    saveTitleCache(cache);
+  }
+
   if (!existing) {
     return [{ sessionId: '', title: '新对话', updatedAt: timestamp, ...patch }, ...conversations];
   }
@@ -190,16 +257,26 @@ function getActiveConversation(state: ChatStoreV2State): ConversationMeta | unde
     : undefined;
 }
 
+function sortConversationsByRecency(conversations: readonly ConversationMeta[]): ConversationMeta[] {
+  // [2026-06-03] Why: the backend lists sessions by created_at, and in-place meta
+  // updates never reorder the sidebar, so a freshly active conversation stays buried.
+  // How: sort a copy by updatedAt descending (newest first). Purpose: the sidebar is
+  // sorted once on initial load and again after each task terminal event, matching the
+  // recency the user expects without reordering on every streaming delta.
+  return [...conversations].sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
+}
+
 function shouldPreserveConversationMessagesDuringHistoryLoad(
   state: ChatStoreV2State,
   conversationId: string,
   sessionId: string,
 ): boolean {
-  // Why: a history request can finish after the WebSocket has already delivered live
-  // stream blocks for the same conversation. How: detect an active connection for the
-  // target session, or the selected conversation being in a generating state. Purpose:
-  // history hydration must not delete in-flight assistant output during that race.
-  return activeWsSessionId === sessionId || (state.isGenerating && state.activeConversationId === conversationId);
+  // [2026-06-03] Why: the WebSocket is now global and always open, so socket
+  // presence no longer means this conversation is actively streaming. How: preserve
+  // existing cards only when this session is marked generating, or while the active
+  // composer still has an optimistic send pending. Purpose: normal history loads can
+  // replace stale data, but in-flight streams are not erased by a late fetch.
+  return Boolean(state.generatingBySession[sessionId]) || (state.isGenerating && state.activeConversationId === conversationId);
 }
 
 function getLastEventConversationId(state: ChatState, event: SupervisorEvent, fallbackConversationId: string): string {
@@ -233,30 +310,36 @@ function syncConversationsAfterEvent(
   }
 
   const inboundText = typeof payload.text === 'string' ? payload.text : '';
+  // [2026-06-03] Fix: use undefined instead of null/empty for non-inbound events
+  // so that upsertConversationMeta preserves the existing title via its
+  // `patch.title !== undefined` guard. Previously, passing existing?.title
+  // (which could be undefined for brand-new conversations) would overwrite
+  // the default '新对话' with undefined.
   const title = isInbound && inboundText && (!existing || existing.title === '新对话' || existing.title === 'New conversation')
     ? getInitialTitleFromClientPrefs(inboundText, existing?.title)
-    : existing?.title;
-  const sessionIdForSidebar = existing && nextChatState.conversationIdsBySession[event.session_id] !== conversationId
+    : undefined; // let upsertConversationMeta keep the existing title
+  const sessionIdForSidebar = existing?.sessionId && existing.sessionId !== event.session_id
     ? existing.sessionId
     : event.session_id;
 
   return upsertConversationMeta(conversations, {
     id: conversationId,
-    // Why: branch events can resolve to the parent conversation through source_inbound_seq
-    // while still carrying the child session id. How: only replace the sidebar session id
-    // when the reducer already maps that event session to this conversation. Purpose: the
-    // visible conversation remains attached to the web-created session, not a child task.
+    // [2026-06-03] Why: the global WebSocket can route branch-session events into
+    // their parent web conversation, and those branch ids must not replace the
+    // visible parent session in the sidebar. How: preserve an existing sidebar
+    // session id unless this event is already from that same session or the row is
+    // brand new. Purpose: child or branch task streams remain visible without
+    // breaking future history loads for the real web session.
     sessionId: sessionIdForSidebar,
     title,
     updatedAt: event.ts || new Date().toISOString(),
   });
 }
 
-function shouldStopGenerating(event: SupervisorEvent): boolean {
-  return FINAL_RESPONSE_EVENTS.has(event.type);
-}
-
-function shouldCloseAfterEvent(event: SupervisorEvent): boolean {
+function isTerminalTaskEvent(event: SupervisorEvent): boolean {
+  // [2026-06-03] Why: outbound_message can arrive before task cleanup finishes. How:
+  // only task terminal events end the local generating state. Purpose: the composer is
+  // not unlocked early while tools, routing, or branch cleanup can still be running.
   return TERMINAL_TASK_EVENTS.has(event.type);
 }
 
@@ -287,69 +370,292 @@ function maybeAutoApproveApprovalRequest(event: SupervisorEvent, get: StoreGette
   if (!toolName || !shouldAutoApproveTool(toolName, prefs.autoApproveTools)) return;
 
   autoApprovedApprovalIds.add(approvalId);
+  saveAutoApproved(autoApprovedApprovalIds);
   // [2026-06-01] Why: frontend auto-approval should behave like a local click, not
   // a backend policy change. How: submit the normal approval decision endpoint and
   // ignore transport errors so the pending card remains available for manual action.
   // Purpose: low-risk local rules can proceed while high-risk tools still need users.
   void decideApproval(approvalId, 'allow', 'auto-approved by client preference').catch(() => {
     autoApprovedApprovalIds.delete(approvalId);
+    saveAutoApproved(autoApprovedApprovalIds);
   });
 }
 
-function startSessionWebSocket(sessionId: string, conversationId: string, set: StoreSetter, get: StoreGetter) {
-  clearReconnectTimer();
-  activeWsSessionId = sessionId;
-  set({ connectionStatus: 'connecting' });
+const ACTIVE_TASK_EVENTS = new Set(['task_created', 'task_started', 'task_requeued', 'task_resumed', 'task_suspended']);
 
-  const currentSeq = get().lastSeqBySession[sessionId] || 0;
-  connectSessionWS(
-    sessionId,
-    currentSeq,
+function getMaxKnownSeq(state: ChatStoreV2State): number {
+  // [2026-06-03] Why: /v1/ws replays by global EventLog seq, while ChatState stores
+  // last seq per session. How: reconnect from the largest known session cursor.
+  // Purpose: global reconnects catch up from durable history without adding a second
+  // cursor table to the render state.
+  return Math.max(0, ...Object.values(state.lastSeqBySession));
+}
+
+function getStringValue(value: unknown): string {
+  return typeof value === 'string' ? value : value === undefined || value === null ? '' : String(value);
+}
+
+function getNumberValue(value: unknown): number | undefined {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string' && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function getEventPayload(event: SupervisorEvent): Record<string, unknown> {
+  return isRecord(event.payload) ? event.payload : {};
+}
+
+function getNestedRecord(record: Record<string, unknown>, key: string): Record<string, unknown> {
+  const value = record[key];
+  return isRecord(value) ? value : {};
+}
+
+function getTaskContext(payload: Record<string, unknown>): Record<string, unknown> {
+  const input = getNestedRecord(payload, 'input');
+  return getNestedRecord(input, 'task_context');
+}
+
+function getEventConversationKey(payload: Record<string, unknown>): string {
+  // [2026-06-03] Why: task lifecycle events usually carry conversation metadata
+  // inside input.task_context rather than at the payload top level. How: check the
+  // direct key first, then the persisted task context. Purpose: global WS routing can
+  // identify web sessions even when the event.session_id is a branch session.
+  return getStringValue(payload.conversation_key)
+    || getStringValue(getNestedRecord(payload, 'input').conversation_key)
+    || getStringValue(getTaskContext(payload).conversation_key)
+    || getStringValue(getTaskContext(payload).route_conversation_key);
+}
+
+function getEventParentSessionId(payload: Record<string, unknown>): string {
+  const input = getNestedRecord(payload, 'input');
+  const taskContext = getTaskContext(payload);
+  return getStringValue(payload.parent_session_id)
+    || getStringValue(input.parent_session_id)
+    || getStringValue(taskContext.parent_session_id);
+}
+
+function getEventBranchSessionId(payload: Record<string, unknown>): string {
+  // [2026-06-03] Why: branch_created is delivered on the parent session, while later
+  // task snapshots and stream events may use the branch runtime id. How: read the
+  // branch id from the same top-level, input, and task_context locations used by
+  // backend events. Purpose: the global WebSocket can register branch→conversation
+  // routes before branch_1 events arrive.
+  const input = getNestedRecord(payload, 'input');
+  const taskContext = getTaskContext(payload);
+  return getStringValue(payload.branch_session_id)
+    || getStringValue(input.branch_session_id)
+    || getStringValue(taskContext.branch_session_id);
+}
+
+function getEventSourceInboundSeq(payload: Record<string, unknown>): number | undefined {
+  const seq = getNumberValue(payload.source_inbound_seq);
+  return seq !== undefined && seq > 0 ? seq : undefined;
+}
+
+function findConversationIdBySession(state: ChatStoreV2State, sessionId: string): string {
+  if (!sessionId) return '';
+  return state.conversationIdsBySession[sessionId]
+    || state.conversations.find((conversation) => conversation.sessionId === sessionId)?.id
+    || '';
+}
+
+function resolveEventConversationId(state: ChatStoreV2State, event: SupervisorEvent): string {
+  // [2026-06-03] Why: /v1/ws emits every Supervisor session, including Discord and
+  // internal branch sessions. How: prefer explicit web conversation metadata, then
+  // source inbound and parent-session metadata, before falling back to direct
+  // session routes. Purpose: a stale branch_1→branch_1 route cannot override the
+  // parent web conversation carried by branch task events.
+  const payload = getEventPayload(event);
+  const conversationKey = getEventConversationKey(payload);
+  if (conversationKey) {
+    return conversationKey.startsWith('web:') ? normalizeConversationKey(conversationKey) : '';
+  }
+
+  const sourceInboundSeq = getEventSourceInboundSeq(payload);
+  if (sourceInboundSeq !== undefined) {
+    const userMessageId = state.userMessageByInboundSeq[String(sourceInboundSeq)];
+    const userMessage = userMessageId ? state.messagesById[userMessageId] : undefined;
+    if (userMessage) return userMessage.conversationId;
+  }
+
+  const parentConversationId = findConversationIdBySession(state, getEventParentSessionId(payload));
+  if (parentConversationId) return parentConversationId;
+
+  const direct = findConversationIdBySession(state, event.session_id);
+  if (direct) return direct;
+
+  return findConversationIdBySession(state, getEventBranchSessionId(payload));
+}
+
+function seedConversationRouteForEvent(
+  state: ChatStoreV2State,
+  event: SupervisorEvent,
+  conversationId: string,
+): ChatStoreV2State {
+  // [2026-06-03] Why: branch_created arrives on the parent session, but later live
+  // branch events may arrive with event.session_id=branch_1. How: seed every route id
+  // carried by the event, including branch_session_id, parent_session_id, and
+  // runtime_session_id, before reducer replay. Purpose: reducer event-log rows and
+  // messages land on the parent conversation without creating a branch_1 chat.
+  if (!conversationId) return state;
+
+  const payload = getEventPayload(event);
+  const routeSessionIds = [
+    event.session_id,
+    getEventParentSessionId(payload),
+    getEventBranchSessionId(payload),
+    getStringValue(payload.runtime_session_id),
+  ].filter((sessionId, index, all) => sessionId && all.indexOf(sessionId) === index);
+
+  const conversationIdsBySession = { ...state.conversationIdsBySession };
+  let changed = false;
+  for (const sessionId of routeSessionIds) {
+    if (conversationIdsBySession[sessionId] !== conversationId) {
+      conversationIdsBySession[sessionId] = conversationId;
+      changed = true;
+    }
+  }
+
+  return changed ? { ...state, conversationIdsBySession } : state;
+}
+
+function getAffectedSessionIds(state: ChatStoreV2State, event: SupervisorEvent, conversationId: string): string[] {
+  // [2026-06-03] Why: a task may run in an entry-branch session while the composer
+  // lock belongs to the visible parent web session. How: collect event, payload,
+  // parent, and sidebar session ids. Purpose: terminal task events unlock the correct
+  // active conversation without closing the global WebSocket.
+  const payload = getEventPayload(event);
+  const ids = new Set<string>();
+  const add = (value: string) => { if (value) ids.add(value); };
+
+  add(event.session_id);
+  add(getStringValue(payload.session_id));
+  add(getStringValue(payload.runtime_session_id));
+  add(getEventParentSessionId(payload));
+  add(getEventBranchSessionId(payload));
+
+  const conversation = state.conversations.find((item) => item.id === conversationId);
+  add(conversation?.sessionId || '');
+
+  return [...ids];
+}
+
+function updateGeneratingByEvent(
+  state: ChatStoreV2State,
+  event: SupervisorEvent,
+  conversationId: string,
+): Record<string, boolean> {
+  const shouldMarkActive = ACTIVE_TASK_EVENTS.has(event.type);
+  const shouldMarkDone = isTerminalTaskEvent(event);
+  if (!shouldMarkActive && !shouldMarkDone) return { ...state.generatingBySession };
+
+  const next = { ...state.generatingBySession };
+  for (const sessionId of getAffectedSessionIds(state, event, conversationId)) {
+    next[sessionId] = shouldMarkActive && !shouldMarkDone;
+  }
+  return next;
+}
+
+function isConversationGenerating(
+  conversations: readonly ConversationMeta[],
+  activeConversationId: string | null,
+  generatingBySession: Readonly<Record<string, boolean>>,
+  fallback: boolean,
+): boolean {
+  const active = activeConversationId ? conversations.find((conversation) => conversation.id === activeConversationId) : undefined;
+  return active?.sessionId ? Boolean(generatingBySession[active.sessionId]) : fallback;
+}
+
+function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
+  clearReconnectTimer();
+  if (get().connectionStatus !== 'open') {
+    set({ connectionStatus: 'connecting' });
+  }
+
+  // [2026-06-03] Why: WS catch-up replays historical approval_requested events that
+  // were already decided server-side. Auto-approving them fires POST /v1/approvals/
+  // which returns 404 (approval gone). How: capture the max known seq at connect
+  // time; events with seq <= this are catch-up and must not trigger auto-approval.
+  // Purpose: only live, real-time approval requests get auto-approved.
+  const wsStartSeq = getMaxKnownSeq(get());
+
+  connectGlobalWS(
+    wsStartSeq,
     (event) => {
+      let terminalConversationId = '';
+      let terminalSessionId = '';
+
       set((state) => {
-        // Why: WebSocket delivery and catch-up use the same SupervisorEvent shape.
-        // How: pass the whole current Zustand state to the pure reducer, then merge
-        // the returned ChatState fields back into the store. Purpose: eliminate the
-        // legacy processEvent path and all pending stream/tool accumulators.
-        const reducedState = reduceChatEvent(state, event);
+        const conversationId = resolveEventConversationId(state, event);
+        if (!conversationId) {
+          return { connectionStatus: 'open' };
+        }
+
+        const routedState = seedConversationRouteForEvent(state, event, conversationId);
+        // [2026-06-03] Why: WebSocket delivery and catch-up use the same
+        // SupervisorEvent shape, but now arrive from the all-session endpoint. How:
+        // route first, replay through the pure reducer, then mirror sidebar metadata.
+        // Purpose: concurrent sessions update independently without per-session WS.
+        const reducedState = reduceChatEvent(routedState, event);
+        const conversations = syncConversationsAfterEvent(state.conversations, reducedState, event, conversationId);
+        const generatingBySession = updateGeneratingByEvent({ ...state, conversations }, event, conversationId);
+        const isGenerating = isConversationGenerating(
+          conversations,
+          state.activeConversationId,
+          generatingBySession,
+          state.isGenerating,
+        );
+
+        if (isTerminalTaskEvent(event)) {
+          const conversation = conversations.find((item) => item.id === conversationId);
+          const historySessionId = conversation?.sessionId || getEventParentSessionId(getEventPayload(event)) || event.session_id;
+          terminalConversationId = conversationId;
+          terminalSessionId = historySessionId;
+        }
+
         return {
           ...reducedState,
-          conversations: syncConversationsAfterEvent(state.conversations, reducedState, event, conversationId),
+          conversations,
+          generatingBySession,
           connectionStatus: 'open',
-          isGenerating: shouldStopGenerating(event) ? false : state.isGenerating,
+          isGenerating,
         };
       });
 
-      maybeAutoApproveApprovalRequest(event, get);
+      // [2026-06-03] Skip auto-approval for catch-up events (seq <= connect-time max).
+      if (event.seq > wsStartSeq) {
+        maybeAutoApproveApprovalRequest(event, get);
+      }
 
-      if (shouldCloseAfterEvent(event)) {
-        stopRealtimeConnection();
-        // [2026-06-01] Terminal task events intentionally close realtime transport.
-        // Why: task completion is a normal end state, but using `closed` made the
-        // right panel show a red disconnected warning after successful replies. How:
-        // return to idle after local cleanup. Purpose: reserve `closed` for
-        // unexpected disconnects while generation is not actively closing itself.
-        set({ connectionStatus: 'idle', isGenerating: false });
+      if (terminalConversationId && terminalSessionId) {
+        // [2026-06-03] Why: a finished task means this conversation just received the
+        // latest activity and should rise to the top of the sidebar. How: re-sort by
+        // updatedAt before hydrating history; the terminal event already bumped this
+        // row's updatedAt via upsertConversationMeta. Purpose: recency ordering refreshes
+        // exactly when a task ends, not on every streaming delta.
+        set((state) => ({ conversations: sortConversationsByRecency(state.conversations) }));
+        // [2026-06-03] Why: stream_delta and tool_call_delta are provisional UI
+        // products. How: when the backend emits a task terminal event, fetch the
+        // persisted structured history for the visible session and replace the live
+        // cards. Purpose: the final UI matches backend ConversationStore JSONL.
+        void loadSessionHistoryIntoStore(terminalConversationId, terminalSessionId, set, get);
       }
     },
     () => {
-      if (activeWsSessionId !== sessionId) return;
-      // [2026-06-01] Mark the socket healthy as soon as the browser opens it.
-      // Why: relying on the first non-ping Supervisor event delayed the visible
-      // transition to open and caused stale status in quiet periods. How: the API
-      // client now exposes an onOpen callback that updates this session only if it
-      // is still current. Purpose: keep the right panel aligned with transport state.
+      // [2026-06-03] Why: connectionStatus now describes the global event stream,
+      // not a selected task. How: mark open as soon as /v1/ws accepts the cursor.
+      // Purpose: switching conversations does not make transport status ambiguous.
       set({ connectionStatus: 'open' });
     },
     () => {
-      if (activeWsSessionId !== sessionId) return;
-      if (get().isGenerating) {
-        set({ connectionStatus: 'reconnecting' });
-        reconnectTimer = setTimeout(() => startSessionWebSocket(sessionId, conversationId, set, get), 2000);
-        return;
-      }
-      activeWsSessionId = null;
-      set({ connectionStatus: 'closed' });
+      // [2026-06-03] Why: the global WS should remain alive for all sessions. How:
+      // reconnect after unexpected close regardless of task state. Purpose: task
+      // completion and cancellation no longer control realtime lifetime.
+      set({ connectionStatus: 'reconnecting' });
+      reconnectTimer = setTimeout(() => startGlobalWebSocket(set, get), 2000);
     },
   );
 }
@@ -468,7 +774,11 @@ function createHistoryToolExecutions(
       result: result?.result,
       rawInline: result?.rawInline,
       rejected: result?.rejected,
-      hidden: CONTROL_TOOL_NAMES.has(toolCall.name) && result?.isAutoResult,
+      // [2026-06-02] Why: rejected control tools explain why a final action failed
+      // and must not be treated like the automatic successful "ok" result. How: keep
+      // the existing auto-result hiding but exclude rejected tool results. Purpose:
+      // historical rejected finish/reply/ask calls remain visible in the tool list.
+      hidden: CONTROL_TOOL_NAMES.has(toolCall.name) && result?.isAutoResult && !result?.rejected,
       nodeId,
       createdAt,
       updatedAt: createdAt,
@@ -477,12 +787,21 @@ function createHistoryToolExecutions(
   });
 }
 
-function createTextBlock(id: string, createdAt: string, text: string): TextBlock {
+function createTextBlock(
+  id: string,
+  createdAt: string,
+  text: string,
+  delivery: TextBlock['delivery'] = 'history',
+): TextBlock {
   return {
     id,
     kind: 'text',
     text,
-    delivery: 'history',
+    // [2026-06-02] Why: hydrated reply and finish messages need the same delivery
+    // metadata as live reducer messages. How: keep history as the default while
+    // allowing callers to pass intermediate for reply and final for finish. Purpose:
+    // refresh and reconnect rebuilds preserve the visual reply and finish semantics.
+    delivery,
     streaming: false,
     createdAt,
     updatedAt: createdAt,
@@ -566,6 +885,34 @@ function removeConversationMessages(state: ChatState, conversationId: string): C
   return { ...state, messagesById, messageOrderByConversation, toolExecutionsById, toolExecutionOrder };
 }
 
+function getHistoryEventId(sessionId: string, sourceMessageId: string | undefined, messageId: string): string {
+  // [2026-06-02] Why: active history hydration now compares persisted rows against
+  // live WebSocket messages. How: keep the exact synthetic source id in one helper so
+  // dedupe checks and hydrated messages use the same value. Purpose: repeated history
+  // loads cannot create a second card for an already-hydrated source message.
+  return `history:${sessionId}:${sourceMessageId || messageId}`;
+}
+
+function getMessageTextForHistoryDedupe(message: WsMessage): string {
+  // [2026-06-02] Why: live messages do not share ConversationStore UUIDs with
+  // structured history rows. How: compare only rendered text blocks and leave tool-only
+  // rows to source-id matching. Purpose: stream cards and history cards with the same
+  // visible text do not render twice during active-session races.
+  return message.blocks
+    .filter((block): block is TextBlock => block.kind === 'text')
+    .map((block) => block.text)
+    .join('\n');
+}
+
+function createHistoryContentSignature(role: WsMessage['role'], text: string): string | undefined {
+  // [2026-06-02] Why: content dedupe must not collapse user and assistant messages
+  // that happen to contain the same text. How: normalize whitespace and include the
+  // role in the signature. Purpose: matching stays narrow while catching stream/history
+  // duplicates that differ only in delivery metadata.
+  const compact = collapseForPreview(text);
+  return compact ? `${role}:${compact}` : undefined;
+}
+
 function hydrateStructuredHistory(
   state: ChatState,
   sessionId: string,
@@ -583,6 +930,51 @@ function hydrateStructuredHistory(
   // the caller can skip the removal step for active sessions. Purpose: late history
   // responses do not erase in-flight stream or tool blocks.
   let nextState = preserveExistingMessages ? state : removeConversationMessages(state, conversationId);
+  const existingSourceIds = new Set<string>();
+  const existingMessageIds = new Set<string>();
+  const existingContentSignatures = new Set<string>();
+
+  if (preserveExistingMessages) {
+    // [2026-06-02] Why: preserving live WebSocket messages avoids deleting active
+    // streams, but appending every persisted history row creates duplicate cards. How:
+    // collect source ids, generated message ids, and role-scoped visible text from the
+    // current conversation before hydration. Purpose: late history responses can add
+    // missing old rows without duplicating messages that are already visible.
+    for (const id of nextState.messageOrderByConversation[conversationId] || []) {
+      const existingMessage = nextState.messagesById[id];
+      if (!existingMessage) continue;
+      existingMessageIds.add(existingMessage.id);
+      for (const eventId of existingMessage.eventIds || []) {
+        if (eventId.startsWith(`history:${sessionId}:`)) existingSourceIds.add(eventId);
+      }
+      const signature = createHistoryContentSignature(existingMessage.role, getMessageTextForHistoryDedupe(existingMessage));
+      if (signature) existingContentSignatures.add(signature);
+    }
+  }
+
+  const shouldSkipPreservedHistoryMessage = (
+    sourceEventId: string,
+    messageId: string,
+    role: WsMessage['role'],
+    text: string,
+  ): boolean => {
+    if (!preserveExistingMessages) return false;
+    if (existingSourceIds.has(sourceEventId) || existingMessageIds.has(messageId)) return true;
+    const signature = createHistoryContentSignature(role, text);
+    return Boolean(signature && existingContentSignatures.has(signature));
+  };
+
+  const rememberHydratedHistoryMessage = (sourceEventId: string, messageId: string) => {
+    // [2026-06-02] Why: a malformed or replayed history response can contain the same
+    // persisted source more than once. How: record source and generated ids as each row
+    // is accepted, without adding content signatures that would collapse legitimate
+    // repeated text inside one history payload. Purpose: preserve duplicate human text
+    // while still avoiding duplicate source rows.
+    if (!preserveExistingMessages) return;
+    existingSourceIds.add(sourceEventId);
+    existingMessageIds.add(messageId);
+  };
+
   let accumulatedThinking: string[] = [];
   let accumulatedTools: ToolExecution[] = [];
   let accumulatedCreatedAt = '';
@@ -601,6 +993,11 @@ function hydrateStructuredHistory(
   ) => {
     const createdAt = sourceMessage.created_at || accumulatedCreatedAt || new Date().toISOString();
     const messageId = `message:${conversationId}:history:${sourceMessage.id || nextState.messageOrderByConversation[conversationId]?.length || 0}`;
+    const historyEventId = getHistoryEventId(sessionId, sourceMessage.id, messageId);
+    if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, 'assistant', text)) {
+      resetAccumulatedAssistant();
+      return;
+    }
     const thinkingText = [...accumulatedThinking, ...(sourceMessage.thinking ? [sourceMessage.thinking] : [])]
       .filter((item) => item.trim())
       .join('\n---\n');
@@ -628,7 +1025,18 @@ function hydrateStructuredHistory(
       blocks.push(createToolBlock(blockId, createdAt, tools.map((tool) => tool.stableId)));
       tools.forEach((tool, index) => { tools[index] = { ...tool, blockId }; });
     }
-    if (text) blocks.push(createTextBlock(`${messageId}|block:text:history`, createdAt, text));
+    const textDelivery: TextBlock['delivery'] = completionType === 'reply'
+      ? 'intermediate'
+      : completionType === 'finish'
+        ? 'final'
+        : 'history';
+    if (text) {
+      // [2026-06-02] Why: rebuilt control-tool messages lost their reply/finish
+      // delivery after refresh because every history text block used history. How:
+      // derive the text delivery from completionType before creating the block.
+      // Purpose: reply rebuilds as intermediate and finish rebuilds as final.
+      blocks.push(createTextBlock(`${messageId}|block:text:history`, createdAt, text, textDelivery));
+    }
 
     const status: MessageStatus = 'completed';
     const message: WsMessage = {
@@ -641,7 +1049,7 @@ function hydrateStructuredHistory(
       updatedAt: createdAt,
       source: { nodeId: sourceMessage.source_node_id || undefined },
       blocks,
-      eventIds: [`history:${sessionId}:${sourceMessage.id || messageId}`],
+      eventIds: [historyEventId],
       hydratedFromHistory: true,
       ...(completionType && { completionType }),
     };
@@ -650,6 +1058,7 @@ function hydrateStructuredHistory(
       ...tool,
       eventIds: [`history:${sessionId}:${messageId}:tool:${tool.index ?? 0}`],
     })));
+    rememberHydratedHistoryMessage(historyEventId, messageId);
     resetAccumulatedAssistant();
   };
 
@@ -674,7 +1083,9 @@ function hydrateStructuredHistory(
 
       const createdAt = message.created_at || new Date().toISOString();
       const messageId = `message:${conversationId}:history:${message.id || `user-${nextState.messageOrderByConversation[conversationId]?.length || 0}`}`;
+      const historyEventId = getHistoryEventId(sessionId, message.id, messageId);
       const text = stringifyContent(message.content);
+      if (shouldSkipPreservedHistoryMessage(historyEventId, messageId, 'user', text)) continue;
       const wsMessage: WsMessage = {
         id: messageId,
         conversationId,
@@ -685,10 +1096,11 @@ function hydrateStructuredHistory(
         updatedAt: createdAt,
         source: { nodeId: message.source_node_id || undefined },
         blocks: [createTextBlock(`${messageId}|block:text:history`, createdAt, text)],
-        eventIds: [`history:${sessionId}:${message.id || messageId}`],
+        eventIds: [historyEventId],
         hydratedFromHistory: true,
       };
       nextState = appendHistoryMessage(nextState, wsMessage, []);
+      rememberHydratedHistoryMessage(historyEventId, messageId);
       continue;
     }
 
@@ -712,7 +1124,11 @@ function hydrateStructuredHistory(
       const ctName = controlText.toolName;
       const ctType: WsMessage['completionType'] =
         ctName === 'finish' ? 'finish' : ctName === 'ask' ? 'ask' : ctName === 'reply' ? 'reply' : undefined;
-      pushAssistantMessage(message, displayText, currentTools, ctType);
+      // [2026-06-03] Why: free prose (content) duplicates or precedes the reply/finish
+      // text but has no user-facing value. How: always prefer the control tool text over
+      // the raw content when a control tool is present. Purpose: the card shows the
+      // authoritative reply/finish text, not the internal LLM reasoning.
+      pushAssistantMessage(message, controlText.text, currentTools, ctType);
       continue;
     }
 
@@ -737,14 +1153,14 @@ function hydrateStructuredHistory(
 }
 
 async function loadSessionHistoryIntoStore(conversationId: string, sessionId: string, set: StoreSetter, get: StoreGetter) {
+  // [2026-06-03] Why: the old event ring buffer is fragile and size-limited for
+  // history rebuilds. How: reconstruct only from getSessionHistory, backed by
+  // persistent JSONL. Purpose: final cards use backend-authoritative history while
+  // WebSocket sequence cursors remain transport bookkeeping only.
   let history: StructuredMessage[] = [];
-  let events: SupervisorEvent[] = [];
 
   try {
-    [history, events] = await Promise.all([
-      getSessionHistory(sessionId, 200),
-      pollEvents(sessionId, 0),
-    ]);
+    history = await getSessionHistory(sessionId, 200);
   } catch {
     return;
   }
@@ -754,10 +1170,8 @@ async function loadSessionHistoryIntoStore(conversationId: string, sessionId: st
     const hydrated = history.length > 0
       ? hydrateStructuredHistory(state, sessionId, conversationId, history, preserveExistingMessages)
       : state;
-    const maxSeq = events.reduce((max, event) => Math.max(max, event.seq || 0), hydrated.lastSeqBySession[sessionId] || 0);
     return {
       ...hydrated,
-      lastSeqBySession: { ...hydrated.lastSeqBySession, [sessionId]: maxSeq },
       conversations: upsertConversationMeta(state.conversations, {
         id: conversationId,
         sessionId,
@@ -772,28 +1186,79 @@ async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
   startupLoaded = true;
 
   const serverSessions = await listSessions('web', 50);
-  if (!serverSessions || serverSessions.length === 0) return;
+  const userSessions = (serverSessions || []).filter((session) => !isEntryBranchSessionId(session.session_id));
+  // [2026-06-03] Why: on fresh page load, lastSeqBySession is empty so
+  // getMaxKnownSeq returns 0, causing wsStartSeq=0 and all catch-up events
+  // to pass the auto-approve guard. How: fetch the current max seq from the
+  // backend before opening the WS. Purpose: catch-up events are correctly
+  // identified and auto-approve is skipped for historical approvals.
+  const latestSeq = await fetchLatestSeq();
+  if (latestSeq > 0) {
+    set((state) => ({
+      lastSeqBySession: { ...state.lastSeqBySession, _global: latestSeq },
+    }));
+  }
 
-  const conversations = serverSessions.map((session): ConversationMeta => {
+  if (userSessions.length === 0) {
+    startGlobalWebSocket(set, get);
+    return;
+  }
+
+  const titleCache = loadTitleCache();
+  const seenConversationIds = new Set<string>();
+  const conversations = userSessions.flatMap((session): ConversationMeta[] => {
     const conversationId = normalizeConversationKey(session.conversation_key) || session.session_id;
-    return {
+    if (seenConversationIds.has(conversationId)) {
+      // [2026-06-03] Why: a bad runtime list can contain both parent and internal
+      // rows for the same web conversation. How: keep the first sorted row only.
+      // Purpose: the sidebar cannot render duplicate conversations for one session.
+      return [];
+    }
+    seenConversationIds.add(conversationId);
+    return [{
       id: conversationId,
       sessionId: session.session_id,
-      title: titleFromSession(session.conversation_key, session.session_id),
+      // [2026-06-02] Why: listSessions cannot return frontend-only generated
+      // titles. How: prefer the browser cache before falling back to session ids.
+      // Purpose: refresh keeps the user's readable sidebar title.
+      title: titleCache[conversationId] || titleFromSession(session.conversation_key, session.session_id),
       updatedAt: session.updated_at || session.created_at || new Date().toISOString(),
-    };
+    }];
   });
 
+  // [2026-06-03] Defensive title re-save: after building the conversations list
+  // from titleCache + server sessions, write the cache back. This ensures any
+  // titles that were restored from cache survive even if a subsequent WS event
+  // temporarily replaces the conversation list before user interaction.
+  const restoredCache = loadTitleCache();
+  let cacheUpdated = false;
+  for (const conv of conversations) {
+    if (conv.title && conv.title !== '新对话' && conv.title !== 'New conversation' && restoredCache[conv.id] !== conv.title) {
+      restoredCache[conv.id] = conv.title;
+      cacheUpdated = true;
+    }
+  }
+  if (cacheUpdated) saveTitleCache(restoredCache);
+
+  // [2026-06-03] Sort once on initial load so the sidebar opens with the most
+  // recently updated conversations on top, regardless of backend list order.
+  const sortedConversations = sortConversationsByRecency(conversations);
   set((state) => ({
-    conversations,
-    activeConversationId: state.activeConversationId || conversations[0]?.id || null,
-    conversationIdsBySession: conversations.reduce<Record<string, string>>((acc, conversation) => {
+    conversations: sortedConversations,
+    activeConversationId: state.activeConversationId || sortedConversations[0]?.id || null,
+    conversationIdsBySession: sortedConversations.reduce<Record<string, string>>((acc, conversation) => {
       if (conversation.sessionId) acc[conversation.sessionId] = conversation.id;
       return acc;
     }, { ...state.conversationIdsBySession }),
   }));
 
-  const first = conversations[0];
+  // [2026-06-03] Why: realtime is now an all-session subscription that should
+  // exist as soon as the web app starts. How: open /v1/ws after session metadata
+  // has seeded session routing. Purpose: existing and future sessions can receive
+  // events without waiting for a selected task.
+  startGlobalWebSocket(set, get);
+
+  const first = sortedConversations[0];
   if (first?.sessionId) {
     await loadSessionHistoryIntoStore(first.id, first.sessionId, set, get);
   }
@@ -804,9 +1269,10 @@ export const useChatStoreV2 = create<ChatStoreV2State>((set, get) => ({
   ...createStoreBase(),
 
   resetState: () => {
-    stopRealtimeConnection();
+    stopGlobalRealtimeConnection();
     startupLoaded = false;
     autoApprovedApprovalIds.clear();
+    saveAutoApproved(autoApprovedApprovalIds);
     set({
       ...createInitialChatState(),
       ...createStoreBase(),
@@ -815,8 +1281,21 @@ export const useChatStoreV2 = create<ChatStoreV2State>((set, get) => ({
 
   selectConversation: (id) => {
     const target = get().conversations.find((conversation) => conversation.id === id);
-    set({ activeConversationId: id });
+    set((state) => ({
+      // [2026-06-03] Why: multiple sessions can generate concurrently, so the
+      // composer lock must follow the selected session rather than a single global
+      // active task. How: recompute isGenerating from generatingBySession when the
+      // user switches chats. Purpose: switching away from a running session does not
+      // incorrectly disable another conversation.
+      activeConversationId: id,
+      isGenerating: target?.sessionId ? Boolean(state.generatingBySession[target.sessionId]) : false,
+    }));
     if (target?.sessionId) {
+      // [2026-06-03] Why: selecting a conversation is a view action, not a
+      // transport lifecycle action. How: load only the selected session history here
+      // and leave the long-lived global WebSocket to startup, sendMessage, and reset.
+      // Purpose: switching chats cannot accidentally create, replace, or recover a
+      // realtime connection outside the global connection lifecycle.
       void loadSessionHistoryIntoStore(target.id, target.sessionId, set, get);
     }
   },
@@ -843,13 +1322,37 @@ export const useChatStoreV2 = create<ChatStoreV2State>((set, get) => ({
       const conversationIdsBySession = { ...nextChatState.conversationIdsBySession };
       if (conversation?.sessionId) delete conversationIdsBySession[conversation.sessionId];
 
+      const generatingBySession = conversation?.sessionId
+        ? { ...state.generatingBySession, [conversation.sessionId]: false }
+        : state.generatingBySession;
+
       return {
         ...nextChatState,
         conversationIdsBySession,
         conversations,
         activeConversationId,
+        generatingBySession,
+        // [2026-06-03] Why: generation is tracked per session now. How: after a
+        // deletion chooses a new active conversation, derive the composer lock from
+        // that conversation's session flag. Purpose: deleting a running or old chat
+        // cannot leave the next selected chat incorrectly disabled.
+        isGenerating: isConversationGenerating(conversations, activeConversationId, generatingBySession, false),
       };
     });
+  },
+
+  renameConversation: (id, newTitle) => {
+    const trimmed = newTitle.trim();
+    if (!trimmed) return;
+    set((state) => ({
+      conversations: state.conversations.map((c) =>
+        c.id === id ? { ...c, title: trimmed, updatedAt: new Date().toISOString() } : c,
+      ),
+    }));
+    // Persist to localStorage
+    const cache = loadTitleCache();
+    cache[id] = trimmed;
+    saveTitleCache(cache);
   },
 
   sendMessage: async (text, attachments, entryNodeId) => {
@@ -872,7 +1375,7 @@ export const useChatStoreV2 = create<ChatStoreV2State>((set, get) => ({
       }),
       activeConversationId: conversationId,
       isGenerating: true,
-      connectionStatus: 'connecting',
+      connectionStatus: current.connectionStatus === 'open' ? 'open' : 'connecting',
     }));
 
     let sessionId = '';
@@ -912,8 +1415,70 @@ export const useChatStoreV2 = create<ChatStoreV2State>((set, get) => ({
         entry_node_id: entryNodeId,
       });
       sessionId = result.session_id;
+      // [2026-06-03] Optimistic user message injection. Why: the global WS may
+      // take a moment to deliver the inbound_message event, leaving the chat
+      // visually empty after the user presses send. How: construct a WsMessage
+      // with the same ID format that applyInboundMessage would use, then upsert
+      // it into the store immediately. Purpose: when the real inbound_message
+      // arrives via WS, the existing-branch merge (L201-209 in eventReducer)
+      // will update the message in place without duplication.
+      const inboundSeq = result.inbound_seq;
+      if (inboundSeq != null) {
+        const optimisticId = `message:${conversationId}:user:inbound:${inboundSeq}`;
+        const now = new Date().toISOString();
+        set((current) => {
+          // Skip if reducer already processed the real event
+          if (current.messagesById[optimisticId]) return current;
+          return {
+            ...current,
+            messagesById: {
+              ...current.messagesById,
+              [optimisticId]: {
+                id: optimisticId,
+                conversationId,
+                sessionId,
+                role: 'user' as const,
+                status: 'completed' as const,
+                createdAt: now,
+                updatedAt: now,
+                source: { inboundSeq },
+                blocks: [{
+                  id: `${optimisticId}|block:text:optimistic`,
+                  kind: 'text' as const,
+                  text: trimmed,
+                  delivery: 'final' as const,
+                  streaming: false,
+                  createdAt: now,
+                  updatedAt: now,
+                  eventIds: [],
+                }],
+                attachments: (uploadedAttachments || []).map(a => ({ name: a.name, url: a.path || '' })),
+                eventIds: [],
+              },
+            },
+            messageOrderByConversation: {
+              ...current.messageOrderByConversation,
+              [conversationId]: [
+                ...(current.messageOrderByConversation[conversationId] || []),
+                optimisticId,
+              ],
+            },
+            userMessageByInboundSeq: {
+              ...current.userMessageByInboundSeq,
+              [String(inboundSeq)]: optimisticId,
+            },
+          };
+        });
+      }
     } catch (error) {
-      set({ isGenerating: false, connectionStatus: 'closed' });
+      // [2026-06-03] Why: an inbound HTTP failure is not proof that the global
+      // WebSocket is closed. How: clear only the optimistic generating flag and keep
+      // an already-open realtime status intact. Purpose: one failed send cannot make
+      // the all-session event stream look disconnected.
+      set((current) => ({
+        isGenerating: false,
+        connectionStatus: current.connectionStatus === 'open' ? 'open' : 'closed',
+      }));
       return;
     }
 
@@ -931,10 +1496,17 @@ export const useChatStoreV2 = create<ChatStoreV2State>((set, get) => ({
         ...current.lastSeqBySession,
         [sessionId]: current.lastSeqBySession[sessionId] || 0,
       },
+      generatingBySession: {
+        ...current.generatingBySession,
+        [sessionId]: true,
+      },
     }));
 
-    stopRealtimeConnection();
-    startSessionWebSocket(sessionId, conversationId, set, get);
+    // [2026-06-03] Why: sending a message should not replace another session's
+    // realtime listener. How: keep the existing global /v1/ws connection or open it
+    // if this is the first message in the tab. Purpose: multiple sessions can run
+    // concurrently through one event stream.
+    startGlobalWebSocket(set, get);
   },
 
   cancelCurrentTask: async () => {
@@ -949,12 +1521,18 @@ export const useChatStoreV2 = create<ChatStoreV2State>((set, get) => ({
       // remain locked if the cancel endpoint races with task completion.
     }
 
-    stopRealtimeConnection();
-    // [2026-06-01] Cancellation is a deliberate local stop, not a connection error.
-    // Why: showing Disconnected after the user cancels a task suggests a transport
-    // failure even though the socket was closed by design. How: clear generation and
-    // return to idle. Purpose: only unexpected disconnects stay red in the panel.
-    set({ isGenerating: false, connectionStatus: 'idle' });
+    // [2026-06-03] Why: cancellation should not manage the global WebSocket and
+    // should unlock the active composer immediately. How: clear only the active
+    // session's local generating flags after the cancel API returns or races with
+    // completion. Purpose: resetState remains the only normal path that disconnects
+    // realtime transport, while cancel stays a task action.
+    set((state) => ({
+      isGenerating: false,
+      generatingBySession: {
+        ...state.generatingBySession,
+        [activeConversation.sessionId]: false,
+      },
+    }));
   },
 
   loadStartup: () => {

@@ -438,6 +438,15 @@ class SessionMixin:
     def _apply_inbound_message(self, *, seq: int, session_id: str, payload: dict[str, Any]) -> None:
         if not isinstance(seq, int) or seq <= 0 or not session_id:
             return
+        # [2026-06-03] Why: the sidebar sorts conversations by session.updated_at, but
+        # this (the effective, later-defined) inbound handler never refreshed it, so
+        # updated_at stayed equal to created_at and the list was effectively sorted by
+        # creation time. How: bump updated_at whenever a new inbound message lands.
+        # Purpose: a conversation receiving fresh user input rises to the top.
+        si = self.sessions.get(session_id)
+        if si is not None:
+            si.updated_at = _now()
+            self._persist_session(si)
         if seq not in self._inbound_events:
             self._inbound_events[seq] = {"session_id": session_id, "payload": payload}
             self._inbound_order.append(seq)
@@ -474,6 +483,14 @@ class SessionMixin:
             inbound_seq = int(src) if src is not None else 0
         except Exception:
             inbound_seq = 0
+        # [2026-06-03] Why: bump session.updated_at on outbound (reply/finish) so a
+        # conversation that just produced a response also rises in the recency-sorted
+        # sidebar. How: refresh updated_at + persist before recording reply routing.
+        # Purpose: both user input and assistant output count as recent activity.
+        si = self.sessions.get(session_id)
+        if si is not None:
+            si.updated_at = _now()
+            self._persist_session(si)
         if inbound_seq > 0 and inbound_seq not in self._inbound_routed:
             self._inbound_routed[inbound_seq] = {
                 "action": "reply",
@@ -894,7 +911,25 @@ class SessionMixin:
         from engine.conversation_store import ConversationStore
 
         store = ConversationStore(Path(self.workspace_root) / "data" / "conversations")
-        messages = store.load(session_id)
+        messages = list(store.load(session_id))
+
+        # [2026-06-02] Merge active entry branch messages into the parent history.
+        # Why: the web frontend calls this with the parent session_id, but the latest
+        # conversation turn may still be in an unmerged branch_xxx session. How: find
+        # all active entry branches for this parent and append their messages (that
+        # are newer than the parent's last message) to the result. Purpose: history
+        # reconstruction shows the same content as live WebSocket streaming.
+        with self._lock:
+            branch_ids = self._entry_branch_ids_for_parent_locked(session_id)
+        if branch_ids:
+            parent_msg_ids = {m.id for m in messages}
+            for bid in branch_ids:
+                branch_msgs = store.load(bid)
+                for bm in branch_msgs:
+                    if bm.id not in parent_msg_ids:
+                        messages.append(bm)
+            # Re-sort by created_at to maintain chronological order
+            messages.sort(key=lambda m: m.created_at or "")
 
         result: list[dict[str, Any]] = []
         for msg in messages:

@@ -16,7 +16,7 @@ import {
   switchNode,
   updateSessionProviderOverride,
 } from '../../api/supervisorClient';
-import { useChatStoreV2 } from '../../store/chatStoreV2';
+import { useChatStore } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
 import type { NodeDef } from '../../types';
@@ -150,7 +150,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
   const [modelMsg, setModelMsg] = useState('');
   const [apiKeyPresent, setApiKeyPresent] = useState(false);
   const [edit, setEdit] = useState<SessionModelEdit>({ provider: '', model: '', base_url: '', api_key: '' });
-  const connectionStatus = useChatStoreV2((state) => state.connectionStatus);
+  const connectionStatus = useChatStore((state) => state.connectionStatus);
 
   const switchableNodes = useMemo(() => getSwitchableNodes(availableNodes), [availableNodes]);
   const displayNodeId = activeNodeId || entryNodeId || defaultNodeId;

@@ -164,7 +164,7 @@ export function connectSessionWS(
   // [2026-06-03] Compatibility wrapper. Why: the legacy chatStore still imports the
   // old per-session helper. How: route it through the global WebSocket and filter by
   // session id at the client boundary. Purpose: avoid keeping two WebSocket designs
-  // while chatStoreV2 has moved to all-session realtime delivery.
+  // while chatStore has moved to all-session realtime delivery.
   connectGlobalWS(
     lastSeq,
     (event) => { if (event.session_id === sessionId) onEvent(event); },

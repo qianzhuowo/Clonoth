@@ -421,6 +421,7 @@ export function parseNodeConfig(raw: string, fallbackId = ''): NodeConfigFormSta
     tool_access_mode: toolMode,
     tool_access_allowText: listLineValue(toolBlock, 'allow').join(', '),
     tool_access_denyText: listLineValue(toolBlock, 'deny').join(', '),
+    prompt: deindentChildBlock(topLevelBlock(raw, 'prompt')).trim(),
   };
 }
 

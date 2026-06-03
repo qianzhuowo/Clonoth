@@ -58,6 +58,7 @@ const EMPTY_NODE_CONFIG_FORM: NodeConfigFormState = {
   tool_access_mode: 'all',
   tool_access_allowText: '',
   tool_access_denyText: '',
+  prompt: '',
 };
 
 export const SystemSettingsRightPanel = () => {
@@ -220,6 +221,10 @@ export const AgentsSettingsRightPanel = () => {
                 <label className="block">
                   <span className={STRUCTURED_LABEL_CLASS}>描述</span>
                   <textarea className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ description: event.target.value })} rows={3} value={nodeConfigForm.description} />
+                </label>
+                <label className="block">
+                  <span className={STRUCTURED_LABEL_CLASS}>Prompt（系统提示词）</span>
+                  <textarea className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ prompt: event.target.value })} rows={8} value={nodeConfigForm.prompt} />
                 </label>
                 <label className="block">
                   <span className={STRUCTURED_LABEL_CLASS}>类型</span>

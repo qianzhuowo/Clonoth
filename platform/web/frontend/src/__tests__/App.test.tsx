@@ -1,18 +1,38 @@
 // [2026-05-16] Updated: minimal smoke test for App rendering.
 // [2026-05-31] Step 3 expectation: App must mount the reducer-backed V2 chat list
 // and the bottom event log panel. Why: the integration switch should be protected at
-// the application boundary. How: the smoke test now resets chatStoreV2 and asserts V2
+// the application boundary. How: the smoke test now resets chatStore and asserts canonical
 // only UI text. Purpose: catch accidental fallback to the legacy MessageList path.
 import { render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import App from '../App';
-import { useChatStoreV2 } from '../store/chatStoreV2';
+import { useChatStore } from '../store/chatStore';
 import { useSettingsStore } from '../store/settingsStore';
+
+class FakeWebSocket {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSED = 3;
+  readyState = FakeWebSocket.CONNECTING;
+  onopen: (() => void) | null = null;
+  onmessage: ((event: MessageEvent<string>) => void) | null = null;
+  onclose: (() => void) | null = null;
+  onerror: (() => void) | null = null;
+
+  // [2026-06-03] Why: MainApp now opens the long-lived global WebSocket during
+  // startup even with an empty session list. How: provide a no-op browser-like
+  // WebSocket for this rendering smoke test. Purpose: the test remains focused on
+  // layout instead of trying to reach a live Supervisor socket.
+  constructor(public readonly url: string) {}
+
+  send(_data: string) {}
+  close() { this.readyState = FakeWebSocket.CLOSED; this.onclose?.(); }
+}
 
 describe('Clonoth web app', () => {
   beforeEach(() => {
-    useChatStoreV2.getState().resetState();
+    useChatStore.getState().resetState();
     // [2026-05-17] The app now has an admin login gate. This smoke test is meant
     // to verify the main chat layout, so it explicitly enters the authenticated
     // state instead of accidentally testing the login page.
@@ -25,10 +45,11 @@ describe('Clonoth web app', () => {
       status: 200,
       headers: { 'Content-Type': 'application/json' },
     })));
+    vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket);
   });
 
   afterEach(() => {
-    useChatStoreV2.getState().resetState();
+    useChatStore.getState().resetState();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });

@@ -246,8 +246,13 @@ function applyStreamDelta(state: ChatState, event: SupervisorEvent): ChatState {
     return state;
   }
 
-  const turnKey = getTurnKey(state, event);
-  let result = getOrCreateAssistantMessage(state, event, turnKey);
+  // [2026-06-02] Why: reply()/ask() closes the visible content for one LLM
+  // round, but the task can continue with another LLM request. How: stream deltas
+  // resolve through the post-completion boundary helper before appending tokens.
+  // Purpose: thinking/text after a reply starts a fresh work card instead of
+  // appearing below the reply text.
+  let result = getOrCreateAssistantMessageForRoundStart(state, event);
+
   let message = setMessageStatus(result.message, 'streaming', event);
 
   if (streamType === 'thinking') {
@@ -321,7 +326,14 @@ function applyStreamEnd(state: ChatState, event: SupervisorEvent): ChatState {
   const hadStreamText = hasStreamTextBlock(message);
   const finalized = finalizeStreamingBlocks(message, event);
   const nextStatus: MessageStatus = message.status === 'streaming' || hadStreamText ? 'running_tools' : finalized.status;
-  return upsertMessage(state, setMessageStatus(finalized, nextStatus, event));
+  // [2026-06-03] Mark this card's LLM round as complete. Next stream_delta
+  // (new thinking/text) will trigger a card break, matching history reconstruction
+  // where each assistant message with content is a separate card.
+  const withRoundComplete: WsMessage = {
+    ...setMessageStatus(finalized, nextStatus, event),
+    roundComplete: true,
+  };
+  return upsertMessage(state, withRoundComplete);
 }
 
 function applyOutboundMessage(state: ChatState, event: SupervisorEvent): ChatState {
@@ -380,7 +392,15 @@ function applyIntermediateReply(state: ChatState, event: SupervisorEvent): ChatS
   // the intermediate block. Purpose: the UI does not show an endless streaming mark.
   message = finalizeStreamingBlocks(message, event);
   message = appendOrMergeTextBlock(message, event, text, 'intermediate', false);
-  message = setMessageStatus(message, 'running_tools', event);
+  message = {
+    ...setMessageStatus(message, 'running_tools', event),
+    // [2026-06-02] Why: MessageCard now draws reply styling from message-level
+    // completionType instead of TextBlock delivery. How: mark live intermediate
+    // reply events as reply completions while preserving their intermediate text
+    // delivery. Purpose: streaming reply cards keep the blue assistant border and
+    // user messages cannot inherit borders from TextBlockView.
+    completionType: 'reply',
+  };
 
   nextState = upsertMessage(nextState, message);
   return nextState;
@@ -706,8 +726,14 @@ function applyToolPatchToAssistant(
   patch: ToolPatch,
   attachBlock: boolean,
 ): ChatState {
-  const turnKey = getTurnKey(state, event);
-  let { state: nextState, message } = getOrCreateAssistantMessage(state, event, turnKey);
+  // [2026-06-03] Why: a reply/ask card closes one visible assistant round, but the
+  // next streamed LLM round can begin with provider tool_call_delta events and no
+  // text/thinking token, so stream_delta-only boundary detection misses it. How:
+  // route new provider tool deltas through the same post-reply boundary helper while
+  // keeping existing tool executions on their original card. Purpose: live streaming
+  // uses the same card split points as structured history without moving same-round
+  // tool end updates away from the reply card.
+  let { state: nextState, message } = getOrCreateAssistantMessageForToolPatch(state, event, patch);
   const toolResult = upsertToolExecution(nextState, message, event, patch);
   nextState = toolResult.state;
 
@@ -749,9 +775,18 @@ function upsertToolExecution(
     ? patch.arguments
     : parseJsonRecord(argumentsTextFromPatch) || current?.arguments;
   const name = patch.name || current?.name || 'tool';
-  const status = patch.status || current?.status || 'queued';
+  const rejected = patch.rejected !== undefined ? patch.rejected : current?.rejected;
+  // [2026-06-02] Why: a rejected tool result is a failed execution even when a
+  // backend payload still carries status=success. How: resolve rejected before status
+  // and coerce the visible lifecycle state to error. Purpose: live replay matches the
+  // error semantics used by historical rejected tool results.
+  const status: ToolStatus = rejected ? 'error' : patch.status || current?.status || 'queued';
   const control = current?.control || CONTROL_TOOL_NAMES.has(name);
-  const hidden = (current?.hidden || false) || (control && status === 'success');
+  // [2026-06-02] Why: successful control tools are hidden as internal bookkeeping,
+  // but rejected finish/reply/ask calls are user-visible failure explanations. How:
+  // calculate rejected before hidden and clear any inherited hidden state when rejected.
+  // Purpose: live stream replay shows rejected control calls the same way history does.
+  const hidden = !rejected && ((current?.hidden || false) || (control && status === 'success'));
   const tool: ToolExecution = {
     stableId: identity.stableId,
     messageId: message.id,
@@ -769,7 +804,7 @@ function upsertToolExecution(
     format: patch.format !== undefined ? patch.format : current?.format,
     elapsedMs: patch.elapsedMs !== undefined ? patch.elapsedMs : current?.elapsedMs,
     control,
-    rejected: patch.rejected !== undefined ? patch.rejected : current?.rejected,
+    rejected,
     hidden,
     error: patch.error || current?.error,
     approvalId: patch.approvalId || current?.approvalId,
@@ -955,6 +990,100 @@ function getAssistantMessageByTurn(state: ChatState, turnKey: string): WsMessage
   return messageId ? state.messagesById[messageId] : undefined;
 }
 
+function shouldBreakCardForNewRound(message: WsMessage): boolean {
+  // [2026-06-03] Why: each LLM round (thinking → text → tools) should be its own
+  // card, matching hydrateStructuredHistory where each assistant message with content
+  // becomes a separate card. How: break on reply/ask completions OR when the previous
+  // round's stream has ended (roundComplete). Purpose: live streaming produces the
+  // same card boundaries as history reconstruction.
+  return message.completionType === 'reply' || message.completionType === 'ask' || message.roundComplete === true;
+}
+
+function isProviderToolStreamEvent(event: SupervisorEvent): boolean {
+  // [2026-06-03] Why: durable tool_call_start/tool_call_end events can be emitted
+  // after reply() while still belonging to the same assistant tool-call row, but
+  // provider tool_call_delta events mark the streamed start of an LLM response. How:
+  // treat only tool_call_delta as a possible post-reply round starter. Purpose: a
+  // tool-only streamed next round gets its own card without splitting same-round
+  // durable tool lifecycle updates.
+  return event.type === 'tool_call_delta';
+}
+
+function hasExistingToolPatchOnMessage(state: ChatState, message: WsMessage, patch: ToolPatch): boolean {
+  // [2026-06-03] Why: later args, start, approval, and end events for a tool already
+  // rendered on a reply card must update that same tool instead of creating a new
+  // card. How: check the reducer's stable external-id and index maps for keys scoped
+  // to the current message id. Purpose: card-boundary detection only applies to new
+  // tool executions, not existing same-round lifecycle patches.
+  const externalKey = patch.id ? `${message.id}|external:${patch.id}` : '';
+  const indexKey = patch.index !== undefined ? `${message.id}|index:${patch.index}` : '';
+  return Boolean(
+    (externalKey && state.toolStableIdByExternalId[externalKey])
+    || (indexKey && state.toolStableIdByIndex[indexKey]),
+  );
+}
+
+function getOrCreateAssistantMessageForToolPatch(
+  state: ChatState,
+  event: SupervisorEvent,
+  patch: ToolPatch,
+): { state: ChatState; message: WsMessage } {
+  const turnKey = getTurnKey(state, event);
+  const currentMessage = getAssistantMessageByTurn(state, turnKey);
+
+  if (
+    currentMessage
+    && shouldBreakCardForNewRound(currentMessage)
+    && isProviderToolStreamEvent(event)
+    && !hasExistingToolPatchOnMessage(state, currentMessage, patch)
+  ) {
+    // [2026-06-03] Why: after reply()/ask(), the next LLM request may stream only
+    // a tool call, so no stream_delta arrives to invoke the normal round-start path.
+    // How: reuse getOrCreateAssistantMessageForRoundStart for a new provider tool
+    // stream that is not already attached to the reply card. Purpose: tool-only
+    // streamed rounds split exactly like text/thinking-started rounds.
+    return getOrCreateAssistantMessageForRoundStart(state, event);
+  }
+
+  return getOrCreateAssistantMessage(state, event, turnKey);
+}
+
+function getOrCreateAssistantMessageForRoundStart(
+  state: ChatState,
+  event: SupervisorEvent,
+): { state: ChatState; message: WsMessage } {
+  const turnKey = getTurnKey(state, event);
+  const currentMessage = getAssistantMessageByTurn(state, turnKey);
+
+  if (!currentMessage || !shouldBreakCardForNewRound(currentMessage)) {
+    return getOrCreateAssistantMessage(state, event, turnKey);
+  }
+
+  const completionType = currentMessage.completionType || 'reply';
+  const freshTurnKey = `after-${completionType}:${turnKey}:${currentMessage.id}`;
+  const payload = getPayload(event);
+  const taskId = getString(payload.task_id);
+  // [2026-06-02] Why: the first stream_delta after a reply is the real
+  // boundary between LLM rounds, not intermediate_reply or tool lifecycle events.
+  // How: close the current reply/ask card, then bind the task to a deterministic
+  // key derived from the completed card id rather than from the triggering event
+  // id. Purpose: every later event for the same task resolves to one new work
+  // card, while same-round tools still remain on the reply card.
+  const closedMessage = setMessageStatus(finalizeStreamingBlocks(currentMessage, event), 'completed', event);
+  const stateWithClosedMessage = upsertMessage(state, closedMessage);
+  const stateWithFreshTurn = taskId
+    ? {
+        ...stateWithClosedMessage,
+        taskTurnKeys: {
+          ...stateWithClosedMessage.taskTurnKeys,
+          [taskId]: freshTurnKey,
+        },
+      }
+    : stateWithClosedMessage;
+
+  return getOrCreateAssistantMessage(stateWithFreshTurn, event, freshTurnKey);
+}
+
 function upsertToolRecord(state: ChatState, tool: ToolExecution): ChatState {
   // [AutoC 2026-05-31] Why: approval events update an already-created tool without
   // changing its arguments or block membership. How: replace only the normalized
@@ -1051,15 +1180,20 @@ function buildEventLogEntry(state: ChatState, event: SupervisorEvent, eventId: s
 
 function getTurnKey(state: ChatState, event: SupervisorEvent): string {
   const payload = getPayload(event);
+  const taskId = getString(payload.task_id);
+  if (taskId && state.taskTurnKeys[taskId]) {
+    // [2026-06-02] Why: one backend task can span multiple visible LLM-round cards
+    // after reply()/ask(). How: prefer an explicit task-to-turn binding when it is
+    // present, and let source_inbound_seq seed only the initial task card below.
+    // Purpose: once the reducer moves a task to a post-reply turn key, later events
+    // with the same source inbound sequence do not collapse back into the reply card.
+    return state.taskTurnKeys[taskId];
+  }
+
   const sourceInboundSeq = getSourceInboundSeq(payload);
 
   if (sourceInboundSeq !== undefined) {
     return `inbound:${sourceInboundSeq}`;
-  }
-
-  const taskId = getString(payload.task_id);
-  if (taskId && state.taskTurnKeys[taskId]) {
-    return state.taskTurnKeys[taskId];
   }
 
   if (taskId) {
@@ -1138,6 +1272,10 @@ function mergeSource(current: MessageSource, patch: MessageSource): MessageSourc
 }
 
 function appendOrMergeThinkingBlock(message: WsMessage, event: SupervisorEvent, text: string): WsMessage {
+  // [2026-06-03] Only merge into the very last block if it is an active thinking
+  // block. Why: scanning backwards could pull thinking text across intervening
+  // text or tool blocks, breaking the natural event arrival order. How: check
+  // only message.blocks[-1]. Purpose: blocks remain in the order they arrive.
   const lastBlock = message.blocks[message.blocks.length - 1];
 
   if (lastBlock?.kind === 'thinking' && lastBlock.streaming !== false) {
@@ -1238,17 +1376,26 @@ function finalizeStreamingBlocks(message: WsMessage, event: SupervisorEvent): Ws
   const blocks = message.blocks.map((block) => {
     if ((block.kind === 'thinking' || block.kind === 'text') && block.streaming) {
       changed = true;
-      const finalized = {
+      // [2026-06-02] Close active ThinkingBlock timers whenever a card is finalized.
+      // Why: reply-boundary cards and finish outbound cards can be finalized without a
+      // stream_end event, leaving reasoning blocks visually active. How: text blocks
+      // only clear streaming, while thinking blocks also receive endedAt. Purpose: the
+      // UI can show a fixed elapsed time instead of an ever-running timer.
+      if (block.kind === 'thinking') {
+        return {
+          ...block,
+          streaming: false,
+          endedAt: event.ts,
+          updatedAt: event.ts,
+          eventIds: appendUnique(block.eventIds, getEventId(event)),
+        };
+      }
+      return {
         ...block,
         streaming: false,
         updatedAt: event.ts,
         eventIds: appendUnique(block.eventIds, getEventId(event)),
       };
-      // Record endedAt for thinking blocks so UI can show elapsed time
-      if (block.kind === 'thinking') {
-        (finalized as ThinkingBlock).endedAt = event.ts;
-      }
-      return finalized;
     }
     return block;
   });

@@ -16,6 +16,7 @@ import { ChevronRightW400 } from '@material-symbols-svg/react/icons/chevron-righ
 import { CloseW400 } from '@material-symbols-svg/react/icons/close';
 import { CodeW400 } from '@material-symbols-svg/react/icons/code';
 import { DeleteW400 } from '@material-symbols-svg/react/icons/delete';
+import { EditW400 } from '@material-symbols-svg/react/icons/edit';
 import { DisplaySettingsW400 } from '@material-symbols-svg/react/icons/display-settings';
 import { DraftW400 } from '@material-symbols-svg/react/icons/draft';
 import { ErrorW400 } from '@material-symbols-svg/react/icons/error';
@@ -55,6 +56,7 @@ const ICON_MAP: Record<string, SvgIcon> = {
   close: CloseW400,
   code: CodeW400,
   delete: DeleteW400,
+  edit: EditW400,
   display_settings: DisplaySettingsW400,
   draft: DraftW400,
   error: ErrorW400,

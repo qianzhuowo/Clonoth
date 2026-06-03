@@ -13,8 +13,8 @@ import { useEffect } from 'react';
 import { checkHealth, resetConversation } from './api/supervisorClient';
 import { LoginPage } from './components/auth/LoginPage';
 import { AppLayout } from './components/layout';
-import { useChatV2 } from './hooks/useChatV2';
-import { useChatStoreV2 } from './store/chatStoreV2';
+import { useChat } from './hooks/useChat';
+import { useChatStore } from './store/chatStore';
 import { useSettingsStore } from './store/settingsStore';
 import { useViewStore } from './store/viewStore';
 import type { Attachment } from './types';
@@ -23,13 +23,13 @@ import { viewRegistry, type AppViewContext } from './views/viewRegistry';
 const MainApp = () => {
   const {
     conversations, activeConversationId, activeConversation, messages, isGenerating,
-    selectConversation, createConversation, deleteConversation, sendMessage, cancelCurrentTask,
-  } = useChatV2();
+    selectConversation, createConversation, deleteConversation, renameConversation, sendMessage, cancelCurrentTask,
+  } = useChat();
   // [2026-05-31] MessageListV2 needs the normalized tool table beside ordered
   // messages. Why: tool blocks store stable tool ids, not full tool objects. How:
-  // subscribe to toolExecutionsById directly from chatStoreV2. Purpose: preserve the
+  // subscribe to toolExecutionsById directly from chatStore. Purpose: preserve the
   // reducer-owned data model without reintroducing legacy streamPreview state.
-  const toolsById = useChatStoreV2((state) => state.toolExecutionsById);
+  const toolsById = useChatStore((state) => state.toolExecutionsById);
   const { activeNodeId, entryNodeId } = useSettingsStore();
   const viewMode = useViewStore(state => state.viewMode);
   const activeSessionId = activeConversation?.sessionId || '';
@@ -38,12 +38,12 @@ const MainApp = () => {
   // stored conversation titles and IDs remain unchanged while empty-state UI is Chinese.
   const activeTitle = activeConversation?.title || '未选择对话';
 
-  // [2026-05-31] Startup loading now belongs to chatStoreV2. Why: the V2 store
+  // [2026-05-31] Startup loading now belongs to chatStore. Why: the canonical store
   // hydrates ConversationMeta and structured history through reducer-shaped data.
   // How: call loadStartup once from the store singleton. Purpose: avoid mounting the
   // legacy startup loader and its old message accumulator.
   useEffect(() => {
-    useChatStoreV2.getState().loadStartup();
+    useChatStore.getState().loadStartup();
   }, []);
 
   // [2026-06-01] Health check runs at App level so every registered view can show
@@ -91,6 +91,9 @@ const MainApp = () => {
     onSendMessage: handleSend,
     onCancel: cancelCurrentTask,
     onReset: handleReset,
+    onTitleChange: activeConversationId
+      ? (newTitle: string) => renameConversation(activeConversationId, newTitle)
+      : undefined,
   };
 
   return (

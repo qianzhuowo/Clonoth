@@ -12,11 +12,11 @@ interface TextBlockViewProps {
   block: TextBlock;
 }
 
-function getDeliveryClassName(delivery: TextBlock['delivery']): string {
-  if (delivery === 'intermediate') {
-    return 'border-l-2 border-blue-400 pl-3';
-  }
-
+function getDeliveryClassName(_delivery: TextBlock['delivery']): string {
+  // [2026-06-02] Why: delivery is not role-aware, and user messages can also carry
+  // final delivery. How: leave TextBlockView visually neutral and let MessageCard add
+  // assistant-only reply or finish borders from message completionType. Purpose: user
+  // text blocks never receive reply/finish borders by accident.
   return '';
 }
 

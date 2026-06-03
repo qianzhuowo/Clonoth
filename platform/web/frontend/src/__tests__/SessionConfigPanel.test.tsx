@@ -7,7 +7,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { SessionConfigPanel } from '../components/settings/SessionConfigPanel';
-import { useChatStoreV2, type ConnectionStatus } from '../store/chatStoreV2';
+import { useChatStore, type ConnectionStatus } from '../store/chatStore';
 import { useSettingsStore } from '../store/settingsStore';
 import type { NodeDef } from '../types';
 
@@ -45,7 +45,7 @@ function seedStores(override: Record<string, unknown> | null, connectionStatus: 
     sessionProviderOverride: override,
     rightPanelOpen: true,
   });
-  useChatStoreV2.setState({ connectionStatus });
+  useChatStore.setState({ connectionStatus });
 }
 
 function stubSupervisorFetch(override: Record<string, unknown> = {}) {
@@ -75,7 +75,7 @@ function stubSupervisorFetch(override: Record<string, unknown> = {}) {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
-  useChatStoreV2.getState().resetState();
+  useChatStore.getState().resetState();
 });
 
 describe('SessionConfigPanel compact session UX', () => {

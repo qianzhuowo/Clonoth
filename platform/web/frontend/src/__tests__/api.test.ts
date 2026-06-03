@@ -1,7 +1,7 @@
 // [2026-05-16] Updated: tests for real Supervisor API client signatures.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { postInbound, pollEvents, checkHealth, getAdminState, checkAdminAuth, decideApproval, getAllToolNames } from '../api/supervisorClient';
+import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, decideApproval, getAllToolNames } from '../api/supervisorClient';
 
 describe('Supervisor API client', () => {
   afterEach(() => {
@@ -12,8 +12,11 @@ describe('Supervisor API client', () => {
     expect(typeof postInbound).toBe('function');
   });
 
-  it('exports pollEvents as a function', () => {
-    expect(typeof pollEvents).toBe('function');
+  it('exports connectGlobalWS as a function', () => {
+    // [2026-06-03] Why: event transport moved from session polling to one global
+    // WebSocket. How: assert the public helper exists instead of the removed polling
+    // helper. Purpose: API exports match the long-lived realtime architecture.
+    expect(typeof connectGlobalWS).toBe('function');
   });
 
   it('exports checkHealth as a function', () => {

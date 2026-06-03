@@ -1,6 +1,6 @@
 // [2026-06-01] Auto-approval tests for browser-local tool rules.
 // Why: frontend builds can allow selected low-risk tools without changing backend policy.
-// How: replay an approval event through chatStoreV2 and assert decideApproval is called.
+// How: replay an approval event through chatStore and assert decideApproval is called.
 // Purpose: approval automation remains tied to clientPrefsStore and visible tool cards.
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -8,17 +8,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ToolCallCard } from '../components/chat/v2';
 import * as supervisorClient from '../api/supervisorClient';
 import { useClientPrefsStore } from '../store/clientPrefsStore';
-import { useChatStoreV2 } from '../store/chatStoreV2';
+import { useChatStore } from '../store/chatStore';
 import type { SupervisorEvent } from '../types/chat';
 import type { ToolExecution } from '../types/message';
 
 class FakeWebSocket {
+  static readonly CONNECTING = 0;
+  static readonly OPEN = 1;
+  static readonly CLOSED = 3;
   static instances: FakeWebSocket[] = [];
 
   onopen: (() => void) | null = null;
   onmessage: ((event: MessageEvent<string>) => void) | null = null;
   onclose: (() => void) | null = null;
   onerror: (() => void) | null = null;
+  readyState = FakeWebSocket.CONNECTING;
   sent: string[] = [];
 
   constructor(public readonly url: string) {
@@ -30,10 +34,12 @@ class FakeWebSocket {
   }
 
   close() {
+    this.readyState = FakeWebSocket.CLOSED;
     this.onclose?.();
   }
 
   open() {
+    this.readyState = FakeWebSocket.OPEN;
     this.onopen?.();
   }
 
@@ -72,12 +78,12 @@ describe('client auto-approval', () => {
     FakeWebSocket.instances = [];
     localStorage.clear();
     useClientPrefsStore.getState().resetClientPrefs();
-    useChatStoreV2.getState().resetState();
+    useChatStore.getState().resetState();
     vi.stubGlobal('WebSocket', FakeWebSocket as unknown as typeof WebSocket);
   });
 
   afterEach(() => {
-    useChatStoreV2.getState().resetState();
+    useChatStore.getState().resetState();
     useClientPrefsStore.getState().resetClientPrefs();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
@@ -92,8 +98,8 @@ describe('client auto-approval', () => {
       return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
     }));
 
-    const conversationId = useChatStoreV2.getState().createConversation();
-    await useChatStoreV2.getState().sendMessage('read file', undefined, 'ereuna_main');
+    const conversationId = useChatStore.getState().createConversation();
+    await useChatStore.getState().sendMessage('read file', undefined, 'ereuna_main');
     const ws = FakeWebSocket.instances[0];
     ws.open();
     ws.receive(event(1, 'inbound_message', { conversation_key: `web:${conversationId}`, text: 'read file' }));
@@ -101,6 +107,33 @@ describe('client auto-approval', () => {
     ws.receive(event(3, 'approval_requested', { source_inbound_seq: 1, approval_id: 'approval-auto', tool_call_id: 'call-auto', operation: 'read_file', details: { path: 'README.md' }, status: 'pending' }));
 
     await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith('approval-auto', 'allow', 'auto-approved by client preference'));
+
+    // [2026-06-02] Why: auto-approved ids used to be module-only state and were lost
+    // after a browser refresh. How: assert the dedicated localStorage cache receives
+    // the id when the store submits an automatic approval. Purpose: refreshed clients
+    // keep treating the same pending request as already handled locally.
+    expect(JSON.parse(localStorage.getItem('clonoth_auto_approved_ids') || '[]')).toContain('approval-auto');
+  });
+
+  it('removes a failed automatic approval id from localStorage', async () => {
+    const approvalSpy = vi.spyOn(supervisorClient, 'decideApproval').mockRejectedValue(new Error('network down'));
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/v1/inbound')) {
+        return new Response(JSON.stringify({ session_id: 'sess-auto', inbound_seq: 1, accepted: true }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      return new Response(JSON.stringify([]), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }));
+
+    const conversationId = useChatStore.getState().createConversation();
+    await useChatStore.getState().sendMessage('read file', undefined, 'ereuna_main');
+    const ws = FakeWebSocket.instances[0];
+    ws.open();
+    ws.receive(event(1, 'inbound_message', { conversation_key: `web:${conversationId}`, text: 'read file' }));
+    ws.receive(event(2, 'tool_call_start', { source_inbound_seq: 1, tool_call_id: 'call-auto', tool_name: 'read_file', arguments: { path: 'README.md' } }));
+    ws.receive(event(3, 'approval_requested', { source_inbound_seq: 1, approval_id: 'approval-auto', tool_call_id: 'call-auto', operation: 'read_file', details: { path: 'README.md' }, status: 'pending' }));
+
+    await waitFor(() => expect(approvalSpy).toHaveBeenCalledWith('approval-auto', 'allow', 'auto-approved by client preference'));
+    await waitFor(() => expect(JSON.parse(localStorage.getItem('clonoth_auto_approved_ids') || '[]')).not.toContain('approval-auto'));
   });
 
   it('shows auto-approved pending tool approvals as a badge instead of manual buttons', () => {

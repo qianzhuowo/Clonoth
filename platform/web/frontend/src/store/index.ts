@@ -1,11 +1,9 @@
+// [2026-06-03] The chat store now has no V2 suffix. Why: the reducer-backed
+// implementation became the canonical store. How: expose only the renamed store
+// hook and its public types. Purpose: barrel imports cannot resolve duplicate
+// chat store symbols after the mechanical rename.
 export { useChatStore } from './chatStore';
-export type { ChatState } from './chatStore';
-// [2026-05-31] Export the reducer-backed store beside the legacy store. Why: Step
-// 2A keeps both stores available during migration. How: re-export only the new hook
-// and its distinct V2 types. Purpose: avoid changing old imports while allowing new
-// components and tests to consume chatStoreV2 explicitly.
-export { useChatStoreV2 } from './chatStoreV2';
-export type { ChatStoreV2State, ConversationMeta, ConnectionStatus } from './chatStoreV2';
+export type { ChatStoreState, ConversationMeta, ConnectionStatus } from './chatStore';
 export { useClientPrefsStore, shouldAutoApproveTool } from './clientPrefsStore';
 export type { ClientPrefs, TitleGenerationMode } from './clientPrefsStore';
 export { useSettingsStore } from './settingsStore';

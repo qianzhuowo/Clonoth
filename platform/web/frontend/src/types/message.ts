@@ -145,6 +145,9 @@ export interface WsMessage {
   hydratedFromHistory?: boolean;
   // [2026-06-01] Explicit completion type — replaces heuristic isTaskCompleteMessage.
   completionType?: 'finish' | 'ask' | 'reply';
+  // [2026-06-03] Marks that this card's LLM round has ended (stream_end received).
+  // Next stream_delta should start a new card.
+  roundComplete?: boolean;
 }
 
 export interface EventLogEntry {

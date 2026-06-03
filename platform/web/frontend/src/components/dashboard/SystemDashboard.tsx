@@ -6,7 +6,7 @@
 import { useEffect, useMemo, useState } from 'react';
 
 import { checkHealth, getAdminState, type AdminState, type HealthState } from '../../api/supervisorClient';
-import { useChatStoreV2 } from '../../store/chatStoreV2';
+import { useChatStore } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
 
 interface DashboardData {
@@ -85,7 +85,7 @@ const Stat = ({ label, value, detail }: { label: string; value: string | number;
 export const SystemDashboard = () => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const isConnected = useSettingsStore(state => state.isConnected);
-  const connectionStatus = useChatStoreV2(state => state.connectionStatus);
+  const connectionStatus = useChatStore(state => state.connectionStatus);
   const [data, setData] = useState<DashboardData>({ adminState: null, health: null, error: '', loading: true });
 
   useEffect(() => {

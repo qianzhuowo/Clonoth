@@ -6,7 +6,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { SystemDashboard } from '../components/dashboard/SystemDashboard';
-import { useChatStoreV2 } from '../store/chatStoreV2';
+import { useChatStore } from '../store/chatStore';
 import { useSettingsStore } from '../store/settingsStore';
 
 function jsonResponse(value: unknown): Response {
@@ -19,7 +19,7 @@ function jsonResponse(value: unknown): Response {
 describe('SystemDashboard', () => {
   beforeEach(() => {
     useSettingsStore.setState({ adminToken: 'admin-token', isConnected: true });
-    useChatStoreV2.setState({ connectionStatus: 'open' });
+    useChatStore.setState({ connectionStatus: 'open' });
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith('/v1/admin/state')) {

@@ -14,7 +14,7 @@ import { SettingsHeader } from '../components/settings/SettingsHeader';
 import { SettingsPageHost } from '../components/settings/SettingsPageHost';
 import { SettingsRightPanel } from '../components/settings/SettingsRightPanel';
 import { SettingsSidebar } from '../components/settings/SettingsSidebar';
-import type { ConversationMeta } from '../store/chatStoreV2';
+import type { ConversationMeta } from '../store/chatStore';
 import type { ViewMode } from '../store/viewStore';
 import type { Attachment } from '../types';
 import type { ToolExecution, WsMessage } from '../types/message';
@@ -33,6 +33,7 @@ export interface AppViewContext {
   onSendMessage: (text: string, attachments?: Attachment[]) => Promise<void> | void;
   onCancel: () => void;
   onReset: () => void;
+  onTitleChange?: (newTitle: string) => void;
 }
 
 export interface AppViewDefinition {
@@ -64,6 +65,7 @@ export const viewRegistry: Record<ViewMode, AppViewDefinition> = {
         isGenerating={ctx.isGenerating}
         onCancel={ctx.onCancel}
         onReset={ctx.onReset}
+        onTitleChange={ctx.onTitleChange}
         sessionId={safeSessionId(ctx.sessionId)}
         title={ctx.title}
       />

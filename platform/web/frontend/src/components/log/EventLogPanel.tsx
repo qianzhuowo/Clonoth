@@ -8,7 +8,7 @@ import { useEffect, useMemo, useRef } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 
 import { selectEventLog } from '../../store/eventSelectors';
-import { useChatStoreV2 } from '../../store/chatStoreV2';
+import { useChatStore } from '../../store/chatStore';
 import type { EventLogEntry } from '../../types/message';
 
 interface EventLogPanelProps {
@@ -48,7 +48,7 @@ function formatLogSummary(entry: EventLogEntry): string {
 
 export const EventLogPanel = ({ limit = 200, defaultCollapsed: _defaultCollapsed = false }: EventLogPanelProps) => {
   const bottomRef = useRef<HTMLDivElement>(null);
-  const { activeSessionId, eventLog } = useChatStoreV2(
+  const { activeSessionId, eventLog } = useChatStore(
     useShallow((state) => {
       const activeConversation = state.activeConversationId
         ? state.conversations.find((conversation) => conversation.id === state.activeConversationId)

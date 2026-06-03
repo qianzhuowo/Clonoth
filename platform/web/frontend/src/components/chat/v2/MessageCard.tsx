@@ -47,12 +47,16 @@ function isActiveStatus(status: MessageStatus): boolean {
   return status === 'streaming' || status === 'running_tools';
 }
 
-function isTaskCompleteMessage(message: WsMessage): boolean {
-  // [2026-06-01] Explicit check via completionType instead of heuristic block inspection.
-  // Why: finish messages can contain thinking blocks (LLM reasons before calling finish),
-  // and the old heuristic incorrectly excluded them. How: use the backend-provided
-  // action_type field propagated through outbound_message or history hydration.
-  return message.completionType === 'finish';
+function getBlocksContainerClassName(message: WsMessage): string {
+  // [2026-06-02] Why: reply and finish should share the left-border pattern while
+  // user messages must remain unbordered even when their text delivery is final. How:
+  // compute the border at the MessageCard container from role plus completionType.
+  // Purpose: live and hydrated assistant reply/finish cards are visually distinct
+  // without relying on block-level delivery styling.
+  if (message.role !== 'assistant') return 'space-y-2';
+  if (message.completionType === 'reply') return 'space-y-2 border-l-2 border-blue-400 pl-3';
+  if (message.completionType === 'finish') return 'space-y-2 border-l-2 border-green-400 pl-3';
+  return 'space-y-2';
 }
 
 function getStatusClassName(status: MessageStatus): string {
@@ -88,7 +92,7 @@ function formatAttachmentMeta(attachment: Attachment): string {
 export const MessageCard = ({ message, toolsById }: MessageCardProps) => {
   const roleStyle = ROLE_STYLES[message.role];
   const active = isActiveStatus(message.status);
-  const taskComplete = isTaskCompleteMessage(message);
+  const blocksContainerClassName = getBlocksContainerClassName(message);
   const attachments = message.attachments ?? [];
 
   return (
@@ -101,27 +105,36 @@ export const MessageCard = ({ message, toolsById }: MessageCardProps) => {
           <time className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]" dateTime={message.createdAt}>
             {formatTime(message.createdAt)}
           </time>
-          {taskComplete ? (
-            <span className="inline-flex items-center gap-1 rounded-sm bg-green-100 px-1.5 py-0.5 font-mono text-[0.55rem] font-semibold text-green-700">
-              {/* [2026-06-01] Why: replace the completion checkmark glyph with Material Symbols.
-                  How: render check_circle at badge size. Purpose: message status
-                  badges share the same icon font as tool statuses. */}
-              <Icon name="check_circle" size={12} />
-              <span>任务完成</span>
-            </span>
-          ) : (
-            <span className={`font-mono text-[0.55rem] ${getStatusClassName(message.status)}`}>{STATUS_LABELS[message.status]}</span>
-          )}
+          {/* [2026-06-02] Why: finish no longer uses a special green status pill.
+              How: always render the normal status text and move finish emphasis to
+              the assistant-only body border. Purpose: reply and finish have one
+              consistent visual language while status remains plain text. */}
+          <span className={`font-mono text-[0.55rem] ${getStatusClassName(message.status)}`}>{STATUS_LABELS[message.status]}</span>
           {message.source.nodeName && (
             <span className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]">{message.source.nodeName}</span>
           )}
           {active && <span aria-label="消息正在活动" className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />}
         </header>
 
-        <div className="space-y-2">
-          {message.blocks.map((block) => (
-            <RenderBlockView key={block.id} block={block} toolsById={toolsById} />
-          ))}
+        <div className={blocksContainerClassName}>
+          {message.blocks
+            .filter((block) => {
+              // [2026-06-03] Why: free prose (stream/final text) duplicates reply text
+              // and clutters the card. How: when a card contains any intermediate text
+              // block (from reply/ask), hide non-intermediate text blocks. Cards without
+              // any intermediate block (pure free prose) render normally.
+              // Purpose: reply/finish/ask text is the authoritative user-facing output;
+              // free prose is internal LLM reasoning noise.
+              if (block.kind !== 'text') return true;
+              const hasIntermediateText = message.blocks.some(
+                (b) => b.kind === 'text' && (b as TextBlock).delivery === 'intermediate',
+              );
+              if (!hasIntermediateText) return true;
+              return (block as TextBlock).delivery === 'intermediate';
+            })
+            .map((block) => (
+              <RenderBlockView key={block.id} block={block} toolsById={toolsById} />
+            ))}
         </div>
 
         {attachments.length > 0 && (

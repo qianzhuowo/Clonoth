@@ -1,9 +1,9 @@
 // [2026-05-16] Upgraded: connection status from settingsStore, settings toggle, delete conversation.
 // [2026-05-31] Step 3 accepts V2 ConversationMeta rows instead of legacy
-// Conversation objects. Why: chatStoreV2 keeps message bodies normalized outside the
+// Conversation objects. Why: chatStore keeps message bodies normalized outside the
 // sidebar list. How: render title, session preview, and updated time without reading a
 // messages array. Purpose: let App switch stores without changing sidebar behavior.
-import type { ConversationMeta } from '../../store/chatStoreV2';
+import type { ConversationMeta } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useViewStore } from '../../store/viewStore';
 import { Button, Icon } from '../common';

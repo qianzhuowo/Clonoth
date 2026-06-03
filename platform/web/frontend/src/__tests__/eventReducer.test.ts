@@ -385,4 +385,380 @@ describe('eventReducer', () => {
       toolCallId: 'call-write',
     });
   });
+
+  it('marks intermediate replies as reply completions during stream replay', () => {
+    // [2026-06-02] Why: MessageCard now applies reply and finish borders from
+    // completionType at the message level. How: intermediate_reply must mark the
+    // assistant message as a reply while keeping its text block delivery intermediate.
+    // Purpose: live reply output receives the blue assistant-only border without
+    // relying on TextBlockView block-level styling.
+    const state = replaySupervisorEvents([
+      event(1, 'inbound_message', { conversation_key: 'web:conv-intermediate-reply', text: 'continue' }),
+      event(2, 'intermediate_reply', {
+        source_inbound_seq: 1,
+        task_id: 'task-intermediate-reply',
+        node_id: 'ereuna_main',
+        text: 'partial answer',
+      }),
+    ], createInitialChatState());
+
+    const messages = selectMessages(state, 'conv-intermediate-reply');
+    expect(messages).toHaveLength(2);
+    expect(messages[1]).toMatchObject({ role: 'assistant', status: 'running_tools', completionType: 'reply' });
+    expect(messages[1].blocks[0]).toMatchObject({ kind: 'text', text: 'partial answer', delivery: 'intermediate' });
+  });
+
+
+  it('keeps same-round tools on the reply card when intermediate_reply arrives before tool ends', () => {
+    // [2026-06-02] Regression for same-round tool splitting.
+    // Why: intermediate_reply marks the assistant card as a reply before other tools
+    // from the same LLM request have ended. How: replay reply and mcp_time tools with
+    // tool_call_end events after intermediate_reply. Purpose: tool lifecycle events do
+    // not create a new card until a later stream_delta starts the next LLM round.
+    const state = replaySupervisorEvents([
+      event(1, 'inbound_message', { conversation_key: 'web:conv-reply-same-round-tools', text: 'tell me time' }),
+      event(2, 'task_created', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-same-round-tools',
+        node_id: 'ereuna_main',
+      }),
+      event(3, 'tool_call_start', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-same-round-tools',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-reply',
+        tool_name: 'reply',
+        arguments: { text: '我先回复。' },
+      }),
+      event(4, 'tool_call_start', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-same-round-tools',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-time',
+        tool_name: 'mcp_time_current_time',
+        arguments: { timezone: 'UTC' },
+      }),
+      event(5, 'intermediate_reply', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-same-round-tools',
+        node_id: 'ereuna_main',
+        text: '我先回复。',
+      }),
+      event(6, 'tool_call_end', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-same-round-tools',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-reply',
+        tool_name: 'reply',
+        status: 'success',
+        raw_inline: 'ok',
+      }),
+      event(7, 'tool_call_end', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-same-round-tools',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-time',
+        tool_name: 'mcp_time_current_time',
+        status: 'success',
+        result: { time: '2026-06-02 16:34:00' },
+      }),
+    ], createInitialChatState());
+
+    const messages = selectMessages(state, 'conv-reply-same-round-tools');
+    expect(messages).toHaveLength(2);
+    const replyCard = messages[1];
+    expect(replyCard).toMatchObject({ role: 'assistant', status: 'running_tools', completionType: 'reply' });
+    expect(replyCard.blocks.at(-1)).toMatchObject({ kind: 'text', text: '我先回复。', delivery: 'intermediate' });
+
+    const toolBlock = replyCard.blocks.find((block) => block.kind === 'tool');
+    const tools = toolBlock?.kind === 'tool' ? selectToolExecutions(state, toolBlock.toolIds) : [];
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({ id: 'call-time', name: 'mcp_time_current_time', status: 'success' });
+    expect(Object.values(state.toolExecutionsById).some((tool) => tool.id === 'call-reply' && tool.hidden)).toBe(true);
+  });
+
+  it('starts a fresh assistant card when a new round begins after an intermediate reply', () => {
+    // [2026-06-02] Why: reply() ends the visible content for its LLM round, but
+    // the task can continue with another LLM request after reply returns ok. How:
+    // replay a reply round followed by a normal tool round and a final outbound
+    // finish. Purpose: the reply text remains the last visible element of its card,
+    // while later thinking and tool calls move to the next work card.
+    const state = replaySupervisorEvents([
+      event(1, 'inbound_message', { conversation_key: 'web:conv-reply-break', text: 'work in phases' }),
+      event(2, 'task_created', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-break',
+        node_id: 'ereuna_main',
+      }),
+      event(3, 'stream_delta', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-break',
+        node_id: 'ereuna_main',
+        type: 'thinking',
+        content: 'round 1 thinking',
+      }),
+      event(4, 'tool_call_start', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-break',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-reply',
+        tool_name: 'reply',
+        arguments: { text: 'round 1 visible reply' },
+      }),
+      event(5, 'intermediate_reply', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-break',
+        node_id: 'ereuna_main',
+        text: 'round 1 visible reply',
+      }),
+      event(6, 'tool_call_end', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-break',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-reply',
+        tool_name: 'reply',
+        status: 'success',
+        raw_inline: 'ok',
+      }),
+      event(7, 'stream_delta', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-break',
+        node_id: 'ereuna_main',
+        type: 'thinking',
+        content: 'round 2 thinking',
+      }),
+      event(8, 'stream_delta', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-break',
+        node_id: 'ereuna_main',
+        type: 'thinking',
+        content: ' continued',
+      }),
+      event(9, 'tool_call_start', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-break',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-search',
+        tool_name: 'search_in_files',
+        arguments: { query: 'needle' },
+      }),
+      event(10, 'tool_call_end', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-break',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-search',
+        tool_name: 'search_in_files',
+        status: 'success',
+        result: { success: true, data: { results: [], count: 0 } },
+        raw_inline: 'no matches',
+        format: 'json',
+      }),
+      event(11, 'tool_call_start', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-break',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-finish',
+        tool_name: 'finish',
+        arguments: { text: 'final answer' },
+      }),
+      event(12, 'tool_call_end', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-break',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-finish',
+        tool_name: 'finish',
+        status: 'success',
+        raw_inline: 'ok',
+      }),
+      event(13, 'outbound_message', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-break',
+        node_id: 'ereuna_main',
+        action_type: 'finish',
+        text: 'final answer',
+        attachments: [],
+      }),
+    ], createInitialChatState());
+
+    const messages = selectMessages(state, 'conv-reply-break');
+    expect(messages).toHaveLength(4);
+
+    const replyCard = messages[1];
+    const workCard = messages[2];
+    const finalCard = messages[3];
+    expect(replyCard).toMatchObject({ role: 'assistant', status: 'completed', completionType: 'reply' });
+    expect(replyCard.blocks.at(-1)).toMatchObject({ kind: 'text', text: 'round 1 visible reply', delivery: 'intermediate' });
+    expect(workCard).toMatchObject({ role: 'assistant', status: 'completed' });
+    expect(workCard.completionType).toBeUndefined();
+    // [2026-06-02] Why: the fresh post-reply turn key must be stable after it is
+    // assigned. How: two consecutive thinking deltas after reply should merge into
+    // the same block on the same work card. Purpose: prevent every stream_delta from
+    // creating its own card when one task continues after reply().
+    expect(workCard.blocks[0]).toMatchObject({
+      kind: 'thinking',
+      text: 'round 2 thinking continued',
+      streaming: false,
+      endedAt: '2026-05-31T02:43:13.000Z',
+    });
+
+    const toolBlock = workCard.blocks.find((block) => block.kind === 'tool');
+    const tools = toolBlock?.kind === 'tool' ? selectToolExecutions(state, toolBlock.toolIds) : [];
+    expect(tools.some((tool) => tool.name === 'search_in_files' && tool.status === 'success')).toBe(true);
+    expect(tools.some((tool) => tool.name === 'finish')).toBe(false);
+    expect(Object.values(state.toolExecutionsById).some((tool) => tool.name === 'finish' && tool.hidden)).toBe(true);
+    expect(finalCard).toMatchObject({ role: 'assistant', status: 'completed', completionType: 'finish' });
+    expect(finalCard.blocks).toHaveLength(1);
+    expect(finalCard.blocks[0]).toMatchObject({ kind: 'text', text: 'final answer', delivery: 'final' });
+  });
+
+  it('keeps rejected control tools visible during stream replay', () => {
+    // Why: successful finish and reply calls are hidden as control bookkeeping, but a
+    // rejected finish is the only visible explanation for why the stream did not
+    // complete. How: replay a rejected finish tool result. Purpose: stream rendering
+    // shows the rejection immediately instead of only after history hydration.
+    const state = replaySupervisorEvents([
+      event(1, 'inbound_message', { conversation_key: 'web:conv-rejected-finish', text: 'finish badly' }),
+      event(2, 'tool_call_start', {
+        source_inbound_seq: 1,
+        task_id: 'task-rejected-finish',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-finish-rejected',
+        tool_name: 'finish',
+        arguments: { text: 'invalid output' },
+      }),
+      event(3, 'tool_call_end', {
+        source_inbound_seq: 1,
+        task_id: 'task-rejected-finish',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-finish-rejected',
+        tool_name: 'finish',
+        status: 'success',
+        rejected: true,
+        raw_inline: 'REJECTED: finish must be called alone',
+      }),
+    ], createInitialChatState());
+
+    const messages = selectMessages(state, 'conv-rejected-finish');
+    const toolBlock = messages[1].blocks.find((block) => block.kind === 'tool');
+    const tools = toolBlock?.kind === 'tool' ? selectToolExecutions(state, toolBlock.toolIds) : [];
+
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({
+      id: 'call-finish-rejected',
+      name: 'finish',
+      status: 'error',
+      rejected: true,
+      hidden: false,
+    });
+  });
+
+  it('starts a fresh card when streamed tool deltas begin after a reply card', () => {
+    // [2026-06-03] Why: history hydration treats the first assistant row after a
+    // reply as new visible work even when that row starts with tool calls rather than
+    // text. How: replay a reply card followed by provider tool_call_delta events for
+    // the next LLM round. Purpose: live stream cards split the same way as refreshed
+    // structured history instead of appending all later work under the reply.
+    const state = replaySupervisorEvents([
+      event(1, 'inbound_message', { conversation_key: 'web:conv-reply-then-tool-delta', text: 'work in two rounds' }),
+      event(2, 'task_created', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-then-tool-delta',
+        node_id: 'ereuna_main',
+      }),
+      event(3, 'intermediate_reply', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-then-tool-delta',
+        node_id: 'ereuna_main',
+        text: 'first visible reply',
+      }),
+      event(4, 'tool_call_delta', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-then-tool-delta',
+        node_id: 'ereuna_main',
+        event: 'tool_call_start',
+        index: 0,
+        id: 'call-search-after-reply',
+        name: 'search_in_files',
+      }),
+      event(5, 'tool_call_delta', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-then-tool-delta',
+        node_id: 'ereuna_main',
+        event: 'tool_call_args_delta',
+        index: 0,
+        id: 'call-search-after-reply',
+        delta: '{"query":"needle"}',
+      }),
+      event(6, 'tool_call_start', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-then-tool-delta',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-search-after-reply',
+        tool_name: 'search_in_files',
+        arguments: { query: 'needle' },
+      }),
+      event(7, 'tool_call_end', {
+        source_inbound_seq: 1,
+        task_id: 'task-reply-then-tool-delta',
+        node_id: 'ereuna_main',
+        tool_call_id: 'call-search-after-reply',
+        tool_name: 'search_in_files',
+        status: 'success',
+        result: { success: true },
+      }),
+    ], createInitialChatState());
+
+    const messages = selectMessages(state, 'conv-reply-then-tool-delta');
+    expect(messages).toHaveLength(3);
+    expect(messages[1]).toMatchObject({ role: 'assistant', completionType: 'reply', status: 'completed' });
+    expect(messages[1].blocks).toHaveLength(1);
+    expect(messages[1].blocks[0]).toMatchObject({ kind: 'text', text: 'first visible reply', delivery: 'intermediate' });
+
+    const workCard = messages[2];
+    expect(workCard).toMatchObject({ role: 'assistant', status: 'running_tools' });
+    expect(workCard.completionType).toBeUndefined();
+    expect(workCard.blocks.map((block) => block.kind)).toEqual(['tool']);
+    const toolBlock = workCard.blocks[0];
+    const tools = toolBlock.kind === 'tool' ? selectToolExecutions(state, toolBlock.toolIds) : [];
+    expect(tools).toHaveLength(1);
+    expect(tools[0]).toMatchObject({ id: 'call-search-after-reply', name: 'search_in_files', status: 'success' });
+    expect(tools[0].argumentsText).toBe('{"query":"needle"}');
+  });
+
+  it('does not merge thinking deltas across intervening text blocks', () => {
+    // [2026-06-03] Why: thinking blocks must preserve render order instead of
+    // reaching backward across text or tool blocks. How: replay thinking, then text,
+    // then more thinking in one streamed assistant turn. Purpose: the reducer appends
+    // blocks by event order and avoids moving later reasoning above visible text.
+    const state = replaySupervisorEvents([
+      event(1, 'inbound_message', { conversation_key: 'web:conv-thinking-order', text: 'show order' }),
+      event(2, 'stream_delta', {
+        source_inbound_seq: 1,
+        task_id: 'task-thinking-order',
+        node_id: 'ereuna_main',
+        type: 'thinking',
+        content: 'first thinking',
+      }),
+      event(3, 'stream_delta', {
+        source_inbound_seq: 1,
+        task_id: 'task-thinking-order',
+        node_id: 'ereuna_main',
+        type: 'text',
+        content: 'visible text',
+      }),
+      event(4, 'stream_delta', {
+        source_inbound_seq: 1,
+        task_id: 'task-thinking-order',
+        node_id: 'ereuna_main',
+        type: 'thinking',
+        content: 'second thinking',
+      }),
+    ], createInitialChatState());
+
+    const messages = selectMessages(state, 'conv-thinking-order');
+    expect(messages[1].blocks.map((block) => block.kind)).toEqual(['thinking', 'text', 'thinking']);
+    expect(messages[1].blocks[0]).toMatchObject({ kind: 'thinking', text: 'first thinking' });
+    expect(messages[1].blocks[1]).toMatchObject({ kind: 'text', text: 'visible text' });
+    expect(messages[1].blocks[2]).toMatchObject({ kind: 'thinking', text: 'second thinking' });
+  });
 });

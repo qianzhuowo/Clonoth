@@ -16,14 +16,19 @@ interface HeaderProps {
   isGenerating: boolean;
   onCancel?: () => void;
   onReset?: () => void;
+  onTitleChange?: (newTitle: string) => void;
 }
 
-export const Header = ({ title, sessionId, isGenerating, onCancel, onReset }: HeaderProps) => {
+export const Header = ({ title, sessionId, isGenerating, onCancel, onReset, onTitleChange }: HeaderProps) => {
   const {
     adminToken, availableNodes, activeNodeId, entryNodeId, globalModel, sessionProviderOverride,
     setActiveNode, setGlobalConfig, setAvailableNodes,
   } = useSettingsStore();
-  const [configModalFocus, setConfigModalFocus] = useState<'node' | 'model' | null>(null);
+  const [configModalFocus, setConfigModalFocus] = useState<'node' | 'model' | 'title' | null>(null);
+  const [draftTitle, setDraftTitle] = useState(title);
+
+  // Sync draft when title prop changes from outside
+  useEffect(() => { setDraftTitle(title); }, [title]);
 
   const displayNodeId = activeNodeId || entryNodeId;
   const activeNode = availableNodes.find(n => n.id === displayNodeId);
@@ -31,12 +36,21 @@ export const Header = ({ title, sessionId, isGenerating, onCancel, onReset }: He
   const sessionModel = typeof sessionProviderOverride?.model === 'string' ? sessionProviderOverride.model : '';
   const displayModel = sessionModel || nodeModel || globalModel || '(默认)';
 
-  const openSessionConfigModal = (focus: 'node' | 'model') => {
-    // [2026-06-01] Header labels now open a focused session configuration modal.
-    // Why: the chat right rail is reserved for the persistent SystemDashboard. How:
-    // keep a local modal focus state instead of routing through settings view or a
-    // right-panel override. Purpose: node/model edits do not disturb dashboard state.
+  const openSessionConfigModal = (focus: 'node' | 'model' | 'title') => {
+    if (focus === 'title') {
+      setDraftTitle(title);
+    }
     setConfigModalFocus(focus);
+  };
+
+  const handleTitleSave = () => {
+    const trimmed = draftTitle.trim();
+    setConfigModalFocus(null);
+    if (trimmed && trimmed !== title && onTitleChange) {
+      onTitleChange(trimmed);
+    } else {
+      setDraftTitle(title);
+    }
   };
 
   // Fetch active node from backend when sessionId changes — backend is source of truth
@@ -70,7 +84,13 @@ export const Header = ({ title, sessionId, isGenerating, onCancel, onReset }: He
       <div className="mx-auto flex max-w-3xl items-center justify-between gap-2">
         {/* Left: title + badges */}
         <div className="min-w-0 flex-1">
-          <h2 className="truncate font-mono text-sm font-semibold tracking-[-0.03em]">{title}</h2>
+          <h2
+            className={`truncate font-mono text-sm font-semibold tracking-[-0.03em]${onTitleChange ? ' cursor-pointer transition-colors hover:text-[var(--duties-text)]' : ''}`}
+            onClick={onTitleChange ? () => openSessionConfigModal('title') : undefined}
+            title={onTitleChange ? '点击编辑标题' : undefined}
+          >
+            {title}
+          </h2>
           <div className="mt-1 flex flex-wrap items-center gap-1.5 font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
             <span
               className="cursor-pointer transition-colors hover:text-[var(--duties-text)]"
@@ -78,9 +98,6 @@ export const Header = ({ title, sessionId, isGenerating, onCancel, onReset }: He
               title="切换节点"
             >
               <span className="inline-flex items-center gap-1">
-                {/* [2026-06-01] Why: replace the node hexagon glyph with Material Symbols.
-                    How: render the shared Icon using the hub symbol. Purpose: header
-                    badges share the same visual icon system as settings tabs. */}
                 <Icon name="hub" size={13} />
                 <span>{activeNode?.name || displayNodeId || '选择节点'}</span>
               </span>
@@ -92,9 +109,6 @@ export const Header = ({ title, sessionId, isGenerating, onCancel, onReset }: He
               title="模型配置"
             >
               <span className="inline-flex items-center gap-1">
-                {/* [2026-06-01] Why: replace the model antenna emoji with Material Symbols.
-                    How: render the model_training symbol through Icon. Purpose: model
-                    badges are font-based icons instead of emoji. */}
                 <Icon name="model_training" size={13} />
                 <span>{displayModel}</span>
               </span>
@@ -106,24 +120,41 @@ export const Header = ({ title, sessionId, isGenerating, onCancel, onReset }: He
         <div className="flex items-center gap-2">
           {isGenerating && onCancel && (
             <Button className="h-7 px-2 text-[0.6rem]" onClick={onCancel} variant="ghost">
-              {/* [2026-06-01] Why: remove the stop-sign emoji from the cancel control.
-                  How: use the Material Symbols cancel icon before the text. Purpose:
-                  header actions remain accessible text plus consistent iconography. */}
               <Icon name="cancel" size={14} /> 取消
             </Button>
           )}
           {!isGenerating && onReset && (
             <Button className="h-7 px-2 text-[0.6rem]" onClick={onReset} variant="ghost" title="重置对话">
-              {/* [2026-06-01] Why: remove the reset emoji from the header action.
-                  How: render refresh through Material Symbols. Purpose: all header
-                  action icons are drawn from the shared font. */}
               <Icon name="refresh" size={14} />
             </Button>
           )}
         </div>
       </div>
     </header>
-      {configModalFocus && (
+      {/* Title edit modal */}
+      {configModalFocus === 'title' && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" onClick={() => setConfigModalFocus(null)}>
+          <div className="w-full max-w-sm border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4 shadow-lg" onClick={(e) => e.stopPropagation()}>
+            <p className="mb-3 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">编辑对话标题</p>
+            <input
+              autoFocus
+              className="mb-3 w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5 font-mono text-sm outline-none focus:border-[var(--duties-accent)]"
+              onChange={(e) => setDraftTitle(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleTitleSave();
+                if (e.key === 'Escape') setConfigModalFocus(null);
+              }}
+              value={draftTitle}
+            />
+            <div className="flex justify-end gap-2">
+              <Button className="h-7 px-3 text-[0.6rem]" onClick={() => setConfigModalFocus(null)} variant="ghost">取消</Button>
+              <Button className="h-7 px-3 text-[0.6rem]" onClick={handleTitleSave}>保存</Button>
+            </div>
+          </div>
+        </div>
+      )}
+      {/* Node/Model config modal */}
+      {(configModalFocus === 'node' || configModalFocus === 'model') && (
         <SessionConfigModal
           focus={configModalFocus}
           onClose={() => setConfigModalFocus(null)}

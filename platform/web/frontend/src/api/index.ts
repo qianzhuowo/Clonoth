@@ -1,8 +1,9 @@
 export {
   postInbound,
-  pollEvents,
-  // [2026-05-17] Export the Phase 3 WebSocket controls from the public API barrel
-  // so stores can import realtime session events without coupling to file layout.
+  // [2026-06-03] Export global realtime controls so stores subscribe once to all
+  // Supervisor sessions instead of replacing per-session sockets.
+  connectGlobalWS,
+  disconnectGlobalWS,
   connectSessionWS,
   disconnectSessionWS,
   checkHealth,

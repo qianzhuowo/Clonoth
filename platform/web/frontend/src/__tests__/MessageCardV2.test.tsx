@@ -74,6 +74,88 @@ describe('MessageCard v2', () => {
     expect(screen.getByLabelText('流式输出光标')).toBeInTheDocument();
   });
 
+  it('renders assistant reply and finish borders from message completion type only', () => {
+    const { container, rerender } = render(
+      <MessageCard
+        message={baseMessage({
+          status: 'running_tools',
+          completionType: 'reply',
+          blocks: [{
+            id: 'block-reply',
+            kind: 'text',
+            text: 'reply text',
+            delivery: 'intermediate',
+            streaming: false,
+            createdAt: now,
+            updatedAt: now,
+            eventIds: ['ev-reply'],
+          }],
+        })}
+        toolsById={{}}
+      />,
+    );
+
+    // [2026-06-02] Why: reply and finish visual markers moved from TextBlockView to
+    // the MessageCard block container. How: assert the container has the blue reply
+    // border while the text block itself does not. Purpose: user messages cannot gain
+    // borders from reused text-block delivery metadata.
+    expect(container.querySelector('.space-y-2')).toHaveClass('border-l-2', 'border-blue-400', 'pl-3');
+    expect(screen.getByText('reply text').closest('.markdown-body')).not.toHaveClass('border-l-2');
+
+    rerender(
+      <MessageCard
+        message={baseMessage({
+          status: 'completed',
+          completionType: 'finish',
+          blocks: [{
+            id: 'block-finish',
+            kind: 'text',
+            text: 'finish text',
+            delivery: 'final',
+            streaming: false,
+            createdAt: now,
+            updatedAt: now,
+            eventIds: ['ev-finish'],
+          }],
+        })}
+        toolsById={{}}
+      />,
+    );
+
+    expect(container.querySelector('.space-y-2')).toHaveClass('border-l-2', 'border-green-400', 'pl-3');
+    expect(screen.getByText('已完成')).toBeInTheDocument();
+    expect(screen.queryByText('任务完成')).not.toBeInTheDocument();
+  });
+
+  it('does not render borders for user messages even when text delivery is final', () => {
+    const { container } = render(
+      <MessageCard
+        message={baseMessage({
+          role: 'user',
+          status: 'completed',
+          blocks: [{
+            id: 'block-user',
+            kind: 'text',
+            text: 'user text',
+            delivery: 'final',
+            streaming: false,
+            createdAt: now,
+            updatedAt: now,
+            eventIds: ['ev-user'],
+          }],
+        })}
+        toolsById={{}}
+      />,
+    );
+
+    // [2026-06-02] Why: user messages also use final text delivery. How: apply reply
+    // and finish borders only when MessageCard is rendering an assistant completion.
+    // Purpose: user input remains visually plain after final delivery gains a green
+    // assistant finish border.
+    expect(container.querySelector('.space-y-2')).not.toHaveClass('border-l-2');
+    expect(screen.getByText('user text').closest('.markdown-body')).not.toHaveClass('border-l-2');
+  });
+
   it('renders visible tools but omits hidden successful control tools', () => {
     const visibleTool = baseTool();
     const hiddenTool = baseTool({
@@ -104,6 +186,32 @@ describe('MessageCard v2', () => {
 
     expect(screen.getByText('execute_command')).toBeInTheDocument();
     expect(screen.queryByText('finish')).not.toBeInTheDocument();
+  });
+
+  it('renders rejected control tools instead of hiding them', () => {
+    render(
+      <ToolCallCard
+        tool={baseTool({
+          stableId: 'tool-rejected-finish',
+          id: 'call-finish-rejected',
+          name: 'finish',
+          status: 'error',
+          control: true,
+          hidden: false,
+          rejected: true,
+          rawInline: 'REJECTED: finish must be called alone',
+          summary: '',
+        })}
+      />,
+    );
+
+    // Why: rejected control tools explain a failed assistant action. How: keep the
+    // finish row visible and render the rejected result as an error payload. Purpose:
+    // users can see the rejection during live streaming without waiting for refresh.
+    expect(screen.getByText('finish')).toBeInTheDocument();
+    expect(screen.getByText('错误')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /finish/ }));
+    expect(screen.getByText('REJECTED: finish must be called alone')).toBeInTheDocument();
   });
 
   it('previews oversized tool details and shows byte sizes', () => {

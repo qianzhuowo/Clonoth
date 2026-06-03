@@ -261,9 +261,6 @@ class EventLog:
             if int(e.get("seq", 0)) > after_seq
         ]
 
-    def last_event(self) -> dict[str, Any] | None:
-        return self._events[-1] if self._events else None
-
     def last_boot_run_id(self) -> str | None:
         # 从尾部倒序找到最近一次 boot 事件
         for e in reversed(self._events):

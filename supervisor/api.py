@@ -586,36 +586,27 @@ def create_app(
             return
         await websocket.accept()
 
-        last_seq = 0
+        # [2026-06-03] Why: replay is removed. WS is a pure live-forward stream.
+        # Clients rebuild historical state via GET /v1/sessions/{id}/history.
+        # How: consume the optional initial message for backward compat, then go
+        # straight to the live event loop. Purpose: eliminate catch-up replay that
+        # caused stale events (e.g. old approval_requested) to be re-delivered.
         try:
-            initial_message = await asyncio.wait_for(
+            await asyncio.wait_for(
                 websocket.receive_text(),
                 timeout=_WS_INITIAL_MESSAGE_TIMEOUT_SEC,
             )
-            last_seq = _parse_ws_initial_last_seq(initial_message)
         except asyncio.TimeoutError:
-            last_seq = 0
+            pass
         except WebSocketDisconnect:
             return
         except Exception:
-            last_seq = 0
+            pass
 
-        # [WS events 2026-05-17] Why: subscribing only after replay creates a race
-        # where an event appended between list_events() and subscribe() is lost.
-        # How: subscribe first, replay EventLog rows next, then skip queued rows at
-        # or below the highest sent seq. Purpose: clients still observe catch-up
-        # before live delivery while the server closes the replay/live gap.
         queue = st.eventlog.subscribe(session_id)
-        sent_seq = last_seq
+        sent_seq = 0
         receive_task: asyncio.Task | None = None
         try:
-            for evt in st.list_events(session_id=session_id, after_seq=last_seq):
-                await _send_ws_json(websocket, evt)
-                try:
-                    sent_seq = max(sent_seq, int(evt.get("seq", 0) or 0))
-                except Exception:
-                    pass
-
             receive_task = asyncio.create_task(websocket.receive_text())
             while True:
                 event_task = asyncio.create_task(queue.get())
@@ -676,36 +667,29 @@ def create_app(
         st: SupervisorState = app.state.state
         await websocket.accept()
 
-        last_seq = 0
+        # [2026-06-03] Why: replay is removed. WS is a pure live-forward stream.
+        # Web frontend rebuilds state via loadSessionHistoryIntoStore(); SDK uses
+        # _init_seq() to fast-forward before connecting. No client depends on WS
+        # catch-up replay. How: consume the optional initial message for backward
+        # compat, then go straight to the live loop. Purpose: eliminate full-history
+        # replay that caused 109KB tool_call_end events to blow up browsers and
+        # stale approval_requested events to trigger 404 auto-approve errors.
         try:
-            initial_message = await asyncio.wait_for(
+            await asyncio.wait_for(
                 websocket.receive_text(),
                 timeout=_WS_INITIAL_MESSAGE_TIMEOUT_SEC,
             )
-            last_seq = _parse_ws_initial_last_seq(initial_message)
         except asyncio.TimeoutError:
-            last_seq = 0
+            pass
         except WebSocketDisconnect:
             return
         except Exception:
-            last_seq = 0
+            pass
 
-        # [WS events 2026-05-19] Why: the global endpoint must not lose events
-        # appended between replay and live subscription. How: subscribe globally
-        # before replaying list_all_events(), then skip live rows at or below the
-        # highest sent seq. Purpose: give /v1/ws the same replay/live race safety
-        # as the existing per-session WebSocket endpoint.
         queue = st.eventlog.subscribe_global()
-        sent_seq = last_seq
+        sent_seq = 0
         receive_task: asyncio.Task | None = None
         try:
-            for evt in st.eventlog.list_all_events(after_seq=last_seq):
-                await _send_ws_json(websocket, evt)
-                try:
-                    sent_seq = max(sent_seq, int(evt.get("seq", 0) or 0))
-                except Exception:
-                    pass
-
             receive_task = asyncio.create_task(websocket.receive_text())
             while True:
                 event_task = asyncio.create_task(queue.get())
@@ -765,19 +749,6 @@ def create_app(
                 with contextlib.suppress(Exception):
                     receive_task.result()
             st.eventlog.unsubscribe_global(queue)
-
-    @app.get("/v1/events/latest_seq")
-    async def latest_event_seq() -> dict:
-        """Return the seq of the most recent event in the global EventLog.
-
-        [2026-06-03] Why: the web frontend needs to know the current max seq
-        before opening a WS catch-up so it can distinguish historical events
-        from live ones (e.g. to skip auto-approving old approval_requested).
-        How: O(1) lookup on the ring buffer tail. Purpose: one lightweight GET
-        replaces fetching and discarding a full event list."""
-        st: SupervisorState = app.state.state
-        last = st.eventlog.last_event()
-        return {"seq": int(last.get("seq", 0)) if last else 0}
 
     @app.get("/v1/events", response_model=list[Event])
     async def global_events(

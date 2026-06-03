@@ -10,7 +10,7 @@ import {
   cancelActiveTasks,
   decideApproval,
   deleteSession,
-  fetchLatestSeq,
+
   getSessionHistory,
   listSessions,
   postInbound,
@@ -575,15 +575,11 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
     set({ connectionStatus: 'connecting' });
   }
 
-  // [2026-06-03] Why: WS catch-up replays historical approval_requested events that
-  // were already decided server-side. Auto-approving them fires POST /v1/approvals/
-  // which returns 404 (approval gone). How: capture the max known seq at connect
-  // time; events with seq <= this are catch-up and must not trigger auto-approval.
-  // Purpose: only live, real-time approval requests get auto-approved.
-  const wsStartSeq = getMaxKnownSeq(get());
-
+  // [2026-06-03] Why: WS is now a pure live-forward stream with no replay.
+  // The backend no longer sends historical events on connect. All events
+  // received are real-time, so auto-approve runs unconditionally.
   connectGlobalWS(
-    wsStartSeq,
+    0,
     (event) => {
       let terminalConversationId = '';
       let terminalSessionId = '';
@@ -625,10 +621,7 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
         };
       });
 
-      // [2026-06-03] Skip auto-approval for catch-up events (seq <= connect-time max).
-      if (event.seq > wsStartSeq) {
-        maybeAutoApproveApprovalRequest(event, get);
-      }
+      maybeAutoApproveApprovalRequest(event, get);
 
       if (terminalConversationId && terminalSessionId) {
         // [2026-06-03] Why: a finished task means this conversation just received the
@@ -1187,18 +1180,6 @@ async function loadStartupSessions(set: StoreSetter, get: StoreGetter) {
 
   const serverSessions = await listSessions('web', 50);
   const userSessions = (serverSessions || []).filter((session) => !isEntryBranchSessionId(session.session_id));
-  // [2026-06-03] Why: on fresh page load, lastSeqBySession is empty so
-  // getMaxKnownSeq returns 0, causing wsStartSeq=0 and all catch-up events
-  // to pass the auto-approve guard. How: fetch the current max seq from the
-  // backend before opening the WS. Purpose: catch-up events are correctly
-  // identified and auto-approve is skipped for historical approvals.
-  const latestSeq = await fetchLatestSeq();
-  if (latestSeq > 0) {
-    set((state) => ({
-      lastSeqBySession: { ...state.lastSeqBySession, _global: latestSeq },
-    }));
-  }
-
   if (userSessions.length === 0) {
     startGlobalWebSocket(set, get);
     return;

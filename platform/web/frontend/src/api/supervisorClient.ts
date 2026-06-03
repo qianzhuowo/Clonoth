@@ -183,15 +183,6 @@ export function disconnectSessionWS(): void {
 // ── Events ──
 
 /** Fetch the latest global event seq from the backend (1 lightweight GET). */
-export async function fetchLatestSeq(): Promise<number> {
-  try {
-    const resp = await apiFetch('/events/latest_seq');
-    const data: { seq?: number } = await resp.json();
-    if (typeof data.seq === 'number') return data.seq;
-  } catch { /* startup tolerance: if this fails, fall through to 0 */ }
-  return 0;
-}
-
 // ── Health ──
 
 export interface HealthState {

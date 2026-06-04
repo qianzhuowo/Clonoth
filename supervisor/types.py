@@ -124,6 +124,11 @@ class Task(BaseModel):
     updated_at: datetime
     lease_expires_at: datetime | None = None
     result: dict[str, Any] = Field(default_factory=dict)
+    # [AutoC 2026-06-04] Runtime-only task activity tracking. Not persisted.
+    # Updated by supervisor when transient events (stream_delta, tool_call_*,
+    # approval_*) arrive. Read by GET /v1/admin/tasks/active.
+    current_phase: str = ""
+    current_detail: str = ""
 
 
 class TaskCompleteIn(BaseModel):

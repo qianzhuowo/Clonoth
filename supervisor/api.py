@@ -802,6 +802,32 @@ def create_app(
                 _evt_task = st.tasks.get(_evt_task_id)
                 if _evt_task is not None and _evt_task.status == TaskStatus.running:
                     _evt_task.updated_at = datetime.now(timezone.utc)
+                    # [AutoC 2026-06-04] Why: GET /v1/admin/tasks/active must
+                    # return the current activity of each task without relying on
+                    # EventLog or frontend WS inference. How: update current_phase
+                    # and current_detail on the live Task object whenever a
+                    # transient event arrives. Purpose: modal shows real-time
+                    # task state on first open, not just after WS events.
+                    _ev_type = ev.type
+                    _payload = ev.payload or {}
+                    if _ev_type == "stream_delta":
+                        _evt_task.current_phase = "thinking" if _payload.get("type") == "thinking" else "generating"
+                        _evt_task.current_detail = ""
+                    elif _ev_type == "stream_end":
+                        _evt_task.current_phase = ""
+                        _evt_task.current_detail = ""
+                    elif _ev_type == "tool_call_start":
+                        _evt_task.current_phase = "tool_call"
+                        _evt_task.current_detail = str(_payload.get("tool_name") or "")
+                    elif _ev_type == "tool_call_end":
+                        _evt_task.current_phase = ""
+                        _evt_task.current_detail = ""
+                    elif _ev_type == "approval_requested":
+                        _evt_task.current_phase = "awaiting_approval"
+                        _evt_task.current_detail = str(_payload.get("tool_name") or "")
+                    elif _ev_type == "approval_decided":
+                        _evt_task.current_phase = ""
+                        _evt_task.current_detail = ""
         return {"ok": True}
 
     @app.get("/v1/sessions")
@@ -1135,6 +1161,8 @@ def create_app(
                     "caller_task_id": t.caller_task_id,
                     "input_summary": input_text[:200] if input_text else "",
                     "cancel_requested": t.cancel_requested,
+                    "current_phase": t.current_phase,
+                    "current_detail": t.current_detail,
                 })
         result.sort(key=lambda x: x["created_at"], reverse=True)
         return result

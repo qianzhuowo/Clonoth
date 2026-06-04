@@ -235,6 +235,8 @@ export interface ActiveTask {
   // duplicate cancellation requests from typed data.
   input_summary: string;
   cancel_requested: boolean;
+  current_phase: string;
+  current_detail: string;
 }
 
 export interface AdminNode extends NodeDef {

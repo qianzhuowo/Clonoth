@@ -68,10 +68,13 @@ function activityLabel(activity: TaskActivity): string {
 }
 
 function selectTaskActivity(task: ActiveTask, activities: Readonly<Record<string, TaskActivity>>): TaskActivity | undefined {
-  // [AutoC 2026-06-04] Why: WebSocket events are not perfectly consistent about
-  // including task_id. How: look up task_id first, then session+node and node-only
-  // fallbacks, and choose the newest candidate. Purpose: stream_end or approval
-  // events without task_id can still override older live task labels.
+  // [AutoC 2026-06-04] Why: the backend now maintains current_phase/current_detail
+  // on the live Task object, so the API response already carries the real-time state.
+  // How: prefer backend fields; fall back to WS-driven taskActivities for sub-5s
+  // freshness between API polls. Purpose: modal shows correct state on first open.
+  if (task.current_phase) {
+    return { phase: task.current_phase as TaskActivity['phase'], detail: task.current_detail || '', lastEventAt: Date.now() };
+  }
   const candidates: TaskActivity[] = [];
   const byTask = activities[task.task_id];
   if (byTask) candidates.push(byTask);

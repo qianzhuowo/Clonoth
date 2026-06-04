@@ -16,3 +16,4 @@ export { StatusDot, getChildNodeStatusLabel } from './StatusDot';
 // the same textarea editor. How: re-export the component and its lightweight YAML
 // helper. Purpose: page imports stay short and consistent.
 export { YamlEditor, hasSuspiciousYamlTabs } from './YamlEditor';
+export { Modal } from './Modal';

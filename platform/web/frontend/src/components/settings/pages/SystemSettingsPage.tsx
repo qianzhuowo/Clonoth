@@ -5,18 +5,27 @@
 // while still requiring admin auth and restart confirmation.
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import { ActiveTasksModal } from '../../dashboard/ActiveTasksModal';
+
 import { checkHealth, getAdminState, reloadConfig, restartEngine, type AdminState, type HealthState } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Button } from '../../common';
 import { AuthRequired, Card, PageHeader, PageShell, StatusText, countActiveTasks, formatUptime } from './settingsPagePrimitives';
 
-const Stat = ({ label, value, detail }: { label: string; value: string | number; detail?: string }) => (
-  <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3">
-    <p className="font-mono text-[0.6rem] uppercase tracking-[0.16em] text-[var(--duties-tertiary)]">{label}</p>
-    <p className="mt-1 font-mono text-lg font-semibold tracking-[-0.04em]">{value}</p>
-    {detail && <p className="mt-1 text-xs text-[var(--duties-secondary)]">{detail}</p>}
-  </div>
-);
+const Stat = ({ label, value, detail, onClick }: { label: string; value: string | number; detail?: string; onClick?: () => void }) => {
+  const content = (
+    <>
+      <p className="font-mono text-[0.6rem] uppercase tracking-[0.16em] text-[var(--duties-tertiary)]">{label}</p>
+      <p className="mt-1 font-mono text-lg font-semibold tracking-[-0.04em]">{value}</p>
+      {detail && <p className="mt-1 text-xs text-[var(--duties-secondary)]">{detail}</p>}
+    </>
+  );
+  const cls = `border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 ${onClick ? 'w-full cursor-pointer text-left transition-colors hover:bg-[var(--duties-muted)]' : ''}`;
+  if (onClick) {
+    return <button aria-label={`查看${label}详情`} className={cls} onClick={onClick} type="button">{content}</button>;
+  }
+  return <div className={cls}>{content}</div>;
+};
 
 export const SystemSettingsPage = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
@@ -24,6 +33,7 @@ export const SystemSettingsPage = () => {
   const [health, setHealth] = useState<HealthState | null>(null);
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
+  const [activeTasksOpen, setActiveTasksOpen] = useState(false);
 
   const load = useCallback(async (showSpinner = true) => {
     if (!adminToken || !isAuthenticated) return;
@@ -95,7 +105,7 @@ export const SystemSettingsPage = () => {
             <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <Stat label="会话数" value={adminState?.sessions ?? (loading ? '…' : '无数据')} />
               <Stat label="待审批数" value={adminState?.approvals?.pending ?? adminState?.pending_approvals?.length ?? 0} />
-              <Stat label="运行中任务数" value={countActiveTasks(adminState?.tasks)} detail="运行中、等待中、已挂起" />
+              <Stat label="运行中任务数" value={countActiveTasks(adminState?.tasks)} detail="运行中、等待中、已挂起" onClick={() => setActiveTasksOpen(true)} />
               <Stat label="运行时间" value={formatUptime(health?.uptime_seconds)} />
             </div>
             <div className="mt-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3 text-xs leading-5">
@@ -105,6 +115,8 @@ export const SystemSettingsPage = () => {
               <Button disabled={loading} onClick={() => load()}>{loading ? '刷新中...' : '刷新状态'}</Button>
             </div>
           </Card>
+
+          <ActiveTasksModal open={activeTasksOpen} onClose={() => setActiveTasksOpen(false)} />
 
           <Card title="运行控制" description="配置重载会重新读取配置；引擎重启需要二次确认。">
             <div className="flex flex-wrap gap-2">

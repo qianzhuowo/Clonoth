@@ -8,7 +8,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { checkHealth, getAdminState, type AdminState, type HealthState } from '../../api/supervisorClient';
 import { useChatStore } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
-import { ActiveTasksModal } from './ActiveTasksModal';
+
 
 interface DashboardData {
   adminState: AdminState | null;
@@ -75,36 +75,20 @@ function countRunningTasks(tasks: Record<string, number> | undefined): number {
   return (tasks?.running || 0) + (tasks?.pending || 0) + (tasks?.suspended || 0);
 }
 
-const Stat = ({ label, value, detail, onClick }: { label: string; value: string | number; detail?: string; onClick?: () => void }) => {
-  const content = (
-    <>
-      <p className="font-mono text-[0.55rem] uppercase tracking-[0.16em] text-[var(--duties-tertiary)]">{label}</p>
-      <p className="mt-1 font-mono text-lg font-semibold tracking-[-0.04em] text-[var(--duties-text)]">{value}</p>
-      {detail && <p className="mt-0.5 truncate text-[0.65rem] text-[var(--duties-secondary)]">{detail}</p>}
-    </>
-  );
-  const className = `border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2.5 ${onClick ? 'w-full cursor-pointer text-left transition-colors hover:bg-[var(--duties-muted)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--duties-accent)]' : ''}`;
-
-  if (onClick) {
-    // [AutoC 2026-06-04] Why: only the active-task statistic needs interaction.
-    // How: render clickable stats as real buttons while preserving the same visual
-    // structure. Purpose: keyboard and screen-reader users can open the detail modal.
-    return (
-      <button aria-label={`查看${label}详情`} className={className} onClick={onClick} type="button">
-        {content}
-      </button>
-    );
-  }
-
-  return <div className={className}>{content}</div>;
-};
+const Stat = ({ label, value, detail }: { label: string; value: string | number; detail?: string }) => (
+  <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2.5">
+    <p className="font-mono text-[0.55rem] uppercase tracking-[0.16em] text-[var(--duties-tertiary)]">{label}</p>
+    <p className="mt-1 font-mono text-lg font-semibold tracking-[-0.04em] text-[var(--duties-text)]">{value}</p>
+    {detail && <p className="mt-0.5 truncate text-[0.65rem] text-[var(--duties-secondary)]">{detail}</p>}
+  </div>
+);
 
 export const SystemDashboard = () => {
   const adminToken = useSettingsStore(state => state.adminToken);
   const isConnected = useSettingsStore(state => state.isConnected);
   const connectionStatus = useChatStore(state => state.connectionStatus);
   const [data, setData] = useState<DashboardData>({ adminState: null, health: null, error: '', loading: true });
-  const [activeTasksOpen, setActiveTasksOpen] = useState(false);
+
 
   useEffect(() => {
     let cancelled = false;
@@ -170,7 +154,7 @@ export const SystemDashboard = () => {
       <div className="grid grid-cols-2 gap-2">
         <Stat label="会话数" value={data.adminState?.sessions ?? (data.loading ? '…' : '无数据')} />
         <Stat label="待审批" value={pendingApprovals} />
-        <Stat label="运行中任务" value={activeTasks} detail="运行中、等待中、已挂起" onClick={() => setActiveTasksOpen(true)} />
+        <Stat label="运行中任务" value={activeTasks} detail="运行中、等待中、已挂起" />
         <Stat label="运行时间" value={formatUptime(data.health?.uptime_seconds)} />
       </div>
 
@@ -180,7 +164,6 @@ export const SystemDashboard = () => {
         <p className="mt-1 text-[0.65rem] leading-4 text-[var(--duties-secondary)]">{engine.detail}</p>
       </div>
 
-      <ActiveTasksModal open={activeTasksOpen} onClose={() => setActiveTasksOpen(false)} />
     </section>
   );
 };

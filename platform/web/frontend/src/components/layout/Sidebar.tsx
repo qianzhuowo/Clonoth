@@ -70,7 +70,7 @@ export const Sidebar = ({
       {/* Header */}
       <div className="border-b border-[var(--duties-border)] p-3">
         <div className="flex items-center gap-2.5">
-          <img src="/logo.jpg" alt="Clonoth" className="h-9 w-9 rounded-lg" />
+          <img src={`${import.meta.env.BASE_URL}logo.jpg`} alt="Clonoth" className="h-9 w-9 rounded-lg" />
           <div>
             <h1 className="font-mono text-base font-semibold tracking-[-0.04em]">Clonoth</h1>
             <p className="text-[0.6rem] text-[var(--duties-tertiary)]">调度器网页界面</p>

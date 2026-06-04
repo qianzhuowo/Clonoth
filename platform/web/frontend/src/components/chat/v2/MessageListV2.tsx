@@ -49,15 +49,12 @@ export const MessageListV2 = ({ messages, toolsById }: MessageListV2Props) => {
     const prevCount = prevMessageCountRef.current;
     prevMessageCountRef.current = currentCount;
 
-    // First render with messages = history hydration → don't scroll
+    // First render with messages = history hydration → scroll to bottom
     if (!hasInitialized && prevCount === 0 && currentCount > 0) {
-      // History just loaded. Don't auto-scroll. User sees top of chat.
-      // But do check if content fits without scrolling (short conversation)
-      const el = containerRef.current;
-      if (el && el.scrollHeight <= el.clientHeight + SCROLL_THRESHOLD) {
-        // Content fits in viewport, mark as near bottom
-        setIsUserNearBottom(true);
-      }
+      // History just loaded. Scroll to bottom so user sees latest messages.
+      setHasInitialized(true);
+      setIsUserNearBottom(true);
+      bottomRef.current?.scrollIntoView({ behavior: 'instant' });
       return;
     }
 

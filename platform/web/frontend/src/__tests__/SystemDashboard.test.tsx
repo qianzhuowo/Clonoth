@@ -2,7 +2,7 @@
 // Why: the main chat right panel should show system status instead of session editing.
 // How: mock Supervisor state and health responses, then assert the displayed counters.
 // Purpose: the right rail remains a stable operations dashboard across chat turns.
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { SystemDashboard } from '../components/dashboard/SystemDashboard';
@@ -33,6 +33,24 @@ describe('SystemDashboard', () => {
       if (url.endsWith('/v1/health')) {
         return jsonResponse({ status: 'ok', run_id: 'run-1', workspace_root: '/repo', started_at: '2026-06-01T13:00:00.000Z', uptime_seconds: 3723 });
       }
+      if (url.endsWith('/v1/admin/tasks/active')) {
+        // [AutoC 2026-06-04] Why: clicking the task-count card should open a live
+        // detail modal. How: provide one active task summary from the new endpoint.
+        // Purpose: the dashboard test covers the modal integration without using
+        // the chat stream or WebSocket events.
+        const now = Date.now();
+        return jsonResponse([{
+          task_id: 'task-alpha-123456',
+          session_id: 'session-alpha',
+          node_id: 'node-alpha',
+          status: 'running',
+          kind: 'node',
+          created_at: new Date(now - 65_000).toISOString(),
+          updated_at: new Date(now - 3_000).toISOString(),
+          worker_id: 'wk-123456789',
+          caller_task_id: null,
+        }]);
+      }
       return jsonResponse({});
     }));
   });
@@ -54,5 +72,20 @@ describe('SystemDashboard', () => {
     expect(screen.getByText('1小时 2分钟')).toBeInTheDocument();
     expect(screen.getByText('worker-a')).toBeInTheDocument();
     expect(screen.getByText('WebSocket 已连接')).toBeInTheDocument();
+  });
+
+  it('opens the active task modal from the running task statistic', async () => {
+    render(<SystemDashboard />);
+
+    await waitFor(() => expect(screen.getByText('6')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: '查看运行中任务详情' }));
+
+    await waitFor(() => expect(screen.getByRole('dialog', { name: '活跃任务详情' })).toBeInTheDocument());
+    expect(screen.getByText('node-alpha')).toBeInTheDocument();
+    expect(screen.getByText('running')).toBeInTheDocument();
+    expect(screen.getByText('wk-12345')).toBeInTheDocument();
+    expect(fetch).toHaveBeenCalledWith('/v1/admin/tasks/active', {
+      headers: { Authorization: 'Bearer admin-token' },
+    });
   });
 });

@@ -219,6 +219,18 @@ export interface AdminState {
   engine_runtime: Record<string, unknown>;
 }
 
+export interface ActiveTask {
+  task_id: string;
+  session_id: string;
+  node_id: string | null;
+  status: 'running' | 'pending' | 'suspended';
+  kind: 'node' | 'tool';
+  created_at: string;
+  updated_at: string;
+  worker_id: string | null;
+  caller_task_id: string | null;
+}
+
 export interface AdminNode extends NodeDef {
   tool_access?: unknown;
   skills?: unknown;
@@ -293,6 +305,17 @@ export async function getAdminState(token: string): Promise<AdminState> {
   // How: call /v1/admin/state with the existing bearer token helper. Purpose: keep
   // dashboard polling inside the API client instead of scattering endpoint strings.
   const resp = await apiFetch('/admin/state', { headers: authHeaders(token) });
+  return resp.json();
+}
+
+export async function fetchActiveTasks(token = ''): Promise<ActiveTask[]> {
+  // [AutoC 2026-06-04] Why: the System dashboard task count now opens a detail
+  // modal. How: call the new protected summary endpoint with the same bearer-token
+  // helper used by other admin APIs. Purpose: task monitoring stays independent of
+  // chatStore and does not duplicate request construction in UI components.
+  const init = token ? { headers: authHeaders(token) } : undefined;
+  const resp = await fetch(`${API}/admin/tasks/active`, init);
+  if (!resp.ok) throw new Error(`Failed to fetch active tasks: ${resp.status}`);
   return resp.json();
 }
 

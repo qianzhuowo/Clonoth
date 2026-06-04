@@ -1,7 +1,7 @@
 // [2026-05-16] Updated: tests for real Supervisor API client signatures.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, decideApproval, getAllToolNames } from '../api/supervisorClient';
+import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, decideApproval, getAllToolNames, fetchActiveTasks } from '../api/supervisorClient';
 
 describe('Supervisor API client', () => {
   afterEach(() => {
@@ -37,6 +37,29 @@ describe('Supervisor API client', () => {
 
   it('exports getAllToolNames as a function', () => {
     expect(typeof getAllToolNames).toBe('function');
+  });
+
+  it('exports fetchActiveTasks as a function', () => {
+    // [AutoC 2026-06-04] Why: the System dashboard task count now opens a detail
+    // modal. How: assert the API wrapper exists before implementing the client.
+    // Purpose: prevent future refactors from removing the task-monitor entry point.
+    expect(typeof fetchActiveTasks).toBe('function');
+  });
+
+  it('fetches active task summaries with the admin bearer token', async () => {
+    // [AutoC 2026-06-04] Why: active task details are served by a protected admin
+    // endpoint. How: verify the wrapper calls the exact URL with the bearer token.
+    // Purpose: the modal can load summaries without duplicating request plumbing.
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify([]), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(fetchActiveTasks('secret-token')).resolves.toEqual([]);
+    expect(fetchMock).toHaveBeenCalledWith('/v1/admin/tasks/active', {
+      headers: { Authorization: 'Bearer secret-token' },
+    });
   });
 
   it('fetches all approval tool names with the admin bearer token', async () => {

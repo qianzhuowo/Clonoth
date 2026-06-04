@@ -1101,6 +1101,36 @@ def create_app(
         st: SupervisorState = app.state.state
         return st.admin_state()
 
+    @app.get("/v1/admin/tasks/active")
+    async def admin_active_tasks(request: Request) -> list[dict[str, Any]]:
+        verify_admin_token(request)
+        st: SupervisorState = app.state.state
+        active_statuses = {TaskStatus.running, TaskStatus.pending, TaskStatus.suspended}
+        result: list[dict[str, Any]] = []
+        with st._lock:
+            for t in st.tasks.values():
+                if t.status not in active_statuses:
+                    continue
+                # [AutoC 2026-06-04] Why: the System dashboard modal needs task
+                # details, but full Task objects include large input/result and
+                # continuation payloads. How: return only identifying metadata and
+                # timestamps while holding the state lock during iteration. Purpose:
+                # operators can inspect active work without leaking heavy payloads or
+                # racing concurrent task updates.
+                result.append({
+                    "task_id": t.task_id,
+                    "session_id": t.session_id,
+                    "node_id": t.node_id,
+                    "status": t.status.value,
+                    "kind": t.kind.value,
+                    "created_at": t.created_at.isoformat(),
+                    "updated_at": t.updated_at.isoformat(),
+                    "worker_id": t.worker_id,
+                    "caller_task_id": t.caller_task_id,
+                })
+        result.sort(key=lambda x: x["created_at"], reverse=True)
+        return result
+
     @app.post("/v1/admin/restart", response_model=RestartOut)
     async def admin_restart(inp: RestartIn, request: Request) -> RestartOut:
         verify_admin_token(request)

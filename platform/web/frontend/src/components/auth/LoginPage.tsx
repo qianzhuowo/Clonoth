@@ -70,9 +70,14 @@ export const LoginPage = () => {
     <div className="flex h-screen items-center justify-center bg-[var(--duties-bg)] text-[var(--duties-text)]">
       <div className="w-full max-w-80 px-4">
         <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-6">
-          <p className="font-mono text-[0.6rem] uppercase tracking-[0.22em] text-[var(--duties-tertiary)]">Clonoth</p>
-          <h1 className="mt-2 font-mono text-xl font-semibold tracking-[-0.04em]">Clonoth 网页端</h1>
-          <p className="mt-2 text-xs text-[var(--duties-secondary)]">请输入管理员令牌以继续</p>
+          <div className="flex items-center gap-3">
+            <img src="/logo.jpg" alt="Clonoth" className="h-11 w-11 rounded-lg" />
+            <div>
+              <h1 className="font-mono text-xl font-semibold tracking-[-0.04em]">Clonoth</h1>
+              <p className="text-[0.6rem] text-[var(--duties-tertiary)]">调度器网页界面</p>
+            </div>
+          </div>
+          <p className="mt-3 text-xs text-[var(--duties-secondary)]">请输入管理员令牌以继续</p>
           <input
             autoFocus
             className="mt-4 w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"

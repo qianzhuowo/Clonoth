@@ -26,9 +26,13 @@ export const SettingsSidebar = () => {
           <Icon name="arrow_back" size={16} />
           <span>返回聊天</span>
         </button>
-        <p className="font-mono text-[0.6rem] uppercase tracking-[0.22em] text-[var(--duties-tertiary)]">Clonoth</p>
-        <h1 className="mt-1.5 font-mono text-lg font-semibold tracking-[-0.04em]">设置</h1>
-        <p className="mt-1.5 text-xs text-[var(--duties-secondary)]">配置分类</p>
+        <div className="flex items-center gap-2.5">
+          <img src="/logo.jpg" alt="Clonoth" className="h-8 w-8 rounded-lg" />
+          <div>
+            <h1 className="font-mono text-base font-semibold tracking-[-0.04em]">设置</h1>
+            <p className="text-[0.6rem] text-[var(--duties-tertiary)]">配置分类</p>
+          </div>
+        </div>
       </div>
 
       <nav aria-label="设置分区" className="min-h-0 flex-1 overflow-y-auto p-2">

@@ -69,9 +69,13 @@ export const Sidebar = ({
     <div className="flex h-full min-h-0 flex-col">
       {/* Header */}
       <div className="border-b border-[var(--duties-border)] p-3">
-        <p className="font-mono text-[0.6rem] uppercase tracking-[0.22em] text-[var(--duties-tertiary)]">Clonoth</p>
-        <h1 className="mt-1.5 font-mono text-lg font-semibold tracking-[-0.04em]">Clonoth 网页端</h1>
-        <p className="mt-1.5 text-xs text-[var(--duties-secondary)]">调度器网页界面</p>
+        <div className="flex items-center gap-2.5">
+          <img src="/logo.jpg" alt="Clonoth" className="h-9 w-9 rounded-lg" />
+          <div>
+            <h1 className="font-mono text-base font-semibold tracking-[-0.04em]">Clonoth</h1>
+            <p className="text-[0.6rem] text-[var(--duties-tertiary)]">调度器网页界面</p>
+          </div>
+        </div>
         <Button className="mt-3 w-full" onClick={onCreateConversation} variant="primary">
           新对话
         </Button>

@@ -7,6 +7,7 @@ import { useEffect, useState } from 'react';
 import { cancelTask, fetchActiveTasks, type ActiveTask } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { useChatStore, type TaskActivity } from '../../store/chatStore';
+import { useViewStore } from '../../store/viewStore';
 import { Modal } from '../common';
 
 interface ActiveTasksModalProps {
@@ -227,6 +228,10 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
                       aria-label={`查看任务 ${task.task_id} 的 session`}
                       className="rounded-sm border border-blue-500/40 bg-blue-500/10 px-2 py-1 font-mono text-[0.6rem] text-blue-700 transition-colors hover:bg-blue-500/20"
                       onClick={() => {
+                        // [AutoC 2026-06-04] Fix: switch back to chat view, then
+                        // enter virtual child session. This is a temporary overlay
+                        // that does not touch the sidebar conversation list.
+                        useViewStore.getState().closeSettings();
                         useChatStore.getState().viewChildSession(task.session_id, task.task_id);
                         onClose();
                       }}

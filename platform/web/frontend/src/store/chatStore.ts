@@ -1916,11 +1916,19 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
   viewChildSession: (sessionId, taskId) => {
     const trimmed = sessionId.trim();
     if (!trimmed) return;
-    // [2026-06-03] Why: child session navigation is a view switch, not a new sidebar
-    // conversation selection. How: store the viewed child id and asynchronously hydrate
-    // its own history into childSessionMessages. Purpose: users can inspect child chat
-    // streams and return to the parent without losing the active parent conversation.
-    set({ viewingChildSessionId: trimmed });
+    // [AutoC 2026-06-04] Why: this is a virtual temporary session overlay — it must
+    // not pollute the sidebar conversation list or leave stale state from a previous
+    // virtual session. How: immediately set the new viewingChildSessionId and clear
+    // any cached messages for the new target so the UI shows a loading state while
+    // history is fetched. Purpose: switching between tasks in the monitor modal
+    // correctly replaces the chat stream.
+    set((state) => ({
+      viewingChildSessionId: trimmed,
+      childSessionMessages: {
+        ...state.childSessionMessages,
+        [trimmed]: [],  // clear target to avoid showing stale data
+      },
+    }));
     void loadChildSessionHistoryIntoStore(trimmed, set, taskId?.trim() || undefined);
   },
 

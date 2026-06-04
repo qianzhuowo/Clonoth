@@ -1788,16 +1788,23 @@ async function loadChildSessionHistoryIntoStore(sessionId: string, set: StoreSet
 
   set((state) => {
     const conversationId = getChildConversationId(sessionId);
-    // [2026-06-03] Why: child sessions reuse the same persisted history format as
-    // parent sessions. How: hydrate into a child-namespaced conversation id and then
-    // cache the ordered messages under the real child session id. Purpose: MessageList
-    // can switch to childSessionMessages without adding a second renderer.
+    // [AutoC 2026-06-04] Why: hydrateStructuredHistory writes sessionId into
+    // conversationIdsBySession, which causes WS events for child sessions to be
+    // routed into the sidebar via syncConversationsAfterEvent, creating ghost
+    // entries with empty titles. How: hydrate into a temporary copy, extract only
+    // the message data we need (messagesById, messageOrderByConversation,
+    // toolExecutionsById), and discard the polluted conversationIdsBySession.
+    // Purpose: virtual child session view never contaminates the sidebar.
     const hydrated = hydrateStructuredHistory(state, sessionId, conversationId, history, false);
+    const messages = selectOrderedMessagesFromState(hydrated, conversationId);
     return {
-      ...hydrated,
+      // Only take message-level state, NOT conversationIdsBySession or conversations
+      messagesById: hydrated.messagesById,
+      messageOrderByConversation: hydrated.messageOrderByConversation,
+      toolExecutionsById: hydrated.toolExecutionsById,
       childSessionMessages: {
         ...state.childSessionMessages,
-        [sessionId]: selectOrderedMessagesFromState(hydrated, conversationId),
+        [sessionId]: messages,
       },
     };
   });

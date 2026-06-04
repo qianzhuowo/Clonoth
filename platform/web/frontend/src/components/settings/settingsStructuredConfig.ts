@@ -158,7 +158,7 @@ export function parseNodeConfig(raw: string, fallbackId = ''): NodeConfigFormSta
     provider: str(doc.provider),
     memory_book: str(doc.memory_book),
     persistent: doc.persistent === true,
-    prompt: '',
+    prompt: str(doc.prompt),
     delegate_targetsText: Array.isArray(doc.delegate_targets) ? doc.delegate_targets.map(String).join(', ') : '',
     tool_access_mode: normalizeToolAccessMode(str(ta.mode, 'all')),
     tool_access_allowText: Array.isArray(ta.allow) ? ta.allow.map(String).join(', ') : '',
@@ -176,6 +176,7 @@ export function serializeNodeConfig(raw: string, form: NodeConfigFormState): str
   if (form.provider.trim()) doc.provider = form.provider.trim(); else delete doc.provider;
   if (form.memory_book.trim()) doc.memory_book = form.memory_book.trim(); else delete doc.memory_book;
   doc.persistent = form.persistent;
+  if (form.prompt.trim()) doc.prompt = form.prompt; else delete doc.prompt;
   doc.delegate_targets = commaTextToItems(form.delegate_targetsText);
   const mode = normalizeToolAccessMode(form.tool_access_mode);
   const ta: Record<string, any> = { mode };

@@ -223,10 +223,6 @@ export const AgentsSettingsRightPanel = () => {
                   <textarea className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ description: event.target.value })} rows={3} value={nodeConfigForm.description} />
                 </label>
                 <label className="block">
-                  <span className={STRUCTURED_LABEL_CLASS}>Prompt（系统提示词）</span>
-                  <textarea className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ prompt: event.target.value })} rows={8} value={nodeConfigForm.prompt} />
-                </label>
-                <label className="block">
                   <span className={STRUCTURED_LABEL_CLASS}>类型</span>
                   <select className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ type: event.target.value as NodeConfigType })} value={nodeConfigForm.type}>
                     <option value="ai">ai</option>
@@ -249,6 +245,10 @@ export const AgentsSettingsRightPanel = () => {
                 <label className="flex items-center justify-between gap-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
                   <span>持久化</span>
                   <input checked={nodeConfigForm.persistent} onChange={(event) => updateNodeConfigForm({ persistent: event.target.checked })} type="checkbox" />
+                </label>
+                <label className="block">
+                  <span className={STRUCTURED_LABEL_CLASS}>系统提示词</span>
+                  <textarea className={`${STRUCTURED_INPUT_CLASS} min-h-[12rem]`} onChange={(event) => updateNodeConfigForm({ prompt: event.target.value })} rows={12} value={nodeConfigForm.prompt} />
                 </label>
                 <label className="block">
                   <span className={STRUCTURED_LABEL_CLASS}>委派目标，使用英文逗号分隔</span>

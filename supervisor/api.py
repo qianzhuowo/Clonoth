@@ -909,10 +909,14 @@ def create_app(
         return st.session_messages(session_id=session_id, limit=limit)
 
     @app.get("/v1/sessions/{session_id}/history")
-    async def session_history(session_id: str, limit: int = Query(200, ge=0, le=1000)) -> list[dict[str, Any]]:
+    async def session_history(
+        session_id: str,
+        limit: int = Query(200, ge=0, le=1000),
+        task_id: str = Query("", description="Filter messages by source_task_id"),
+    ) -> list[dict[str, Any]]:
         """Structured message history from ConversationStore (for web frontend)."""
         st: SupervisorState = app.state.state
-        return st.session_history_structured(session_id=session_id, limit=limit)
+        return st.session_history_structured(session_id=session_id, limit=limit, task_id=task_id.strip() or None)
 
     @app.get("/v1/sessions/{session_id}/children")
     async def session_children(session_id: str) -> list[dict[str, Any]]:

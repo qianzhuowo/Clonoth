@@ -901,11 +901,13 @@ class SessionMixin:
 
     # ---- 结构化历史 (ConversationStore) ----
 
-    def session_history_structured(self, *, session_id: str, limit: int = 200) -> list[dict[str, Any]]:
+    def session_history_structured(self, *, session_id: str, limit: int = 200, task_id: str | None = None) -> list[dict[str, Any]]:
         """Read structured messages from ConversationStore for web frontend.
 
         Returns Message objects with thinking, tool_calls, and tool results
         as structured fields rather than flattened text.
+
+        If task_id is provided, only messages whose source_task_id matches are returned.
         """
         from pathlib import Path
         from engine.conversation_store import ConversationStore
@@ -930,6 +932,14 @@ class SessionMixin:
                         messages.append(bm)
             # Re-sort by created_at to maintain chronological order
             messages.sort(key=lambda m: m.created_at or "")
+
+        # [AutoC 2026-06-04] Why: the active-task modal needs to show only the
+        # messages produced by a single task, not the entire session history.
+        # How: filter by source_task_id when the caller provides a task_id.
+        # Purpose: operators can inspect one task's work without noise from
+        # prior tasks in the same long-lived session.
+        if task_id:
+            messages = [m for m in messages if getattr(m, 'source_task_id', '') == task_id]
 
         result: list[dict[str, Any]] = []
         for msg in messages:

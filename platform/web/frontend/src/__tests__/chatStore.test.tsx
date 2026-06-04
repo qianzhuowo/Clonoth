@@ -144,6 +144,11 @@ describe('chatStore', () => {
     // successful turns leave the global WebSocket open without rebuilding history.
     expect(state.connectionStatus).toBe('open');
     expect(state.eventLog.map((entry) => entry.type)).toEqual(['inbound_message', 'stream_delta', 'outbound_message', 'task_completed']);
+    // [AutoC 2026-06-04] Why: task completion used to fetch /history and replace all
+    // visible cards. How: inspect the mocked transport calls after the terminal event.
+    // Purpose: this test prevents reintroducing task-completion history rebuilds.
+    const fetchMock = fetch as unknown as { mock: { calls: Array<[RequestInfo | URL, RequestInit?]> } };
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes('/history'))).toBe(false);
   });
 
   it('tracks transient task activity from global WebSocket events', async () => {
@@ -590,7 +595,15 @@ describe('chatStore', () => {
       if (url.includes('/v1/sessions/sess-history/history')) {
         return jsonResponse([
           { id: 'u1', role: 'user', content: 'hello', message_type: 'user_input', created_at: '2026-05-31T03:00:01.000Z' },
-          { id: 'a-tools', role: 'assistant', content: '', created_at: '2026-05-31T03:00:02.000Z', thinking: 'thought', tool_calls: [{ id: 'search-1', name: 'search_in_files', arguments: { query: 'needle' } }] },
+          {
+            id: 'a-tools',
+            role: 'assistant',
+            content: '',
+            created_at: '2026-05-31T03:00:02.000Z',
+            thinking: 'thought',
+            thinking_blocks: [{ text: 'thought', started_at: '2026-05-31T03:00:02.100Z', ended_at: '2026-05-31T03:00:03.400Z' }],
+            tool_calls: [{ id: 'search-1', name: 'search_in_files', arguments: { query: 'needle' } }],
+          },
           { id: 't-tools', role: 'tool', content: 'found one', message_type: 'tool_result', tool_call_id: 'search-1', tool_name: 'search_in_files', created_at: '2026-05-31T03:00:03.000Z' },
           { id: 'a-finish', role: 'assistant', content: '', created_at: '2026-05-31T03:00:04.000Z', tool_calls: [{ id: 'finish-1', name: 'finish', arguments: { text: 'hi there' } }] },
           { id: 't-finish', role: 'tool', content: 'ok', message_type: 'tool_result', tool_call_id: 'finish-1', tool_name: 'finish', created_at: '2026-05-31T03:00:05.000Z' },
@@ -612,6 +625,16 @@ describe('chatStore', () => {
     // How: this history fixture places a visible finish after a tool-only assistant row.
     // Purpose: hydration must render the prior tool card and the final finish card separately.
     expect(messages[1].blocks.map((block) => block.kind)).toEqual(['thinking', 'tool']);
+    // [AutoC 2026-06-04] Why: /history now returns structured reasoning blocks with
+    // timing metadata. How: assert hydration transfers those fields to ThinkingBlock.
+    // Purpose: historical reasoning renders elapsed time instead of a character-count
+    // fallback in the collapsed header.
+    expect(messages[1].blocks[0]).toMatchObject({
+      kind: 'thinking',
+      text: 'thought',
+      startedAt: '2026-05-31T03:00:02.100Z',
+      endedAt: '2026-05-31T03:00:03.400Z',
+    });
     expect(messages[2].blocks.map((block) => block.kind)).toEqual(['tool', 'text']);
     expect(messages[2].blocks.at(-1)).toMatchObject({ kind: 'text', text: 'hi there', delivery: 'final' });
   });

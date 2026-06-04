@@ -227,7 +227,7 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
                       aria-label={`查看任务 ${task.task_id} 的 session`}
                       className="rounded-sm border border-blue-500/40 bg-blue-500/10 px-2 py-1 font-mono text-[0.6rem] text-blue-700 transition-colors hover:bg-blue-500/20"
                       onClick={() => {
-                        useChatStore.getState().viewChildSession(task.session_id);
+                        useChatStore.getState().viewChildSession(task.session_id, task.task_id);
                         onClose();
                       }}
                       type="button"

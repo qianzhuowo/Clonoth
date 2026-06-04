@@ -854,9 +854,11 @@ export interface ChildSessionInfo {
   completed_at?: string;
 }
 
-export async function getSessionHistory(sessionId: string, limit = 200): Promise<StructuredMessage[]> {
+export async function getSessionHistory(sessionId: string, limit = 200, taskId?: string): Promise<StructuredMessage[]> {
   try {
-    const resp = await fetch(`${API}/sessions/${sessionId}/history?limit=${limit}`);
+    let url = `${API}/sessions/${sessionId}/history?limit=${limit}`;
+    if (taskId) url += `&task_id=${encodeURIComponent(taskId)}`;
+    const resp = await fetch(url);
     if (!resp.ok) return [];
     return resp.json();
   } catch {

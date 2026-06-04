@@ -90,7 +90,7 @@ export interface ChatStoreState extends ChatState {
   sendMessage: (text: string, attachments?: any[], entryNodeId?: string) => Promise<void>;
   cancelCurrentTask: () => Promise<void>;
   resetState: () => void;
-  viewChildSession: (sessionId: string) => void;
+  viewChildSession: (sessionId: string, taskId?: string) => void;
   exitChildSession: () => void;
   loadStartup: () => void;
 }
@@ -1766,10 +1766,10 @@ async function loadSessionHistoryIntoStore(conversationId: string, sessionId: st
   });
 }
 
-async function loadChildSessionHistoryIntoStore(sessionId: string, set: StoreSetter) {
+async function loadChildSessionHistoryIntoStore(sessionId: string, set: StoreSetter, taskId?: string) {
   let history: StructuredMessage[] = [];
   try {
-    history = await getSessionHistory(sessionId, 200);
+    history = await getSessionHistory(sessionId, 200, taskId);
   } catch {
     return;
   }
@@ -1913,7 +1913,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     return selectHasActiveChildNodesFromState(get(), conversationId);
   },
 
-  viewChildSession: (sessionId) => {
+  viewChildSession: (sessionId, taskId) => {
     const trimmed = sessionId.trim();
     if (!trimmed) return;
     // [2026-06-03] Why: child session navigation is a view switch, not a new sidebar
@@ -1921,7 +1921,7 @@ export const useChatStore = create<ChatStoreState>((set, get) => ({
     // its own history into childSessionMessages. Purpose: users can inspect child chat
     // streams and return to the parent without losing the active parent conversation.
     set({ viewingChildSessionId: trimmed });
-    void loadChildSessionHistoryIntoStore(trimmed, set);
+    void loadChildSessionHistoryIntoStore(trimmed, set, taskId?.trim() || undefined);
   },
 
   exitChildSession: () => {

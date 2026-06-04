@@ -22,7 +22,22 @@ function selectChildNodesForConversation(
   // filter the normalized childNodes map by parentConversationId and sort by start
   // time. Purpose: the floating panel mirrors Sidebar order while avoiding store edits.
   return Object.values(childNodes)
-    .filter((child) => child.parentConversationId === conversationId)
+    .filter((child) => {
+      if (child.parentConversationId !== conversationId) return false;
+      // [AutoC 2026-06-04] Why: system nodes (turn_summarizer, memory_extractor,
+      // compactor, dream) are internal housekeeping and should not clutter the
+      // operator-facing panel. How: exclude any node whose id starts with 'system.'.
+      // Purpose: only user-visible child agents appear in the floating panel.
+      if (child.nodeId.startsWith('system.')) return false;
+      // [AutoC 2026-06-04] Why: completed/failed/cancelled child nodes should not
+      // persist in the panel indefinitely. How: hide terminal nodes whose completedAt
+      // is older than 30 seconds. Purpose: brief flash of completion then auto-hide.
+      if (child.completedAt) {
+        const elapsed = Date.now() - new Date(child.completedAt).getTime();
+        if (elapsed > 30_000) return false;
+      }
+      return true;
+    })
     .sort((a, b) => (a.startedAt || '').localeCompare(b.startedAt || ''));
 }
 

@@ -35,6 +35,12 @@ function groupChildNodesByConversation(
 
   Object.values(childNodes).forEach((child) => {
     if (!knownConversationIds.has(child.parentConversationId)) return;
+    // [AutoC 2026-06-04] Filter out system nodes and stale terminal nodes.
+    if (child.nodeId.startsWith('system.')) return;
+    if (child.completedAt) {
+      const elapsed = Date.now() - new Date(child.completedAt).getTime();
+      if (elapsed > 30_000) return;
+    }
     grouped[child.parentConversationId] = [...(grouped[child.parentConversationId] || []), child];
   });
 

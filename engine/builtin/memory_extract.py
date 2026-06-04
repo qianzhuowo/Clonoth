@@ -105,15 +105,19 @@ class MemoryExtractHandler:
         if task_input.get("_system_task"):
             log.debug("memory_extract gate: blocked by _system_task")
             return
-        # [2026-05-22] Why: child/dispatch tasks and branch tasks are short-lived
-        # and do not represent real user conversation turns. How: skip tasks that
-        # have a caller_task_id (dispatched by another node) or whose task_id
-        # starts with 'branch_'. Purpose: prevent CPU waste from high-frequency
-        # gate checks on child node callbacks.
+        # [2026-06-04] Why: fresh child tasks are short-lived and disposable (session
+        # cleaned within 24h), so extracting memory from them wastes CPU. However,
+        # accumulate/persistent child nodes (like Smith) maintain long-lived sessions
+        # with valuable context worth extracting. How: check dispatch_context_mode
+        # from task input — only skip fresh children. Purpose: enable memory
+        # extraction for persistent sub-agents while still filtering throwaway tasks.
         caller_tid = getattr(task, "caller_task_id", None)
         if caller_tid:
-            log.debug("memory_extract gate: blocked by caller_task_id=%s (child task)", str(caller_tid)[:8])
-            return
+            ctx_mode = str(task_input.get("dispatch_context_mode") or "").strip()
+            if ctx_mode == "fresh" or not ctx_mode:
+                log.debug("memory_extract gate: blocked by caller_task_id=%s (fresh/unknown child)", str(caller_tid)[:8])
+                return
+            log.debug("memory_extract gate: allowing %s child (context_mode=%s)", str(caller_tid)[:8], ctx_mode)
         # [2026-05-23 fix] Entry tasks run on temporary branch sessions (task.session_id
         # starts with 'branch_'), but they represent real user conversation turns. The
         # on_entry_task_complete hook passes the merged parent session in ctx["session_id"].

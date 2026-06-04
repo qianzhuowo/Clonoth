@@ -52,8 +52,18 @@ function useElapsedTime(startedAt?: string, endedAt?: string, streaming?: boolea
 }
 
 function getLastLines(text: string, maxLines = 6): string {
+  // [AutoC 2026-06-04] Why: streaming text often ends with a trailing newline,
+  // causing split('\n') to produce an empty last element. The preview then
+  // shows the second-to-last line instead of the actual last content line.
+  // How: filter out empty trailing lines before slicing. Purpose: the collapsed
+  // streaming preview always ends on the most recent visible line.
   const lines = text.split('\n');
-  if (lines.length <= maxLines) return text;
+  // Remove trailing empty lines
+  while (lines.length > 0 && lines[lines.length - 1].trim() === '') {
+    lines.pop();
+  }
+  if (lines.length === 0) return '';
+  if (lines.length <= maxLines) return lines.join('\n');
   return '…\n' + lines.slice(-maxLines).join('\n');
 }
 

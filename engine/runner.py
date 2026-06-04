@@ -1109,6 +1109,12 @@ async def _run_node_task(
         print(f"[engine] Failed to write task record: {_tr_err}", flush=True)
 
     _result = action.to_dict()
+    if getattr(rctx, "current_llm_request_id", "") and not _result.get("llm_request_id"):
+        # [AutoC 2026-06-04] Why: some TaskAction producers are hooks rather than
+        # pseudo handlers, but they still end the current provider request. How: fill
+        # the task result from RunContext when the action did not set it itself.
+        # Purpose: supervisor outbound events remain request-scoped for every finish path.
+        _result["llm_request_id"] = rctx.current_llm_request_id
     # 轮摘要节点化：传递 _tool_call_count 和 _total_tokens 给 supervisor 做门控判断
     _result["_tool_call_count"] = _tool_call_count
     _result["_total_tokens"] = _total_tokens

@@ -53,6 +53,11 @@ class TaskAction:
     # 非空时表示此 task 的消息存储在 child session 的 JSONL 中，而非 snapshot。
     child_session_id: str = ""
     summary: str = ""  # 简短摘要（用于事件日志、进度展示）
+    # [AutoC 2026-06-04] Why: supervisor emits outbound_message after the engine
+    # task returns, but the frontend must replace the card for the specific LLM
+    # request that produced finish/ask. How: carry that request id through the task
+    # result protocol. Purpose: final delivery is request-scoped instead of task-scoped.
+    llm_request_id: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         d: dict[str, Any] = {
@@ -61,6 +66,8 @@ class TaskAction:
             "context_ref": self.context_ref,
             "summary": self.summary,
         }
+        if self.llm_request_id:
+            d["llm_request_id"] = self.llm_request_id
         # Child Session 隔离（Phase B）：将 child_session_id 写入 task result
         if self.child_session_id:
             d["child_session_id"] = self.child_session_id

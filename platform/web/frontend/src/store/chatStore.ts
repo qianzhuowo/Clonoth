@@ -1250,8 +1250,12 @@ function normalizeHistoryThinkingSegments(message: StructuredMessage): HistoryTh
     if (!text.trim()) return null;
     return {
       text,
-      startedAt: typeof block.started_at === 'string' ? block.started_at : undefined,
-      endedAt: typeof block.ended_at === 'string' ? block.ended_at : undefined,
+      // [AutoC 2026-06-04] Why: /history has used both snake_case and camelCase
+      // timestamp keys during the streaming refactor. How: normalize both shapes into
+      // the render block fields. Purpose: refreshed thinking blocks show elapsed time
+      // instead of the character-count fallback.
+      startedAt: typeof block.started_at === 'string' ? block.started_at : typeof block.startedAt === 'string' ? block.startedAt : undefined,
+      endedAt: typeof block.ended_at === 'string' ? block.ended_at : typeof block.endedAt === 'string' ? block.endedAt : undefined,
     };
   };
 
@@ -1599,7 +1603,15 @@ function hydrateStructuredHistory(
       status,
       createdAt,
       updatedAt: createdAt,
-      source: { nodeId: sourceMessage.source_node_id || undefined },
+      source: {
+        // [AutoC 2026-06-04] Why: request-scoped live cards can later be compared
+        // with hydrated assistant rows. How: preserve llm_request_id from /history
+        // when the backend provides it. Purpose: task-level metadata is no longer the
+        // only way to identify a historical assistant card.
+        llmRequestId: sourceMessage.llm_request_id || undefined,
+        taskId: sourceMessage.source_task_id || undefined,
+        nodeId: sourceMessage.source_node_id || undefined,
+      },
       blocks,
       eventIds: [historyEventId],
       hydratedFromHistory: true,

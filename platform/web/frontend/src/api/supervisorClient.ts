@@ -795,6 +795,11 @@ export interface StructuredThinkingBlock {
   text: string;
   started_at?: string;
   ended_at?: string;
+  // [AutoC 2026-06-04] Why: mixed backend versions may serialize structured
+  // thinking timestamps in camelCase. How: type both naming conventions. Purpose:
+  // history hydration keeps elapsed-time headers instead of falling back to length.
+  startedAt?: string;
+  endedAt?: string;
 }
 
 export interface StructuredMessage {
@@ -809,6 +814,11 @@ export interface StructuredMessage {
   // selected backend metadata fields returned by /history. Purpose: the UI can show
   // a child-session jump button after page refresh without parsing callback text.
   source_task_id?: string;
+  // [AutoC 2026-06-04] Why: history rows may be correlated with live request cards
+  // after request-scoped streaming. How: type the optional backend request id.
+  // Purpose: future hydration can reconcile one persisted assistant row with one
+  // request card without falling back to task-level matching.
+  llm_request_id?: string;
   child_session_id?: string;
   // [AutoC 2026-06-04] Why: dispatch_result history now uses explicit child/caller
   // metadata and summary. How: expose the new fields while keeping legacy dispatch_*

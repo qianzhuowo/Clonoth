@@ -182,6 +182,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             result=result_payload,
             context_ref=ctx_ref,
             summary=_short(summary_text, 240) if summary_text else "",
+            llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
         )
 
     # switch_node 也需要 ctx_ref，单独计算
@@ -215,6 +216,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             },
             context_ref=ctx_ref,
             summary=f"switch → {switch_target or 'default'}",
+            llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
         )
 
     return None  # 未知伪工具，按非终止处理

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -45,10 +46,33 @@ class RunContext:
     first_shadow_message_id: str = ""   # UUID of first message written to ConversationStore
     last_shadow_message_id: str = ""    # UUID of last message written to ConversationStore
     completed_steps: int = 0             # actual step count from ai_step loop
+    # [AutoC 2026-06-04] Why: one visible streaming card must map to one concrete LLM
+    # request, not to the whole task. How: keep the current request id on RunContext
+    # and let emit_event copy it into stream/tool/outbound-related payloads. Purpose:
+    # frontend reducers can replace the exact card that produced the request.
+    current_llm_request_id: str = ""
+    llm_request_index: int = 0
+
+    def begin_llm_request(self) -> str:
+        """Start a new request-scoped id for one provider call."""
+        # [AutoC 2026-06-04] Why: task_id is too coarse because one task can make
+        # several provider requests. How: combine task id, a monotonic per-task counter,
+        # and a short uuid suffix. Purpose: every stream card has a stable backend key
+        # for final replacement without depending on event order heuristics.
+        self.llm_request_index += 1
+        base = self.task_id or self.session_id or "llm"
+        self.current_llm_request_id = f"{base}:llm:{self.llm_request_index}:{uuid.uuid4().hex[:8]}"
+        return self.current_llm_request_id
 
     async def emit_event(self, event_type: str, payload: dict[str, Any]) -> None:
         if self.source_inbound_seq is not None:
             payload.setdefault("source_inbound_seq", self.source_inbound_seq)
+        if self.current_llm_request_id:
+            # [AutoC 2026-06-04] Why: realtime stream/tool events and the later
+            # outbound_message must share a request-level identity. How: attach the
+            # current LLM request id unless a caller supplied a more specific value.
+            # Purpose: frontend replacement targets the exact streaming card.
+            payload.setdefault("llm_request_id", self.current_llm_request_id)
         # [Fork/Merge 2026-05-12] Events are delivered through the parent session
         # when this task is running on an entry branch. Why: SDK session maps are
         # keyed by the user-facing parent session, while self.session_id remains

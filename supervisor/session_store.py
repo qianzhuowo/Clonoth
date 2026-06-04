@@ -120,12 +120,18 @@ class SessionStore:
                     if isinstance(created_str, str)
                     else _now()
                 )
+                updated_str = entry.get("updated_at")
+                updated_at = (
+                    datetime.fromisoformat(updated_str)
+                    if isinstance(updated_str, str) and updated_str
+                    else created_at
+                )
                 info = SessionInfo(
                     session_id=str(entry.get("session_id") or sid),
                     channel=str(entry.get("channel") or ""),
                     conversation_key=str(entry.get("conversation_key") or ""),
                     created_at=created_at,
-                    updated_at=created_at,
+                    updated_at=updated_at,
                     # Why: older sessions.json files do not have entry_node_id.
                     # How: normalize a missing or empty value to "" during load.
                     # Purpose: schema extension remains backward compatible while
@@ -162,6 +168,7 @@ class SessionStore:
             "channel": info.channel,
             "conversation_key": info.conversation_key,
             "created_at": info.created_at.isoformat(),
+            "updated_at": info.updated_at.isoformat() if info.updated_at else info.created_at.isoformat(),
             "reset": False,
             # Why: session creation can already know the desired entry node in
             # restored or specialized flows. How: serialize the SessionInfo field
@@ -254,6 +261,20 @@ class SessionStore:
             "last_active_at": now_str,
         }
         self._flush()
+
+    def touch_updated_at(self, session_id: str, updated_at: datetime) -> None:
+        """Sync updated_at into the registry (no immediate flush).
+
+        [AutoC 2026-06-04] Why: _apply_inbound/outbound_message sets
+        si.updated_at in memory, but the registry dict is never refreshed,
+        so sessions.json keeps updated_at=None. On restart, load() falls back
+        to created_at and sidebar ordering is stuck at creation time.
+        How: update the registry entry in memory; periodic _flush persists it.
+        Purpose: updated_at survives restarts without per-message disk writes.
+        """
+        entry = self._registry.get(session_id)
+        if entry is not None and not entry.get("is_child") and not entry.get("reset"):
+            entry["updated_at"] = updated_at.isoformat()
 
     def update_last_active(self, child_session_id: str) -> None:
         """更新 child session 的 last_active_at 时间戳。

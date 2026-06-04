@@ -751,6 +751,7 @@ class TaskRouterMixin:
             attachments=atts, source_inbound_seq=task.source_inbound_seq,
             node_id=task.node_id,
             action_type=action_type,
+            llm_request_id=str(task.result.get("llm_request_id") or "").strip(),
         )
 
 

@@ -211,6 +211,7 @@ function applyInboundMessage(state: ChatState, event: SupervisorEvent): ChatStat
     // keep legacy task_id/node_id fallbacks for older event logs. Purpose: realtime
     // callback cards render from structured data without parsing localized text.
     taskId: childTaskId || undefined,
+    llmRequestId: getLlmRequestId(payload) || undefined,
     childTaskId: childTaskId || undefined,
     nodeId: childNodeId || undefined,
     childNodeId: childNodeId || undefined,
@@ -1024,7 +1025,18 @@ function getAssistantMessageByTurn(state: ChatState, turnKey: string): WsMessage
 function findOutboundReplacementTarget(state: ChatState, event: SupervisorEvent): WsMessage | undefined {
   const payload = getPayload(event);
   const conversationId = getConversationId(state, event);
-  const directMessage = getAssistantMessageByTurn(state, getTurnKey(state, event));
+  const turnKey = getTurnKey(state, event);
+  const directMessage = getAssistantMessageByTurn(state, turnKey);
+  const llmRequestId = getLlmRequestId(payload);
+
+  if (llmRequestId && directMessage) {
+    // [AutoC 2026-06-04] Why: outbound_message now carries the exact provider
+    // request id that produced the visible stream card. How: return the card bound
+    // to that request key before running task/inbound fallback heuristics. Purpose:
+    // final text replaces the original card and never targets another request in
+    // the same task.
+    return directMessage;
+  }
   const sourceInboundSeq = getSourceInboundSeq(payload);
   const taskId = getString(payload.task_id);
   const nodeId = getString(payload.node_id);
@@ -1269,6 +1281,15 @@ function buildEventLogEntry(state: ChatState, event: SupervisorEvent, eventId: s
 
 function getTurnKey(state: ChatState, event: SupervisorEvent): string {
   const payload = getPayload(event);
+  const llmRequestId = getLlmRequestId(payload);
+  if (llmRequestId) {
+    // [AutoC 2026-06-04] Why: a task can contain multiple LLM requests, each with its
+    // own stream card. How: prefer the backend request id over task and inbound keys.
+    // Purpose: stream_delta, tool events, stream_end, and outbound_message for one
+    // provider request all update exactly one card.
+    return `llm-request:${llmRequestId}`;
+  }
+
   const taskId = getString(payload.task_id);
   if (taskId && state.taskTurnKeys[taskId]) {
     // [2026-06-02] Why: one backend task can span multiple visible LLM-round cards
@@ -1341,6 +1362,7 @@ function buildMessageSource(state: ChatState, event: SupervisorEvent): MessageSo
   return {
     inboundSeq,
     taskId: childTaskId || undefined,
+    llmRequestId: getLlmRequestId(payload) || undefined,
     childTaskId: childTaskId || undefined,
     nodeId: childNodeId || nodeInfo?.nodeId,
     childNodeId: childNodeId || undefined,
@@ -1380,6 +1402,7 @@ function mergeSource(current: MessageSource, patch: MessageSource): MessageSourc
   return {
     inboundSeq: patch.inboundSeq !== undefined ? patch.inboundSeq : current.inboundSeq,
     taskId: patch.taskId || current.taskId,
+    llmRequestId: patch.llmRequestId || current.llmRequestId,
     childTaskId: patch.childTaskId || current.childTaskId,
     nodeId: patch.nodeId || current.nodeId,
     childNodeId: patch.childNodeId || current.childNodeId,
@@ -1813,6 +1836,17 @@ function getNumber(value: unknown): number | undefined {
 
 function getBoolean(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined;
+}
+
+function getLlmRequestId(payload: EventPayload): string {
+  const nestedResult = getRecord(payload.result);
+  // [AutoC 2026-06-04] Why: task_completed stores engine output under result while
+  // realtime stream and outbound events put the id at the payload top level. How:
+  // read both shapes plus a conservative request_id alias for mixed-version logs.
+  // Purpose: reducer card lookup remains request-scoped across live and terminal events.
+  return getString(payload.llm_request_id)
+    || getString(payload.request_id)
+    || (nestedResult ? getString(nestedResult.llm_request_id) || getString(nestedResult.request_id) : '');
 }
 
 function getSourceInboundSeq(payload: EventPayload): number | undefined {

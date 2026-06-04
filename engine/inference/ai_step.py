@@ -514,6 +514,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
         message_type="assistant",
         timestamp=datetime.now(timezone.utc).isoformat(),
+        llm_request_id=getattr(ls.rctx, "current_llm_request_id", ""),
         metadata={_provider_name: resp.provider_meta} if resp.provider_meta else {},
         tool_call_ids=[tc.id for tc in (resp.tool_calls or [])],
         reasoning=resp.reasoning or "",
@@ -1686,6 +1687,7 @@ async def run_ai_node(
                     await ls.rctx.emit_event("stream_text_final", {
                         "node_id": ls.node.id,
                         "task_id": ls.rctx.task_id,
+                        "llm_request_id": getattr(ls.rctx, "current_llm_request_id", ""),
                         "text": _clean_text,
                     })
 

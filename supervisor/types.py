@@ -73,6 +73,11 @@ class OutboundMessageIn(BaseModel):
     text: str
     source_inbound_seq: int | None = None
     attachments: list[dict[str, Any]] | None = None
+    # [AutoC 2026-06-04] Why: manual outbound API calls may also be used to finalize
+    # an existing live request card. How: accept the same request-level id that engine
+    # task results carry. Purpose: the API contract remains consistent across outbound
+    # producers.
+    llm_request_id: str | None = None
 
 
 class OutboundMessageOut(BaseModel):

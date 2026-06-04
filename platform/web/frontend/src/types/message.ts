@@ -109,6 +109,10 @@ export interface ToolExecution {
   approvalStatus?: 'pending' | 'allowed' | 'denied';
   approvalDetails?: Record<string, unknown>;
   taskId?: string;
+  // [AutoC 2026-06-04] Why: a task can span several visible LLM request cards.
+  // How: keep the backend request id on the normalized source beside taskId.
+  // Purpose: debugging and future hydration can correlate one card to one request.
+  llmRequestId?: string;
   nodeId?: string;
   nodeName?: string;
   createdAt: string;
@@ -128,6 +132,10 @@ export type MessageStatus =
 export interface MessageSource {
   inboundSeq?: number;
   taskId?: string;
+  // [AutoC 2026-06-04] Why: a task can span several visible LLM request cards.
+  // How: keep the backend request id on the normalized source beside taskId.
+  // Purpose: debugging and future hydration can correlate one card to one request.
+  llmRequestId?: string;
   nodeId?: string;
   nodeName?: string;
   branchSessionId?: string;

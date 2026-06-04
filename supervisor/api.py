@@ -515,6 +515,7 @@ def create_app(
                 text=str(body.text or ""),
                 attachments=body.attachments,
                 source_inbound_seq=body.source_inbound_seq,
+                llm_request_id=body.llm_request_id,
             )
         except KeyError:
             raise HTTPException(status_code=404, detail="session not found")

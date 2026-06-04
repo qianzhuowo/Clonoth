@@ -191,6 +191,25 @@ describe('eventReducer', () => {
     expect(selectEventLog(state, 'sess-1', 20).map((entry) => entry.type)).toContain('handoff_progress');
   });
 
+  it('uses llm_request_id to replace the exact request card instead of the latest task card', () => {
+    // [AutoC 2026-06-04] Why: one task can issue multiple provider requests, so a
+    // task-level outbound match can replace the wrong card when events arrive late.
+    // How: give each stream and outbound event a distinct llm_request_id. Purpose:
+    // the reducer proves that final text targets the original request card.
+    const state = replaySupervisorEvents([
+      event(1, 'inbound_message', { conversation_key: 'web:conv-request-key', text: 'multi step' }),
+      event(2, 'stream_delta', { source_inbound_seq: 1, task_id: 'task-request-key', llm_request_id: 'req-a', type: 'text', content: 'draft A' }),
+      event(3, 'stream_end', { source_inbound_seq: 1, task_id: 'task-request-key', llm_request_id: 'req-a', has_text: true }),
+      event(4, 'stream_delta', { source_inbound_seq: 1, task_id: 'task-request-key', llm_request_id: 'req-b', type: 'text', content: 'draft B' }),
+      event(5, 'outbound_message', { source_inbound_seq: 1, task_id: 'task-request-key', llm_request_id: 'req-a', text: 'final A', attachments: [] }),
+    ], createInitialChatState());
+
+    const messages = selectMessages(state, 'conv-request-key');
+    expect(messages).toHaveLength(3);
+    expect(messages[1].blocks.at(-1)).toMatchObject({ kind: 'text', text: 'final A', delivery: 'final' });
+    expect(messages[2].blocks.at(-1)).toMatchObject({ kind: 'text', text: 'draft B', delivery: 'stream' });
+  });
+
   it('replaces streamed text on the original card when outbound_message arrives', () => {
     // [AutoC 2026-06-04] Why: outbound_message belongs to the LLM request that just
     // streamed. How: replay only the minimal inbound, stream, and outbound sequence.

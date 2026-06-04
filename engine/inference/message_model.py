@@ -37,6 +37,11 @@ class MessageMeta:
     tool_mode: str = "fake-native"  # fake-native / native / json — 该消息使用的工具调用格式
     message_type: str = ""          # user_input / tool_result / assistant / system
     timestamp: str = ""             # ISO 格式生成时间
+    # [AutoC 2026-06-04] Why: structured history and outbound replacement need to
+    # correlate one assistant row with one provider request. How: persist the current
+    # request id in message metadata. Purpose: refreshed history can keep request-level
+    # identity instead of only task-level identity.
+    llm_request_id: str = ""
 
     # ── Provider 元数据命名空间 ──
     # [refactor 2026-04-18] 替代旧 raw_parts，结构为 {provider_name: {provider 自定义内容}}
@@ -86,6 +91,8 @@ class MessageMeta:
             d["message_type"] = self.message_type
         if self.timestamp:
             d["timestamp"] = self.timestamp
+        if self.llm_request_id:
+            d["llm_request_id"] = self.llm_request_id
         if self.metadata:
             d["metadata"] = self.metadata
         if self.tool_call_ids:
@@ -139,6 +146,7 @@ class MessageMeta:
             tool_mode=str(data.get("tool_mode") or "fake-native"),
             message_type=str(data.get("message_type") or ""),
             timestamp=str(data.get("timestamp") or ""),
+            llm_request_id=str(data.get("llm_request_id") or ""),
             metadata=dict(metadata),
             tool_call_ids=list(data.get("tool_call_ids") or []),
             control_tool_name=str(data.get("control_tool_name") or ""),

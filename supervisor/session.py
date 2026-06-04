@@ -446,6 +446,7 @@ class SessionMixin:
         si = self.sessions.get(session_id)
         if si is not None:
             si.updated_at = _now()
+            self._session_store.touch_updated_at(session_id, si.updated_at)
         if seq not in self._inbound_events:
             self._inbound_events[seq] = {"session_id": session_id, "payload": payload}
             self._inbound_order.append(seq)
@@ -491,6 +492,9 @@ class SessionMixin:
         si = self.sessions.get(session_id)
         if si is not None:
             si.updated_at = _now()
+            # [AutoC 2026-06-04] Outbound is low-frequency enough to flush.
+            self._session_store.touch_updated_at(session_id, si.updated_at)
+            self._session_store._flush()
         if inbound_seq > 0 and inbound_seq not in self._inbound_routed:
             self._inbound_routed[inbound_seq] = {
                 "action": "reply",
@@ -691,6 +695,7 @@ class SessionMixin:
         source_inbound_seq: int | None = None,
         node_id: str | None = None,
         action_type: str | None = None,
+        llm_request_id: str | None = None,
     ) -> dict[str, Any]:
         text_clean = str(text or "").strip()
         # [Fix] 当 source_inbound_seq 存在时，允许空文本通过。
@@ -730,6 +735,13 @@ class SessionMixin:
                 payload["source_inbound_seq"] = src_seq
             if node_id:
                 payload["node_id"] = node_id
+            if llm_request_id:
+                # [AutoC 2026-06-04] Why: outbound_message is emitted after the task
+                # has already finished, but it must finalize the card for one LLM
+                # request. How: persist the request id captured by the engine in the
+                # outbound event payload. Purpose: clients replace the existing stream
+                # card instead of creating a second final card.
+                payload["llm_request_id"] = str(llm_request_id).strip()
             if action_type:
                 # [AutoC 2026-05-31] Why: Phase 0 routes ask through the same
                 # outbound path as finish, but Phase 1 needs to distinguish the
@@ -959,26 +971,55 @@ class SessionMixin:
             }
             # Extract thinking/reasoning from meta
             if isinstance(msg.meta, dict):
-                reasoning = str(msg.meta.get("reasoning") or "")
+                reasoning = str(
+                    msg.meta.get("reasoning")
+                    or msg.meta.get("thinking_text")
+                    or msg.meta.get("thinking")
+                    or ""
+                )
+                _llm_req_id = str(msg.meta.get("llm_request_id") or "").strip()
+                if _llm_req_id:
+                    entry["llm_request_id"] = _llm_req_id
                 if reasoning:
-                    # [AutoC 2026-06-04] Why: the web client now needs historical
-                    # reasoning in the same block shape as live stream reasoning.
-                    # How: keep the legacy flat thinking field for compatibility and
-                    # add thinking_blocks with text plus start/end timestamps, falling
-                    # back to created_at for older rows that predate timing capture.
-                    # Purpose: history hydration can render elapsed-time ThinkingBlock
-                    # headers instead of the no-time character-count fallback.
-                    _rs = msg.meta.get("reasoning_started_at") or msg.created_at
-                    _re = msg.meta.get("reasoning_ended_at") or _rs
-                    entry["thinking"] = reasoning
+                    # [AutoC 2026-06-04] Why: refreshed pages must render historical
+                    # reasoning with the same timed ThinkingBlock header as live streams.
+                    # How: accept new and legacy reasoning keys, normalize timestamp
+                    # aliases, and fall back to created_at when old rows predate timing.
+                    # Purpose: history no longer falls back to the character-count title.
+                    _rs = (
+                        msg.meta.get("reasoning_started_at")
+                        or msg.meta.get("reasoning_startedAt")
+                        or msg.meta.get("thinking_started_at")
+                        or msg.meta.get("thinking_startedAt")
+                        or msg.created_at
+                    )
+                    _re = (
+                        msg.meta.get("reasoning_ended_at")
+                        or msg.meta.get("reasoning_endedAt")
+                        or msg.meta.get("thinking_ended_at")
+                        or msg.meta.get("thinking_endedAt")
+                        or _rs
+                    )
+                    entry["thinking"] = {"text": reasoning, "started_at": _rs, "ended_at": _re}
+                    entry["thinking_text"] = reasoning
                     entry["thinking_blocks"] = [{
                         "text": reasoning,
                         "started_at": _rs,
                         "ended_at": _re,
                     }]
                 # [thinking-time 2026-06-01] Pass precise reasoning timing to frontend.
-                _rs = msg.meta.get("reasoning_started_at")
-                _re = msg.meta.get("reasoning_ended_at")
+                _rs = (
+                    msg.meta.get("reasoning_started_at")
+                    or msg.meta.get("reasoning_startedAt")
+                    or msg.meta.get("thinking_started_at")
+                    or msg.meta.get("thinking_startedAt")
+                )
+                _re = (
+                    msg.meta.get("reasoning_ended_at")
+                    or msg.meta.get("reasoning_endedAt")
+                    or msg.meta.get("thinking_ended_at")
+                    or msg.meta.get("thinking_endedAt")
+                )
                 if _rs:
                     entry["reasoning_started_at"] = _rs
                 if _re:

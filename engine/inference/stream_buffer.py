@@ -12,10 +12,15 @@ if TYPE_CHECKING:
 
 
 class _StreamBuffer:
-    def __init__(self, rctx: "RunContext", node_id: str, kind: str) -> None:
+    def __init__(self, rctx: "RunContext", node_id: str, kind: str, *, request_id: str = "") -> None:
         self._rctx = rctx
         self._node_id = node_id
         self._kind = kind
+        # [AutoC 2026-06-04] Why: buffered stream chunks may flush after other task
+        # bookkeeping has happened. How: capture the request id when the buffer is
+        # created and emit it with every chunk. Purpose: stream cards are keyed by the
+        # provider request that produced them, not by the wider task.
+        self._request_id = request_id
         self._buf: list[str] = []
         self._last_flush = time.monotonic()
         self.flushed_any = False
@@ -59,6 +64,7 @@ class _StreamBuffer:
         await self._rctx.emit_event("stream_delta", {
             "node_id": self._node_id,
             "task_id": self._rctx.task_id,
+            "llm_request_id": self._request_id,
             "type": self._kind,
             "content": text,
         })

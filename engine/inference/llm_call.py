@@ -184,13 +184,18 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     _bus.emit(Signal(name="llm.call.start", payload=_sig_payload, span_id=_span_id))
 
     while True:
+        # [AutoC 2026-06-04] Why: retries and multi-step tasks can issue several
+        # provider requests under one task id. How: create a fresh request id at the
+        # start of each actual provider call attempt, before any stream delta can be
+        # emitted. Purpose: all realtime blocks from this attempt share one card key.
+        request_id = ls.rctx.begin_llm_request()
         text_buf: _StreamBuffer | None = None
         think_buf: _StreamBuffer | None = None
 
         # ---- 流式调用 ----
         if ls.use_stream:
-            text_buf = _StreamBuffer(ls.rctx, ls.node.id, "text")
-            think_buf = _StreamBuffer(ls.rctx, ls.node.id, "thinking")
+            text_buf = _StreamBuffer(ls.rctx, ls.node.id, "text", request_id=request_id)
+            think_buf = _StreamBuffer(ls.rctx, ls.node.id, "thinking", request_id=request_id)
 
             async def _emit_tool_delta(payload: dict[str, Any]) -> None:
                 # [tool-stream 2026-05-19] 将 provider 的工具调用增量接入 RunContext 事件流。
@@ -200,6 +205,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 event_payload = dict(payload or {})
                 event_payload.setdefault("node_id", ls.node.id)
                 event_payload.setdefault("task_id", ls.rctx.task_id)
+                event_payload.setdefault("llm_request_id", request_id)
                 await ls.rctx.emit_event("tool_call_delta", event_payload)
 
             stream_task = asyncio.create_task(
@@ -226,7 +232,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     await think_buf.flush()
                     if text_buf.flushed_any or think_buf.flushed_any:
                         # [refactor 2026-04-18] has_thinking → has_reasoning 事件字段对齐
-                        await ls.rctx.emit_event("stream_end", {"node_id": ls.node.id, "has_text": text_buf.flushed_any, "has_reasoning": think_buf.flushed_any})
+                        await ls.rctx.emit_event("stream_end", {"node_id": ls.node.id, "llm_request_id": request_id, "has_text": text_buf.flushed_any, "has_reasoning": think_buf.flushed_any})
                     await ls.rctx.emit_event("cancel_acknowledged", {"node_id": ls.node.id, "task_id": ls.rctx.task_id, "step": step})
                     # Phase 1: Signal — 取消时也发射 end 信号
                     _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
@@ -262,6 +268,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                                 if text_buf.flushed_any or think_buf.flushed_any:
                                     await ls.rctx.emit_event("stream_end", {
                                         "node_id": ls.node.id,
+                                        "llm_request_id": request_id,
                                         "has_text": text_buf.flushed_any,
                                         "has_reasoning": think_buf.flushed_any,
                                     })
@@ -298,6 +305,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                 # [refactor 2026-04-18] has_thinking → has_reasoning 事件字段对齐
                 await ls.rctx.emit_event("stream_end", {
                     "node_id": ls.node.id,
+                    "llm_request_id": request_id,
                     "has_text": text_buf.flushed_any,
                     "has_reasoning": think_buf.flushed_any,
                 })

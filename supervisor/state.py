@@ -1061,6 +1061,31 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         decision = self.policy.evaluate(op=op, parameters=parameters)
         if decision.safety_level == SafetyLevel.auto:
             return OpRequestOut(safety_level=SafetyLevel.auto, reason=decision.reason, approval_id=None)
+        # [AutoC 2026-06-04] Why: hard policy denials must not be converted into
+        # human approval requests. How: return SafetyLevel.deny immediately before
+        # any scheduler or approval handling. Purpose: destructive or invalid
+        # operations stay blocked even when they come from unattended jobs.
+        if decision.safety_level == SafetyLevel.deny:
+            return OpRequestOut(safety_level=SafetyLevel.deny, reason=decision.reason, approval_id=None)
+
+        # [AutoC 2026-06-04] Why: scheduler-triggered tasks have no source inbound
+        # sequence, so their approval events cannot be routed to Discord and would
+        # leave the task suspended forever. How: when the active task belongs to a
+        # session whose conversation_key starts with "scheduler:", convert the
+        # approval-required decision into an automatic allow. Purpose: scheduled
+        # maintenance tasks can continue while normal user tasks still use approval.
+        if task_id:
+            task = self.tasks.get(task_id)
+            if task:
+                session = self.sessions.get(task.session_id or session_id)
+                conversation_key = str(getattr(session, "conversation_key", "") or "") if session else ""
+                if conversation_key.startswith("scheduler:"):
+                    return OpRequestOut(
+                        safety_level=SafetyLevel.auto,
+                        reason="auto-approved: scheduler task",
+                        approval_id=None,
+                    )
+
         # [AutoC 2026-05-31] Why: request_guard can now identify the active tool
         # call. How: forward that identity to create_approval. Purpose: the emitted
         # approval_requested event can be merged into the same ToolCallCard.

@@ -27,7 +27,7 @@ export const SettingsSidebar = () => {
           <span>返回聊天</span>
         </button>
         <div className="flex items-center gap-2.5">
-          <img src={`${import.meta.env.BASE_URL}logo.jpg`} alt="Clonoth" className="h-8 w-8 rounded-lg" />
+          <img src={`${import.meta.env.BASE_URL}logo-sm.jpg`} alt="Clonoth" className="h-8 w-8 rounded-lg" />
           <div>
             <h1 className="font-mono text-base font-semibold tracking-[-0.04em]">设置</h1>
             <p className="text-[0.6rem] text-[var(--duties-tertiary)]">配置分类</p>

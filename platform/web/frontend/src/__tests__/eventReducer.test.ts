@@ -160,20 +160,25 @@ describe('eventReducer', () => {
     const state = replaySupervisorEvents(events, createInitialChatState());
     const messages = selectMessages(state, 'conv-2');
 
-    expect(messages).toHaveLength(2);
-    const assistant = messages[1];
-    expect(assistant.status).toBe('completed');
-    expect(assistant.source).toMatchObject({ inboundSeq: 1, taskId: 'task-1', nodeId: 'ereuna_main', nodeName: 'EreunaMain' });
-    // [AutoC 2026-06-04] Why: outbound_message is the final backend form of the
-    // same LLM request, not a second assistant turn. How: the reducer replaces the
-    // stream text on the existing card while preserving reasoning and tool blocks.
-    // Purpose: replay follows the one-request-one-card contract without duplicate
-    // final-output cards.
-    expect(assistant.blocks.map((block) => block.kind)).toEqual(['thinking', 'tool', 'text']);
-    expect(assistant.blocks[0]).toMatchObject({ kind: 'thinking', text: 'thinking...', streaming: false });
-    expect(assistant.blocks.at(-1)).toMatchObject({ kind: 'text', text: 'done', delivery: 'final', streaming: false });
+    expect(messages).toHaveLength(3);
+    const streamCard = messages[1];
+    const finalCard = messages[2];
+    expect(streamCard.status).toBe('completed');
+    expect(finalCard.status).toBe('completed');
+    expect(streamCard.source).toMatchObject({ inboundSeq: 1, taskId: 'task-1', nodeId: 'ereuna_main', nodeName: 'EreunaMain' });
+    expect(finalCard.source).toMatchObject({ inboundSeq: 1, taskId: 'task-1', nodeId: 'ereuna_main' });
+    // [AutoC 2026-06-04] Why: this fixture has stream_end before provider tool
+    // deltas, so it represents two LLM request cards. How: keep the completed stream
+    // card, then let outbound_message replace only the later tool request card.
+    // Purpose: one request still maps to one card, without adding a third assistant
+    // card for the outbound payload.
+    expect(streamCard.blocks.map((block) => block.kind)).toEqual(['thinking', 'text']);
+    expect(streamCard.blocks[0]).toMatchObject({ kind: 'thinking', text: 'thinking...', streaming: false });
+    expect(streamCard.blocks[1]).toMatchObject({ kind: 'text', text: 'partial', delivery: 'stream', streaming: false });
+    expect(finalCard.blocks.map((block) => block.kind)).toEqual(['tool', 'text']);
+    expect(finalCard.blocks.at(-1)).toMatchObject({ kind: 'text', text: 'done', delivery: 'final', streaming: false });
 
-    const toolBlock = assistant.blocks.find((block) => block.kind === 'tool');
+    const toolBlock = finalCard.blocks.find((block) => block.kind === 'tool');
     expect(toolBlock?.kind).toBe('tool');
     const tools = toolBlock?.kind === 'tool' ? selectToolExecutions(state, toolBlock.toolIds) : [];
     expect(tools).toHaveLength(1);
@@ -603,15 +608,13 @@ describe('eventReducer', () => {
     ], createInitialChatState());
 
     const messages = selectMessages(state, 'conv-reply-break');
-    expect(messages).toHaveLength(4);
+    expect(messages).toHaveLength(3);
 
     const replyCard = messages[1];
     const workCard = messages[2];
-    const finalCard = messages[3];
     expect(replyCard).toMatchObject({ role: 'assistant', status: 'completed', completionType: 'reply' });
     expect(replyCard.blocks.at(-1)).toMatchObject({ kind: 'text', text: 'round 1 visible reply', delivery: 'intermediate' });
-    expect(workCard).toMatchObject({ role: 'assistant', status: 'completed' });
-    expect(workCard.completionType).toBeUndefined();
+    expect(workCard).toMatchObject({ role: 'assistant', status: 'completed', completionType: 'finish' });
     // [2026-06-02] Why: the fresh post-reply turn key must be stable after it is
     // assigned. How: two consecutive thinking deltas after reply should merge into
     // the same block on the same work card. Purpose: prevent every stream_delta from
@@ -628,9 +631,11 @@ describe('eventReducer', () => {
     expect(tools.some((tool) => tool.name === 'search_in_files' && tool.status === 'success')).toBe(true);
     expect(tools.some((tool) => tool.name === 'finish')).toBe(false);
     expect(Object.values(state.toolExecutionsById).some((tool) => tool.name === 'finish' && tool.hidden)).toBe(true);
-    expect(finalCard).toMatchObject({ role: 'assistant', status: 'completed', completionType: 'finish' });
-    expect(finalCard.blocks).toHaveLength(1);
-    expect(finalCard.blocks[0]).toMatchObject({ kind: 'text', text: 'final answer', delivery: 'final' });
+    // [AutoC 2026-06-04] Why: outbound_message finalizes the current post-reply
+    // request rather than creating a new final card. How: assert the final text is
+    // appended to the work card that already owns reasoning and tool blocks. Purpose:
+    // finishing a continued task does not create a duplicate card after task end.
+    expect(workCard.blocks.at(-1)).toMatchObject({ kind: 'text', text: 'final answer', delivery: 'final' });
   });
 
   it('keeps rejected control tools visible during stream replay', () => {

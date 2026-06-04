@@ -114,9 +114,11 @@ export const ThinkingBlock = ({ block }: ThinkingBlockProps) => {
           {hasText ? block.text : '思考中...'}
         </pre>
       ) : isStreaming && hasText ? (
-        <pre className="mt-1.5 max-h-24 overflow-hidden whitespace-pre-wrap break-words text-[0.68rem] text-[var(--duties-tertiary)] leading-relaxed">
-          {getLastLines(block.text)}
-        </pre>
+        <div className="mt-1.5 flex max-h-24 flex-col-reverse overflow-hidden">
+          <pre className="whitespace-pre-wrap break-words text-[0.68rem] text-[var(--duties-tertiary)] leading-relaxed">
+            {getLastLines(block.text)}
+          </pre>
+        </div>
       ) : hasText ? (
         <div className="mt-1.5 truncate text-[0.68rem] text-[var(--duties-tertiary)]">{getPreview(block.text)}</div>
       ) : null}

@@ -128,21 +128,20 @@ describe('chatStore', () => {
 
     const state = useChatStore.getState();
     const messages = selectMessages(state, conversationId);
-    expect(messages.map((message) => message.role)).toEqual(['user', 'assistant', 'assistant']);
+    expect(messages.map((message) => message.role)).toEqual(['user', 'assistant']);
     expect(messages[0].blocks[0]).toMatchObject({ kind: 'text', text: 'run uname' });
-    // Why: outbound_message is rendered as a separate assistant card. How: the first
-    // assistant keeps the closed stream preview and the second assistant holds the final
-    // outbound text. Purpose: this store-level test follows reducer ownership exactly.
+    // [AutoC 2026-06-04] Why: outbound_message finalizes the same LLM request that
+    // produced the stream_delta. How: assert the single assistant card now contains
+    // the backend final text rather than a closed stream preview plus a second card.
+    // Purpose: the store-level realtime path follows the one-request-one-card rule.
     expect(messages[1].status).toBe('completed');
-    expect(messages[1].blocks[0]).toMatchObject({ kind: 'text', text: 'working', delivery: 'stream', streaming: false });
-    expect(messages[2].status).toBe('completed');
-    expect(messages[2].blocks[0]).toMatchObject({ kind: 'text', text: 'done', delivery: 'final', streaming: false });
+    expect(messages[1].blocks[0]).toMatchObject({ kind: 'text', text: 'done', delivery: 'final', streaming: false });
     expect(state.lastSeqBySession['sess-chat']).toBe(4);
     expect(state.isGenerating).toBe(false);
     // [2026-06-03] A terminal task event no longer closes realtime transport.
     // Why: the same /v1/ws connection must continue receiving all sessions. How:
-    // completion only clears generation and reloads authoritative history. Purpose:
-    // successful turns leave the global WebSocket open.
+    // completion only clears generation and preserves reducer-owned cards. Purpose:
+    // successful turns leave the global WebSocket open without rebuilding history.
     expect(state.connectionStatus).toBe('open');
     expect(state.eventLog.map((entry) => entry.type)).toEqual(['inbound_message', 'stream_delta', 'outbound_message', 'task_completed']);
   });

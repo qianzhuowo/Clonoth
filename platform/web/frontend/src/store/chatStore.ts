@@ -18,6 +18,7 @@ import {
   uploadAttachment,
   type ChildSessionInfo,
   type StructuredMessage,
+  type StructuredThinkingBlock,
 } from '../api/supervisorClient';
 import type { SupervisorEvent } from '../types/chat';
 import type {
@@ -113,6 +114,12 @@ type HistoryToolCall = {
   id?: string;
   name: string;
   arguments?: Record<string, unknown>;
+};
+
+type HistoryThinkingSegment = {
+  text: string;
+  startedAt?: string;
+  endedAt?: string;
 };
 
 // Why: ask is also a control tool that ends the assistant turn by requesting
@@ -1137,17 +1144,12 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
       maybeAutoApproveApprovalRequest(event, get);
 
       if (terminalConversationId && terminalSessionId) {
-        // [2026-06-03] Why: a finished task means this conversation just received the
-        // latest activity and should rise to the top of the sidebar. How: re-sort by
-        // updatedAt before hydrating history; the terminal event already bumped this
-        // row's updatedAt via upsertConversationMeta. Purpose: recency ordering refreshes
-        // exactly when a task ends, not on every streaming delta.
+        // [AutoC 2026-06-04] Why: each LLM request card is finalized in place when
+        // stream_end/outbound_message arrives, so task completion must not clear and
+        // rebuild the whole conversation from /history. How: keep only the sidebar
+        // recency sort on terminal events and leave the reducer-owned messages intact.
+        // Purpose: completing a task no longer causes visible card jumps.
         set((state) => ({ conversations: sortConversationsByRecency(state.conversations) }));
-        // [2026-06-03] Why: stream_delta and tool_call_delta are provisional UI
-        // products. How: when the backend emits a task terminal event, fetch the
-        // persisted structured history for the visible session and replace the live
-        // cards. Purpose: the final UI matches backend ConversationStore JSONL.
-        void loadSessionHistoryIntoStore(terminalConversationId, terminalSessionId, set, get);
       }
     },
     () => {
@@ -1240,6 +1242,41 @@ function normalizeHistoryToolCalls(value: StructuredMessage['tool_calls']): Hist
     name: toolCall.name || 'unknown',
     arguments: isRecord(toolCall.arguments) ? toolCall.arguments : undefined,
   }));
+}
+
+function normalizeHistoryThinkingSegments(message: StructuredMessage): HistoryThinkingSegment[] {
+  const normalizeBlock = (block: StructuredThinkingBlock): HistoryThinkingSegment | null => {
+    const text = typeof block.text === 'string' ? block.text : '';
+    if (!text.trim()) return null;
+    return {
+      text,
+      startedAt: typeof block.started_at === 'string' ? block.started_at : undefined,
+      endedAt: typeof block.ended_at === 'string' ? block.ended_at : undefined,
+    };
+  };
+
+  const structuredBlocks = Array.isArray(message.thinking_blocks)
+    ? message.thinking_blocks.map(normalizeBlock).filter((block): block is HistoryThinkingSegment => Boolean(block))
+    : [];
+  if (structuredBlocks.length > 0) return structuredBlocks;
+
+  if (isRecord(message.thinking)) {
+    const normalized = normalizeBlock(message.thinking as StructuredThinkingBlock);
+    return normalized ? [normalized] : [];
+  }
+
+  const text = typeof message.thinking === 'string' ? message.thinking : message.thinking_text || '';
+  if (!text.trim()) return [];
+
+  // [AutoC 2026-06-04] Why: older /history rows exposed reasoning as a flat string
+  // plus optional top-level timestamps. How: normalize that legacy shape into the
+  // same segment model used by thinking_blocks. Purpose: hydration has one path and
+  // can keep elapsed-time metadata whenever the backend provides it.
+  return [{
+    text,
+    startedAt: message.reasoning_started_at,
+    endedAt: message.reasoning_ended_at,
+  }];
 }
 
 function extractControlToolText(toolCalls: readonly HistoryToolCall[]): { text: string; toolName?: string } {
@@ -1484,7 +1521,7 @@ function hydrateStructuredHistory(
     existingMessageIds.add(messageId);
   };
 
-  let accumulatedThinking: string[] = [];
+  let accumulatedThinking: HistoryThinkingSegment[] = [];
   let accumulatedTools: ToolExecution[] = [];
   let accumulatedCreatedAt = '';
 
@@ -1507,9 +1544,10 @@ function hydrateStructuredHistory(
       resetAccumulatedAssistant();
       return;
     }
-    const thinkingText = [...accumulatedThinking, ...(sourceMessage.thinking ? [sourceMessage.thinking] : [])]
-      .filter((item) => item.trim())
-      .join('\n---\n');
+    const thinkingSegments = [
+      ...accumulatedThinking,
+      ...normalizeHistoryThinkingSegments(sourceMessage),
+    ].filter((item) => item.text.trim());
     const tools = [...accumulatedTools, ...currentTools].map((tool) => ({
       ...tool,
       // Why: a tool-only assistant history entry may be merged into a later visible
@@ -1520,13 +1558,18 @@ function hydrateStructuredHistory(
     }));
     const blocks: RenderBlock[] = [];
 
-    if (thinkingText) {
+    for (const [index, thinking] of thinkingSegments.entries()) {
+      // [AutoC 2026-06-04] Why: backend history can now return multiple structured
+      // reasoning blocks, each with its own timing. How: create one ThinkingBlock per
+      // segment instead of flattening everything into a string separated by markers.
+      // Purpose: refreshed history keeps the same elapsed-time display model as live
+      // streaming cards.
       blocks.push(createThinkingBlock(
-        `${messageId}|block:thinking:history`,
+        `${messageId}|block:thinking:history:${index}`,
         createdAt,
-        thinkingText,
-        sourceMessage.reasoning_started_at,
-        sourceMessage.reasoning_ended_at,
+        thinking.text,
+        thinking.startedAt,
+        thinking.endedAt,
       ));
     }
     if (tools.length > 0) {
@@ -1668,7 +1711,7 @@ function hydrateStructuredHistory(
     }
 
     if (!displayText && !hasControlTool) {
-      if (message.thinking) accumulatedThinking.push(message.thinking);
+      accumulatedThinking.push(...normalizeHistoryThinkingSegments(message));
       if (currentTools.length > 0) accumulatedTools.push(...currentTools);
       if (!accumulatedCreatedAt) accumulatedCreatedAt = message.created_at || '';
       continue;

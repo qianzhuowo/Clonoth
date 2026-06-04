@@ -222,19 +222,32 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
                     <p className="text-[0.55rem] uppercase tracking-[0.14em] text-[var(--duties-tertiary)]">worker</p>
                     <p className="truncate">{shortId(task.worker_id) || '无'}</p>
                   </div>
-                  <button
-                    aria-label={`取消任务 ${task.task_id}`}
-                    className={`rounded-sm border px-2 py-1 font-mono text-[0.6rem] transition-colors ${
-                      cancelling
-                        ? 'cursor-not-allowed border-gray-300 bg-gray-100 text-gray-500'
-                        : 'border-red-500/40 bg-red-500/10 text-red-700 hover:bg-red-500/20'
-                    }`}
-                    disabled={cancelling}
-                    onClick={() => { void handleCancel(task); }}
-                    type="button"
-                  >
-                    {cancelling ? '取消中...' : '取消'}
-                  </button>
+                  <div className="flex gap-1">
+                    <button
+                      aria-label={`查看任务 ${task.task_id} 的 session`}
+                      className="rounded-sm border border-blue-500/40 bg-blue-500/10 px-2 py-1 font-mono text-[0.6rem] text-blue-700 transition-colors hover:bg-blue-500/20"
+                      onClick={() => {
+                        useChatStore.getState().viewChildSession(task.session_id);
+                        onClose();
+                      }}
+                      type="button"
+                    >
+                      查看
+                    </button>
+                    <button
+                      aria-label={`取消任务 ${task.task_id}`}
+                      className={`rounded-sm border px-2 py-1 font-mono text-[0.6rem] transition-colors ${
+                        cancelling
+                          ? 'cursor-not-allowed border-gray-300 bg-gray-100 text-gray-500'
+                          : 'border-red-500/40 bg-red-500/10 text-red-700 hover:bg-red-500/20'
+                      }`}
+                      disabled={cancelling}
+                      onClick={() => { void handleCancel(task); }}
+                      type="button"
+                    >
+                      {cancelling ? '取消中...' : '取消'}
+                    </button>
+                  </div>
                 </li>
               );
             })}

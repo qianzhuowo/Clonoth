@@ -949,9 +949,23 @@ class SessionMixin:
             }
             # Extract thinking/reasoning from meta
             if isinstance(msg.meta, dict):
-                reasoning = msg.meta.get("reasoning", "")
+                reasoning = str(msg.meta.get("reasoning") or "")
                 if reasoning:
+                    # [AutoC 2026-06-04] Why: the web client now needs historical
+                    # reasoning in the same block shape as live stream reasoning.
+                    # How: keep the legacy flat thinking field for compatibility and
+                    # add thinking_blocks with text plus start/end timestamps, falling
+                    # back to created_at for older rows that predate timing capture.
+                    # Purpose: history hydration can render elapsed-time ThinkingBlock
+                    # headers instead of the no-time character-count fallback.
+                    _rs = msg.meta.get("reasoning_started_at") or msg.created_at
+                    _re = msg.meta.get("reasoning_ended_at") or _rs
                     entry["thinking"] = reasoning
+                    entry["thinking_blocks"] = [{
+                        "text": reasoning,
+                        "started_at": _rs,
+                        "ended_at": _re,
+                    }]
                 # [thinking-time 2026-06-01] Pass precise reasoning timing to frontend.
                 _rs = msg.meta.get("reasoning_started_at")
                 _re = msg.meta.get("reasoning_ended_at")

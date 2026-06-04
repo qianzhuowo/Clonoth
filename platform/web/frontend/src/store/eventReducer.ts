@@ -368,35 +368,41 @@ function applyOutboundMessage(state: ChatState, event: SupervisorEvent): ChatSta
 
   if (!text && attachments.length === 0) return state;
 
-  // Why: outbound_message is an independent visible assistant response, not a patch
-  // to the message that contains streams and tool calls. How: key it by event id so
-  // every outbound event gets its own card. Purpose: final replies no longer merge
-  // into the previous tool card or erase its intermediate stream content.
-  const outboundTurnKey = `outbound:${getEventId(event)}`;
-  let { state: nextState, message } = getOrCreateAssistantMessage(state, event, outboundTurnKey);
+  const targetMessage = findOutboundReplacementTarget(state, event);
+  let nextState = state;
+  let message: WsMessage;
 
-  if (text) {
-    message = appendOrMergeTextBlock(message, event, text, 'final', false);
+  if (targetMessage) {
+    const eventId = getEventId(event);
+    message = {
+      ...targetMessage,
+      updatedAt: event.ts,
+      source: mergeSource(targetMessage.source, buildMessageSource(state, event)),
+      eventIds: appendUnique(targetMessage.eventIds, eventId),
+    };
+  } else {
+    const created = getOrCreateAssistantMessage(state, event, getTurnKey(state, event));
+    nextState = created.state;
+    message = created.message;
   }
+
+  message = replaceAssistantTextWithOutbound(message, event, text);
 
   // Read action_type from backend payload (finish/reply/ask)
   const actionType = getString(payload.action_type) as WsMessage['completionType'] | '';
   message = {
-    ...setMessageStatus(message, 'completed', event),
+    ...setMessageStatus(finalizeStreamingBlocks(message, event), 'completed', event),
     attachments: attachments.length > 0 ? attachments : message.attachments,
+    roundComplete: true,
     ...(actionType && { completionType: actionType as WsMessage['completionType'] }),
   };
 
-  const originalTurnKey = getTurnKey(state, event);
-  const originalMessage = getAssistantMessageByTurn(nextState, originalTurnKey);
-  if (originalMessage && originalMessage.id !== message.id) {
-    // Why: the old assistant card may still contain streaming preview blocks when the
-    // final outbound card is created. How: close those blocks and mark the old card
-    // completed without deleting them. Purpose: intermediate work remains inspectable
-    // and no block is left in a perpetual streaming state.
-    nextState = upsertMessage(nextState, setMessageStatus(finalizeStreamingBlocks(originalMessage, event), 'completed', event));
-  }
-
+  // [AutoC 2026-06-04] Why: one LLM request owns exactly one streaming card, and
+  // outbound_message is the backend-authoritative text for that same request. How:
+  // resolve the existing assistant card by task/turn or by the latest matching
+  // inbound-source card, then replace its text blocks in place instead of using an
+  // outbound:event-id key. Purpose: final delivery no longer creates a duplicate card
+  // or causes a visible card jump after the stream finishes.
   nextState = upsertMessage(nextState, message);
   return nextState;
 }
@@ -1013,6 +1019,64 @@ function getOrCreateAssistantMessage(
 function getAssistantMessageByTurn(state: ChatState, turnKey: string): WsMessage | undefined {
   const messageId = state.assistantMessageByTurn[turnKey];
   return messageId ? state.messagesById[messageId] : undefined;
+}
+
+function findOutboundReplacementTarget(state: ChatState, event: SupervisorEvent): WsMessage | undefined {
+  const payload = getPayload(event);
+  const conversationId = getConversationId(state, event);
+  const directMessage = getAssistantMessageByTurn(state, getTurnKey(state, event));
+  const sourceInboundSeq = getSourceInboundSeq(payload);
+  const taskId = getString(payload.task_id);
+  const nodeId = getString(payload.node_id);
+  const order = state.messageOrderByConversation[conversationId] || [];
+
+  for (let index = order.length - 1; index >= 0; index -= 1) {
+    const message = state.messagesById[order[index]];
+    if (!message || message.role !== 'assistant') continue;
+
+    if (taskId && message.source.taskId !== taskId && message.source.childTaskId !== taskId) continue;
+    if (!taskId && sourceInboundSeq !== undefined && message.source.inboundSeq !== sourceInboundSeq) continue;
+    if (!taskId && sourceInboundSeq === undefined && directMessage && message.id !== directMessage.id) continue;
+    if (nodeId && message.source.nodeId && message.source.nodeId !== nodeId && message.source.childNodeId !== nodeId) continue;
+
+    // [AutoC 2026-06-04] Why: outbound_message can lack task_id after a task has
+    // moved through more than one LLM request. How: scan the existing conversation
+    // backwards and choose the newest assistant card that matches the source inbound
+    // sequence, task, and node metadata. Purpose: the final backend payload replaces
+    // the stream card for the current request instead of falling back to the first
+    // inbound turn card.
+    return message;
+  }
+
+  return directMessage;
+}
+
+function replaceAssistantTextWithOutbound(message: WsMessage, event: SupervisorEvent, text: string): WsMessage {
+  const retainedBlocks = message.blocks.filter((block) => block.kind !== 'text');
+  const blocks: RenderBlock[] = [...retainedBlocks];
+
+  if (text) {
+    blocks.push(createTextBlock({
+      id: `${message.id}|block:text:outbound:${getEventId(event)}`,
+      event,
+      text,
+      delivery: 'final',
+      streaming: false,
+    }));
+  }
+
+  // [AutoC 2026-06-04] Why: streamed text is provisional and may contain partial
+  // protocol output, while outbound_message contains the backend's final response
+  // text for the same LLM request. How: remove prior text blocks and append one final
+  // text block, while preserving thinking, tools, approvals, and notices on the same
+  // message id. Purpose: the visible card is replaced in place without losing work
+  // trace blocks that belong to the request.
+  return {
+    ...message,
+    blocks,
+    updatedAt: event.ts,
+    eventIds: appendUnique(message.eventIds, getEventId(event)),
+  };
 }
 
 function shouldBreakCardForNewRound(message: WsMessage): boolean {

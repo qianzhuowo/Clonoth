@@ -160,22 +160,18 @@ describe('eventReducer', () => {
     const state = replaySupervisorEvents(events, createInitialChatState());
     const messages = selectMessages(state, 'conv-2');
 
-    expect(messages).toHaveLength(3);
+    expect(messages).toHaveLength(2);
     const assistant = messages[1];
-    const outbound = messages[2];
     expect(assistant.status).toBe('completed');
-    expect(outbound.status).toBe('completed');
     expect(assistant.source).toMatchObject({ inboundSeq: 1, taskId: 'task-1', nodeId: 'ereuna_main', nodeName: 'EreunaMain' });
-    expect(outbound.source).toMatchObject({ inboundSeq: 1, taskId: 'task-1', nodeId: 'ereuna_main' });
-    // Why: outbound_message must now become its own assistant card instead of being
-    // merged into the work-in-progress tool message. How: the original message keeps
-    // finalized stream/tool blocks, while the outbound card contains only final text.
-    // Purpose: users can inspect intermediate work without mixing it into final output.
-    expect(assistant.blocks.map((block) => block.kind)).toEqual(['thinking', 'text', 'tool']);
+    // [AutoC 2026-06-04] Why: outbound_message is the final backend form of the
+    // same LLM request, not a second assistant turn. How: the reducer replaces the
+    // stream text on the existing card while preserving reasoning and tool blocks.
+    // Purpose: replay follows the one-request-one-card contract without duplicate
+    // final-output cards.
+    expect(assistant.blocks.map((block) => block.kind)).toEqual(['thinking', 'tool', 'text']);
     expect(assistant.blocks[0]).toMatchObject({ kind: 'thinking', text: 'thinking...', streaming: false });
-    expect(assistant.blocks[1]).toMatchObject({ kind: 'text', text: 'partial', delivery: 'stream', streaming: false });
-    expect(outbound.blocks).toHaveLength(1);
-    expect(outbound.blocks[0]).toMatchObject({ kind: 'text', text: 'done', delivery: 'final', streaming: false });
+    expect(assistant.blocks.at(-1)).toMatchObject({ kind: 'text', text: 'done', delivery: 'final', streaming: false });
 
     const toolBlock = assistant.blocks.find((block) => block.kind === 'tool');
     expect(toolBlock?.kind).toBe('tool');
@@ -190,10 +186,11 @@ describe('eventReducer', () => {
     expect(selectEventLog(state, 'sess-1', 20).map((entry) => entry.type)).toContain('handoff_progress');
   });
 
-  it('keeps streamed text on the original card and creates an outbound card', () => {
-    // Why: outbound_message is now a separate assistant card. How: replay only the
-    // minimal inbound, stream, and outbound sequence. Purpose: final output is not
-    // merged into the earlier streaming card, while the stream block is still closed.
+  it('replaces streamed text on the original card when outbound_message arrives', () => {
+    // [AutoC 2026-06-04] Why: outbound_message belongs to the LLM request that just
+    // streamed. How: replay only the minimal inbound, stream, and outbound sequence.
+    // Purpose: final output replaces the provisional stream block without creating a
+    // second assistant card.
     const state = replaySupervisorEvents([
       event(1, 'inbound_message', { conversation_key: 'web:conv-final', text: 'hello' }),
       event(2, 'stream_delta', { source_inbound_seq: 1, type: 'text', content: 'draft answer' }),
@@ -202,23 +199,19 @@ describe('eventReducer', () => {
     ], createInitialChatState());
 
     const messages = selectMessages(state, 'conv-final');
-    const originalAssistant = messages[1];
-    const outboundAssistant = messages[2];
-    const originalTextBlocks = originalAssistant.blocks.filter((block) => block.kind === 'text');
+    const assistant = messages[1];
+    const textBlocks = assistant.blocks.filter((block) => block.kind === 'text');
 
-    expect(messages).toHaveLength(3);
-    expect(originalAssistant.status).toBe('completed');
-    expect(originalTextBlocks).toHaveLength(1);
-    expect(originalTextBlocks[0]).toMatchObject({ kind: 'text', text: 'draft answer', delivery: 'stream', streaming: false });
-    expect(outboundAssistant.status).toBe('completed');
-    expect(outboundAssistant.blocks).toHaveLength(1);
-    expect(outboundAssistant.blocks[0]).toMatchObject({ kind: 'text', text: 'final answer', delivery: 'final', streaming: false });
+    expect(messages).toHaveLength(2);
+    expect(assistant.status).toBe('completed');
+    expect(textBlocks).toHaveLength(1);
+    expect(textBlocks[0]).toMatchObject({ kind: 'text', text: 'final answer', delivery: 'final', streaming: false });
   });
 
-  it('creates outbound_message separately from the previous tool-call message', () => {
-    // Why: a final reply used to merge into the same assistant message that held tool
-    // calls. How: replay a tool-only assistant card followed by outbound_message.
-    // Purpose: the reducer must preserve the tool card and create a separate final card.
+  it('replaces the previous tool-call message when outbound_message finalizes that request', () => {
+    // [AutoC 2026-06-04] Why: a tool-only streamed request still owns one card. How:
+    // replay a tool-only assistant card followed by outbound_message. Purpose: the
+    // reducer preserves the tool block and appends final text on the same card.
     const state = replaySupervisorEvents([
       event(1, 'inbound_message', { conversation_key: 'web:conv-outbound-tool', text: 'search' }),
       event(2, 'tool_call_start', {
@@ -242,12 +235,10 @@ describe('eventReducer', () => {
 
     const messages = selectMessages(state, 'conv-outbound-tool');
     const toolMessage = messages[1];
-    const outboundMessage = messages[2];
 
-    expect(messages).toHaveLength(3);
-    expect(toolMessage.blocks.map((block) => block.kind)).toEqual(['tool']);
-    expect(outboundMessage.blocks).toHaveLength(1);
-    expect(outboundMessage.blocks[0]).toMatchObject({ kind: 'text', text: 'final answer', delivery: 'final' });
+    expect(messages).toHaveLength(2);
+    expect(toolMessage.blocks.map((block) => block.kind)).toEqual(['tool', 'text']);
+    expect(toolMessage.blocks.at(-1)).toMatchObject({ kind: 'text', text: 'final answer', delivery: 'final' });
   });
 
   it('caps reducer event bookkeeping for long sessions', () => {

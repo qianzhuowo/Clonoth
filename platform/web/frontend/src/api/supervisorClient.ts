@@ -791,6 +791,12 @@ export async function getSessionMessages(sessionId: string, limit = 200): Promis
 
 // ── Structured history (ConversationStore) ──
 
+export interface StructuredThinkingBlock {
+  text: string;
+  started_at?: string;
+  ended_at?: string;
+}
+
 export interface StructuredMessage {
   id: string;
   role: string;
@@ -814,7 +820,13 @@ export interface StructuredMessage {
   summary?: string;
   dispatch_task_id?: string;
   dispatch_node_id?: string;
-  thinking?: string;
+  // [AutoC 2026-06-04] Why: historical reasoning needs the same timing metadata as
+  // live ThinkingBlock cards. How: accept the new backend thinking_blocks array while
+  // keeping flat string/object thinking for old rows. Purpose: refreshed history can
+  // render elapsed thinking time instead of falling back to character counts.
+  thinking?: string | StructuredThinkingBlock;
+  thinking_text?: string;
+  thinking_blocks?: StructuredThinkingBlock[];
   // Clonoth format: {id, name, arguments(object)}
   tool_calls?: Array<{ id?: string; name: string; arguments?: Record<string, unknown> }>;
   tool_call_id?: string;

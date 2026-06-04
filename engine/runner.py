@@ -955,7 +955,30 @@ async def _run_node_task(
     # 下 caller task 被 supervisor 重新唤醒，input.instruction 仍是原先的用户指令，
     # 此指令已在首次进入时写过 JSONL，这里不应再写一次。
     # 只在非 resume 场景追加 user_input 消息。
-    if (instruction or input_attachments) and _conv_store and not is_resume:
+    _inbound_message_type = str(input_data.get("inbound_message_type") or "").strip()
+    _inbound_summary = str(input_data.get("inbound_summary") or "").strip()
+    _inbound_child_session_id = str(input_data.get("inbound_child_session_id") or "").strip()
+    _inbound_child_task_id = str(
+        input_data.get("inbound_child_task_id")
+        or input_data.get("inbound_task_id")
+        or ""
+    ).strip()
+    _inbound_node_id = str(
+        input_data.get("inbound_child_node_id")
+        or input_data.get("inbound_node_id")
+        or ""
+    ).strip()
+    _inbound_caller_node_id = str(input_data.get("inbound_caller_node_id") or "").strip()
+    # [AutoC 2026-06-04] Why: dispatch_result.text can be empty when the child only
+    # returns a summary, but the callback still has semantic content. How: allow the
+    # shadow write when dispatch_result has inbound_summary. Purpose: ConversationStore
+    # keeps a structured callback row even without raw result text.
+    _should_write_user_input = bool(
+        instruction
+        or input_attachments
+        or (_inbound_message_type == "dispatch_result" and _inbound_summary)
+    )
+    if _should_write_user_input and _conv_store and not is_resume:
         from datetime import datetime, timezone
         _target_sid = child_session_id or session_id
         # [AutoC 2026-06-01] Why: persisting only plain instruction text lost
@@ -968,23 +991,22 @@ async def _run_node_task(
             _user_content = build_multimodal_content(instruction, input_attachments, workspace_root=ws_root)
         else:
             _user_content = instruction
-        # [AutoC 2026-06-03] Why: supervisor-injected callback inbounds carry
-        # message_type and child-session metadata that would be lost if every user row
-        # were persisted as plain user_input. How: read the task_store inbound_* copy
-        # and write selected values to ConversationStore message_type/meta. Purpose:
-        # refreshed web history renders dispatch callbacks with the same role and jump
-        # target as realtime WebSocket delivery.
-        _inbound_message_type = str(input_data.get("inbound_message_type") or "").strip()
+        # [AutoC 2026-06-04] Why: supervisor-injected dispatch callbacks now carry
+        # child_* metadata and summary separately from raw text. How: persist only the
+        # selected structured fields in Message.meta while leaving content as the raw
+        # child result. Purpose: refreshed history can render callbacks without storing
+        # the LLM-only English prefix or any backend-localized prose.
         _inbound_meta: dict[str, Any] = {}
-        _inbound_child_session_id = str(input_data.get("inbound_child_session_id") or "").strip()
+        if _inbound_summary:
+            _inbound_meta["summary"] = _inbound_summary
         if _inbound_child_session_id:
             _inbound_meta["child_session_id"] = _inbound_child_session_id
-        _inbound_task_id = str(input_data.get("inbound_task_id") or "").strip()
-        if _inbound_task_id:
-            _inbound_meta["dispatch_task_id"] = _inbound_task_id
-        _inbound_node_id = str(input_data.get("inbound_node_id") or "").strip()
+        if _inbound_child_task_id:
+            _inbound_meta["child_task_id"] = _inbound_child_task_id
         if _inbound_node_id:
-            _inbound_meta["dispatch_node_id"] = _inbound_node_id
+            _inbound_meta["child_node_id"] = _inbound_node_id
+        if _inbound_caller_node_id:
+            _inbound_meta["caller_node_id"] = _inbound_caller_node_id
         _user_msg = Message(
             id=str(uuid.uuid4()),
             role="user",
@@ -996,6 +1018,18 @@ async def _run_node_task(
             source_task_id=task_id,
         )
         _conv_store.append(_target_sid, _user_msg)
+
+    if _inbound_message_type == "dispatch_result":
+        # [AutoC 2026-06-04] Why: the model still needs context that this inbound came
+        # from an async child task, but that presentation must not be persisted in
+        # ConversationStore. How: prepend an English, LLM-only wrapper after the raw
+        # callback row has been stored. Purpose: storage remains pure while the caller
+        # node receives an actionable instruction.
+        _prefix_parts = [f"[Async task completed] Node {_inbound_node_id or 'unknown'} finished."]
+        if _inbound_summary:
+            _prefix_parts.append(f"Summary: {_inbound_summary}")
+        _prefix_parts.append(f"Result:\n{instruction}")
+        instruction = "\n".join(_prefix_parts)
 
     # Phase 0/1: Signal System — 初始化信号总线并安装 JSONL 桥接。
     # get_bus() 返回全局单例，install_event_bridge 是幂等的（多次调用只注册一次）。

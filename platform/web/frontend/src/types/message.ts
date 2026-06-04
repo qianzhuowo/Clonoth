@@ -132,10 +132,14 @@ export interface MessageSource {
   nodeName?: string;
   branchSessionId?: string;
   parentSessionId?: string;
-  // [AutoC 2026-06-03] Why: dispatch-result cards need to open the child chat that
-  // produced the callback. How: store the backend-provided child session id on the
-  // normalized message source. Purpose: MessageCard can render a structured jump
-  // button without parsing localized callback text.
+  // [AutoC 2026-06-04] Why: dispatch-result cards now receive pure structured
+  // callback metadata instead of backend-localized text. How: store caller id, child
+  // node/task ids, summary, and child session id on the normalized source. Purpose:
+  // MessageCard can build the Chinese title and jump action without parsing content.
+  callerNodeId?: string;
+  childNodeId?: string;
+  childTaskId?: string;
+  summary?: string;
   childSessionId?: string;
 }
 

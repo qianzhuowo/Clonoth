@@ -13,14 +13,10 @@ interface MessageCardProps {
   toolsById: Record<string, ToolExecution>;
 }
 
-const ROLE_LABELS: Record<MessageRole, string> = {
+const ROLE_LABELS: Record<Exclude<MessageRole, 'dispatch_callback'>, string> = {
   user: '你',
   assistant: '助手',
   system: '系统',
-  // [AutoC 2026-06-03] Why: child-task callbacks should not inherit the orange
-  // generic system label. How: give the dedicated role its own visible label.
-  // Purpose: users can distinguish a child-node result from ordinary system notices.
-  dispatch_callback: '子节点回调',
 };
 
 const ROLE_STYLES: Record<MessageRole, { row: string; label: string }> = {
@@ -57,6 +53,26 @@ const STATUS_LABELS: Record<MessageStatus, string> = {
 
 function isActiveStatus(status: MessageStatus): boolean {
   return status === 'streaming' || status === 'running_tools';
+}
+
+function getDispatchCallbackTitle(message: WsMessage): string {
+  // [AutoC 2026-06-04] Why: dispatch_result payload text is now raw child output and
+  // no longer includes a localized title. How: derive the Chinese title from
+  // MessageSource caller/child fields, with the old fixed label only when all
+  // structured fields are absent. Purpose: old history remains readable while new
+  // cards never parse result text for presentation.
+  const source = message.source || {};
+  const nodeId = (source.childNodeId || source.nodeId || '').trim();
+  const callerNodeId = (source.callerNodeId || '').trim();
+  const hasStructuredSource = Boolean(nodeId || callerNodeId || source.summary || source.childSessionId || source.childTaskId);
+  if (!hasStructuredSource) return '子节点回调';
+  const displayNodeId = nodeId || '未知';
+  return callerNodeId ? `${callerNodeId} 委派的 ${displayNodeId} 已完成` : `子节点 ${displayNodeId} 已完成`;
+}
+
+function getRoleLabel(message: WsMessage): string {
+  if (message.role === 'dispatch_callback') return getDispatchCallbackTitle(message);
+  return ROLE_LABELS[message.role];
 }
 
 function getBlocksContainerClassName(message: WsMessage): string {
@@ -111,13 +127,17 @@ export const MessageCard = ({ message, toolsById }: MessageCardProps) => {
   // messages without an action. Purpose: navigation stays structured and does not
   // parse the callback text.
   const childSessionId = message.role === 'dispatch_callback' ? message.source.childSessionId?.trim() || '' : '';
+  // [AutoC 2026-06-04] Why: child result summaries moved out of backend text into
+  // structured source metadata. How: render source.summary directly below the dynamic
+  // dispatch title. Purpose: users see the summary without duplicating it in payload.text.
+  const dispatchSummary = message.role === 'dispatch_callback' ? message.source.summary?.trim() || '' : '';
 
   return (
     <article className={`border-b border-[var(--duties-border)] px-3 py-3 sm:px-4 ${roleStyle.row}`}>
       <div className="mx-auto max-w-3xl">
         <header className="mb-1.5 flex flex-wrap items-center gap-2">
           <span className={`font-mono text-[0.6rem] font-semibold uppercase tracking-[0.18em] ${roleStyle.label}`}>
-            {ROLE_LABELS[message.role]}
+            {getRoleLabel(message)}
           </span>
           <time className="font-mono text-[0.55rem] text-[var(--duties-tertiary)]" dateTime={message.createdAt}>
             {formatTime(message.createdAt)}
@@ -132,6 +152,12 @@ export const MessageCard = ({ message, toolsById }: MessageCardProps) => {
           )}
           {active && <span aria-label="消息正在活动" className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-blue-500" />}
         </header>
+
+        {dispatchSummary && (
+          <div className="mb-2 text-xs text-purple-700">
+            {dispatchSummary}
+          </div>
+        )}
 
         <div className={blocksContainerClassName}>
           {message.blocks

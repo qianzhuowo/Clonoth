@@ -412,12 +412,11 @@ describe('chatStore', () => {
   });
 
   it('hydrates dispatch result inbound history as a dispatch callback card instead of a user message', async () => {
-    // [2026-06-03] Why: supervisor now marks child-task callbacks with the
-    // structured dispatch_result message_type, so the frontend must not depend on
-    // localized notification text. How: hydrate a dispatch_result row whose id has no
-    // special prefix and includes child_session_id. Purpose: refresh renders
-    // backend-marked callbacks with the dedicated role and child-session target
-    // without carrying the old Chinese-prefix heuristic forward.
+    // [AutoC 2026-06-04] Why: refreshed dispatch history must use the same pure
+    // structured contract as realtime events. How: hydrate a dispatch_result row with
+    // raw content plus child_task_id, child_node_id, caller_node_id, summary, and
+    // child_session_id. Purpose: the web client builds its own Chinese presentation
+    // without carrying backend-localized text in ConversationStore.
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.includes('/v1/sessions?channel=web')) {
@@ -425,7 +424,18 @@ describe('chatStore', () => {
       }
       if (url.includes('/v1/sessions/sess-dispatch/history')) {
         return jsonResponse([
-          { id: 'u-dispatch', role: 'user', content: '[异步子任务完成] smith 委派的 scout 已完成。\n摘要：done', message_type: 'dispatch_result', child_session_id: 'child-scout', created_at: '2026-06-03T12:00:10.000Z' },
+          {
+            id: 'u-dispatch',
+            role: 'user',
+            content: 'raw child result',
+            message_type: 'dispatch_result',
+            child_session_id: 'child-scout',
+            child_task_id: 'task-child',
+            child_node_id: 'scout',
+            caller_node_id: 'smith',
+            summary: 'done',
+            created_at: '2026-06-03T12:00:10.000Z',
+          },
         ]);
       }
       return jsonResponse([]);
@@ -436,8 +446,14 @@ describe('chatStore', () => {
     await waitFor(() => expect(selectMessages(useChatStore.getState(), 'conv-dispatch')).toHaveLength(1));
     const [message] = selectMessages(useChatStore.getState(), 'conv-dispatch');
     expect(message.role).toBe('dispatch_callback');
-    expect(message.source.childSessionId).toBe('child-scout');
-    expect(message.blocks[0]).toMatchObject({ kind: 'text', text: expect.stringContaining('[异步子任务完成]') });
+    expect(message.source).toMatchObject({
+      childSessionId: 'child-scout',
+      childTaskId: 'task-child',
+      childNodeId: 'scout',
+      callerNodeId: 'smith',
+      summary: 'done',
+    });
+    expect(message.blocks[0]).toMatchObject({ kind: 'text', text: 'raw child result' });
   });
 
   it('does not classify localized dispatch-looking text as a dispatch result', async () => {

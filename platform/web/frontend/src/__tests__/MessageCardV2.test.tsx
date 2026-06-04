@@ -164,11 +164,11 @@ describe('MessageCard v2', () => {
     expect(screen.getByText('user text').closest('.markdown-body')).not.toHaveClass('border-l-2');
   });
 
-  it('renders dispatch callback label and opens the structured child session target', () => {
-    // [AutoC 2026-06-03] Why: dispatch callbacks need a direct way to inspect the
-    // child-node transcript. How: render a dispatch_callback message with
-    // source.childSessionId and click the visible action. Purpose: MessageCard uses
-    // structured metadata instead of parsing the callback body.
+  it('renders dispatch callback title, summary, and opens the structured child session target', () => {
+    // [AutoC 2026-06-04] Why: dispatch callbacks no longer receive localized backend
+    // notification text. How: render a dispatch_callback message whose title inputs
+    // live in source.callerNodeId, source.childNodeId, and source.summary. Purpose:
+    // MessageCard proves it builds the Chinese presentation from structured metadata.
     const viewSpy = vi.spyOn(useChatStore.getState(), 'viewChildSession').mockImplementation(() => undefined);
 
     render(
@@ -176,11 +176,17 @@ describe('MessageCard v2', () => {
         message={baseMessage({
           role: 'dispatch_callback',
           status: 'completed',
-          source: { childSessionId: 'child-scout' },
+          source: {
+            childSessionId: 'child-scout',
+            callerNodeId: 'parent',
+            childNodeId: 'scout',
+            nodeId: 'scout',
+            summary: 'done summary',
+          },
           blocks: [{
             id: 'block-dispatch-callback',
             kind: 'text',
-            text: '[异步子任务完成] parent 委派的 scout 已完成。\n结果：done',
+            text: 'done',
             delivery: 'final',
             streaming: false,
             createdAt: now,
@@ -192,8 +198,9 @@ describe('MessageCard v2', () => {
       />,
     );
 
-    expect(screen.getByText('子节点回调')).toBeInTheDocument();
-    expect(screen.getByText(/结果：done/)).toBeInTheDocument();
+    expect(screen.getByText('parent 委派的 scout 已完成')).toBeInTheDocument();
+    expect(screen.getByText('done summary')).toBeInTheDocument();
+    expect(screen.getByText('done')).toBeInTheDocument();
     fireEvent.click(screen.getByRole('button', { name: /查看子节点详情/ }));
     expect(viewSpy).toHaveBeenCalledWith('child-scout');
   });

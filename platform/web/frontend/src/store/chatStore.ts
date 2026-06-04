@@ -1508,8 +1508,16 @@ function hydrateStructuredHistory(
         createdAt,
         updatedAt: createdAt,
         source: {
-          nodeId: message.dispatch_node_id || message.source_node_id || undefined,
-          taskId: message.dispatch_task_id || message.source_task_id || undefined,
+          // [AutoC 2026-06-04] Why: history rows now expose child_* callback metadata
+          // in addition to legacy dispatch_* fields. How: prefer child_node_id and
+          // child_task_id, then fall back to old names and generic source ids. Purpose:
+          // refreshed dispatch cards use the same structured source as live events.
+          nodeId: message.child_node_id || message.dispatch_node_id || message.source_node_id || undefined,
+          childNodeId: message.child_node_id || message.dispatch_node_id || undefined,
+          taskId: message.child_task_id || message.dispatch_task_id || message.source_task_id || undefined,
+          childTaskId: message.child_task_id || message.dispatch_task_id || undefined,
+          callerNodeId: message.caller_node_id || undefined,
+          summary: message.summary || undefined,
           // [AutoC 2026-06-03] Why: the dispatch callback button needs a stable
           // child-session target after refresh. How: read child_session_id from the
           // structured history row emitted by the backend. Purpose: the renderer does

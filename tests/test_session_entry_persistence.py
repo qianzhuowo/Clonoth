@@ -117,6 +117,41 @@ def test_recorded_entry_node_is_used_after_restart(tmp_path: Path) -> None:
     assert restarted.get_session_active_node(session_id)["node_id"] == "recorded.entry"
 
 
+def test_dispatch_result_summary_only_inbound_preserves_structured_metadata(tmp_path: Path) -> None:
+    """Dispatch-result inbounds should route even when raw child text is empty."""
+    _write_runtime_config(tmp_path, entry_node_id="caller.entry")
+    state = _make_state(tmp_path)
+    session_id = state.get_or_create_session(channel="web", conversation_key="web:dispatch")
+
+    with state._lock:
+        task = state._create_entry_task_for_inbound_locked(
+            inbound_seq=3,
+            session_id=session_id,
+            payload={
+                "text": "",
+                "summary": "child summary",
+                "message_type": "dispatch_result",
+                "caller_node_id": "caller.node",
+                "child_node_id": "child.node",
+                "child_task_id": "child-task-id",
+                "child_session_id": "child-session-id",
+            },
+        )
+
+    # [AutoC 2026-06-04] Why: after removing backend notification text, a child may
+    # return only summary and no raw text. How: assert task creation still happens and
+    # the inbound_* fields survive into runner input. Purpose: runner can build the
+    # LLM-only English prefix while ConversationStore keeps raw text empty.
+    assert task is not None
+    assert task.input["instruction"] == ""
+    assert task.input["inbound_message_type"] == "dispatch_result"
+    assert task.input["inbound_summary"] == "child summary"
+    assert task.input["inbound_caller_node_id"] == "caller.node"
+    assert task.input["inbound_child_node_id"] == "child.node"
+    assert task.input["inbound_child_task_id"] == "child-task-id"
+    assert task.input["inbound_child_session_id"] == "child-session-id"
+
+
 def test_first_inbound_records_entry_node_when_session_has_none(tmp_path: Path) -> None:
     """The first routed inbound should backfill entry_node_id into sessions.json."""
     _write_runtime_config(tmp_path, entry_node_id="global.default")

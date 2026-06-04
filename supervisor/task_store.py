@@ -215,7 +215,16 @@ class TaskStoreMixin:
     def _create_entry_task_for_inbound_locked(self, *, inbound_seq: int, session_id: str, payload: dict[str, Any]) -> Task | None:
         text = str(payload.get("text") or "").strip()
         has_attachments = isinstance(payload.get("attachments"), list) and bool(payload.get("attachments"))
-        if not text and not has_attachments:
+        # [AutoC 2026-06-04] Why: dispatch_result.text is now the raw child result and
+        # can legitimately be empty when a child only returns summary. How: treat a
+        # dispatch_result summary as sufficient inbound content for task creation.
+        # Purpose: runner can still deliver the summary to the LLM through the new
+        # LLM-only English prefix while ConversationStore keeps text empty.
+        has_dispatch_summary = (
+            str(payload.get("message_type") or "").strip() == "dispatch_result"
+            and bool(str(payload.get("summary") or "").strip())
+        )
+        if not text and not has_attachments and not has_dispatch_summary:
             return None
         # 优先级: session 覆盖（AI switch） > 前端指定 > session 记录的 > 全局默认
         default_node = self._default_entry_node()
@@ -305,15 +314,32 @@ class TaskStoreMixin:
         _inbound_message_type = str(payload.get("message_type") or "").strip()
         if _inbound_message_type:
             inbound_metadata["inbound_message_type"] = _inbound_message_type
+        _inbound_summary = str(payload.get("summary") or "").strip()
+        if _inbound_summary:
+            # [AutoC 2026-06-04] Why: dispatch result summaries now live beside raw
+            # text instead of inside backend presentation prose. How: copy summary into
+            # runner input under an inbound_* key. Purpose: runner can build the LLM-only
+            # English prefix without changing the ConversationStore content field.
+            inbound_metadata["inbound_summary"] = _inbound_summary
         _inbound_child_session_id = str(payload.get("child_session_id") or "").strip()
         if _inbound_child_session_id:
             inbound_metadata["inbound_child_session_id"] = _inbound_child_session_id
-        _inbound_task_id = str(payload.get("task_id") or "").strip()
-        if _inbound_task_id:
-            inbound_metadata["inbound_task_id"] = _inbound_task_id
-        _inbound_node_id = str(payload.get("node_id") or "").strip()
-        if _inbound_node_id:
-            inbound_metadata["inbound_node_id"] = _inbound_node_id
+        _inbound_child_task_id = str(payload.get("child_task_id") or payload.get("task_id") or "").strip()
+        if _inbound_child_task_id:
+            # [AutoC 2026-06-04] Why: callback task ids now describe the completed
+            # child task, not the newly-created inbound handling task. How: prefer the
+            # explicit child_task_id while accepting legacy task_id during replay.
+            # Purpose: runner and frontend metadata use the unambiguous child_* name.
+            inbound_metadata["inbound_child_task_id"] = _inbound_child_task_id
+        _inbound_child_node_id = str(payload.get("child_node_id") or payload.get("node_id") or "").strip()
+        if _inbound_child_node_id:
+            # [AutoC 2026-06-04] Why: callback node ids point at the finished child
+            # node. How: map child_node_id, with legacy node_id fallback, to runner
+            # input. Purpose: the LLM prefix and persisted meta use the same child id.
+            inbound_metadata["inbound_child_node_id"] = _inbound_child_node_id
+        _inbound_caller_node_id = str(payload.get("caller_node_id") or "").strip()
+        if _inbound_caller_node_id:
+            inbound_metadata["inbound_caller_node_id"] = _inbound_caller_node_id
         # [2026-05-29 方案C第一步] 为什么：dispatch 子任务的父频道不能再靠
         # agent: 字符串反解析。怎么改：在入口 task input 生成前准备结构化
         # dispatch 元数据，并把 parent_conversation_key 同步到 task_context。

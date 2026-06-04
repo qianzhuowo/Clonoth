@@ -202,14 +202,20 @@ function applyInboundMessage(state: ChatState, event: SupervisorEvent): ChatStat
     delivery: 'final',
     streaming: false,
   });
+  const childTaskId = getString(payload.child_task_id) || getString(payload.task_id);
+  const childNodeId = getString(payload.child_node_id) || getString(payload.node_id);
   const source: MessageSource = {
     inboundSeq,
-    // [AutoC 2026-06-03] Why: dispatch-result cards need structured metadata for
-    // navigation and audit, while ordinary inbound messages should remain unchanged.
-    // How: copy optional backend fields into MessageSource only when present.
-    // Purpose: the renderer can open the child session without parsing message text.
-    taskId: getString(payload.task_id) || undefined,
-    nodeId: getString(payload.node_id) || undefined,
+    // [AutoC 2026-06-04] Why: dispatch-result inbound payloads now use explicit
+    // child_* metadata plus caller_node_id and summary. How: prefer the new fields and
+    // keep legacy task_id/node_id fallbacks for older event logs. Purpose: realtime
+    // callback cards render from structured data without parsing localized text.
+    taskId: childTaskId || undefined,
+    childTaskId: childTaskId || undefined,
+    nodeId: childNodeId || undefined,
+    childNodeId: childNodeId || undefined,
+    callerNodeId: getString(payload.caller_node_id) || undefined,
+    summary: getString(payload.summary) || undefined,
     nodeName: getString(payload.node_name) || undefined,
     branchSessionId: getString(payload.branch_session_id) || undefined,
     parentSessionId: getString(payload.parent_session_id) || undefined,
@@ -1259,19 +1265,34 @@ function buildMessageSource(state: ChatState, event: SupervisorEvent): MessageSo
   const payload = getPayload(event);
   const taskId = getString(payload.task_id);
   const input = getRecord(payload.input);
+  const childTaskId = getString(payload.child_task_id)
+    || taskId
+    || (input ? getString(input.child_task_id) || getString(input.inbound_child_task_id) : '');
+  const childNodeId = getString(payload.child_node_id)
+    || getString(payload.node_id)
+    || (input ? getString(input.child_node_id) || getString(input.inbound_child_node_id) : '');
   const nodeInfo = taskId ? state.nodeByTaskId[taskId] : undefined;
   const inboundSeq = getSourceInboundSeq(payload);
 
   return {
     inboundSeq,
-    taskId: taskId || undefined,
-    nodeId: getString(payload.node_id) || nodeInfo?.nodeId,
+    taskId: childTaskId || undefined,
+    childTaskId: childTaskId || undefined,
+    nodeId: childNodeId || nodeInfo?.nodeId,
+    childNodeId: childNodeId || undefined,
+    callerNodeId: getString(payload.caller_node_id)
+      || (input ? getString(input.caller_node_id) || getString(input.inbound_caller_node_id) : '')
+      || undefined,
+    summary: getString(payload.summary)
+      || (input ? getString(input.summary) || getString(input.inbound_summary) : '')
+      || undefined,
     nodeName: getString(payload.node_name) || nodeInfo?.nodeName,
     branchSessionId: getString(payload.branch_session_id) || (input ? getString(input.branch_session_id) : ''),
     parentSessionId: getString(payload.parent_session_id) || (input ? getString(input.parent_session_id) : ''),
-    // [AutoC 2026-06-03] Why: downstream task events can also carry child session
-    // metadata. How: preserve it in the shared source builder. Purpose: any card
-    // anchored to those events can keep the same structured navigation target.
+    // [AutoC 2026-06-04] Why: downstream task events can also carry callback metadata.
+    // How: preserve child-session and child/caller fields in the shared source builder.
+    // Purpose: any card anchored to those events keeps the same structured navigation
+    // and title data as inbound dispatch_result events.
     childSessionId: getString(payload.child_session_id) || (input ? getString(input.child_session_id) : ''),
   };
 }
@@ -1295,13 +1316,17 @@ function mergeSource(current: MessageSource, patch: MessageSource): MessageSourc
   return {
     inboundSeq: patch.inboundSeq !== undefined ? patch.inboundSeq : current.inboundSeq,
     taskId: patch.taskId || current.taskId,
+    childTaskId: patch.childTaskId || current.childTaskId,
     nodeId: patch.nodeId || current.nodeId,
+    childNodeId: patch.childNodeId || current.childNodeId,
+    callerNodeId: patch.callerNodeId || current.callerNodeId,
+    summary: patch.summary || current.summary,
     nodeName: patch.nodeName || current.nodeName,
     branchSessionId: patch.branchSessionId || current.branchSessionId,
     parentSessionId: patch.parentSessionId || current.parentSessionId,
-    // [AutoC 2026-06-03] Why: message sources are merged across related events.
-    // How: carry forward an existing child session id unless a newer patch supplies
-    // one. Purpose: dispatch callback navigation survives later message updates.
+    // [AutoC 2026-06-04] Why: message sources are merged across related events.
+    // How: carry forward existing child/caller metadata unless a newer patch supplies
+    // it. Purpose: dispatch callback navigation and titles survive later updates.
     childSessionId: patch.childSessionId || current.childSessionId,
   };
 }

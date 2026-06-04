@@ -758,6 +758,14 @@ export interface StructuredMessage {
   // a child-session jump button after page refresh without parsing callback text.
   source_task_id?: string;
   child_session_id?: string;
+  // [AutoC 2026-06-04] Why: dispatch_result history now uses explicit child/caller
+  // metadata and summary. How: expose the new fields while keeping legacy dispatch_*
+  // fields typed for old rows. Purpose: TypeScript callers can render refreshed
+  // callback cards from structure instead of localized content text.
+  child_task_id?: string;
+  child_node_id?: string;
+  caller_node_id?: string;
+  summary?: string;
   dispatch_task_id?: string;
   dispatch_node_id?: string;
   thinking?: string;

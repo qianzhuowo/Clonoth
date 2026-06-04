@@ -769,6 +769,11 @@ class TaskRouterMixin:
 
         此方法在 self._lock 内调用，不可调用会再次获取 _lock 的公开方法。
         """
+        # [AutoC 2026-06-04] Why: dispatch result payloads must be language-neutral
+        # and should not store presentation text. How: keep the child finish text and
+        # summary as raw fields, then emit caller/child ids as structured metadata.
+        # Purpose: the LLM and each client can render their own localized wrapper
+        # without parsing or persisting backend-generated Chinese prose.
         result_text = str(fallback_result.get("text") or "").strip()
         result_summary = str(fallback_result.get("summary") or "").strip()
         caller_node = str(task.input.get("_caller_node_id") or "").strip()
@@ -777,15 +782,6 @@ class TaskRouterMixin:
         # completed dispatch task from task.input. Purpose: clients do not need to
         # infer the child transcript from localized notification text.
         child_session_id = str(task.input.get("child_session_id") or "").strip()
-
-        notify_parts: list[str] = [f"[异步子任务完成] 节点 {task.node_id} 已完成。"]
-        if caller_node:
-            notify_parts[0] = f"[异步子任务完成] {caller_node} 委派的 {task.node_id} 已完成。"
-        if result_summary:
-            notify_parts.append(f"摘要：{result_summary}")
-        if result_text:
-            notify_parts.append(f"结果：\n{result_text}")
-        notify_text = "\n".join(notify_parts)
 
         result_atts = (
             fallback_result.get("attachments")
@@ -825,25 +821,22 @@ class TaskRouterMixin:
             "channel": channel,
             "conversation_key": conv_key,
             "message_id": msg_id,
-            "text": notify_text,
-            # [AutoC 2026-06-03] Why: dispatch callbacks need structured metadata
-            # for frontend rendering and child-session navigation. How: include the
-            # completed child task id and node id in the inbound payload. Purpose:
-            # realtime clients can style and audit the callback without text parsing.
-            "task_id": task.task_id,
-            "node_id": task.node_id,
-            # [AutoC 2026-06-03] Why: web history must not identify dispatch
-            # callbacks by localized notification text. How: mark supervisor-injected
-            # callback inbounds with a structured message_type. Purpose: frontend and
-            # future clients can render dispatch results from backend-owned metadata.
+            # [AutoC 2026-06-04] Why: payload.text must be the child node's raw finish
+            # result, not a localized notification wrapper. How: place summary and ids
+            # in sibling structured fields. Purpose: ConversationStore preserves the
+            # actual child output while renderers build their own presentation layer.
+            "text": result_text,
+            "summary": result_summary,
+            # [AutoC 2026-06-04] Why: dispatch callbacks need a stable structured
+            # contract after removing localized wrapper assembly. How: emit caller, child node, child
+            # task, and child session identifiers under explicit child_* names. Purpose:
+            # clients and LLM prompts no longer infer metadata from natural language.
             "message_type": "dispatch_result",
+            "caller_node_id": caller_node,
+            "child_node_id": task.node_id,
+            "child_task_id": task.task_id,
+            "child_session_id": child_session_id,
         }
-        if child_session_id:
-            # [AutoC 2026-06-03] Why: the child-session id is optional for old or
-            # compact callbacks, but when present it is the canonical jump target.
-            # How: attach it as a structured inbound field. Purpose: frontend buttons
-            # can open the exact child transcript without scanning childNodes by name.
-            payload["child_session_id"] = child_session_id
         if result_atts:
             payload["attachments"] = result_atts
 
@@ -912,17 +905,12 @@ class TaskRouterMixin:
         if target_session_id in self._cancelled_sessions:
             return
 
-        # 组装结果文本
+        # [AutoC 2026-06-04] Why: dispatch_origin callbacks share the new
+        # language-neutral dispatch_result contract. How: keep raw child result text
+        # and summary separate from caller/child ids. Purpose: this path cannot persist
+        # backend-localized notification text while the legacy path has been cleaned.
         result_text = str(fallback_result.get("text") or "").strip()
         result_summary = str(fallback_result.get("summary") or "").strip()
-        notify_parts: list[str] = [f"[异步子任务完成] 节点 {task.node_id} 已完成。"]
-        if caller_node:
-            notify_parts[0] = f"[异步子任务完成] {caller_node} 委派的 {task.node_id} 已完成。"
-        if result_summary:
-            notify_parts.append(f"摘要：{result_summary}")
-        if result_text:
-            notify_parts.append(f"结果：\n{result_text}")
-        notify_text = "\n".join(notify_parts)
 
         result_atts = (
             fallback_result.get("attachments")
@@ -939,25 +927,21 @@ class TaskRouterMixin:
             "channel": channel,
             "conversation_key": conv_key,
             "message_id": msg_id,
-            "text": notify_text,
-            # [AutoC 2026-06-03] Why: dispatch_origin callbacks need the same
-            # structured metadata as legacy async callbacks. How: include the
-            # completed child task id and node id in the inbound payload. Purpose:
-            # realtime clients can render callback cards and audit their source.
-            "task_id": task.task_id,
-            "node_id": task.node_id,
-            # [AutoC 2026-06-03] Why: dispatch_origin callbacks are the same
-            # backend-injected result class as legacy async dispatch callbacks. How:
-            # emit the shared dispatch_result message_type on the inbound payload.
-            # Purpose: clients use one structured contract instead of id or text hacks.
+            # [AutoC 2026-06-04] Why: payload.text must remain the raw child result in
+            # the dispatch_origin path too. How: move summary and routing information
+            # into structured fields. Purpose: frontend cards and LLM prompts can render
+            # localized context without storing it in backend payload text.
+            "text": result_text,
+            "summary": result_summary,
+            # [AutoC 2026-06-04] Why: task_id/node_id were ambiguous after callbacks
+            # became user-visible messages. How: emit explicit child_* metadata plus the
+            # caller id. Purpose: clients know these ids describe the completed child.
             "message_type": "dispatch_result",
+            "caller_node_id": caller_node,
+            "child_node_id": task.node_id,
+            "child_task_id": task.task_id,
+            "child_session_id": child_session_id,
         }
-        if child_session_id:
-            # [AutoC 2026-06-03] Why: child-session navigation must work for the
-            # dispatch_origin path as well. How: attach the structured session id
-            # whenever the finished child task has one. Purpose: the frontend avoids
-            # fallback parsing or childNodes reverse lookup.
-            payload["child_session_id"] = child_session_id
         if result_atts:
             payload["attachments"] = result_atts
 

@@ -966,12 +966,25 @@ class SessionMixin:
                 _child_sid = str(msg.meta.get("child_session_id") or "").strip()
                 if _child_sid:
                     entry["child_session_id"] = _child_sid
-                _dispatch_tid = str(msg.meta.get("dispatch_task_id") or "").strip()
-                if _dispatch_tid:
-                    entry["dispatch_task_id"] = _dispatch_tid
-                _dispatch_node_id = str(msg.meta.get("dispatch_node_id") or "").strip()
-                if _dispatch_node_id:
-                    entry["dispatch_node_id"] = _dispatch_node_id
+                # [AutoC 2026-06-04] Why: dispatch callback metadata was renamed from
+                # dispatch_* to explicit child_* fields and gained caller/summary.
+                # How: expose the new fields while retaining legacy dispatch_* output
+                # when older rows still contain it. Purpose: refreshed web history uses
+                # the same structured contract as realtime inbound events.
+                _child_tid = str(msg.meta.get("child_task_id") or msg.meta.get("dispatch_task_id") or "").strip()
+                if _child_tid:
+                    entry["child_task_id"] = _child_tid
+                    entry["dispatch_task_id"] = _child_tid
+                _child_node_id = str(msg.meta.get("child_node_id") or msg.meta.get("dispatch_node_id") or "").strip()
+                if _child_node_id:
+                    entry["child_node_id"] = _child_node_id
+                    entry["dispatch_node_id"] = _child_node_id
+                _caller_node_id = str(msg.meta.get("caller_node_id") or "").strip()
+                if _caller_node_id:
+                    entry["caller_node_id"] = _caller_node_id
+                _dispatch_summary = str(msg.meta.get("summary") or "").strip()
+                if _dispatch_summary:
+                    entry["summary"] = _dispatch_summary
             # Tool calls (assistant requesting tools)
             if msg.tool_calls:
                 entry["tool_calls"] = msg.tool_calls

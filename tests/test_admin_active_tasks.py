@@ -46,6 +46,8 @@ def _task(
     updated_at: datetime | None = None,
     worker_id: str | None = None,
     caller_task_id: str | None = None,
+    input_payload: dict[str, object] | None = None,
+    cancel_requested: bool = False,
 ) -> Task:
     """Build a Task containing large fields that the summary API must omit."""
     # Why: the dashboard only needs identifying metadata. How: populate input,
@@ -56,10 +58,16 @@ def _task(
         session_id=f"session-{task_id}",
         kind=kind,
         node_id=f"node-{task_id}",
-        input={"large_prompt": "x" * 512},
+        # [AutoC 2026-06-04] Why: the active-task modal may show a short input
+        # preview but must never receive the full task input. How: allow each
+        # fixture to provide text or instruction while preserving heavy default
+        # payloads for omission checks. Purpose: the test describes the exact
+        # summary-only contract before the API implementation changes.
+        input=input_payload or {"large_prompt": "x" * 512},
         continuation={"history": ["hidden"]},
         result={"secret": "must-not-leak"},
         status=status,
+        cancel_requested=cancel_requested,
         worker_id=worker_id,
         caller_task_id=caller_task_id,
         created_at=created_at,
@@ -87,23 +95,28 @@ def test_admin_active_tasks_returns_summaries_sorted_and_requires_auth(tmp_path:
                 created_at=now - timedelta(minutes=5),
                 updated_at=now - timedelta(seconds=5),
                 worker_id="worker-running-123456",
+                input_payload={"text": "run " + "x" * 260, "secret_input": "must-not-leak-input"},
             ),
             "pending-new": _task(
                 "pending-new",
                 status=TaskStatus.pending,
                 created_at=now - timedelta(minutes=1),
                 caller_task_id="caller-1",
+                input_payload={"instruction": "prepare deployment window"},
+                cancel_requested=True,
             ),
             "suspended-mid": _task(
                 "suspended-mid",
                 status=TaskStatus.suspended,
                 kind=TaskKind.tool,
                 created_at=now - timedelta(minutes=3),
+                input_payload={"text": "inspect paused tool"},
             ),
             "completed-hidden": _task(
                 "completed-hidden",
                 status=TaskStatus.completed,
                 created_at=now,
+                input_payload={"text": "must-not-leak-completed-input"},
             ),
         }
 
@@ -130,6 +143,16 @@ def test_admin_active_tasks_returns_summaries_sorted_and_requires_auth(tmp_path:
     assert payload[1]["kind"] == "tool"
     assert payload[2]["worker_id"] == "worker-running-123456"
     assert payload[0]["caller_task_id"] == "caller-1"
+    # [AutoC 2026-06-04] Why: operators need enough context to identify work
+    # without downloading the full Task.input. How: assert text/instruction summaries
+    # and cancellation flags only. Purpose: future endpoint changes cannot leak
+    # complete inputs or drop the cancel state used by the modal.
+    assert payload[0]["input_summary"] == "prepare deployment window"
+    assert payload[0]["cancel_requested"] is True
+    assert payload[1]["input_summary"] == "inspect paused tool"
+    assert payload[1]["cancel_requested"] is False
+    assert payload[2]["input_summary"] == ("run " + "x" * 260)[:200]
+    assert len(payload[2]["input_summary"]) == 200
     for item in payload:
         assert set(item) == {
             "task_id",
@@ -141,5 +164,9 @@ def test_admin_active_tasks_returns_summaries_sorted_and_requires_auth(tmp_path:
             "updated_at",
             "worker_id",
             "caller_task_id",
+            "input_summary",
+            "cancel_requested",
         }
+        assert "large_prompt" not in str(item)
+        assert "secret_input" not in str(item)
         assert "must-not-leak" not in str(item)

@@ -4,8 +4,9 @@
 // shared Modal shell. Purpose: DRY modal UX, reusable from any page.
 import { useEffect, useState } from 'react';
 
-import { fetchActiveTasks, type ActiveTask } from '../../api/supervisorClient';
+import { cancelTask, fetchActiveTasks, type ActiveTask } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
+import { useChatStore, type TaskActivity } from '../../store/chatStore';
 import { Modal } from '../common';
 
 interface ActiveTasksModalProps {
@@ -29,8 +30,8 @@ function formatRuntime(createdAt: string): string {
   return `${minutes}m ${seconds}s`;
 }
 
-function formatRelative(updatedAt: string): string {
-  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - parseTime(updatedAt)) / 1000));
+function formatRelativeMs(timestamp: number): string {
+  const elapsedSeconds = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
   if (elapsedSeconds < 60) return `${elapsedSeconds}s ago`;
   const minutes = Math.floor(elapsedSeconds / 60);
   if (minutes < 60) return `${minutes}m ago`;
@@ -40,10 +41,49 @@ function formatRelative(updatedAt: string): string {
   return `${days}d ago`;
 }
 
+function formatRelative(updatedAt: string): string {
+  return formatRelativeMs(parseTime(updatedAt));
+}
+
 function statusClass(status: ActiveTask['status']): string {
   if (status === 'running') return 'border-green-500/40 bg-green-500/10 text-green-700';
   if (status === 'pending') return 'border-yellow-500/40 bg-yellow-500/10 text-yellow-700';
   return 'border-gray-400/40 bg-gray-400/10 text-gray-600';
+}
+
+function activityClass(activity: TaskActivity): string {
+  if (activity.phase === 'thinking') return 'animate-pulse border-yellow-500/50 bg-yellow-500/10 text-yellow-700';
+  if (activity.phase === 'generating') return 'animate-pulse border-green-500/50 bg-green-500/10 text-green-700';
+  if (activity.phase === 'tool_call') return 'border-blue-500/50 bg-blue-500/10 text-blue-700';
+  if (activity.phase === 'awaiting_approval') return 'border-orange-500/50 bg-orange-500/10 text-orange-700';
+  return '';
+}
+
+function activityLabel(activity: TaskActivity): string {
+  if (activity.phase === 'thinking') return '思考中';
+  if (activity.phase === 'generating') return '生成中';
+  if (activity.phase === 'tool_call') return `工具: ${activity.detail || '未知'}`;
+  if (activity.phase === 'awaiting_approval') return '等待审批';
+  return '';
+}
+
+function selectTaskActivity(task: ActiveTask, activities: Readonly<Record<string, TaskActivity>>): TaskActivity | undefined {
+  // [AutoC 2026-06-04] Why: WebSocket events are not perfectly consistent about
+  // including task_id. How: look up task_id first, then session+node and node-only
+  // fallbacks, and choose the newest candidate. Purpose: stream_end or approval
+  // events without task_id can still override older live task labels.
+  const candidates: TaskActivity[] = [];
+  const byTask = activities[task.task_id];
+  if (byTask) candidates.push(byTask);
+  if (task.node_id) {
+    const bySessionNode = activities[`${task.session_id}:${task.node_id}`];
+    const byNode = activities[task.node_id];
+    if (bySessionNode) candidates.push(bySessionNode);
+    if (byNode) candidates.push(byNode);
+  }
+  const bySession = activities[task.session_id];
+  if (bySession) candidates.push(bySession);
+  return candidates.sort((a, b) => b.lastEventAt - a.lastEventAt)[0];
 }
 
 function taskTitle(task: ActiveTask): string {
@@ -52,9 +92,12 @@ function taskTitle(task: ActiveTask): string {
 
 export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
   const adminToken = useSettingsStore(state => state.adminToken);
+  const taskActivities = useChatStore(state => state.taskActivities);
   const [tasks, setTasks] = useState<ActiveTask[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [refreshTick, setRefreshTick] = useState(0);
+  const [cancellingTaskIds, setCancellingTaskIds] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     if (!open) return undefined;
@@ -92,12 +135,33 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
       cancelled = true;
       clearInterval(timer);
     };
-  }, [adminToken, open]);
+  }, [adminToken, open, refreshTick]);
+
+  const handleCancel = async (task: ActiveTask) => {
+    if (!adminToken || task.cancel_requested || cancellingTaskIds[task.task_id]) return;
+    // [AutoC 2026-06-04] Why: cancellation is per row and may take a backend worker
+    // round-trip to become visible in polling. How: keep a local disabled state,
+    // call the precise cancel endpoint, then trigger an immediate list refresh.
+    // Purpose: users get fast feedback and cannot double-submit the same task cancel.
+    setCancellingTaskIds(current => ({ ...current, [task.task_id]: true }));
+    try {
+      await cancelTask(adminToken, task.task_id);
+      setRefreshTick(value => value + 1);
+    } catch (cancelError) {
+      setError(cancelError instanceof Error ? cancelError.message : '任务取消失败。');
+    } finally {
+      setCancellingTaskIds(current => {
+        const next = { ...current };
+        delete next[task.task_id];
+        return next;
+      });
+    }
+  };
 
   return (
     <Modal
       ariaLabel="活跃任务详情"
-      maxWidth="max-w-3xl"
+      maxWidth="max-w-4xl"
       onClose={onClose}
       open={open}
       subtitle="任务监控"
@@ -120,32 +184,57 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
           </div>
         ) : (
           <ul className="space-y-2">
-            {tasks.map(task => (
-              <li
-                className="grid grid-cols-[minmax(0,1.4fr)_auto_minmax(5rem,0.7fr)_minmax(5rem,0.7fr)_minmax(4rem,0.6fr)] items-center gap-2 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2.5 text-[0.7rem]"
-                key={task.task_id}
-              >
-                <div className="min-w-0">
-                  <p className="truncate font-mono text-xs font-semibold text-[var(--duties-text)]">{taskTitle(task)}</p>
-                  <p className="mt-0.5 truncate font-mono text-[0.6rem] text-[var(--duties-tertiary)]">{task.task_id}</p>
-                </div>
-                <span className={`rounded-sm border px-1.5 py-0.5 font-mono text-[0.6rem] ${statusClass(task.status)}`}>
-                  {task.status}
-                </span>
-                <div className="font-mono text-[0.65rem] text-[var(--duties-secondary)]">
-                  <p className="text-[0.55rem] uppercase tracking-[0.14em] text-[var(--duties-tertiary)]">运行时长</p>
-                  <p>{formatRuntime(task.created_at)}</p>
-                </div>
-                <div className="font-mono text-[0.65rem] text-[var(--duties-secondary)]">
-                  <p className="text-[0.55rem] uppercase tracking-[0.14em] text-[var(--duties-tertiary)]">最后活动</p>
-                  <p>{formatRelative(task.updated_at)}</p>
-                </div>
-                <div className="min-w-0 font-mono text-[0.65rem] text-[var(--duties-secondary)]">
-                  <p className="text-[0.55rem] uppercase tracking-[0.14em] text-[var(--duties-tertiary)]">worker</p>
-                  <p className="truncate">{shortId(task.worker_id) || '无'}</p>
-                </div>
-              </li>
-            ))}
+            {tasks.map(task => {
+              const activity = selectTaskActivity(task, taskActivities);
+              const hasLiveStatus = Boolean(activity && activity.phase !== 'idle');
+              const statusLabel = hasLiveStatus && activity ? activityLabel(activity) : task.status;
+              const statusStyles = hasLiveStatus && activity ? activityClass(activity) : statusClass(task.status);
+              const cancelling = Boolean(cancellingTaskIds[task.task_id]) || task.cancel_requested;
+              return (
+                <li
+                  className="grid grid-cols-[minmax(0,1.5fr)_auto_minmax(5rem,0.65fr)_minmax(5rem,0.65fr)_minmax(4rem,0.55fr)_auto] items-center gap-2 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2.5 text-[0.7rem]"
+                  key={task.task_id}
+                >
+                  <div className="min-w-0">
+                    <p className="truncate font-mono text-xs font-semibold text-[var(--duties-text)]">
+                      {taskTitle(task)} <span className="text-[var(--duties-tertiary)]">#{shortId(task.task_id)}</span>
+                    </p>
+                    <p className="mt-0.5 truncate font-mono text-[0.6rem] text-[var(--duties-tertiary)]">{task.task_id}</p>
+                    <p className="mt-1 truncate text-[0.65rem] leading-4 text-[var(--duties-secondary)]" title={task.input_summary || '无输入摘要'}>
+                      {task.input_summary || '无输入摘要'}
+                    </p>
+                  </div>
+                  <span className={`rounded-sm border px-1.5 py-0.5 font-mono text-[0.6rem] ${statusStyles}`}>
+                    {statusLabel}
+                  </span>
+                  <div className="font-mono text-[0.65rem] text-[var(--duties-secondary)]">
+                    <p className="text-[0.55rem] uppercase tracking-[0.14em] text-[var(--duties-tertiary)]">运行时长</p>
+                    <p>{formatRuntime(task.created_at)}</p>
+                  </div>
+                  <div className="font-mono text-[0.65rem] text-[var(--duties-secondary)]">
+                    <p className="text-[0.55rem] uppercase tracking-[0.14em] text-[var(--duties-tertiary)]">最后活动</p>
+                    <p>{activity ? formatRelativeMs(activity.lastEventAt) : formatRelative(task.updated_at)}</p>
+                  </div>
+                  <div className="min-w-0 font-mono text-[0.65rem] text-[var(--duties-secondary)]">
+                    <p className="text-[0.55rem] uppercase tracking-[0.14em] text-[var(--duties-tertiary)]">worker</p>
+                    <p className="truncate">{shortId(task.worker_id) || '无'}</p>
+                  </div>
+                  <button
+                    aria-label={`取消任务 ${task.task_id}`}
+                    className={`rounded-sm border px-2 py-1 font-mono text-[0.6rem] transition-colors ${
+                      cancelling
+                        ? 'cursor-not-allowed border-gray-300 bg-gray-100 text-gray-500'
+                        : 'border-red-500/40 bg-red-500/10 text-red-700 hover:bg-red-500/20'
+                    }`}
+                    disabled={cancelling}
+                    onClick={() => { void handleCancel(task); }}
+                    type="button"
+                  >
+                    {cancelling ? '取消中...' : '取消'}
+                  </button>
+                </li>
+              );
+            })}
           </ul>
         )}
       </div>

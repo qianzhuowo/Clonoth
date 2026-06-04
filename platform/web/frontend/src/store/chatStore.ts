@@ -45,6 +45,16 @@ export interface ConversationMeta {
 export type ConnectionStatus = 'idle' | 'connecting' | 'open' | 'reconnecting' | 'closed';
 
 export type ChildNodeStatus = 'running' | 'awaiting_approval' | 'completed' | 'failed' | 'cancelled';
+export type TaskActivityPhase = 'idle' | 'thinking' | 'generating' | 'tool_call' | 'awaiting_approval';
+
+export interface TaskActivity {
+  // [AutoC 2026-06-04] Why: ActiveTasksModal needs a small live status snapshot,
+  // not the full event stream. How: store only the current phase, a short detail,
+  // and the event timestamp. Purpose: modal rendering stays cheap and transient.
+  phase: TaskActivityPhase;
+  detail: string;
+  lastEventAt: number;
+}
 
 export interface ChildNodeState {
   // [2026-06-03] Why: dispatched child agents run in independent Supervisor sessions.
@@ -68,6 +78,7 @@ export interface ChatStoreState extends ChatState {
   childNodes: Readonly<Record<string, ChildNodeState>>;
   viewingChildSessionId: string | null;
   childSessionMessages: Readonly<Record<string, WsMessage[]>>;
+  taskActivities: Readonly<Record<string, TaskActivity>>;
 
   selectConversation: (id: string) => void;
   selectChildNodes: (conversationId: string) => ChildNodeState[];
@@ -210,7 +221,7 @@ function createConversationMeta(id = createConversationId(), sessionId = ''): Co
   return { id, sessionId, title: '新对话', updatedAt: timestamp };
 }
 
-function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'generatingBySession' | 'childNodes' | 'viewingChildSessionId' | 'childSessionMessages'> {
+function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConversationId' | 'isGenerating' | 'connectionStatus' | 'generatingBySession' | 'childNodes' | 'viewingChildSessionId' | 'childSessionMessages' | 'taskActivities'> {
   return {
     conversations: [],
     activeConversationId: null,
@@ -227,6 +238,10 @@ function createStoreBase(): Pick<ChatStoreState, 'conversations' | 'activeConver
     // switching in and out of child streams does not mutate the sidebar conversation.
     viewingChildSessionId: null,
     childSessionMessages: {},
+    // [AutoC 2026-06-04] Why: task activity is a browser-local live overlay on top
+    // of the polled active-task list. How: reset it with the rest of store-owned
+    // metadata. Purpose: page refresh or reset never shows stale task phases.
+    taskActivities: {},
   };
 }
 
@@ -521,6 +536,84 @@ function getNumberValue(value: unknown): number | undefined {
 
 function getEventPayload(event: SupervisorEvent): Record<string, unknown> {
   return isRecord(event.payload) ? event.payload : {};
+}
+
+function getTaskActivityTimestamp(event: SupervisorEvent): number {
+  const parsed = event.ts ? new Date(event.ts).getTime() : Number.NaN;
+  return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+function getTaskActivityKeys(event: SupervisorEvent, payload: Record<string, unknown>): string[] {
+  // [AutoC 2026-06-04] Why: some realtime events carry task_id, while stream_end
+  // and approval events may only carry node/session identity. How: index the same
+  // activity by task id plus node fallbacks. Purpose: the modal can find the newest
+  // status even when later cleanup events omit task_id.
+  const taskId = getStringValue(payload.task_id);
+  const nodeId = getStringValue(payload.node_id);
+  const keys = [
+    taskId,
+    event.session_id && nodeId ? `${event.session_id}:${nodeId}` : '',
+    nodeId,
+    taskId || nodeId ? '' : event.session_id,
+  ];
+  return keys.filter((key, index, all): key is string => Boolean(key) && all.indexOf(key) === index);
+}
+
+function getTaskActivityDetail(event: SupervisorEvent, payload: Record<string, unknown>): string {
+  if (event.type === 'tool_call_start') {
+    return getStringValue(payload.tool_name) || getStringValue(payload.name) || getStringValue(payload.operation);
+  }
+  if (event.type === 'approval_requested') {
+    return getStringValue(payload.tool_name) || getStringValue(payload.operation) || getStringValue(payload.name);
+  }
+  return '';
+}
+
+function getTaskActivityPhase(event: SupervisorEvent, payload: Record<string, unknown>): TaskActivityPhase | null {
+  if (event.type === 'stream_delta') {
+    const deltaType = getStringValue(payload.type);
+    if (deltaType === 'thinking') return 'thinking';
+    if (deltaType === 'text') return 'generating';
+    return null;
+  }
+  if (event.type === 'tool_call_start') return 'tool_call';
+  if (event.type === 'approval_requested') return 'awaiting_approval';
+  if (event.type === 'stream_end' || event.type === 'tool_call_end' || event.type === 'approval_decided') return 'idle';
+  return null;
+}
+
+function updateTaskActivitiesByEvent(
+  current: Readonly<Record<string, TaskActivity>>,
+  event: SupervisorEvent,
+): Record<string, TaskActivity> {
+  const payload = getEventPayload(event);
+  const keys = getTaskActivityKeys(event, payload);
+  if (keys.length === 0) return { ...current };
+
+  const isTerminal = event.type === 'task_completed' || event.type === 'task_cancelled' || event.type === 'task_failed';
+  const hasTaskId = Boolean(getStringValue(payload.task_id));
+  const phase = getTaskActivityPhase(event, payload);
+  if (!isTerminal && !phase) return { ...current };
+
+  const next = { ...current };
+  const lastEventAt = getTaskActivityTimestamp(event);
+
+  if (isTerminal && hasTaskId) {
+    // [AutoC 2026-06-04] Why: completed or cancelled tasks should disappear from
+    // the realtime overlay once the authoritative active-task list catches up. How:
+    // delete all known keys when task_id is present. Purpose: stale live labels do
+    // not outlive terminal task events.
+    for (const key of keys) delete next[key];
+    return next;
+  }
+
+  const activity: TaskActivity = {
+    phase: isTerminal ? 'idle' : phase || 'idle',
+    detail: isTerminal ? '' : getTaskActivityDetail(event, payload),
+    lastEventAt,
+  };
+  for (const key of keys) next[key] = activity;
+  return next;
 }
 
 function getNestedRecord(record: Record<string, unknown>, key: string): Record<string, unknown> {
@@ -961,15 +1054,22 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
       let terminalSessionId = '';
 
       set((state) => {
-        const conversationId = resolveEventConversationId(state, event);
+        const taskActivities = updateTaskActivitiesByEvent(state.taskActivities, event);
+        // [AutoC 2026-06-04] Why: active-task activity should update for every
+        // global WebSocket frame, including sessions that are not currently routed
+        // to a visible chat. How: merge taskActivities before normal conversation
+        // routing and preserve it through reducer returns. Purpose: the System modal
+        // can show live phases independent of selected conversation state.
+        const stateWithTaskActivity = { ...state, taskActivities };
+        const conversationId = resolveEventConversationId(stateWithTaskActivity, event);
         if (!conversationId) {
-          return { connectionStatus: 'open' };
+          return { connectionStatus: 'open', taskActivities };
         }
 
         const payload = getEventPayload(event);
-        const isAgentChildRoute = isAgentEventRoutedToConversation(state, payload, conversationId);
+        const isAgentChildRoute = isAgentEventRoutedToConversation(stateWithTaskActivity, payload, conversationId);
         const reducerEvent = createReducerEventForConversation(event, payload, conversationId, isAgentChildRoute);
-        const routedState = seedConversationRouteForEvent(state, event, conversationId);
+        const routedState = seedConversationRouteForEvent(stateWithTaskActivity, event, conversationId);
         const childNodes = updateChildNodesByEvent(routedState, event, conversationId);
 
         // [2026-06-03] Why: child-agent events (agent:*) routed to a parent conversation
@@ -1001,6 +1101,7 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
           }
           return {
             ...nextState,
+            taskActivities,
             connectionStatus: 'open' as const,
           };
         }
@@ -1027,6 +1128,7 @@ function startGlobalWebSocket(set: StoreSetter, get: StoreGetter) {
           conversations,
           generatingBySession,
           childNodes,
+          taskActivities,
           connectionStatus: 'open',
           isGenerating,
         };

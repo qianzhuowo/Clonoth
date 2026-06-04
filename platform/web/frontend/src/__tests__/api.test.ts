@@ -1,7 +1,7 @@
 // [2026-05-16] Updated: tests for real Supervisor API client signatures.
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, decideApproval, getAllToolNames, fetchActiveTasks } from '../api/supervisorClient';
+import { postInbound, connectGlobalWS, checkHealth, getAdminState, checkAdminAuth, decideApproval, getAllToolNames, fetchActiveTasks, cancelTask } from '../api/supervisorClient';
 
 describe('Supervisor API client', () => {
   afterEach(() => {
@@ -46,6 +46,13 @@ describe('Supervisor API client', () => {
     expect(typeof fetchActiveTasks).toBe('function');
   });
 
+  it('exports cancelTask as a function', () => {
+    // [AutoC 2026-06-04] Why: each active-task row now owns a single-task cancel
+    // button. How: assert the client wrapper exists before wiring the modal. Purpose:
+    // UI code can call one typed helper instead of constructing endpoint strings.
+    expect(typeof cancelTask).toBe('function');
+  });
+
   it('fetches active task summaries with the admin bearer token', async () => {
     // [AutoC 2026-06-04] Why: active task details are served by a protected admin
     // endpoint. How: verify the wrapper calls the exact URL with the bearer token.
@@ -59,6 +66,24 @@ describe('Supervisor API client', () => {
     await expect(fetchActiveTasks('secret-token')).resolves.toEqual([]);
     expect(fetchMock).toHaveBeenCalledWith('/v1/admin/tasks/active', {
       headers: { Authorization: 'Bearer secret-token' },
+    });
+  });
+
+  it('cancels a single task with admin context headers', async () => {
+    // [AutoC 2026-06-04] Why: the cancel endpoint is public today, but the System
+    // modal should still send the configured admin context. How: verify both the
+    // normal bearer header and the explicit X-Admin-Token header. Purpose: future
+    // backend hardening can accept the same client call without changing the UI.
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ ok: true }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(cancelTask('secret-token', 'task-abc')).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledWith('/v1/tasks/task-abc/cancel', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer secret-token', 'X-Admin-Token': 'secret-token' },
     });
   });
 

@@ -1117,6 +1117,12 @@ def create_app(
                 # timestamps while holding the state lock during iteration. Purpose:
                 # operators can inspect active work without leaking heavy payloads or
                 # racing concurrent task updates.
+                # [AutoC 2026-06-04] Why: operators need enough context to
+                # identify a task in the modal, but returning full Task.input can be
+                # large or sensitive. How: extract only text/instruction, normalize it
+                # to a trimmed string, and cap it at 200 characters. Purpose: the
+                # active-task API supports a safe human-readable input preview.
+                input_text = str(t.input.get("text") or t.input.get("instruction") or "").strip()
                 result.append({
                     "task_id": t.task_id,
                     "session_id": t.session_id,
@@ -1127,6 +1133,8 @@ def create_app(
                     "updated_at": t.updated_at.isoformat(),
                     "worker_id": t.worker_id,
                     "caller_task_id": t.caller_task_id,
+                    "input_summary": input_text[:200] if input_text else "",
+                    "cancel_requested": t.cancel_requested,
                 })
         result.sort(key=lambda x: x["created_at"], reverse=True)
         return result

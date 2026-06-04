@@ -147,6 +147,39 @@ describe('chatStore', () => {
     expect(state.eventLog.map((entry) => entry.type)).toEqual(['inbound_message', 'stream_delta', 'outbound_message', 'task_completed']);
   });
 
+  it('tracks transient task activity from global WebSocket events', async () => {
+    // [AutoC 2026-06-04] Why: ActiveTasksModal needs live task phases without owning
+    // the WebSocket. How: drive the existing global socket path and inspect the new
+    // store-owned taskActivities map. Purpose: stream, tool, approval, and terminal
+    // events update modal state independently of the 5-second polling fallback.
+    vi.stubGlobal('fetch', vi.fn(async () => jsonResponse([])));
+    useChatStore.setState((state) => ({
+      conversations: [{ id: 'conv-activity', sessionId: 'sess-activity', title: 'Activity', updatedAt: '2026-06-04T02:00:00.000Z' }],
+      activeConversationId: 'conv-activity',
+      conversationIdsBySession: { ...state.conversationIdsBySession, 'sess-activity': 'conv-activity' },
+    }));
+
+    useChatStore.getState().loadStartup();
+    await waitFor(() => expect(FakeWebSocket.instances).toHaveLength(1));
+    const ws = FakeWebSocket.instances[0];
+    ws.open();
+
+    ws.receive(supervisorEvent(10, 'stream_delta', { task_id: 'task-live', node_id: 'ereuna_main', type: 'thinking', content: 'reasoning' }, 'sess-activity'));
+    expect(useChatStore.getState().taskActivities['task-live']).toMatchObject({ phase: 'thinking', detail: '' });
+
+    ws.receive(supervisorEvent(11, 'stream_delta', { task_id: 'task-live', node_id: 'ereuna_main', type: 'text', content: 'answer' }, 'sess-activity'));
+    expect(useChatStore.getState().taskActivities['task-live']).toMatchObject({ phase: 'generating', detail: '' });
+
+    ws.receive(supervisorEvent(12, 'tool_call_start', { task_id: 'task-live', node_id: 'ereuna_main', tool_name: 'read_file' }, 'sess-activity'));
+    expect(useChatStore.getState().taskActivities['task-live']).toMatchObject({ phase: 'tool_call', detail: 'read_file' });
+
+    ws.receive(supervisorEvent(13, 'approval_requested', { node_id: 'ereuna_main', operation: 'execute_command' }, 'sess-activity'));
+    expect(useChatStore.getState().taskActivities['sess-activity:ereuna_main']).toMatchObject({ phase: 'awaiting_approval', detail: 'execute_command' });
+
+    ws.receive(supervisorEvent(14, 'task_completed', { task_id: 'task-live', node_id: 'ereuna_main' }, 'sess-activity'));
+    expect(useChatStore.getState().taskActivities['task-live']).toBeUndefined();
+  });
+
   it('keeps realtime marked open and lets cancelCurrentTask unlock generation', async () => {
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       if (String(input).includes('/history')) return jsonResponse([]);

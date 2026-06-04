@@ -229,6 +229,12 @@ export interface ActiveTask {
   updated_at: string;
   worker_id: string | null;
   caller_task_id: string | null;
+  // [AutoC 2026-06-04] Why: the active-task modal should identify work without
+  // downloading the full task input. How: mirror the backend's capped preview and
+  // explicit cancellation flag. Purpose: UI rows can show context and disable
+  // duplicate cancellation requests from typed data.
+  input_summary: string;
+  cancel_requested: boolean;
 }
 
 export interface AdminNode extends NodeDef {
@@ -317,6 +323,21 @@ export async function fetchActiveTasks(token = ''): Promise<ActiveTask[]> {
   const resp = await fetch(`${API}/admin/tasks/active`, init);
   if (!resp.ok) throw new Error(`Failed to fetch active tasks: ${resp.status}`);
   return resp.json();
+}
+
+export async function cancelTask(adminToken: string, taskId: string): Promise<void> {
+  // [AutoC 2026-06-04] Why: ActiveTasksModal cancels one task at a time, while the
+  // existing cancelActiveTasks helper targets an entire session. How: call the
+  // public single-task endpoint and still include admin context headers for future
+  // backend hardening. Purpose: row-level cancel buttons remain precise and safe.
+  const headers = adminToken
+    ? { ...authHeaders(adminToken), 'X-Admin-Token': adminToken }
+    : {};
+  const resp = await fetch(`${API}/tasks/${encodeURIComponent(taskId)}/cancel`, {
+    method: 'POST',
+    headers,
+  });
+  if (!resp.ok) throw new Error(`Cancel failed: ${resp.status}`);
 }
 
 // ── Admin auth ──

@@ -24,6 +24,10 @@ export {
   updateModelConfig,
   decideApproval,
   cancelActiveTasks,
+  // [AutoC 2026-06-04] Why: task-monitor UI code may import from the API barrel.
+  // How: re-export the row-level cancellation helper beside session cancellation.
+  // Purpose: components keep a stable import surface while using precise task cancel.
+  cancelTask,
   resetConversation,
 } from './supervisorClient';
 export type { AdminState, ChildSessionInfo, HealthState } from './supervisorClient';

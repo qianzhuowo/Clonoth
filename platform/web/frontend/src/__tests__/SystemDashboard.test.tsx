@@ -19,7 +19,10 @@ function jsonResponse(value: unknown): Response {
 describe('SystemDashboard', () => {
   beforeEach(() => {
     useSettingsStore.setState({ adminToken: 'admin-token', isConnected: true });
-    useChatStore.setState({ connectionStatus: 'open' });
+    // [AutoC 2026-06-04] Why: ActiveTasksModal now reads transient task activity
+    // from chatStore. How: reset that map with the connection state in each test.
+    // Purpose: live status from one modal test cannot leak into another.
+    useChatStore.setState({ connectionStatus: 'open', taskActivities: {} });
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
       const url = String(input);
       if (url.endsWith('/v1/admin/state')) {
@@ -49,6 +52,8 @@ describe('SystemDashboard', () => {
           updated_at: new Date(now - 3_000).toISOString(),
           worker_id: 'wk-123456789',
           caller_task_id: null,
+          input_summary: 'Inspect current production state',
+          cancel_requested: false,
         }]);
       }
       return jsonResponse({});
@@ -83,9 +88,37 @@ describe('SystemDashboard', () => {
     await waitFor(() => expect(screen.getByRole('dialog', { name: '活跃任务详情' })).toBeInTheDocument());
     expect(screen.getByText('node-alpha')).toBeInTheDocument();
     expect(screen.getByText('running')).toBeInTheDocument();
+    expect(screen.getByText('Inspect current production state')).toBeInTheDocument();
     expect(screen.getByText('wk-12345')).toBeInTheDocument();
     expect(fetch).toHaveBeenCalledWith('/v1/admin/tasks/active', {
       headers: { Authorization: 'Bearer admin-token' },
     });
+  });
+
+  it('shows live task activity and calls the single-task cancel API', async () => {
+    // [AutoC 2026-06-04] Why: the modal should prefer transient WebSocket activity
+    // over the coarser polled task status. How: seed chatStore with a live tool-call
+    // status before opening the modal. Purpose: the row shows the operator what the
+    // task is doing right now while keeping the polling fallback.
+    useChatStore.setState({
+      taskActivities: {
+        'task-alpha-123456': { phase: 'tool_call', detail: 'read_file', lastEventAt: Date.now() },
+      },
+    });
+
+    render(<SystemDashboard />);
+
+    await waitFor(() => expect(screen.getByText('6')).toBeInTheDocument());
+    fireEvent.click(screen.getByRole('button', { name: '查看运行中任务详情' }));
+
+    await waitFor(() => expect(screen.getByText('工具: read_file')).toBeInTheDocument());
+    expect(screen.queryByText('running')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '取消任务 task-alpha-123456' }));
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/v1/tasks/task-alpha-123456/cancel', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer admin-token', 'X-Admin-Token': 'admin-token' },
+    }));
   });
 });

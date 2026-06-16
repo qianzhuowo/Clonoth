@@ -66,8 +66,11 @@ if __name__ == "__main__":
     except ValueError:
         fail(f'Invalid size format: {size}. Use WxH, e.g. 1024x1536')
     
-    url = 'https://zoaholic.zhenxia.top/v1/chat/completions'
-    api_key = os.environ.get('ZOAHOLIC_API_KEY', 'sk-KJr51AvQsCfphE11zPtZInappmQS64ZYecrk1uKnlncy7Qjv')
+    base_url = os.environ.get('OPENAI_BASE_URL', 'https://api.openai.com/v1').rstrip('/')
+    url = f'{base_url}/chat/completions'
+    api_key = os.environ.get('OPENAI_API_KEY', '')
+    if not api_key:
+        fail('No API key available')
     
     headers = {
         'Content-Type': 'application/json',

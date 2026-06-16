@@ -48,7 +48,7 @@ if __name__ == "__main__":
     api_key = args.get('api_key', '')
     
     if not api_key:
-        api_key = os.environ.get('ZOAHOLIC_API_KEY', 'sk-KJr51AvQsCfphE11zPtZInappmQS64ZYecrk1uKnlncy7Qjv')
+        api_key = os.environ.get('OPENAI_API_KEY', '')
     
     if not api_key:
         fail('No API key available')
@@ -60,8 +60,9 @@ if __name__ == "__main__":
         'max_output_tokens': max_tokens
     }).encode('utf-8')
     
+    base_url = os.environ.get('XAI_BASE_URL', 'https://api.x.ai/v1').rstrip('/')
     req = urllib.request.Request(
-        'https://zoaholic.zhenxia.top/v1/responses',
+        f'{base_url}/responses',
         data=payload,
         headers={
             'Authorization': f'Bearer {api_key}',

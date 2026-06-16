@@ -90,6 +90,7 @@ class AdapterConfig:
     download_timeout: float
     enable_auto_like: bool
     auto_like_times: int
+    custom_emoji_index_path: Path | None
     conversation_hash_secret: str
 
     @classmethod
@@ -126,6 +127,7 @@ class AdapterConfig:
             download_timeout=float(os.getenv("ONEBOT_DOWNLOAD_TIMEOUT", "15.0")),
             enable_auto_like=_env_bool("ONEBOT_ENABLE_AUTO_LIKE", True),
             auto_like_times=max(1, min(20, int(os.getenv("ONEBOT_AUTO_LIKE_TIMES", "10")))),
+            custom_emoji_index_path=(Path(p).expanduser().resolve() if (p := os.getenv("ONEBOT_CUSTOM_EMOJI_INDEX_PATH", os.getenv("CLONOTH_BQBS_PATH", "")).strip()) else None),
             conversation_hash_secret=os.getenv("ONEBOT_CONVERSATION_HASH_SECRET", "").strip(),
         )
 
@@ -232,9 +234,27 @@ class ClonothOneBotAdapter:
         self._reply_message_cache: dict[str, dict[str, Any]] = {}
         self._reply_message_cache_order: Deque[str] = deque()
         self._auto_like_today: dict[int, str] = {}
+        self._custom_emoji_names = self.load_custom_emoji_names(config.custom_emoji_index_path)
+        self._custom_face_cache: list[Any] | None = None
         self._qq_queue_condition = asyncio.Condition()
         self._qq_waiting_replies: dict[str, asyncio.Event] = {}
         self.load_state()
+
+    @staticmethod
+    def load_custom_emoji_names(path: Path | None) -> list[str]:
+        """Load QQ custom emoji names used to map [QQ_EMOJI:name] to fetch_custom_face items."""
+        if path is None:
+            return []
+        try:
+            names = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        except FileNotFoundError:
+            LOG.warning("custom emoji index file not found: %s", path)
+            return []
+        except OSError:
+            LOG.warning("failed to read custom emoji index file: %s", path, exc_info=True)
+            return []
+        LOG.info("loaded %s QQ custom emoji names from %s", len(names), path)
+        return names
 
     def load_state(self) -> None:
         path = self.config.state_file
@@ -1354,7 +1374,7 @@ class ClonothOneBotAdapter:
                 await self.set_reaction(target.get("last_message_id"), emoji_id, True)
         sent_text = False
         for part in self.split_output_text(clean_text):
-            segments = self.output_text_to_segments(part)
+            segments = await self.output_text_to_segments(part)
             if not segments:
                 continue
             if self.config.reply_to_trigger and not sent_text and target.get("type") == "group" and target.get("last_message_id"):
@@ -1437,21 +1457,84 @@ class ClonothOneBotAdapter:
                 parts.append(part)
         return parts
 
-    def output_text_to_segments(self, text: str) -> list[dict[str, Any]]:
+    async def output_text_to_segments(self, text: str) -> list[dict[str, Any]]:
         segments: list[dict[str, Any]] = []
         pos = 0
-        text = _QQ_EMOJI_RE.sub(lambda m: f"[表情:{m.group(1)}]", text)
-        for match in _AT_OUT_RE.finditer(text):
-            before = text[pos:match.start()]
+        emoji_matches = [(m.start(), m.end(), "emoji", m) for m in _QQ_EMOJI_RE.finditer(text)]
+        at_matches = [(m.start(), m.end(), "at", m) for m in _AT_OUT_RE.finditer(text)]
+        for start, end, kind, match in sorted(emoji_matches + at_matches, key=lambda item: item[0]):
+            if start < pos:
+                continue
+            before = text[pos:start]
             if before:
                 segments.append({"type": "text", "data": {"text": before}})
-            qq = match.group(1) or match.group(2) or ""
-            segments.append({"type": "at", "data": {"qq": qq}})
-            pos = match.end()
+            if kind == "at":
+                qq = match.group(1) or match.group(2) or ""
+                segments.append({"type": "at", "data": {"qq": qq}})
+            else:
+                name = match.group(1).strip()
+                emoji_segment = await self.custom_emoji_to_segment(name)
+                if emoji_segment:
+                    segments.append(emoji_segment)
+                elif name:
+                    segments.append({"type": "text", "data": {"text": f"[表情:{name}]"}})
+            pos = end
         after = text[pos:]
         if after:
             segments.append({"type": "text", "data": {"text": after}})
         return segments
+
+    async def custom_emoji_to_segment(self, name: str) -> dict[str, Any] | None:
+        """Resolve [QQ_EMOJI:name] to a NapCat custom-face image segment when configured."""
+        if not name or name not in self._custom_emoji_names:
+            return None
+        faces = await self.fetch_custom_faces()
+        index = self._custom_emoji_names.index(name)
+        if index >= len(faces):
+            LOG.warning("custom emoji index out of range: name=%s index=%s faces=%s", name, index, len(faces))
+            return None
+        src = self.custom_face_source(faces[index])
+        if not src:
+            LOG.warning("custom emoji has no sendable source: name=%s index=%s face=%r", name, index, faces[index])
+            return None
+        data_key = "file" if self._looks_like_file_source(src) else "url"
+        return {"type": "image", "data": {data_key: src}}
+
+    async def fetch_custom_faces(self) -> list[Any]:
+        if self._custom_face_cache is not None:
+            return self._custom_face_cache
+        try:
+            resp = await self.connection.call_action("fetch_custom_face", {})
+        except Exception:
+            LOG.warning("fetch_custom_face failed", exc_info=True)
+            self._custom_face_cache = []
+            return self._custom_face_cache
+        data = resp.get("data")
+        if isinstance(data, list):
+            self._custom_face_cache = data
+        elif isinstance(data, dict):
+            faces = data.get("faces") or data.get("items") or data.get("list")
+            self._custom_face_cache = faces if isinstance(faces, list) else []
+        else:
+            self._custom_face_cache = []
+        LOG.info("fetched %s QQ custom faces", len(self._custom_face_cache))
+        return self._custom_face_cache
+
+    @staticmethod
+    def custom_face_source(face: Any) -> str:
+        if isinstance(face, str):
+            return face.strip()
+        if isinstance(face, dict):
+            for key in ("url", "file", "image", "path"):
+                value = str(face.get(key) or "").strip()
+                if value:
+                    return value
+        return ""
+
+    @staticmethod
+    def _looks_like_file_source(src: str) -> bool:
+        lower = src.lower()
+        return lower.startswith("file://") or lower.startswith("base64://") or bool(re.match(r"^[a-zA-Z]:[\\/]", src)) or lower.startswith("/")
 
     @staticmethod
     def extract_reactions(text: str) -> tuple[str, list[str]]:

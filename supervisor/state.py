@@ -1058,6 +1058,39 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         node_id: str | None = None,
         task_id: str | None = None,
     ) -> OpRequestOut:
+        session = self.sessions.get(session_id)
+        conv_key = str(getattr(session, "conversation_key", "") or "") if session else ""
+        platform_auth = dict(parameters.get("platform_auth") or {}) if isinstance(parameters.get("platform_auth"), dict) else {}
+        is_qq = conv_key.startswith("qq_")
+        is_admin = bool(platform_auth.get("is_admin"))
+
+        # QQ 普通用户硬限制：禁止敏感工具与提示词读取。
+        if is_qq and not is_admin:
+            path = str(parameters.get("path") or "")
+            sensitive_read_prefixes = (
+                "config/nodes/",
+                "engine/system_nodes/",
+                "data/",
+            )
+            if op in {"execute_command", "restart"}:
+                return OpRequestOut(
+                    safety_level=SafetyLevel.deny,
+                    reason="qq non-admin users cannot execute sensitive operations",
+                    approval_id=None,
+                )
+            if op == "write_file":
+                return OpRequestOut(
+                    safety_level=SafetyLevel.deny,
+                    reason="qq non-admin users cannot modify files",
+                    approval_id=None,
+                )
+            if op == "read_file" and path.replace('\\', '/').startswith(sensitive_read_prefixes):
+                return OpRequestOut(
+                    safety_level=SafetyLevel.deny,
+                    reason="qq non-admin users cannot read sensitive files",
+                    approval_id=None,
+                )
+
         decision = self.policy.evaluate(op=op, parameters=parameters)
         if decision.safety_level == SafetyLevel.auto:
             return OpRequestOut(safety_level=SafetyLevel.auto, reason=decision.reason, approval_id=None)

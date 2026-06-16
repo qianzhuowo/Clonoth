@@ -900,6 +900,7 @@ async def _execute_real_tools(
         # session-scoped built-ins stay attached to the durable user session.
         parent_session_id=getattr(ls.rctx, "parent_session_id", "") or "",
         conversation_key=str((getattr(ls.rctx, "task_context", None) or {}).get("conversation_key", "")).strip(),
+        platform_auth=dict((getattr(ls.rctx, "task_context", None) or {}).get("platform_auth") or {}),
         # [AutoC 2026-05-31] Why: the context object is created before iterating
         # individual real tool calls. How: initialize node_id here and set
         # tool_call_id inside each loop iteration below. Purpose: approval requests

@@ -288,6 +288,7 @@ class TaskStoreMixin:
         active_tasks_summary = self._active_tasks_summary_locked(session_id)
         attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else None
         use_context = bool(payload.get("use_context", True))
+        platform_auth = dict(payload.get("platform_auth") or {}) if isinstance(payload.get("platform_auth"), dict) else {}
         # Step 2（2026-04-16）：主节点切 ConversationStore。
         # flag 开启时不再注入 context_ref，engine 侧 runner.py 会从 data/conversations/{session_id}.jsonl
         # 加载 history，不再依赖 node_contexts snapshot。
@@ -387,6 +388,7 @@ class TaskStoreMixin:
                     "is_system_task": bool(payload.get("_system_task", False)),
                     "switched_from": default_node if session_override else "",
                     "use_context": use_context,
+                    "platform_auth": platform_auth,
                     # [2026-05-29 方案C第一步] 为什么：SDK 只读取 task_created
                     # 事件的 payload.input.task_context，不能依赖后续对 Task 的补写。
                     # 怎么改：把 dispatch 上下文模式和父频道 route key 写入

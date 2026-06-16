@@ -32,6 +32,7 @@ class ToolContext:
     # merged into the matching ToolCallCard.
     tool_call_id: str = ""
     node_id: str = ""
+    platform_auth: dict[str, Any] | None = None
 
     def route_session_id(self) -> str:
         """Return the user-visible session for supervisor API calls."""
@@ -58,7 +59,7 @@ class ToolContext:
             json={
                 "session_id": route_session_id,
                 "op": op,
-                "parameters": parameters,
+                "parameters": {**parameters, "platform_auth": dict(self.platform_auth or {})},
                 # [AutoC 2026-05-31] Why: approval_requested events need the tool
                 # execution identity. How: send optional context fields only known
                 # at runtime. Purpose: the supervisor can attach approval state to

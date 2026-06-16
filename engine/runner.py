@@ -1154,6 +1154,7 @@ async def _run_tool_task(
         session_generation=session_generation,
         parent_session_id=parent_session_id,
         conversation_key=str(_task_ctx.get("conversation_key", "")).strip(),
+        platform_auth=dict(_task_ctx.get("platform_auth") or {}),
         approval_poll_interval_sec=0.5,
         # [AutoC 2026-05-31] Why: direct standalone tool tasks can still trigger
         # policy approvals. How: use the task id as the best available tool_call_id

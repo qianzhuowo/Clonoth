@@ -20,6 +20,15 @@ read_file:
     - pattern: "**/.env"
       decision: deny
       reason: "do not allow reading dotenv secrets"
+    - pattern: "config/nodes/**"
+      decision: deny
+      reason: "node prompts are internal"
+    - pattern: "engine/system_nodes/**"
+      decision: deny
+      reason: "system prompts are internal"
+    - pattern: "data/**"
+      decision: approval_required
+      reason: "runtime data may contain secrets or private context"
 
 write_file:
   default: auto

@@ -61,6 +61,9 @@ class InboundMessageIn(BaseModel):
     dispatch_origin: dict[str, Any] | None = None
     dispatch_context_mode: str | None = None
     dispatch_fork_from_session: str | None = None
+    # Platform-provided identity metadata. This is produced by trusted adapters
+    # such as OneBot/Discord, not parsed from user text.
+    platform_auth: dict[str, Any] = Field(default_factory=dict)
 
 
 class InboundMessageOut(BaseModel):
@@ -94,6 +97,7 @@ class InboundWorkItem(BaseModel):
     attachments: list[dict[str, Any]] | None = None
     use_context: bool = True
     entry_node_id: str | None = None
+    platform_auth: dict[str, Any] = Field(default_factory=dict)
 
 
 class InboundAckIn(BaseModel):

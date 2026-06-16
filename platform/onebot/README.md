@@ -32,7 +32,9 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 | `CLONOTH_WORKSPACE` | 否 | `/www/wwwroot/Clonoth` | 工作区路径，用于 SDK 导入和附件存储 |
 | `CLONOTH_ENTRY_NODE` | 否 | `main` | 入口节点 ID |
 | `CLONOTH_BQBS_PATH` | 否 | 空 | QQ 自定义表情名称索引文件路径 |
-| `CLONOTH_ALLOWED_GROUPS` | 否 | 空 | 允许接入的 QQ 群号，逗号分隔。为空时允许全部群 |
+| `CLONOTH_ADMIN_QQ_USERS` | 是 | `[占位符],[占位符]` | Clonoth 审批管理员 QQ 号，逗号分隔。只有这些用户能通过私聊命令批准/拒绝审批 |
+| `CLONOTH_ALLOWED_GROUPS` | 是 | `[占位符]` | 允许接入的 QQ 群号，逗号分隔。默认占位符不会匹配任何真实群，避免空配置开放所有群 |
+| `CLONOTH_ALLOWED_PRIVATE_USERS` | 否 | `[私聊只允许已经通过好友请求的人]` | 允许私聊使用 Clonoth 的 QQ 用户，逗号分隔。默认仅允许好友私聊；管理员始终允许 |
 
 ## 部署步骤
 
@@ -63,7 +65,9 @@ nonebot.load_plugin("platform.onebot")
 CLONOTH_BASE_URL=http://127.0.0.1:8765
 CLONOTH_WORKSPACE=/path/to/clonoth
 CLONOTH_ENTRY_NODE=main
-CLONOTH_ALLOWED_GROUPS=123456789,987654321
+CLONOTH_ADMIN_QQ_USERS=[占位符],[占位符]
+CLONOTH_ALLOWED_PRIVATE_USERS=[私聊只允许已经通过好友请求的人]
+CLONOTH_ALLOWED_GROUPS=[占位符]
 ```
 
 ### 4. 确保 Supervisor 已启动
@@ -80,8 +84,9 @@ nb run
 
 ### 消息处理
 
-- 群聊中 @Bot 触发回复，同时携带最近群聊历史作为上下文。
-- 私聊消息直接触发回复，无需 @。
+- 群聊中 @Bot 触发回复，同时携带最近群聊历史作为上下文；只有 `CLONOTH_ALLOWED_GROUPS` 中的群会接入。
+- 私聊消息直接触发回复，无需 @；默认只允许好友私聊，或通过 `CLONOTH_ALLOWED_PRIVATE_USERS` 指定用户。
+- 管理员 QQ 号通过 `CLONOTH_ADMIN_QQ_USERS` 配置；管理员始终允许私聊，用于处理审批命令。
 - 支持引用消息解析。
 
 ### 附件处理
@@ -91,6 +96,17 @@ nb run
 ### QQ 表情
 
 支持 QQ 自定义表情（face segment）的文本化。如果配置了 `CLONOTH_BQBS_PATH`，可将表情 ID 映射为可读名称。
+
+### 审批流程
+
+QQ 适配器不会再自动放行 `approval_requested`。当 Clonoth 触发需要审批的内部或外部操作时：
+
+1. Bot 会把审批摘要私聊发送给 `CLONOTH_ADMIN_QQ_USERS` 中的管理员。
+2. 管理员通过私聊回复命令处理审批：
+   - 同意：`审批 同意 <approval_id>`
+   - 拒绝：`审批 拒绝 <approval_id>`
+3. `<approval_id>` 可以填写完整 ID，也可以填写唯一前缀。
+4. 如果未配置 `CLONOTH_ADMIN_QQ_USERS`，审批请求会被默认拒绝，避免无人确认时误放行。
 
 ### 任务状态反馈
 
@@ -117,6 +133,6 @@ Bot 处理消息时，通过 QQ 表情 Reaction 反馈当前阶段：
 | 协议 | Discord Gateway (WebSocket) | OneBot 11 (反向 WebSocket) |
 | 框架 | discord.py | NoneBot2 |
 | 触发方式 | 所有消息 / @Bot | 群聊 @Bot / 私聊 |
-| 审批按钮 | Discord UI Button | 不支持（Supervisor 端自动审批） |
+| 审批按钮 | Discord UI Button | QQ 管理员私聊命令审批（不自动放行） |
 | Bridge Server | 有（discord_manage 工具） | 无 |
 | 附件上传 | Discord CDN 下载 → 本地保存 | QQ 临时 URL 下载 → 本地保存 |

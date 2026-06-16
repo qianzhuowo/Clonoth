@@ -25,7 +25,10 @@ from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message, 
 from nonebot.rule import Rule, to_me
 
 from .config import (
+    ADMIN_QQ_USERS,
     ALLOWED_GROUPS,
+    ALLOWED_PRIVATE_USERS,
+    ALLOW_PRIVATE_FRIENDS,
     BQBS_PATH,
     CLONOTH_BASE_URL,
     CLONOTH_WORKSPACE,
@@ -86,6 +89,9 @@ _session_targets: Dict[str, Dict[str, Any]] = {}
 _conversation_bots: Dict[str, Bot] = {}
 _last_bot: Optional[Bot] = None
 
+# 待管理员审批的 Clonoth 操作。key 为 approval_id，value 保存操作、详情和来源会话。
+_pending_approvals: Dict[str, Dict[str, Any]] = {}
+
 _client: Optional[ClonothClient] = None
 _session_state: Optional[SessionState] = None
 _event_router: Optional[EventRouter] = None
@@ -95,8 +101,26 @@ _bqbs: List[str] = []
 
 
 def _is_group_allowed(group_id: int) -> bool:
-    """判断群是否允许接入 Clonoth；空列表表示全部群允许。"""
-    return not ALLOWED_GROUPS or group_id in ALLOWED_GROUPS
+    """判断群是否允许接入 Clonoth；空列表表示不允许任何群。"""
+    return group_id in ALLOWED_GROUPS
+
+
+def _is_admin_user(user_id: Any) -> bool:
+    """判断 QQ 用户是否为 Clonoth 审批管理员。"""
+    try:
+        return int(user_id) in ADMIN_QQ_USERS
+    except Exception:
+        return False
+
+
+def _is_private_allowed(event: PrivateMessageEvent) -> bool:
+    """判断 QQ 私聊是否允许接入 Clonoth。"""
+    user_id = int(event.user_id)
+    if user_id in ADMIN_QQ_USERS or user_id in ALLOWED_PRIVATE_USERS:
+        return True
+    if not ALLOW_PRIVATE_FRIENDS:
+        return False
+    return str(getattr(event, "sub_type", "") or "").lower() == "friend"
 
 
 async def _allowed_group_rule(event: Event) -> bool:
@@ -111,6 +135,66 @@ async def _private_message_rule(event: Event) -> bool:
     # 2026-05-01 修改原因：私聊没有群号，也不需要 @Bot；这里单独识别
     # PrivateMessageEvent，使私聊入口和现有群聊入口互不影响。
     return isinstance(event, PrivateMessageEvent)
+
+
+def _approval_summary(approval_id: str, operation: str, details: Dict[str, Any]) -> str:
+    """生成发给 QQ 管理员的审批摘要，限制长度并避免刷屏。"""
+    lines = [
+        "【Clonoth 审批请求】",
+        f"ID: {approval_id}",
+        f"操作: {operation or 'unknown'}",
+    ]
+    for key in ("tool_name", "path", "command", "reason", "safety_level"):
+        value = details.get(key)
+        if value is not None and value != "":
+            lines.append(f"{key}: {str(value)[:1000]}")
+    args = details.get("args") or details.get("parameters")
+    if args:
+        lines.append(f"参数: {str(args)[:1500]}")
+    lines.extend([
+        "",
+        f"同意：审批 同意 {approval_id}",
+        f"拒绝：审批 拒绝 {approval_id}",
+    ])
+    return _truncate_qq_text("\n".join(lines))
+
+
+def _parse_approval_command(text: str) -> Optional[tuple[str, str]]:
+    """解析管理员私聊审批命令，返回 (decision, approval_id_or_prefix)。"""
+    normalized = re.sub(r"\s+", " ", (text or "").strip())
+    if not normalized:
+        return None
+    parts = normalized.split(" ")
+    if len(parts) < 2:
+        return None
+    verbs_allow = {"同意", "批准", "通过", "允许", "allow", "approve", "yes", "y"}
+    verbs_deny = {"拒绝", "驳回", "deny", "reject", "no", "n"}
+    if parts[0] in {"审批", "approval"} and len(parts) >= 3:
+        verb = parts[1].lower()
+        token = parts[2]
+    else:
+        verb = parts[0].lower()
+        token = parts[1]
+    if verb in verbs_allow:
+        return "allow", token
+    if verb in verbs_deny:
+        return "deny", token
+    return None
+
+
+def _resolve_pending_approval_id(token: str) -> tuple[Optional[str], str]:
+    """允许管理员用完整 approval_id 或唯一前缀审批。"""
+    token = (token or "").strip()
+    if not token:
+        return None, "缺少审批 ID。"
+    if token in _pending_approvals:
+        return token, ""
+    matches = [aid for aid in _pending_approvals if aid.startswith(token)]
+    if len(matches) == 1:
+        return matches[0], ""
+    if not matches:
+        return None, f"没有找到待审批 ID：{token}"
+    return None, f"审批 ID 前缀不唯一：{token}"
 
 
 def _sanitize_name(name: str, max_len: int = 32) -> str:
@@ -885,34 +969,63 @@ class TangQiuCallbacks:
         conversation_key: str = "",
         session_id: str = "",
     ) -> None:
-        """QQ 端不展示审批界面；收到审批请求时直接放行。"""
-        # 2026-05-03 修改原因：本轮要求 TangQiu QQ 插件审批全部放行。
-        # EventRouter 对外部操作仍会进入 show_approval_ui，所以这里直接提交
-        # allow 决策；目的是避免 QQ 端没有审批控件时任务卡在等待审批。
+        """QQ 端审批必须由管理员私聊确认；不再自动放行。"""
         if _client is None:
             logger.warning(
-                "approval auto-approve skipped on QQ: client unavailable id=%s operation=%s",
+                "approval review skipped on QQ: client unavailable id=%s operation=%s",
                 approval_id,
                 operation,
             )
             return
-        try:
-            ok = await _client.approve(
-                approval_id,
-                decision="allow",
-                comment="TangQiu QQ adapter auto-approved.",
-            )
-        except Exception:
-            logger.exception(
-                "approval auto-approve failed on QQ: id=%s operation=%s",
-                approval_id,
-                operation,
-            )
+
+        _pending_approvals[approval_id] = {
+            "operation": operation,
+            "details": dict(details or {}),
+            "conversation_key": conversation_key,
+            "session_id": session_id,
+            "created_at": time.time(),
+        }
+
+        if not ADMIN_QQ_USERS:
+            try:
+                await _client.approve(
+                    approval_id,
+                    decision="deny",
+                    comment="QQ adapter denied because CLONOTH_ADMIN_QQ_USERS is not configured.",
+                )
+            except Exception:
+                logger.exception("approval deny failed on QQ: id=%s operation=%s", approval_id, operation)
+            _pending_approvals.pop(approval_id, None)
+            logger.warning("approval denied on QQ: no admin users configured id=%s operation=%s", approval_id, operation)
             return
-        if ok:
-            logger.info("approval auto-approved on QQ: id=%s operation=%s", approval_id, operation)
-        else:
-            logger.warning("approval auto-approve rejected on QQ: id=%s operation=%s", approval_id, operation)
+
+        bot = _get_fallback_bot()
+        if not bot:
+            logger.warning("approval review pending but no QQ bot available: id=%s operation=%s", approval_id, operation)
+            return
+
+        summary = _approval_summary(approval_id, operation, details or {})
+        delivered = 0
+        for admin_id in ADMIN_QQ_USERS:
+            try:
+                await bot.send_private_msg(user_id=int(admin_id), message=summary)
+                delivered += 1
+            except Exception:
+                logger.exception("send approval request to QQ admin failed: admin=%s id=%s", admin_id, approval_id)
+
+        target = _target_from_conversation_key(conversation_key)
+        if target:
+            try:
+                await _send_qq_message(bot, target, "当前操作需要 Clonoth 管理员审批，已提交等待处理。")
+            except Exception:
+                logger.debug("send approval pending notice failed: id=%s", approval_id, exc_info=True)
+
+        logger.info(
+            "approval pending on QQ: id=%s operation=%s admins_notified=%s",
+            approval_id,
+            operation,
+            delivered,
+        )
 
     async def refresh_typing(self, trigger: TriggerInfo) -> None:
         return None
@@ -974,10 +1087,9 @@ async def _startup() -> None:
         entry_node_id=ENTRY_NODE_ID,
         conversation_key_prefix="qq_group",
         workspace_root=Path(CLONOTH_WORKSPACE),
-        # 2026-05-03 修改原因：TangQiu QQ 侧不展示审批控件。本轮要求
-        # 审批默认放行，所以打开 SDK 的内部操作自动审批开关，目的是避免
-        # 内部工具调用停在等待审批状态。
-        auto_approve_internal=True,
+        # QQ 侧不再自动审批内部操作；所有 approval_requested 都必须由
+        # CLONOTH_ADMIN_QQ_USERS 中的管理员私聊明确同意后才会放行。
+        auto_approve_internal=False,
     )
     _event_router = EventRouter(
         _client,
@@ -1150,8 +1262,35 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
         await _private_matcher.finish("Clonoth Agent 尚未初始化，请稍后重试。")
 
     user_id = int(event.user_id)
-    conversation_key = f"qq_private:{user_id}"
     user_text = _message_to_text(event.get_message(), getattr(bot, "self_id", None)).strip() or "你好"
+
+    approval_command = _parse_approval_command(user_text)
+    if approval_command is not None:
+        if not _is_admin_user(user_id):
+            await _private_matcher.finish("你不是 Clonoth 审批管理员，不能处理审批请求。")
+        decision, approval_token = approval_command
+        approval_id, error = _resolve_pending_approval_id(approval_token)
+        if not approval_id:
+            await _private_matcher.finish(error)
+        try:
+            ok = await _client.approve(
+                approval_id,
+                decision=decision,
+                comment=f"QQ admin {user_id} {decision}ed via private message.",
+            )
+        except Exception as exc:
+            logger.exception("submit QQ approval decision failed")
+            await _private_matcher.finish(f"提交审批失败：{exc}")
+        info = _pending_approvals.pop(approval_id, {}) if ok else _pending_approvals.get(approval_id, {})
+        operation = str(info.get("operation") or "unknown")
+        if ok:
+            await _private_matcher.finish(f"已{('同意' if decision == 'allow' else '拒绝')}审批：{approval_id}\n操作：{operation}")
+        await _private_matcher.finish("审批提交被 Supervisor 拒绝，请检查日志。")
+
+    if not _is_private_allowed(event):
+        await _private_matcher.finish("当前 QQ 私聊未被允许接入 Clonoth。")
+
+    conversation_key = f"qq_private:{user_id}"
     inbound_text = _build_private_inbound_text(event, bot, user_text)
     # 2026-05-03 修改原因：QQ 私聊图片同样需要作为 Clonoth 附件传入。
     # 做法与群聊入口一致，先下载当前消息和引用消息中的图片，目的是让

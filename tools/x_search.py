@@ -12,7 +12,7 @@ At invocation this file runs as a subprocess:
 
 SPEC = {'description': '搜索 X/Twitter 上的帖子。通过 xAI Grok API 的 Responses API + x_search '
                 '工具实现，支持语义搜索和关键词搜索，返回帖子内容和链接引用。',
- 'input_schema': {'properties': {'api_key': {'description': 'xAI API key，不传则从 data/xai_key.txt 读取',
+ 'input_schema': {'properties': {'api_key': {'description': 'xAI API key。若不传，则依次使用环境变量或 .env 中的 XAI_API_KEY、OPENAI_API_KEY',
                                              'type': 'string'},
                                  'max_tokens': {'default': 64000,
                                                 'description': '最大输出 token 数，默认 64000',
@@ -30,28 +30,52 @@ TIMEOUT_SEC = 130.0
 
 if __name__ == "__main__":
     import json, sys
-    _input = json.loads(sys.stdin.read())
+    _input = json.loads((sys.stdin.read() or "{}").lstrip("\ufeff"))
     def output(result): print(json.dumps(result, ensure_ascii=False)); sys.exit(0)
     def fail(error):
         # [AutoC 2026-05-31] Why: x_search failures should remain readable after
         # the engine prefers data.result. How: emit ok=false with data.result before
         # exiting non-zero. Purpose: preserve specific API errors in tool history.
         print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False)); sys.exit(1)
-    args = _input
+    args = _input if isinstance(_input, dict) else {}
     import urllib.request
     import json
     import os
+
+    def load_dotenv():
+        env_path = os.path.join(os.getcwd(), ".env")
+        values = {}
+        if not os.path.isfile(env_path):
+            return values
+        try:
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f.read().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    values[key.strip()] = value.strip().strip("'\"")
+        except Exception:
+            return {}
+        return values
     
     query = args.get('query', '')
     model = args.get('model', 'grok-4.3')
     max_tokens = args.get('max_tokens', 64000)
-    api_key = args.get('api_key', '')
+    api_key = str(args.get('api_key') or os.environ.get('XAI_API_KEY') or os.environ.get('OPENAI_API_KEY') or '').strip()
+    base_url = str(args.get('base_url') or os.environ.get('XAI_BASE_URL') or '').strip().rstrip('/')
+
+    if not api_key or not base_url:
+        dotenv = load_dotenv()
+        if not api_key:
+            api_key = str(dotenv.get('XAI_API_KEY') or dotenv.get('OPENAI_API_KEY') or '').strip()
+        if not base_url:
+            base_url = str(dotenv.get('XAI_BASE_URL') or '').strip().rstrip('/')
     
     if not api_key:
-        api_key = os.environ.get('OPENAI_API_KEY', '')
-    
-    if not api_key:
-        fail('No API key available')
+        fail('No API key available. Set XAI_API_KEY or OPENAI_API_KEY in the environment or .env, or pass api_key.')
+    if not base_url:
+        base_url = 'https://api.x.ai/v1'
     
     payload = json.dumps({
         'model': model,
@@ -60,7 +84,6 @@ if __name__ == "__main__":
         'max_output_tokens': max_tokens
     }).encode('utf-8')
     
-    base_url = os.environ.get('XAI_BASE_URL', 'https://api.x.ai/v1').rstrip('/')
     req = urllib.request.Request(
         f'{base_url}/responses',
         data=payload,

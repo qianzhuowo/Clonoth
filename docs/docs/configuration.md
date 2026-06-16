@@ -280,6 +280,8 @@ base_url: "$ENV{OPENAI_BASE_URL}"
 - `OPENAI_API_KEY`：`gpt_image_2.py` 和 `x_search.py` 可使用。
 - `OPENAI_BASE_URL`：`gpt_image_2.py` 可使用，默认 `https://api.openai.com/v1`。
 - `XAI_BASE_URL`：`x_search.py` 可使用，默认 `https://api.x.ai/v1`。
+- `EXA_API_KEY`：`exa_search.py` 可使用，也可写入工作区 `.env`。
+- `EXA_BASE_URL`：`exa_search.py` 可使用，也可写入工作区 `.env`，默认 `https://api.exa.ai`。
 - `GITHUB_TOKEN`：`scan_github_keys.py` 可使用。
 - `DISCORD_BRIDGE_HOST`：`discord_manage.py` 连接 Discord Bridge 时使用，默认 `127.0.0.1`。
 

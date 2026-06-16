@@ -10,12 +10,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import datetime as dt
+import hashlib
+import hmac
+import json
 import logging
 import os
 import re
 import sys
 import time
 from collections import defaultdict, deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, DefaultDict, Deque, Dict, List, Optional
 
@@ -29,10 +33,24 @@ from .config import (
     ALLOWED_GROUPS,
     ALLOWED_PRIVATE_USERS,
     ALLOW_PRIVATE_FRIENDS,
+    AUTO_LIKE_TIMES,
     BQBS_PATH,
     CLONOTH_BASE_URL,
     CLONOTH_WORKSPACE,
+    CONVERSATION_HASH_SECRET,
+    ENABLE_AUTO_LIKE,
+    ENABLE_QQ_QUEUE,
+    ENABLE_REACTIONS,
     ENTRY_NODE_ID,
+    GROUP_HISTORY_MAX,
+    GROUP_TRIGGER,
+    HISTORY_TEXT_LIMIT,
+    QQ_MESSAGE_LIMIT,
+    QQ_QUEUE_INTERVAL,
+    QQ_QUEUE_REPLY_TIMEOUT,
+    REPLY_TO_TRIGGER,
+    TRIGGER_PREFIXES,
+    ONEBOT_STATE_FILE,
 )
 from .emoji_handler import load_bqbs, process_emojis, strip_output_markers
 
@@ -56,11 +74,13 @@ driver = get_driver()
 
 _CST = dt.timezone(dt.timedelta(hours=8))
 _SPLIT_SIGNAL = "[SPLIT]"
-_HISTORY_MAX_LEN = 20
-_HISTORY_TEXT_LIMIT = 400
-_QQ_MESSAGE_LIMIT = 4300
+_HISTORY_MAX_LEN = GROUP_HISTORY_MAX
+_HISTORY_TEXT_LIMIT = HISTORY_TEXT_LIMIT
+_QQ_MESSAGE_LIMIT = QQ_MESSAGE_LIMIT
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _QQ_EMOJI_MARK_RE = re.compile(r"\[QQ_EMOJI:(.+?)\]")
+_CQ_RE = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]*))?\]")
+_SENSITIVE_ID_RE = re.compile(r"(?<!\d)\d{5,12}(?!\d)")
 # 2026-05-03 修改原因：QQ 端需要把 Clonoth 任务生命周期映射为离散 React 阶段。
 # 做法是集中维护阶段到 emoji_id 的映射和阶段顺序，目的在于后续回调只声明
 # 目标阶段，避免 stream_delta 高频到达时重复调用 OneBot React API。
@@ -80,14 +100,45 @@ _REACT_STAGE_ORDER = {
 }
 _REACT_CLEANUP_EMOJIS = tuple(_REACT_STAGE_EMOJIS.values())
 
-# 群聊上下文只保留最近 20 条。这样可以给入口节点提供社交语境，
+# 群聊上下文只保留最近 N 条。这样可以给入口节点提供社交语境，
 # 同时避免每次 inbound 发送过长历史。
 _group_history: DefaultDict[int, Deque[str]] = defaultdict(lambda: deque(maxlen=_HISTORY_MAX_LEN))
 
 # EventRouter 回调只拿到 session/trigger，因此这里保存发送最终回复所需的平台对象。
 _session_targets: Dict[str, Dict[str, Any]] = {}
 _conversation_bots: Dict[str, Bot] = {}
+_real_conversation_keys: Dict[str, str] = {}
+_stable_conversation_keys: Dict[str, str] = {}
+_persisted_session_targets: Dict[str, Dict[str, Any]] = {}
 _last_bot: Optional[Bot] = None
+
+@dataclass
+class QueuedInbound:
+    matcher: Any
+    bot: Bot
+    event: Event
+    channel: str
+    real_conversation_key: str
+    stable_conversation_key: str
+    text: str
+    attachments: List[Dict[str, Any]]
+    is_dm: bool
+    platform_updates: Dict[str, Any]
+    user_text: str
+
+
+_qq_queue: Deque[QueuedInbound] = deque()
+_qq_queue_by_key: Dict[str, QueuedInbound] = {}
+_qq_queue_condition = asyncio.Condition()
+_qq_waiting_replies: Dict[str, asyncio.Event] = {}
+_auto_like_today: Dict[int, str] = {}
+_reply_message_cache: Dict[str, Dict[str, Any]] = {}
+_reply_message_cache_order: Deque[str] = deque()
+_route_state_lock = asyncio.Lock()
+_anon_users: Dict[str, str] = {}
+_anon_groups: Dict[str, str] = {}
+_anon_user_reverse: Dict[str, str] = {}
+_anon_group_reverse: Dict[str, str] = {}
 
 # 待管理员审批的 Clonoth 操作。key 为 approval_id，value 保存操作、详情和来源会话。
 _pending_approvals: Dict[str, Dict[str, Any]] = {}
@@ -96,6 +147,7 @@ _client: Optional[ClonothClient] = None
 _session_state: Optional[SessionState] = None
 _event_router: Optional[EventRouter] = None
 _router_task: Optional[asyncio.Task] = None
+_qq_queue_task: Optional[asyncio.Task] = None
 _callbacks: Optional["TangQiuCallbacks"] = None
 _bqbs: List[str] = []
 
@@ -128,6 +180,16 @@ async def _allowed_group_rule(event: Event) -> bool:
     if not isinstance(event, GroupMessageEvent):
         return False
     return _is_group_allowed(int(event.group_id))
+
+
+async def _agent_group_rule(bot: Bot, event: Event) -> bool:
+    """匹配允许群里的 Agent 触发消息，兼容 @Bot / 前缀 / 全量触发。"""
+    if not isinstance(event, GroupMessageEvent):
+        return False
+    if not _is_group_allowed(int(event.group_id)):
+        return False
+    text = _message_to_text(event.get_message(), getattr(bot, "self_id", None)).strip()
+    return _group_should_trigger(event, bot, text)
 
 
 async def _private_message_rule(event: Event) -> bool:
@@ -257,6 +319,148 @@ def _message_to_text(message: Message, bot_self_id: Any = None) -> str:
     return "".join(parts).strip()
 
 
+
+def _message_to_text_generic(message: Any, bot_self_id: Any = None) -> str:
+    """把 NoneBot Message、OneBot segment list 或 CQ 字符串转换为模型可读文本。"""
+    if message is None:
+        return ""
+    if isinstance(message, Message):
+        return _message_to_text(message, bot_self_id)
+    if isinstance(message, list):
+        parts: List[str] = []
+        for seg in message:
+            if not isinstance(seg, dict):
+                continue
+            seg_type = str(seg.get("type") or "")
+            data = seg.get("data") if isinstance(seg.get("data"), dict) else {}
+            if seg_type == "text":
+                parts.append(str(data.get("text") or ""))
+            elif seg_type == "at":
+                qq = str(data.get("qq") or "")
+                if bot_self_id is not None and qq == str(bot_self_id):
+                    continue
+                parts.append("@全体成员" if qq.lower() == "all" else f"@{qq}")
+            elif seg_type == "image":
+                parts.append("[图片]")
+            elif seg_type == "face":
+                parts.append(f"[QQ表情:{data.get('id', '')}]" if data.get("id") else "[QQ表情]")
+            elif seg_type == "record":
+                parts.append("[语音]")
+            elif seg_type == "video":
+                parts.append("[视频]")
+            elif seg_type == "reply":
+                continue
+            elif seg_type:
+                parts.append(f"[{seg_type}]")
+        return "".join(parts).strip()
+    if isinstance(message, str):
+        return _format_cq_message(message).strip()
+    try:
+        return _message_to_text(Message(message), bot_self_id)
+    except Exception:
+        return str(message).strip()
+
+
+def _parse_cq_params(raw: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for item in (raw or "").split(","):
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        out[key] = value
+    return out
+
+
+def _format_cq_message(text: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        cq_type = match.group(1)
+        params = _parse_cq_params(match.group(2) or "")
+        if cq_type == "at":
+            qq = params.get("qq", "")
+            return "@全体成员" if qq.lower() == "all" else f"@{qq}"
+        if cq_type == "reply":
+            return f"[回复:{params.get('id', '')}]"
+        if cq_type == "image":
+            return "[图片]"
+        if cq_type == "face":
+            return f"[QQ表情:{params.get('id', '')}]"
+        if cq_type == "record":
+            return "[语音]"
+        return match.group(0)
+    return _CQ_RE.sub(repl, text)
+
+
+def _extract_reply_message_id(message: Any, raw_message: Any = None) -> Any | None:
+    """从 reply segment / CQ reply 中提取被引用消息 ID。"""
+    def pick_id(data: Dict[str, Any]) -> Any | None:
+        for key in ("id", "message_id", "messageId", "messageid", "message_seq", "seq"):
+            value = data.get(key)
+            if value is not None and str(value).strip():
+                return value
+        return None
+
+    try:
+        segments = list(message) if message is not None and not isinstance(message, str) else []
+    except Exception:
+        segments = []
+    for seg in segments:
+        seg_type = getattr(seg, "type", "") if not isinstance(seg, dict) else str(seg.get("type") or "")
+        if seg_type != "reply":
+            continue
+        data = (getattr(seg, "data", {}) or {}) if not isinstance(seg, dict) else (seg.get("data") if isinstance(seg.get("data"), dict) else {})
+        rid = pick_id(data)
+        if rid is not None:
+            return rid
+
+    for candidate in (message, raw_message):
+        if not isinstance(candidate, str):
+            continue
+        for match in _CQ_RE.finditer(candidate):
+            if match.group(1) != "reply":
+                continue
+            rid = _parse_cq_params(match.group(2) or "").get("id")
+            if rid is not None and str(rid).strip():
+                return rid
+    return None
+
+
+def _remember_message_for_reply_context(event: Event) -> None:
+    """缓存最近消息，弥补 NapCat/NoneBot reply 字段不完整的情况。"""
+    message_id = getattr(event, "message_id", None)
+    if message_id is None or not str(message_id).strip():
+        return
+    sender = getattr(event, "sender", None)
+    _reply_message_cache[str(message_id)] = {
+        "message": event.get_message() if hasattr(event, "get_message") else None,
+        "raw_message": getattr(event, "raw_message", None),
+        "sender": sender,
+        "user_id": getattr(event, "user_id", None),
+        "time": getattr(event, "time", None),
+    }
+    if str(message_id) not in _reply_message_cache_order:
+        _reply_message_cache_order.append(str(message_id))
+    while len(_reply_message_cache_order) > 1000:
+        old_id = _reply_message_cache_order.popleft()
+        _reply_message_cache.pop(old_id, None)
+
+
+async def _get_reply_message(bot: Bot, reply_message_id: Any) -> Dict[str, Any] | None:
+    """通过 NapCat get_msg 兜底获取被引用消息。"""
+    if reply_message_id is None:
+        return None
+    raw_id = str(reply_message_id).strip()
+    message_id_param: Any = int(raw_id) if raw_id.isdigit() else reply_message_id
+    try:
+        data = await bot.call_api("get_msg", message_id=message_id_param)
+    except Exception:
+        logger.warning("get_msg failed for reply_message_id=%s", reply_message_id, exc_info=True)
+        return None
+    if isinstance(data, dict):
+        return data
+    return None
+
+
+
 def _guess_image_mime(url: str, content_type: str = "") -> str:
     """根据 QQ 图片 URL 和下载响应头推断 Clonoth 需要的图片 MIME 类型。"""
     # 2026-05-03 修改原因：OneBot 图片段通常只给临时 URL，不稳定提供文件名
@@ -292,48 +496,41 @@ def _image_ext_from_url_or_mime(url: str, mime_type: str) -> str:
 
 
 def _iter_qq_image_urls(message: Any) -> List[str]:
-    """从 OneBot Message 中提取 image segment 的下载 URL。"""
-    # 2026-05-03 修改原因：当前消息和引用消息都要复用同一套图片段解析逻辑。
-    # 做法是只读取 image segment 的 data["url"]，目的是严格按 OneBot 提供
-    # 的下载地址采集附件，并让缺少 URL 的图片段自然跳过。
+    """从 OneBot Message、segment list 或 CQ 字符串中提取 image 下载地址。"""
     urls: List[str] = []
     if message is None:
+        return urls
+    if isinstance(message, str):
+        for match in _CQ_RE.finditer(message):
+            if match.group(1) != "image":
+                continue
+            params = _parse_cq_params(match.group(2) or "")
+            src = str(params.get("url") or params.get("path") or params.get("file") or "").strip()
+            if src:
+                urls.append(src)
         return urls
     try:
         segments = list(message)
     except Exception:
         return urls
     for segment in segments:
-        if getattr(segment, "type", "") != "image":
+        if isinstance(segment, dict):
+            seg_type = str(segment.get("type") or "")
+            data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
+        else:
+            seg_type = getattr(segment, "type", "")
+            data = getattr(segment, "data", {}) or {}
+        if seg_type != "image":
             continue
-        data = getattr(segment, "data", {}) or {}
-        url = str(data.get("url") or "").strip()
+        url = str(data.get("url") or data.get("path") or data.get("file") or "").strip()
         if url:
             urls.append(url)
     return urls
 
 
-async def _collect_qq_attachments(event, conversation_key: str) -> list[dict]:
-    """下载 QQ 当前消息及引用消息中的图片，并返回 Clonoth 附件列表。"""
-    # 2026-05-03 修改原因：QQ 图片以前只被转为 [图片] 文本，占位符无法让
-    # Clonoth 读取图像内容。这里把 image segment 的 URL 下载到工作区
-    # data/attachments 下，并返回相对路径，目的是与 Discord 端附件格式一致。
+async def _image_sources_to_attachments(image_urls: List[str], conversation_key: str) -> list[dict]:
+    """下载 OneBot 图片 URL/path 列表，并返回 Clonoth 附件描述。"""
     result: list[dict] = []
-    messages: List[Any] = []
-
-    try:
-        messages.append(event.get_message())
-    except Exception as exc:
-        logger.warning("collect QQ attachments skipped current message: %s", exc)
-
-    reply = getattr(event, "reply", None)
-    reply_msg = getattr(reply, "message", None) if reply else None
-    if reply_msg is not None:
-        messages.append(reply_msg)
-
-    image_urls: List[str] = []
-    for message in messages:
-        image_urls.extend(_iter_qq_image_urls(message))
     if not image_urls:
         return result
 
@@ -348,17 +545,30 @@ async def _collect_qq_attachments(event, conversation_key: str) -> list[dict]:
     async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
         for url in image_urls:
             try:
-                response = await client.get(url)
-                response.raise_for_status()
-                if not response.content:
-                    logger.warning("collect QQ image attachment skipped empty response: %s", url)
+                source = str(url or "").strip()
+                if not source:
                     continue
-                content_type = response.headers.get("content-type", "")
-                mime_type = _guess_image_mime(url, content_type)
-                ext = _image_ext_from_url_or_mime(url, mime_type)
+                if source.startswith("file://"):
+                    local = Path(source[7:])
+                    content = local.read_bytes()
+                    content_type = ""
+                elif re.match(r"^[a-zA-Z]:[\\/]", source) or source.startswith("/"):
+                    local = Path(source)
+                    content = local.read_bytes()
+                    content_type = ""
+                else:
+                    response = await client.get(source)
+                    response.raise_for_status()
+                    content = response.content
+                    content_type = response.headers.get("content-type", "")
+                if not content:
+                    logger.warning("collect QQ image attachment skipped empty response: %s", source)
+                    continue
+                mime_type = _guess_image_mime(source, content_type)
+                ext = _image_ext_from_url_or_mime(source, mime_type)
                 filename = f"{os.urandom(16).hex()}{ext}"
                 file_path = att_dir / filename
-                file_path.write_bytes(response.content)
+                file_path.write_bytes(content)
                 rel_path = file_path.relative_to(workspace).as_posix()
                 result.append({
                     "type": "image",
@@ -371,11 +581,22 @@ async def _collect_qq_attachments(event, conversation_key: str) -> list[dict]:
     return result
 
 
+async def _collect_qq_attachments(event, conversation_key: str) -> list[dict]:
+    """下载 QQ 当前消息中的图片，并返回 Clonoth 附件列表。引用消息由增强 reply 逻辑单独处理。"""
+    try:
+        image_urls = _iter_qq_image_urls(event.get_message())
+    except Exception as exc:
+        logger.warning("collect QQ attachments skipped current message: %s", exc)
+        image_urls = []
+    return await _image_sources_to_attachments(image_urls, conversation_key)
+
+
 def _format_history_line(event: GroupMessageEvent, bot: Bot, override_text: str = "") -> str:
-    """把群消息格式化为 tangqiu_main 提示词要求的历史行。"""
-    text = _compact_text(override_text or _message_to_text(event.get_message(), getattr(bot, "self_id", None)))
-    name = _sender_display_name(event.sender, event.user_id)
-    return f"[{_format_hhmm(getattr(event, 'time', None))}] {name}({event.user_id}): {text}"
+    """把群消息格式化为 tangqiu_main 提示词要求的历史行，并匿名化 QQ ID。"""
+    text = _anonymize_text_for_ai(_compact_text(override_text or _message_to_text(event.get_message(), getattr(bot, "self_id", None))))
+    name = _anonymize_text_for_ai(_sender_display_name(event.sender, event.user_id))
+    user = _anonymize_user_id(event.user_id)
+    return f"[{_format_hhmm(getattr(event, 'time', None))}] {name}({user}): {text}"
 
 
 def _record_group_message(event: GroupMessageEvent, bot: Bot, override_text: str = "") -> None:
@@ -391,42 +612,268 @@ def _record_bot_reply(group_id: int, text: str) -> None:
         return
     text = strip_output_markers(text).replace(_SPLIT_SIGNAL, " ")
     text = _QQ_EMOJI_MARK_RE.sub(lambda m: f"[表情:{m.group(1)}]", text)
-    text = _compact_text(text)
+    text = _anonymize_text_for_ai(_compact_text(text))
     if text:
         _group_history[int(group_id)].append(f"[{dt.datetime.now(_CST).strftime('%H:%M')}] Bot: {text}")
 
 
-def _build_reply_context(event: GroupMessageEvent, bot: Bot) -> str:
-    """提取当前消息引用；OneBot reply 字段不完整时静默跳过。"""
-    reply = getattr(event, "reply", None)
+async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) -> tuple[str, List[Dict[str, Any]]]:
+    """增强引用消息解析：event.reply → 本地缓存 → NapCat get_msg，并采集引用图片附件。"""
+    reply_message_id = _extract_reply_message_id(
+        event.get_message() if hasattr(event, "get_message") else None,
+        getattr(event, "raw_message", None),
+    )
+    reply_obj: Any = getattr(event, "reply", None)
+    reply: Dict[str, Any] | None = None
+
+    if reply_obj is not None:
+        reply = {
+            "message": getattr(reply_obj, "message", None),
+            "raw_message": getattr(reply_obj, "raw_message", None),
+            "sender": getattr(reply_obj, "sender", None),
+            "user_id": getattr(reply_obj, "user_id", None),
+            "time": getattr(reply_obj, "time", None),
+        }
+    if (not reply or reply.get("message") is None) and reply_message_id is not None:
+        reply = _reply_message_cache.get(str(reply_message_id))
+    if (not reply or reply.get("message") is None) and reply_message_id is not None:
+        reply = await _get_reply_message(bot, reply_message_id)
+
     if not reply:
+        if reply_message_id is not None:
+            return _anonymize_text_for_ai(f"（无法获取引用消息内容：message_id={reply_message_id}）"), []
+        return "", []
+
+    message = reply.get("message")
+    raw_message = reply.get("raw_message")
+    text = _message_to_text_generic(message, getattr(bot, "self_id", None)) or _message_to_text_generic(raw_message, getattr(bot, "self_id", None))
+    images = _iter_qq_image_urls(message) or _iter_qq_image_urls(raw_message)
+    quoted_attachments = await _image_sources_to_attachments(images, conversation_key)
+    for att in quoted_attachments:
+        text = text.replace("[图片]", f"[图片: {att['path']}]", 1)
+
+    text = _anonymize_text_for_ai(_compact_text(text))
+    if not text:
+        if reply_message_id is not None:
+            return _anonymize_text_for_ai(f"（引用消息为空或暂不支持的消息类型：message_id={reply_message_id}）"), quoted_attachments
+        return "", quoted_attachments
+
+    sender = reply.get("sender")
+    sender_id = ""
+    if isinstance(sender, dict):
+        sender_id = str(sender.get("user_id") or reply.get("user_id") or "")
+        name_raw = _sanitize_name(str(sender.get("card") or sender.get("nickname") or sender_id or "原作者"))
+    elif sender is not None:
+        sender_id = str(getattr(sender, "user_id", "") or "")
+        name_raw = _sender_display_name(sender, sender_id)
+    else:
+        sender_id = str(reply.get("user_id") or "")
+        name_raw = _sanitize_name(sender_id or "原作者")
+    name = _anonymize_text_for_ai(name_raw)
+    user = _anonymize_user_id(sender_id) if sender_id else "UserUnknown"
+    return f"[{_format_hhmm(reply.get('time'))}] {name}({user}): {text}", quoted_attachments
+
+
+def _alias_from_index(prefix: str, index: int) -> str:
+    letters = ""
+    index = max(0, index)
+    while True:
+        index, rem = divmod(index, 26)
+        letters = chr(ord("A") + rem) + letters
+        if index == 0:
+            break
+        index -= 1
+    return f"{prefix}{letters}"
+
+
+def _anonymize_user_id(user_id: Any) -> str:
+    real = str(user_id or "").strip()
+    if not real:
+        return "UserUnknown"
+    alias = _anon_users.get(real)
+    if alias is None:
+        alias = _alias_from_index("User", len(_anon_users))
+        _anon_users[real] = alias
+        _anon_user_reverse[alias] = real
+    return alias
+
+
+def _anonymize_group_id(group_id: Any) -> str:
+    real = str(group_id or "").strip()
+    if not real:
+        return "GroupUnknown"
+    alias = _anon_groups.get(real)
+    if alias is None:
+        alias = _alias_from_index("Group", len(_anon_groups))
+        _anon_groups[real] = alias
+        _anon_group_reverse[alias] = real
+    return alias
+
+
+def _anonymize_text_for_ai(text: str) -> str:
+    if not text:
         return ""
+    safe = str(text)
+    for real, alias in sorted(_anon_groups.items(), key=lambda item: len(item[0]), reverse=True):
+        safe = re.sub(rf"(?<!\d){re.escape(real)}(?!\d)", alias, safe)
+    for real, alias in sorted(_anon_users.items(), key=lambda item: len(item[0]), reverse=True):
+        safe = re.sub(rf"(?<!\d){re.escape(real)}(?!\d)", alias, safe)
+    return _SENSITIVE_ID_RE.sub(lambda m: _anonymize_user_id(m.group(0)), safe)
+
+
+def _conversation_digest(conversation_key: str) -> str:
+    raw = str(conversation_key or "").strip().encode("utf-8")
+    secret = CONVERSATION_HASH_SECRET.encode("utf-8")
+    if secret:
+        return hmac.new(secret, raw, hashlib.sha256).hexdigest()[:24]
+    return hashlib.sha256(raw).hexdigest()[:24]
+
+
+def _stable_conversation_key(real_conversation_key: str) -> str:
+    """把真实 QQ 会话键转换为可持久化的稳定哈希键，避免 Supervisor 泄漏群号/QQ号。"""
+    if real_conversation_key.startswith("qq_group:"):
+        prefix = "qq_group"
+        _anonymize_group_id(real_conversation_key.split(":", 1)[1])
+    elif real_conversation_key.startswith("qq_private:"):
+        prefix = "qq_private"
+        _anonymize_user_id(real_conversation_key.split(":", 1)[1])
+    else:
+        prefix = "qq_unknown"
+    stable = f"{prefix}:{_conversation_digest(real_conversation_key)}"
+    _real_conversation_keys[stable] = real_conversation_key
+    _stable_conversation_keys[real_conversation_key] = stable
+    return stable
+
+
+def _real_conversation_key(conversation_key: str) -> str:
+    return _real_conversation_keys.get(conversation_key, conversation_key)
+
+
+def _serializable_target(target: Dict[str, Any]) -> Dict[str, Any]:
+    """提取可持久化的 QQ 回复目标，避免把 Bot/Event 对象写进状态文件。"""
+    allowed = {"type", "group_id", "user_id", "conversation_key"}
+    return {key: target[key] for key in allowed if key in target and target[key] is not None}
+
+
+def _load_route_state() -> None:
+    """加载 stable conversation/session 到真实 QQ 目标的本地路由状态。"""
+    path = Path(ONEBOT_STATE_FILE)
+    if not path.exists():
+        return
     try:
-        reply_msg = getattr(reply, "message", None)
-        if reply_msg is None:
-            return ""
-        text = _compact_text(_message_to_text(reply_msg, getattr(bot, "self_id", None)))
-        if not text:
-            return ""
-        sender = getattr(reply, "sender", None)
-        sender_id = getattr(sender, "user_id", "") if sender else ""
-        name = _sender_display_name(sender, sender_id) if sender else "原作者"
-        return f"[{_format_hhmm(getattr(reply, 'time', None))}] {name}: {text}"
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return ""
+        logger.warning("failed to load OneBot route state: %s", path, exc_info=True)
+        return
+    if not isinstance(data, dict):
+        return
+
+    real_map = data.get("real_conversation_keys")
+    if isinstance(real_map, dict):
+        _real_conversation_keys.update({str(k): str(v) for k, v in real_map.items() if str(k) and str(v)})
+        _stable_conversation_keys.update({str(v): str(k) for k, v in _real_conversation_keys.items() if str(k) and str(v)})
+
+    targets = data.get("session_targets")
+    if isinstance(targets, dict):
+        for sid, target in targets.items():
+            if isinstance(target, dict):
+                _persisted_session_targets[str(sid)] = _serializable_target(target)
+
+    logger.info("loaded OneBot route state from %s", path)
 
 
-def _build_inbound_text(event: GroupMessageEvent, bot: Bot, user_text: str) -> str:
-    """组装提交给 tangqiu_main 的群聊 inbound 文本。"""
+async def _save_route_state() -> None:
+    """保存本地路由状态，保障 bot.py 重启后能把 stable key 映射回真实 QQ 目标。"""
+    async with _route_state_lock:
+        path = Path(ONEBOT_STATE_FILE)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "version": 1,
+                "real_conversation_keys": dict(_real_conversation_keys),
+                "session_targets": {
+                    sid: _serializable_target(target)
+                    for sid, target in {**_persisted_session_targets, **_session_targets}.items()
+                    if isinstance(target, dict)
+                },
+            }
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            logger.warning("failed to save OneBot route state: %s", path, exc_info=True)
+
+
+async def _remember_route_state(
+    *,
+    stable_conversation_key: str,
+    real_conversation_key: str,
+    session_id: str = "",
+    target: Optional[Dict[str, Any]] = None,
+) -> None:
+    if stable_conversation_key and real_conversation_key:
+        _real_conversation_keys[stable_conversation_key] = real_conversation_key
+        _stable_conversation_keys[real_conversation_key] = stable_conversation_key
+    if session_id and target:
+        _persisted_session_targets[session_id] = _serializable_target(target)
+    await _save_route_state()
+
+
+def _group_message_mentions_bot(message: Message, bot_self_id: Any) -> bool:
+    for segment in message:
+        if getattr(segment, "type", "") != "at":
+            continue
+        data = getattr(segment, "data", {}) or {}
+        if str(data.get("qq") or "") == str(bot_self_id):
+            return True
+    return False
+
+
+def _group_should_trigger(event: GroupMessageEvent, bot: Bot, text: str) -> bool:
+    mode = (GROUP_TRIGGER or "mention_only").lower()
+    if mode in {"all", "always"}:
+        return True
+    mentions_bot = _group_message_mentions_bot(event.get_message(), getattr(bot, "self_id", None))
+    if mode in {"prefix", "prefix_or_mention", "mention_or_prefix"}:
+        return mentions_bot or any((text or "").strip().startswith(prefix) for prefix in TRIGGER_PREFIXES)
+    return mentions_bot
+
+
+def _strip_trigger_prefix(text: str) -> str:
+    value = (text or "").strip()
+    for prefix in TRIGGER_PREFIXES:
+        if value.startswith(prefix):
+            return value[len(prefix):].strip() or value
+    return value
+
+
+async def _auto_like_user(bot: Bot, user_id: int) -> None:
+    if not ENABLE_AUTO_LIKE:
+        return
+    today = dt.datetime.now(_CST).strftime("%Y-%m-%d")
+    if _auto_like_today.get(user_id) == today:
+        return
+    try:
+        await bot.call_api("send_like", user_id=int(user_id), times=int(AUTO_LIKE_TIMES))
+        _auto_like_today[user_id] = today
+    except Exception:
+        logger.debug("send_like failed for user=%s", user_id, exc_info=True)
+
+
+async def _build_inbound_text(event: GroupMessageEvent, bot: Bot, user_text: str, conversation_key: str, attachments: List[Dict[str, Any]]) -> str:
+    """组装提交给 tangqiu_main 的群聊 inbound 文本，并匿名化 QQ 群号/用户号。"""
     group_id = int(event.group_id)
     history_lines = list(_group_history[group_id])[-_HISTORY_MAX_LEN:]
-    current_name = _sender_display_name(event.sender, event.user_id)
+    current_name = _anonymize_text_for_ai(_sender_display_name(event.sender, event.user_id))
+    current_user = _anonymize_user_id(event.user_id)
     now = dt.datetime.now(_CST).strftime("%Y-%m-%d %H:%M CST")
 
     parts: List[str] = ["【群聊上下文记录】"]
     parts.extend(history_lines or ["（暂无）"])
 
-    reply_context = _build_reply_context(event, bot)
+    reply_context, quoted_attachments = await _build_reply_context(event, bot, conversation_key)
+    if quoted_attachments:
+        attachments.extend(quoted_attachments)
     if reply_context:
         parts.extend(["", "【当前消息引用】", reply_context])
 
@@ -434,25 +881,32 @@ def _build_inbound_text(event: GroupMessageEvent, bot: Bot, user_text: str) -> s
         "",
         f"当前时间: {now}",
         "【当前用户指令】",
-        f"{current_name}（{event.user_id}）: {user_text}",
+        f"{current_name}（{current_user}）: {_anonymize_text_for_ai(user_text)}",
         "",
         "请根据以上上下文，执行当前用户的指令并给出回复。",
     ])
     return "\n".join(parts)
 
 
-def _build_private_inbound_text(event: PrivateMessageEvent, bot: Bot, user_text: str) -> str:
-    """组装提交给 tangqiu_main 的私聊 inbound 文本。"""
-    text = (user_text or _message_to_text(event.get_message(), getattr(bot, "self_id", None))).strip() or "你好"
-    name = _sender_display_name(event.sender, event.user_id)
+async def _build_private_inbound_text(event: PrivateMessageEvent, bot: Bot, user_text: str, conversation_key: str, attachments: List[Dict[str, Any]]) -> str:
+    """组装提交给 tangqiu_main 的私聊 inbound 文本，并匿名化 QQ 用户号。"""
+    text = _anonymize_text_for_ai((user_text or _message_to_text(event.get_message(), getattr(bot, "self_id", None))).strip() or "你好")
+    name = _anonymize_text_for_ai(_sender_display_name(event.sender, event.user_id))
+    user = _anonymize_user_id(event.user_id)
     now = dt.datetime.now(_CST).strftime("%Y-%m-%d %H:%M CST")
-    parts: List[str] = [
-        f"当前时间: {now}",
+    parts: List[str] = [f"当前时间: {now}"]
+    reply_context, quoted_attachments = await _build_reply_context(event, bot, conversation_key)
+    if quoted_attachments:
+        attachments.extend(quoted_attachments)
+    if reply_context:
+        parts.extend(["", "【当前消息引用】", reply_context])
+    parts.extend([
+        "",
         "【当前用户指令】",
-        f"{name}（{event.user_id}）: {text}",
+        f"{name}（{user}）: {text}",
         "",
         "请根据以上上下文，执行当前用户的指令并给出回复。",
-    ]
+    ])
     return "\n".join(parts)
 
 
@@ -537,10 +991,165 @@ async def _try_preempt_running_task(
 
         _session_targets[existing_sid] = dict(fresh_platform)
         _conversation_bots[conversation_key] = bot
+        await _remember_route_state(
+            stable_conversation_key=conversation_key,
+            real_conversation_key=_real_conversation_key(conversation_key),
+            session_id=existing_sid,
+            target=fresh_platform,
+        )
         logger.info("preempt_v2: injected into QQ task %s", rt.task_id[:8])
         return True
 
     return False
+
+
+async def _submit_or_preempt_inbound(
+    *,
+    bot: Bot,
+    event: Event,
+    channel: str,
+    real_conversation_key: str,
+    stable_conversation_key: str,
+    inbound_text: str,
+    user_text: str,
+    attachments: List[Dict[str, Any]],
+    is_dm: bool,
+    platform_updates: Dict[str, Any],
+) -> bool:
+    """提交或打断 QQ 入站消息；对外使用稳定哈希 conversation_key，对内保留真实路由。"""
+    if _client is None or _session_state is None:
+        return False
+
+    preempt_ok = await _try_preempt_running_task(
+        bot=bot,
+        event=event,
+        conversation_key=stable_conversation_key,
+        inbound_text=inbound_text,
+        attachments=attachments or None,
+        is_dm=is_dm,
+        platform_updates=platform_updates,
+    )
+    if preempt_ok:
+        return True
+
+    result = await _client.submit_inbound(
+        channel=channel,
+        conversation_key=stable_conversation_key,
+        text=inbound_text,
+        message_id=str(getattr(event, "message_id", "")),
+        attachments=attachments or None,
+        use_context=True,
+        entry_node_id=ENTRY_NODE_ID,
+        platform_auth={
+            "platform": "qq",
+            "user_id": str(getattr(event, "user_id", "")),
+            "is_admin": _is_admin_user(getattr(event, "user_id", "")),
+        },
+    )
+    if not result.session_id or not result.accepted:
+        return False
+
+    _real_conversation_keys[stable_conversation_key] = real_conversation_key
+    _session_state.register_session(stable_conversation_key, result.session_id)
+    target = dict(platform_updates)
+    target["conversation_key"] = stable_conversation_key
+    _session_targets[result.session_id] = target
+    _conversation_bots[stable_conversation_key] = bot
+    await _remember_route_state(
+        stable_conversation_key=stable_conversation_key,
+        real_conversation_key=real_conversation_key,
+        session_id=result.session_id,
+        target=target,
+    )
+
+    if result.inbound_seq:
+        react_meta: Dict[str, Any] = {}
+        if platform_updates.get("type") == "group" and ENABLE_REACTIONS:
+            react_meta = {
+                "_react_stage": "submitted",
+                "_react_stage_emoji": _REACT_STAGE_EMOJIS["submitted"],
+            }
+        trigger = TriggerInfo(
+            inbound_seq=result.inbound_seq,
+            conversation_key=stable_conversation_key,
+            session_id=result.session_id,
+            is_dm=is_dm,
+            platform_data={
+                **platform_updates,
+                "last_typing_time": time.time(),
+                **react_meta,
+            },
+        )
+        _session_state.register_trigger(trigger)
+    return True
+
+
+async def _enqueue_or_submit_inbound(item: QueuedInbound) -> bool:
+    if not ENABLE_QQ_QUEUE:
+        return await _submit_or_preempt_inbound(
+            bot=item.bot,
+            event=item.event,
+            channel=item.channel,
+            real_conversation_key=item.real_conversation_key,
+            stable_conversation_key=item.stable_conversation_key,
+            inbound_text=item.text,
+            user_text=item.user_text,
+            attachments=item.attachments,
+            is_dm=item.is_dm,
+            platform_updates=item.platform_updates,
+        )
+
+    async with _qq_queue_condition:
+        existing = _qq_queue_by_key.get(item.stable_conversation_key)
+        if existing is not None:
+            existing.text = f"{existing.text}\n\n【排队期间追加消息】\n{item.text}"
+            existing.attachments.extend(item.attachments)
+            existing.event = item.event
+            existing.platform_updates = item.platform_updates
+            existing.user_text = item.user_text
+        else:
+            _qq_queue.append(item)
+            _qq_queue_by_key[item.stable_conversation_key] = item
+        _qq_queue_condition.notify()
+    return True
+
+
+async def _qq_queue_worker_forever() -> None:
+    while True:
+        async with _qq_queue_condition:
+            while not _qq_queue:
+                await _qq_queue_condition.wait()
+            item = _qq_queue.popleft()
+            _qq_queue_by_key.pop(item.stable_conversation_key, None)
+
+        reply_event = asyncio.Event()
+        _qq_waiting_replies[item.stable_conversation_key] = reply_event
+        try:
+            await _submit_or_preempt_inbound(
+                bot=item.bot,
+                event=item.event,
+                channel=item.channel,
+                real_conversation_key=item.real_conversation_key,
+                stable_conversation_key=item.stable_conversation_key,
+                inbound_text=item.text,
+                user_text=item.user_text,
+                attachments=item.attachments,
+                is_dm=item.is_dm,
+                platform_updates=item.platform_updates,
+            )
+            try:
+                await asyncio.wait_for(reply_event.wait(), timeout=QQ_QUEUE_REPLY_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("QQ queue reply wait timed out conversation=%s timeout=%ss", item.real_conversation_key, QQ_QUEUE_REPLY_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("failed to process QQ queue item conversation=%s", item.real_conversation_key)
+        finally:
+            _qq_waiting_replies.pop(item.stable_conversation_key, None)
+        if QQ_QUEUE_INTERVAL > 0:
+            await asyncio.sleep(QQ_QUEUE_INTERVAL)
+
 
 
 def _group_id_from_conversation_key(conversation_key: str) -> Optional[int]:
@@ -569,6 +1178,7 @@ def _target_from_conversation_key(conversation_key: str) -> Optional[Dict[str, A
     """根据 conversation_key 还原 QQ 回复目标，供无 trigger 的回调兜底使用。"""
     # 2026-05-01 修改原因：EventRouter 的 fallback 回调只有 conversation_key；
     # 这里集中解析 group/private 两种 key，避免发送逻辑继续硬编码群聊。
+    conversation_key = _real_conversation_key(conversation_key)
     group_id = _group_id_from_conversation_key(conversation_key)
     if group_id is not None:
         return {"type": "group", "group_id": group_id}
@@ -587,13 +1197,18 @@ def _target_from_platform_data(platform_data: Dict[str, Any]) -> Optional[Dict[s
     msg_id = getattr(event, "message_id", None) if event else None
     sender_id = getattr(event, "user_id", None) if event else None
     target_type = platform_data.get("type")
+    conversation_key = str(platform_data.get("conversation_key") or "")
     if target_type == "private" and platform_data.get("user_id") is not None:
         t: Dict[str, Any] = {"type": "private", "user_id": int(platform_data["user_id"])}
+        if conversation_key:
+            t["conversation_key"] = conversation_key
         if msg_id is not None:
             t["reply_message_id"] = int(msg_id)
         return t
     if target_type == "group" and platform_data.get("group_id") is not None:
         t = {"type": "group", "group_id": int(platform_data["group_id"])}
+        if conversation_key:
+            t["conversation_key"] = conversation_key
         if msg_id is not None:
             t["reply_message_id"] = int(msg_id)
         if sender_id is not None:
@@ -601,6 +1216,8 @@ def _target_from_platform_data(platform_data: Dict[str, Any]) -> Optional[Dict[s
         return t
     if platform_data.get("group_id") is not None:
         t = {"type": "group", "group_id": int(platform_data["group_id"])}
+        if conversation_key:
+            t["conversation_key"] = conversation_key
         if msg_id is not None:
             t["reply_message_id"] = int(msg_id)
         if sender_id is not None:
@@ -644,6 +1261,13 @@ def _message_from_processed_segments(segments: List[Dict[str, Any]]) -> Message:
             if qq_id:
                 message_segments.append(MessageSegment.at(qq_id))
     return Message(message_segments)
+
+
+def _mark_qq_reply_finished(conversation_key: str) -> None:
+    for key in {conversation_key, _real_conversation_key(conversation_key)}:
+        event = _qq_waiting_replies.get(key)
+        if event is not None:
+            event.set()
 
 
 async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any) -> None:
@@ -752,6 +1376,7 @@ async def _send_attachments(bot: Bot, target: Dict[str, Any], attachments: List[
 
 async def _send_text_and_attachments(bot: Bot, target: Dict[str, Any], text: str, attachments: List[Dict[str, Any]]) -> None:
     """统一发送最终文本与附件，并仅在群聊中把最终文本写回群历史。"""
+    conv_key = target.get("conversation_key")
     # 2026-05-01 修改原因：私聊没有群历史缓存，不应写入 _group_history；群聊
     # 仍保留原来的 Bot 回复入库逻辑，维持后续 @Bot 请求的上下文连续性。
     if text:
@@ -761,6 +1386,8 @@ async def _send_text_and_attachments(bot: Bot, target: Dict[str, Any], text: str
                 _record_bot_reply(int(group_id), text)
     if attachments:
         await _send_attachments(bot, target, attachments)
+    if conv_key:
+        _mark_qq_reply_finished(str(conv_key))
 
 
 async def _set_message_react(bot: Bot, event: Any, emoji_id: str, enabled: bool) -> bool:
@@ -768,7 +1395,7 @@ async def _set_message_react(bot: Bot, event: Any, emoji_id: str, enabled: bool)
     # 2026-05-03 修改原因：React 阶段切换需要多处复用 OneBot 扩展 API。
     # 做法是把单次 set_msg_emoji_like 调用包进独立函数，并强制 emoji_id 为 str；
     # 目的在于满足每次 API 调用都单独容错，避免 React 失败影响消息回复。
-    if not bot or not event or not hasattr(event, "message_id"):
+    if not ENABLE_REACTIONS or not bot or not event or not hasattr(event, "message_id"):
         return False
     try:
         await bot.call_api(
@@ -864,7 +1491,7 @@ class TangQiuCallbacks:
 
     async def send_reply_attachment(self, session_id: str, path: str, *args: Any, **kwargs: Any) -> None:
         """兼容旧式 session_id 附件回调；当前 SDK 通常把附件放在 send_reply 中。"""
-        target = _session_targets.get(session_id)
+        target = _session_targets.get(session_id) or _persisted_session_targets.get(session_id)
         if not target:
             return
         bot = target.get("bot") or _get_fallback_bot()
@@ -1073,13 +1700,18 @@ class TangQiuCallbacks:
 @driver.on_startup
 async def _startup() -> None:
     """NoneBot 启动时初始化 Clonoth SDK 与事件路由。"""
-    global _client, _session_state, _event_router, _router_task, _callbacks, _bqbs
+    global _client, _session_state, _event_router, _router_task, _qq_queue_task, _callbacks, _bqbs
     if _router_task is not None and not _router_task.done():
         return
 
     _bqbs = load_bqbs(BQBS_PATH)
+    _load_route_state()
     _client = ClonothClient(CLONOTH_BASE_URL)
     _session_state = SessionState()
+    for sid, target in list(_persisted_session_targets.items()):
+        conv_key = str(target.get("conversation_key") or "")
+        if conv_key:
+            _session_state.register_session(conv_key, sid)
     _callbacks = TangQiuCallbacks()
 
     bot_config = BotConfig(
@@ -1100,13 +1732,15 @@ async def _startup() -> None:
         poll_interval=1.0,
     )
     _router_task = asyncio.create_task(_event_router.run())
+    if ENABLE_QQ_QUEUE and (_qq_queue_task is None or _qq_queue_task.done()):
+        _qq_queue_task = asyncio.create_task(_qq_queue_worker_forever())
     logger.info("Clonoth Agent QQ adapter started: %s", CLONOTH_BASE_URL)
 
 
 @driver.on_shutdown
 async def _shutdown() -> None:
     """NoneBot 关闭时停止事件路由并释放 HTTP 连接。"""
-    global _client, _event_router, _router_task, _callbacks
+    global _client, _event_router, _router_task, _qq_queue_task, _callbacks
     if _event_router is not None:
         _event_router.stop()
     if _router_task is not None:
@@ -1114,6 +1748,11 @@ async def _shutdown() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await _router_task
         _router_task = None
+    if _qq_queue_task is not None:
+        _qq_queue_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _qq_queue_task
+        _qq_queue_task = None
     if _client is not None:
         await _client.close()
         _client = None
@@ -1129,12 +1768,13 @@ _history_matcher = on_message(rule=Rule(_allowed_group_rule), priority=99, block
 @_history_matcher.handle()
 async def _handle_history(bot: Bot, event: GroupMessageEvent) -> None:
     """记录非触发消息，供后续 @Bot 请求作为群聊上下文。"""
+    _remember_message_for_reply_context(event)
     if str(event.user_id) != str(getattr(bot, "self_id", "")):
         _record_group_message(event, bot)
 
 
-# Agent 入口 matcher。只处理 @Bot 的群消息，并阻断后续 matcher，避免重复响应。
-_agent_matcher = on_message(rule=to_me() & Rule(_allowed_group_rule), priority=10, block=True)
+# Agent 入口 matcher。默认只处理 @Bot；也可通过 ONEBOT_GROUP_TRIGGER=prefix/all 切换触发策略。
+_agent_matcher = on_message(rule=Rule(_agent_group_rule), priority=10, block=True)
 
 
 @_agent_matcher.handle()
@@ -1146,103 +1786,50 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     if _client is None or _session_state is None:
         await _agent_matcher.finish("Clonoth Agent 尚未初始化，请稍后重试。")
 
+    _remember_message_for_reply_context(event)
     group_id = int(event.group_id)
-    conversation_key = f"qq_group:{group_id}"
+    real_conversation_key = f"qq_group:{group_id}"
+    stable_conversation_key = _stable_conversation_key(real_conversation_key)
     user_text = _message_to_text(event.get_message(), getattr(bot, "self_id", None)).strip() or "你好"
-    inbound_text = _build_inbound_text(event, bot, user_text)
-    # 2026-05-03 修改原因：QQ 群聊图片需要以 Clonoth 附件形式传入。
-    # 做法是在构造 inbound 文本后立刻下载当前消息和引用消息中的图片，目的
-    # 是让 preempt 与 submit_inbound 使用同一份附件载荷。
-    attachments = await _collect_qq_attachments(event, conversation_key)
-    # 把 inbound_text 中的 [图片] 占位符替换为带路径版本，让 engine 能定位图片
+    user_text = _strip_trigger_prefix(user_text)
+    _record_group_message(event, bot, override_text=user_text)
+    asyncio.create_task(_auto_like_user(bot, int(event.user_id)))
+
+    attachments = await _collect_qq_attachments(event, stable_conversation_key)
+    inbound_text = await _build_inbound_text(event, bot, user_text, stable_conversation_key, attachments)
     if attachments:
         for att in attachments:
             inbound_text = inbound_text.replace("[图片]", f"[图片: {att['path']}]", 1)
 
-    # 2026-05-03 修改原因：在 submit_inbound 前优先尝试 Preempt V2。做法是
-    # 查询当前会话已有 session 的 running task，并只允许同一群用户打断自己的
-    # 入口任务；目的是避免连续 @Bot 时为同一用户并发启动多个入口任务。
-    preempt_ok = await _try_preempt_running_task(
-        bot=bot,
-        event=event,
-        conversation_key=conversation_key,
-        inbound_text=inbound_text,
-        attachments=attachments or None,
-        is_dm=False,
-        platform_updates={
-            "bot": bot,
-            "event": event,
-            "type": "group",
-            "group_id": group_id,
-        },
-    )
-    if preempt_ok:
-        _record_group_message(event, bot, override_text=user_text)
-        await _agent_matcher.finish()
-
+    platform_updates = {
+        "bot": bot,
+        "event": event,
+        "type": "group",
+        "group_id": group_id,
+        "conversation_key": stable_conversation_key,
+    }
     try:
-        # 当前 ClonothZX SDK 暴露的方法名是 submit_inbound；它对应需求中的
-        # send_inbound 语义，即向 Supervisor 提交一条用户输入。
-        result = await _client.submit_inbound(
+        ok = await _enqueue_or_submit_inbound(QueuedInbound(
+            matcher=_agent_matcher,
+            bot=bot,
+            event=event,
             channel="qq_group",
-            conversation_key=conversation_key,
+            real_conversation_key=real_conversation_key,
+            stable_conversation_key=stable_conversation_key,
             text=inbound_text,
-            message_id=str(event.message_id),
-            attachments=attachments or None,
-            use_context=True,
-            entry_node_id=ENTRY_NODE_ID,
-        )
-        # 2026-05-01 修改原因：群聊 @Bot 后需要给触发消息一个反馈；这里在
-        # submit_inbound 成功后立刻调用 OneBot 扩展 API，目的只是展示 reaction，
-        # 因此不支持该接口时静默跳过，不影响原有主流程。
-        try:
-            await bot.call_api("set_msg_emoji_like", message_id=int(event.message_id), emoji_id="76")
-        except Exception:
-            pass
-        # 2026-05-03 修改原因：新增离散 React 状态链。submit_inbound 成功后，
-        # 触发消息不应继续停留在“收到”状态。做法是移除既有 76 并添加 281，
-        # 目的在于提示用户请求已经进入 Clonoth 处理阶段；React 失败仍静默跳过。
-        try:
-            await bot.call_api("set_msg_emoji_like", message_id=int(event.message_id), emoji_id="76", set=False)
-            await bot.call_api("set_msg_emoji_like", message_id=int(event.message_id), emoji_id="281")
-        except Exception:
-            pass
+            attachments=attachments or [],
+            is_dm=False,
+            platform_updates=platform_updates,
+            user_text=user_text,
+        ))
+        if ENABLE_REACTIONS:
+            await _set_message_react(bot, event, "281", True)
     except Exception as exc:
         logger.exception("submit inbound failed")
-        _record_group_message(event, bot, override_text=user_text)
         await _agent_matcher.finish(f"无法连接到 Clonoth Agent：{exc}")
 
-    _record_group_message(event, bot, override_text=user_text)
-
-    if not result.session_id or not result.accepted:
+    if not ok:
         await _agent_matcher.finish("Clonoth Agent 未接受本次请求。")
-
-    _session_state.register_session(conversation_key, result.session_id)
-    _session_targets[result.session_id] = {"type": "group", "group_id": group_id, "bot": bot, "event": event}
-    _conversation_bots[conversation_key] = bot
-
-    if result.inbound_seq:
-        trigger = TriggerInfo(
-            inbound_seq=result.inbound_seq,
-            conversation_key=conversation_key,
-            session_id=result.session_id,
-            is_dm=False,
-            platform_data={
-                "bot": bot,
-                "event": event,
-                "type": "group",
-                "group_id": group_id,
-                "last_typing_time": time.time(),
-                # 2026-05-03 修改原因：submit_inbound 成功后已经把触发消息切到 281。
-                # 做法是在 trigger 平台数据中记录 submitted 阶段，目的在于后续
-                # update_progress 能只向 178、97、326 前进，不重复或倒退切换。
-                "_react_stage": "submitted",
-                "_react_stage_emoji": _REACT_STAGE_EMOJIS["submitted"],
-            },
-        )
-        _session_state.register_trigger(trigger)
-
-    # 纯对话模式不发送“处理中”消息；最终结果由 EventRouter 回调发送。
     await _agent_matcher.finish()
 
 
@@ -1253,14 +1840,13 @@ _private_matcher = on_message(rule=Rule(_private_message_rule), priority=10, blo
 @_private_matcher.handle()
 async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     """把当前 QQ 私聊请求提交给 ClonothZX。"""
-    # 2026-05-01 修改原因：新增 QQ 私聊接入。私聊使用 qq_private:{user_id}
-    # 作为独立会话键，不读取也不写入群聊历史，最终回复通过私聊 API 发回。
     global _last_bot
     _last_bot = bot
 
     if _client is None or _session_state is None:
         await _private_matcher.finish("Clonoth Agent 尚未初始化，请稍后重试。")
 
+    _remember_message_for_reply_context(event)
     user_id = int(event.user_id)
     user_text = _message_to_text(event.get_message(), getattr(bot, "self_id", None)).strip() or "你好"
 
@@ -1290,51 +1876,35 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     if not _is_private_allowed(event):
         await _private_matcher.finish("当前 QQ 私聊未被允许接入 Clonoth。")
 
-    conversation_key = f"qq_private:{user_id}"
-    inbound_text = _build_private_inbound_text(event, bot, user_text)
-    # 2026-05-03 修改原因：QQ 私聊图片同样需要作为 Clonoth 附件传入。
-    # 做法与群聊入口一致，先下载当前消息和引用消息中的图片，目的是让
-    # preempt 与 submit_inbound 在私聊路径也收到正确附件。
-    attachments = await _collect_qq_attachments(event, conversation_key)
+    real_conversation_key = f"qq_private:{user_id}"
+    stable_conversation_key = _stable_conversation_key(real_conversation_key)
+    attachments = await _collect_qq_attachments(event, stable_conversation_key)
+    inbound_text = await _build_private_inbound_text(event, bot, user_text, stable_conversation_key, attachments)
     if attachments:
         for att in attachments:
             inbound_text = inbound_text.replace("[图片]", f"[图片: {att['path']}]", 1)
 
-    # 2026-05-03 修改原因：私聊同一 conversation_key 只对应同一用户。做法是
-    # 在 submit_inbound 前直接尝试打断该私聊 session 的入口任务；目的是让
-    # 用户连续发私聊时复用正在运行的任务，而不是新建并发任务。
-    preempt_ok = await _try_preempt_running_task(
-        bot=bot,
-        event=event,
-        conversation_key=conversation_key,
-        inbound_text=inbound_text,
-        attachments=attachments or None,
-        is_dm=True,
-        platform_updates={
-            "bot": bot,
-            "event": event,
-            "type": "private",
-            "user_id": user_id,
-        },
-    )
-    if preempt_ok:
-        await _private_matcher.finish()
-
+    platform_updates = {
+        "bot": bot,
+        "event": event,
+        "type": "private",
+        "user_id": user_id,
+        "conversation_key": stable_conversation_key,
+    }
     try:
-        # 当前 ClonothZX SDK 暴露的方法名是 submit_inbound；它对应需求中的
-        # send_inbound 语义，即向 Supervisor 提交一条用户输入。
-        result = await _client.submit_inbound(
+        ok = await _enqueue_or_submit_inbound(QueuedInbound(
+            matcher=_private_matcher,
+            bot=bot,
+            event=event,
             channel="qq_private",
-            conversation_key=conversation_key,
+            real_conversation_key=real_conversation_key,
+            stable_conversation_key=stable_conversation_key,
             text=inbound_text,
-            message_id=str(event.message_id),
-            attachments=attachments or None,
-            use_context=True,
-            entry_node_id=ENTRY_NODE_ID,
-        )
-        # 2026-05-01 修改原因：私聊提交成功后需要提示对方“正在输入”；这里调用
-        # OneBot 的 set_input_status 扩展 API，只作为状态提示，目的不是改变会话
-        # 流程，所以兼容不支持该接口的实现并静默跳过。
+            attachments=attachments or [],
+            is_dm=True,
+            platform_updates=platform_updates,
+            user_text=user_text,
+        ))
         try:
             await bot.call_api("set_input_status", user_id=int(event.user_id), event_type=1)
         except Exception:
@@ -1343,28 +1913,6 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
         logger.exception("submit private inbound failed")
         await _private_matcher.finish(f"无法连接到 Clonoth Agent：{exc}")
 
-    if not result.session_id or not result.accepted:
+    if not ok:
         await _private_matcher.finish("Clonoth Agent 未接受本次请求。")
-
-    _session_state.register_session(conversation_key, result.session_id)
-    _session_targets[result.session_id] = {"type": "private", "user_id": user_id, "bot": bot, "event": event}
-    _conversation_bots[conversation_key] = bot
-
-    if result.inbound_seq:
-        trigger = TriggerInfo(
-            inbound_seq=result.inbound_seq,
-            conversation_key=conversation_key,
-            session_id=result.session_id,
-            is_dm=True,
-            platform_data={
-                "bot": bot,
-                "event": event,
-                "type": "private",
-                "user_id": user_id,
-                "last_typing_time": time.time(),
-            },
-        )
-        _session_state.register_trigger(trigger)
-
-    # 纯对话模式不发送“处理中”消息；最终结果由 EventRouter 回调发送。
     await _private_matcher.finish()

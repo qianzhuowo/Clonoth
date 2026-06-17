@@ -17,6 +17,7 @@ skills:
   mode: none
 prompt: |
   {{include:_shared.md}}
+  {{include:_persona.example.md}}
 
   # Role: Shell Orchestrator
 

@@ -51,6 +51,13 @@ ENTRY_NODE_ID = _env_first("CLONOTH_ENTRY_NODE", "ONEBOT_ENTRY_NODE_ID", default
 # QQ 自定义表情名称索引文件路径（可选）。兼容独立 onebot11_adapter.py 的变量名。
 BQBS_PATH = _env_first("ONEBOT_CUSTOM_EMOJI_INDEX_PATH", "CLONOTH_BQBS_PATH", default="")
 
+# QQ 用户身份/称呼配置文件路径（可选，支持 JSON/YAML）。只用于模型可见称呼，不授予权限。
+# 默认读取 Clonoth 工作区 config/qq_user_profiles.yaml；文件不存在时静默跳过。
+USER_PROFILES_PATH = _env_first(
+    "CLONOTH_QQ_USER_PROFILES_PATH",
+    default=os.path.join(CLONOTH_WORKSPACE, "config", "qq_user_profiles.yaml"),
+)
+
 # 群聊触发模式：mention_only（默认，只 @Bot）、prefix（@Bot 或前缀）、all（所有消息）。
 GROUP_TRIGGER = _env_first("ONEBOT_GROUP_TRIGGER", default="mention_only").lower()
 TRIGGER_PREFIXES = tuple(p for p in os.environ.get("ONEBOT_TRIGGER_PREFIXES", "!,！,/，/").split(",") if p)

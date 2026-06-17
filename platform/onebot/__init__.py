@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, DefaultDict, Deque, Dict, List, Optional
 
 import httpx
+import yaml
 from nonebot import get_bot, get_driver, on_message
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message, MessageSegment, PrivateMessageEvent
 from nonebot.rule import Rule, to_me
@@ -50,6 +51,7 @@ from .config import (
     QQ_QUEUE_REPLY_TIMEOUT,
     REPLY_TO_TRIGGER,
     TRIGGER_PREFIXES,
+    USER_PROFILES_PATH,
     ONEBOT_STATE_FILE,
 )
 from .emoji_handler import load_bqbs, process_emojis, strip_output_markers
@@ -145,12 +147,9 @@ _anon_group_reverse: Dict[str, str] = {}
 _pending_approvals: Dict[str, Dict[str, Any]] = {}
 
 
-# QQ 用户本地别名表。把左侧占位符替换为真实 QQ 号，右侧替换为希望模型看到的称呼。
-# 例如："123456789": "老大"。该别名会优先于群名片/昵称写入群聊和私聊 inbound 文本。
-_QQ_USER_ALIASES: Dict[str, str] = {
-    "QQ_USER_ID_PLACEHOLDER_1": "ALIAS_PLACEHOLDER_1",
-    "QQ_USER_ID_PLACEHOLDER_2": "ALIAS_PLACEHOLDER_2",
-}
+# QQ 用户身份/称呼 Profile。只影响模型可见的称呼和身份说明，不授予任何权限。
+# 权限仍只由 CLONOTH_ADMIN_QQ_USERS / _is_admin_user 判定。
+_QQ_USER_PROFILES: Dict[str, Dict[str, Any]] = {}
 
 _client: Optional[ClonothClient] = None
 _session_state: Optional[SessionState] = None
@@ -275,23 +274,80 @@ def _sanitize_name(name: str, max_len: int = 32) -> str:
     return (name[:max_len] + "…") if len(name) > max_len else (name or "未知成员")
 
 
-def _qq_user_alias(user_id: Any) -> str:
-    """按 QQ 号返回本地固定别名；未配置时返回空字符串。"""
+def _load_qq_user_profiles(path_text: str) -> Dict[str, Dict[str, Any]]:
+    """从 JSON/YAML 加载 QQ 用户称呼 Profile；仅用于展示和提示，不授予权限。"""
+    path_text = str(path_text or "").strip()
+    if not path_text:
+        return {}
+    path = Path(path_text).expanduser()
+    if not path.is_absolute():
+        path = (Path(CLONOTH_WORKSPACE) / path).resolve()
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw) if path.suffix.lower() == ".json" else yaml.safe_load(raw)
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        logger.warning("failed to load QQ user profiles: %s", path, exc_info=True)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    users = data.get("users") if isinstance(data.get("users"), dict) else data
+    profiles: Dict[str, Dict[str, Any]] = {}
+    for raw_uid, raw_profile in users.items():
+        uid = str(raw_uid or "").strip()
+        if not uid or not isinstance(raw_profile, dict):
+            continue
+        profile = {
+            "display_name": str(raw_profile.get("display_name") or raw_profile.get("name") or "").strip(),
+            "address_as": str(raw_profile.get("address_as") or raw_profile.get("call_as") or "").strip(),
+            "title": str(raw_profile.get("title") or raw_profile.get("role") or "").strip(),
+            "note": str(raw_profile.get("note") or raw_profile.get("style_note") or "").strip(),
+        }
+        profiles[uid] = {k: v for k, v in profile.items() if v}
+    return profiles
+
+
+def _qq_user_profile(user_id: Any) -> Dict[str, Any]:
     raw = str(user_id or "").strip()
-    if not raw:
-        return ""
-    alias = str(_QQ_USER_ALIASES.get(raw) or "").strip()
-    return _sanitize_name(alias) if alias else ""
+    return dict(_QQ_USER_PROFILES.get(raw) or {})
+
+
+def _qq_profile_display_name(user_id: Any) -> str:
+    name = str(_qq_user_profile(user_id).get("display_name") or "").strip()
+    return _sanitize_name(name) if name else ""
 
 
 def _sender_display_name(sender: Any, fallback_user_id: Any = "") -> str:
-    """优先使用本地 QQ 别名，其次使用群名片/昵称，最后回退到 QQ 号。"""
-    alias = _qq_user_alias(fallback_user_id)
-    if alias:
-        return alias
+    """优先使用 QQ Profile 显示名，其次使用群名片/昵称，最后回退到 QQ 号。"""
+    profile_name = _qq_profile_display_name(fallback_user_id)
+    if profile_name:
+        return profile_name
     card = getattr(sender, "card", "") or ""
     nickname = getattr(sender, "nickname", "") or ""
     return _sanitize_name(card or nickname or str(fallback_user_id or "未知成员"))
+
+
+def _user_identity_lines(user_id: Any, display_name: str) -> List[str]:
+    """生成模型可见的用户身份/称呼提示；权限仍由代码侧 platform_auth 控制。"""
+    profile = _qq_user_profile(user_id)
+    stable_user = _anonymize_user_id(user_id)
+    lines = [
+        f"稳定用户标识: {stable_user}",
+        f"显示名: {_sanitize_name(display_name)}",
+    ]
+    address_as = str(profile.get("address_as") or "").strip()
+    if address_as:
+        lines.append(f"称呼要求: 请称呼该用户为「{_sanitize_name(address_as)}」")
+    title = str(profile.get("title") or "").strip()
+    if title:
+        lines.append(f"身份标签: {_sanitize_name(title)}")
+    note = str(profile.get("note") or "").strip()
+    if note:
+        lines.append(f"称呼/语气备注: {_sanitize_name(note, max_len=80)}")
+    lines.append(f"Clonoth 管理员: {'是' if _is_admin_user(user_id) else '否'}")
+    lines.append("权限说明: 管理员权限仅由系统配置判定，以上称呼配置不授予任何权限。")
+    return lines
 
 
 def _format_hhmm(timestamp: Optional[int]) -> str:
@@ -320,8 +376,8 @@ def _message_to_text(message: Message, bot_self_id: Any = None) -> str:
             qq = data.get("qq", "")
             if str(qq) == str(bot_self_id):
                 continue
-            alias = _qq_user_alias(qq)
-            parts.append("@全体成员" if str(qq).lower() == "all" else f"@{alias or qq}")
+            profile_name = _qq_profile_display_name(qq)
+            parts.append("@全体成员" if str(qq).lower() == "all" else f"@{profile_name or qq}")
         elif seg_type == "image":
             # 2026-05-03 修改原因：图片现在会被下载为 Clonoth 附件；这里仍
             # 保留文本占位符，做法是不改变原有消息转文本输出，目的是让模型
@@ -978,6 +1034,9 @@ async def _build_inbound_text(event: GroupMessageEvent, bot: Bot, user_text: str
     parts.extend([
         "",
         f"当前时间: {now}",
+        "【当前用户身份】",
+        *_user_identity_lines(event.user_id, current_name),
+        "",
         "【当前用户指令】",
         f"{current_name}（{current_user}）: {_anonymize_text_for_ai(user_text)}",
         "",
@@ -999,6 +1058,9 @@ async def _build_private_inbound_text(event: PrivateMessageEvent, bot: Bot, user
     if reply_context:
         parts.extend(["", "【当前消息引用】", reply_context])
     parts.extend([
+        "",
+        "【当前用户身份】",
+        *_user_identity_lines(event.user_id, name),
         "",
         "【当前用户指令】",
         f"{name}（{user}）: {text}",
@@ -1802,7 +1864,11 @@ async def _startup() -> None:
     if _router_task is not None and not _router_task.done():
         return
 
+    global _QQ_USER_PROFILES
     _bqbs = load_bqbs(BQBS_PATH)
+    _QQ_USER_PROFILES = _load_qq_user_profiles(USER_PROFILES_PATH)
+    if _QQ_USER_PROFILES:
+        logger.info("loaded %d QQ user profiles", len(_QQ_USER_PROFILES))
     _load_route_state()
     _client = ClonothClient(CLONOTH_BASE_URL)
     _session_state = SessionState()

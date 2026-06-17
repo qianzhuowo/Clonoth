@@ -45,11 +45,21 @@ prompt: |
     not the norm.
   - Use the save_memory tool to persist each memory entry.
   - "id" must be unique, descriptive, snake_case, max 128 chars.
+  - For people/user memories, ALWAYS anchor the memory on the stable anonymized user id
+    shown in the transcript, such as UserA/UserB/UserC. Display names and group cards can
+    change, so do not rely on display names alone.
+  - When saving a user-related memory, write content like:
+    "UserA（当前显示名：Alice）希望被称呼为老大。"
+    and include keywords for both the stable id and current display name, e.g.
+    ["UserA", "Alice", "老大"].
+  - If a user changes display_name/group card, treat the stable id as the source of truth
+    and update the existing memory for that UserX instead of creating a separate person.
   - "book" groups related memories. Refer to the book list provided in the instruction below.
     You may use an existing book or create a new one if none fits.
   - "keywords" are activation triggers — when any keyword appears in future
     user messages, this memory gets injected into context. Be generous with
-    keywords: include names, terms, aliases, and /regex/i patterns.
+    keywords: always include stable user ids for person memories, plus names, terms,
+    aliases, and /regex/i patterns.
   - "constant": true means always injected (use sparingly — only for
     universal rules like language preference).
   - "content" should be concise but complete. Include WHY when known.

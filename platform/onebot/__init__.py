@@ -80,6 +80,7 @@ _QQ_MESSAGE_LIMIT = QQ_MESSAGE_LIMIT
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _QQ_EMOJI_MARK_RE = re.compile(r"\[QQ_EMOJI:(.+?)\]")
 _CQ_RE = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]*))?\]")
+_AT_QQ_RE = re.compile(r"\[(?:CQ:)?at[,:][^\]]*?qq=([^,\]\s]+)", re.IGNORECASE)
 _SENSITIVE_ID_RE = re.compile(r"(?<!\d)\d{5,12}(?!\d)")
 # 2026-05-03 修改原因：QQ 端需要把 Clonoth 任务生命周期映射为离散 React 阶段。
 # 做法是集中维护阶段到 emoji_id 的映射和阶段顺序，目的在于后续回调只声明
@@ -819,21 +820,97 @@ async def _remember_route_state(
     await _save_route_state()
 
 
-def _group_message_mentions_bot(message: Message, bot_self_id: Any) -> bool:
-    for segment in message:
-        if getattr(segment, "type", "") != "at":
+def _bot_self_id_candidates(event: Event | None, bot: Bot | None) -> set[str]:
+    """收集 Bot 自身 QQ 号候选值，兼容不同 OneBot/NoneBot 对 self_id 的暴露方式。"""
+    candidates: set[str] = set()
+    for source in (bot, event):
+        if source is None:
             continue
-        data = getattr(segment, "data", {}) or {}
-        if str(data.get("qq") or "") == str(bot_self_id):
+        for attr in ("self_id", "bot_id"):
+            value = getattr(source, attr, None)
+            if value is not None and str(value).strip():
+                candidates.add(str(value).strip())
+    return candidates
+
+
+def _qq_matches_bot(qq: Any, bot_ids: set[str]) -> bool:
+    value = str(qq or "").strip()
+    return bool(value and value in bot_ids)
+
+
+def _segment_type_and_data(segment: Any) -> tuple[str, dict[str, Any]]:
+    """兼容 NoneBot MessageSegment 与 OneBot dict segment。"""
+    if isinstance(segment, dict):
+        seg_type = str(segment.get("type") or "")
+        raw_data = segment.get("data")
+        return seg_type, raw_data if isinstance(raw_data, dict) else {}
+    seg_type = str(getattr(segment, "type", "") or "")
+    raw_data = getattr(segment, "data", {}) or {}
+    return seg_type, raw_data if isinstance(raw_data, dict) else {}
+
+
+def _group_message_mentions_bot(message: Any, bot_ids: set[str]) -> bool:
+    try:
+        segments = list(message) if message is not None and not isinstance(message, str) else []
+    except Exception:
+        segments = []
+    for segment in segments:
+        seg_type, data = _segment_type_and_data(segment)
+        if seg_type != "at":
+            continue
+        if _qq_matches_bot(data.get("qq"), bot_ids):
+            return True
+    if isinstance(message, str):
+        return _raw_message_mentions_bot(message, bot_ids)
+    return False
+
+
+def _raw_message_mentions_bot(raw_message: Any, bot_ids: set[str]) -> bool:
+    raw = str(raw_message or "")
+    if not raw or not bot_ids:
+        return False
+    for match in _AT_QQ_RE.finditer(raw):
+        if _qq_matches_bot(match.group(1), bot_ids):
             return True
     return False
+
+
+def _event_mentions_bot(event: GroupMessageEvent, bot: Bot) -> bool:
+    """判断群消息是否 @ 当前 Bot。
+
+    NapCat/OneBot 实现和 NoneBot 版本不同，@Bot 可能表现为：
+    1. 标准 MessageSegment.at；
+    2. event.to_me / event.is_tome()；
+    3. raw_message 中的 CQ/日志风格 at 标记。
+
+    这里把三种信号都纳入判断，避免控制台能看到 [at:qq=...] 但
+    mention_only 规则没有触发正式回复。
+    """
+    bot_ids = _bot_self_id_candidates(event, bot)
+    try:
+        if bool(getattr(event, "to_me", False)):
+            return True
+    except Exception:
+        pass
+    try:
+        is_tome = getattr(event, "is_tome", None)
+        if callable(is_tome) and bool(is_tome()):
+            return True
+    except Exception:
+        pass
+    try:
+        if _group_message_mentions_bot(event.get_message(), bot_ids):
+            return True
+    except Exception:
+        pass
+    return _raw_message_mentions_bot(getattr(event, "raw_message", ""), bot_ids)
 
 
 def _group_should_trigger(event: GroupMessageEvent, bot: Bot, text: str) -> bool:
     mode = (GROUP_TRIGGER or "mention_only").lower()
     if mode in {"all", "always"}:
         return True
-    mentions_bot = _group_message_mentions_bot(event.get_message(), getattr(bot, "self_id", None))
+    mentions_bot = _event_mentions_bot(event, bot)
     if mode in {"prefix", "prefix_or_mention", "mention_or_prefix"}:
         return mentions_bot or any((text or "").strip().startswith(prefix) for prefix in TRIGGER_PREFIXES)
     return mentions_bot

@@ -144,6 +144,14 @@ _anon_group_reverse: Dict[str, str] = {}
 # 待管理员审批的 Clonoth 操作。key 为 approval_id，value 保存操作、详情和来源会话。
 _pending_approvals: Dict[str, Dict[str, Any]] = {}
 
+
+# QQ 用户本地别名表。把左侧占位符替换为真实 QQ 号，右侧替换为希望模型看到的称呼。
+# 例如："123456789": "老大"。该别名会优先于群名片/昵称写入群聊和私聊 inbound 文本。
+_QQ_USER_ALIASES: Dict[str, str] = {
+    "QQ_USER_ID_PLACEHOLDER_1": "ALIAS_PLACEHOLDER_1",
+    "QQ_USER_ID_PLACEHOLDER_2": "ALIAS_PLACEHOLDER_2",
+}
+
 _client: Optional[ClonothClient] = None
 _session_state: Optional[SessionState] = None
 _event_router: Optional[EventRouter] = None
@@ -267,8 +275,20 @@ def _sanitize_name(name: str, max_len: int = 32) -> str:
     return (name[:max_len] + "…") if len(name) > max_len else (name or "未知成员")
 
 
+def _qq_user_alias(user_id: Any) -> str:
+    """按 QQ 号返回本地固定别名；未配置时返回空字符串。"""
+    raw = str(user_id or "").strip()
+    if not raw:
+        return ""
+    alias = str(_QQ_USER_ALIASES.get(raw) or "").strip()
+    return _sanitize_name(alias) if alias else ""
+
+
 def _sender_display_name(sender: Any, fallback_user_id: Any = "") -> str:
-    """优先使用群名片，其次使用昵称，最后回退到 QQ 号。"""
+    """优先使用本地 QQ 别名，其次使用群名片/昵称，最后回退到 QQ 号。"""
+    alias = _qq_user_alias(fallback_user_id)
+    if alias:
+        return alias
     card = getattr(sender, "card", "") or ""
     nickname = getattr(sender, "nickname", "") or ""
     return _sanitize_name(card or nickname or str(fallback_user_id or "未知成员"))
@@ -300,7 +320,8 @@ def _message_to_text(message: Message, bot_self_id: Any = None) -> str:
             qq = data.get("qq", "")
             if str(qq) == str(bot_self_id):
                 continue
-            parts.append("@全体成员" if str(qq).lower() == "all" else f"@{qq}")
+            alias = _qq_user_alias(qq)
+            parts.append("@全体成员" if str(qq).lower() == "all" else f"@{alias or qq}")
         elif seg_type == "image":
             # 2026-05-03 修改原因：图片现在会被下载为 Clonoth 附件；这里仍
             # 保留文本占位符，做法是不改变原有消息转文本输出，目的是让模型

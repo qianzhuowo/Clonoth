@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 import threading
@@ -413,6 +414,25 @@ def memory_dir(workspace_root: Path, memory_book: str = "") -> Path:
     if memory_book:
         return base / memory_book
     return base
+
+
+def _conversation_memory_namespace(conversation_key: Any) -> str:
+    """Return a stable per-conversation memory namespace without leaking raw ids."""
+    raw = str(conversation_key or "").strip()
+    if not raw:
+        return ""
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+    return f"conv_{digest}"
+
+
+def _context_memory_namespace(node: Node | None = None, task_context: dict[str, Any] | None = None) -> str:
+    """Resolve memory namespace: explicit node memory_book wins; otherwise conversation_key."""
+    extra = getattr(node, "extra", {}) if node is not None else {}
+    explicit = str((extra or {}).get("memory_book") or "").strip()
+    if explicit:
+        return explicit
+    ctx = task_context if isinstance(task_context, dict) else {}
+    return _conversation_memory_namespace(ctx.get("conversation_key"))
 
 
 def load_memory_catalog(
@@ -1052,6 +1072,7 @@ def build_knowledge_context(
     instruction_text: str,
     history: list[dict],
     runtime_cfg: dict,
+    task_context: dict[str, Any] | None = None,
 ) -> tuple[list[dict], list[dict], list[dict], list[dict]]:
     """Return ``(skill_static, skill_dynamic, memory_static, memory_dynamic)``.
 
@@ -1067,11 +1088,10 @@ def build_knowledge_context(
     # them into one Entry shape, and render through build_knowledge_messages.
     # Purpose: keep prompt injection behavior stable while deleting the old files.
     entries = normalize_skill_entries(load_skill_catalog(workspace_root))
-    # [2026-05-28] namespace 隔离：从 node.extra 获取 memory_book，加载对应子目录的记忆。
-    # 为什么：持久化子节点的记忆存储在 data/memory/{memory_book}/ 下。
-    # 怎么改：传 memory_book 给 load_memory_catalog，让它扫描正确的目录。
-    # 目的：节点只看到自己 namespace 下的记忆条目。
-    _mb = str(node.extra.get("memory_book") or "").strip()
+    # [2026-06-17] conversation_key 级 memory 隔离：默认每个外部会话读取自己的
+    # data/memory/conv_<hash>/ 命名空间；节点显式配置 memory_book 时仍优先使用
+    # 该节点命名空间。目的：避免私聊/群聊/不同群之间的长期记忆串用和隐私泄露。
+    _mb = _context_memory_namespace(node, task_context)
     entries.extend(normalize_memory_entries(load_memory_catalog(workspace_root, memory_book=_mb)))
 
     return build_knowledge_messages(
@@ -1406,11 +1426,16 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
         except (TypeError, ValueError):
             pass
 
-    # [2026-05-28] 从节点 extra 获取 memory_book namespace，用于写入子目录和 invalidate 对应缓存。
-    # 为什么：持久化子节点的记忆应写入 data/memory/{memory_book}/。
-    # 怎么改：传 memory_book 给 memory_dir 来计算实际路径。
-    _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ns_memory_book = str(_ns_extra.get("memory_book") or "").strip()
+    # [2026-06-17] 写入与读取使用同一 memory namespace：节点显式 memory_book
+    # 优先；否则按 ToolContext.conversation_key 落到 data/memory/conv_<hash>/。
+    # 目的：长期记忆跟随单独聊天，避免私聊/群聊/不同群之间串记忆。
+    _ns_memory_book = _context_memory_namespace(None, {
+        "conversation_key": getattr(ctx, "conversation_key", ""),
+        **(getattr(ctx, "_node_extra", None) or {}),
+    })
+    _node_extra = getattr(ctx, "_node_extra", None) or {}
+    if str(_node_extra.get("memory_book") or "").strip():
+        _ns_memory_book = str(_node_extra.get("memory_book") or "").strip()
     book_path = memory_dir(ctx.workspace_root, _ns_memory_book) / f"{book}.yaml"
     data = _load_book(book_path)
     data.setdefault("book", book)
@@ -1459,10 +1484,11 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     """List memory entries, optionally filtered by book."""
     # Why: list_memories is now plugin-owned like the memory catalog. How: keep
     # the old book scan and preview fields. Purpose: preserve the tool response.
-    # [2026-05-28] namespace 隔离：使用节点 memory_book 确定扫描目录。
+    # [2026-06-17] namespace 隔离：节点显式 memory_book 优先；否则按当前
+    # conversation_key 扫描会话专属 memory 目录。
     book_filter = str(args.get("book") or "").strip() or None
-    _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ns_memory_book = str(_ns_extra.get("memory_book") or "").strip()
+    _node_extra = getattr(ctx, "_node_extra", None) or {}
+    _ns_memory_book = str(_node_extra.get("memory_book") or "").strip() or _conversation_memory_namespace(getattr(ctx, "conversation_key", ""))
     mem_dir = memory_dir(ctx.workspace_root, _ns_memory_book)
     if not mem_dir.exists():
         return _tool_ok("0 memories", entries=[])
@@ -1503,9 +1529,10 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     if not mid:
         return _tool_err("empty memory id")
 
-    # [2026-05-28] namespace 隔离：使用节点 memory_book 确定存储目录。
-    _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ns_memory_book = str(_ns_extra.get("memory_book") or "").strip()
+    # [2026-06-17] namespace 隔离：节点显式 memory_book 优先；否则按当前
+    # conversation_key 删除会话专属 memory 目录中的条目。
+    _node_extra = getattr(ctx, "_node_extra", None) or {}
+    _ns_memory_book = str(_node_extra.get("memory_book") or "").strip() or _conversation_memory_namespace(getattr(ctx, "conversation_key", ""))
     book = str(args.get("book") or "default").strip()
     book_path = memory_dir(ctx.workspace_root, _ns_memory_book) / f"{book}.yaml"
     if not book_path.exists():
@@ -1677,6 +1704,7 @@ class KnowledgeInjector:
             instruction_text,
             history,
             runtime_cfg,
+            task_context=getattr(ctx.rctx, "task_context", {}) or {},
         )
 
         ctx.extra["skill_static_messages"] = skill_static

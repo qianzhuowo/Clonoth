@@ -304,6 +304,9 @@ class MemoryExtractHandler:
             return None
 
         extractor_node = get_str(runtime_cfg, "memory.auto_extract.node_id", "system.memory_extractor").strip()
+        task_input = getattr(task, "input", {}) or {}
+        task_context = task_input.get("task_context") if isinstance(task_input.get("task_context"), dict) else {}
+        conversation_key = str(task_context.get("conversation_key") or "").strip()
         return {
             "session_id": session_id,
             "session_generation": int(getattr(task, "session_generation", 0) or 0),
@@ -312,6 +315,9 @@ class MemoryExtractHandler:
             "pending_task_ids": pending_task_ids,
             "extractor_node": extractor_node,
             "kind": getattr(task, "kind", "node"),
+            # [2026-06-17] 让自动提取出的长期 memory 写入当前 conversation_key
+            # 对应的专属 namespace，避免私聊/群聊/不同群之间串记忆。
+            "conversation_key": conversation_key,
         }
 
     def _schedule_memory_extract_idle_locked(
@@ -401,7 +407,15 @@ class MemoryExtractHandler:
             # while still allowing the extractor to create a new semantic book.
             workspace_value = ctx.get("workspace_root") or pending_extract.get("workspace_root")
             workspace_root = Path(workspace_value) if workspace_value is not None else None
+            conversation_key = str(pending_extract.get("conversation_key") or "").strip()
+            try:
+                from engine.builtin.knowledge_inject import _conversation_memory_namespace
+                memory_namespace = _conversation_memory_namespace(conversation_key)
+            except Exception:
+                memory_namespace = ""
             mem_dir = workspace_root / "data" / "memory" if workspace_root is not None else None
+            if mem_dir is not None and memory_namespace:
+                mem_dir = mem_dir / memory_namespace
             book_names = sorted(
                 p.stem for p in mem_dir.glob("*.yaml")
             ) if mem_dir is not None and mem_dir.exists() else []
@@ -421,6 +435,9 @@ class MemoryExtractHandler:
                     "instruction": book_list_header + transcript,
                     "child_session_id": child_sid,
                     "_system_task": True,
+                    "task_context": {
+                        "conversation_key": conversation_key,
+                    },
                 },
                 continuation={},
                 source_inbound_seq=None,

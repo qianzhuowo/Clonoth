@@ -15,8 +15,6 @@ tool_access:
     - cancel_active_tasks
 skills:
   mode: none
-memories:
-  mode: none
 prompt: |
   {{include:_shared.md}}
 

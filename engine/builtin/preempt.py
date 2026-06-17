@@ -104,6 +104,7 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
         new_instruction,
         scan_history,
         ls.runtime_cfg,
+        task_context=getattr(ls.rctx, "task_context", {}) or {},
     )
     _ = (skill_static, memory_static)
 

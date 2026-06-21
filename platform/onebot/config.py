@@ -73,6 +73,11 @@ REPLY_TO_TRIGGER = _env_bool("ONEBOT_REPLY_TO_TRIGGER", True)
 ENABLE_QQ_QUEUE = _env_bool("ONEBOT_ENABLE_QQ_QUEUE", False)
 QQ_QUEUE_INTERVAL = max(0.0, float(os.environ.get("ONEBOT_QQ_QUEUE_INTERVAL", "2.0")))
 QQ_QUEUE_REPLY_TIMEOUT = max(1.0, float(os.environ.get("ONEBOT_QQ_QUEUE_REPLY_TIMEOUT", "120.0")))
+# [QQ parallel 2026-06-21] 多 worker + 默认不等待回复，避免单个慢/僵死任务阻塞 QQ 聊天。
+QQ_QUEUE_WORKERS = max(1, min(32, int(os.environ.get("ONEBOT_QQ_QUEUE_WORKERS", "4"))))
+QQ_QUEUE_WAIT_FOR_REPLY = _env_bool("ONEBOT_QQ_QUEUE_WAIT_FOR_REPLY", False)
+# [QQ parallel 2026-06-21] preempt 改为显式开启，默认新消息创建新 inbound 并行处理。
+ENABLE_PREEMPT = _env_bool("ONEBOT_ENABLE_PREEMPT", False)
 ENABLE_AUTO_LIKE = _env_bool("ONEBOT_ENABLE_AUTO_LIKE", False)
 AUTO_LIKE_TIMES = max(1, min(20, int(os.environ.get("ONEBOT_AUTO_LIKE_TIMES", "10"))))
 

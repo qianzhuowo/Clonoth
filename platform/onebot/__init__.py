@@ -40,6 +40,7 @@ from .config import (
     CLONOTH_WORKSPACE,
     CONVERSATION_HASH_SECRET,
     ENABLE_AUTO_LIKE,
+    ENABLE_PREEMPT,
     ENABLE_QQ_QUEUE,
     ENABLE_REACTIONS,
     ENTRY_NODE_ID,
@@ -49,6 +50,8 @@ from .config import (
     QQ_MESSAGE_LIMIT,
     QQ_QUEUE_INTERVAL,
     QQ_QUEUE_REPLY_TIMEOUT,
+    QQ_QUEUE_WAIT_FOR_REPLY,
+    QQ_QUEUE_WORKERS,
     REPLY_TO_TRIGGER,
     TRIGGER_PREFIXES,
     USER_PROFILES_PATH,
@@ -155,7 +158,7 @@ _client: Optional[ClonothClient] = None
 _session_state: Optional[SessionState] = None
 _event_router: Optional[EventRouter] = None
 _router_task: Optional[asyncio.Task] = None
-_qq_queue_task: Optional[asyncio.Task] = None
+_qq_queue_tasks: List[asyncio.Task] = []
 _callbacks: Optional["TangQiuCallbacks"] = None
 _bqbs: List[str] = []
 
@@ -1180,17 +1183,18 @@ async def _submit_or_preempt_inbound(
     if _client is None or _session_state is None:
         return False
 
-    preempt_ok = await _try_preempt_running_task(
-        bot=bot,
-        event=event,
-        conversation_key=stable_conversation_key,
-        inbound_text=inbound_text,
-        attachments=attachments or None,
-        is_dm=is_dm,
-        platform_updates=platform_updates,
-    )
-    if preempt_ok:
-        return True
+    if ENABLE_PREEMPT:
+        preempt_ok = await _try_preempt_running_task(
+            bot=bot,
+            event=event,
+            conversation_key=stable_conversation_key,
+            inbound_text=inbound_text,
+            attachments=attachments or None,
+            is_dm=is_dm,
+            platform_updates=platform_updates,
+        )
+        if preempt_ok:
+            return True
 
     result = await _client.submit_inbound(
         channel=channel,
@@ -1282,8 +1286,10 @@ async def _qq_queue_worker_forever() -> None:
             item = _qq_queue.popleft()
             _qq_queue_by_key.pop(item.stable_conversation_key, None)
 
-        reply_event = asyncio.Event()
-        _qq_waiting_replies[item.stable_conversation_key] = reply_event
+        reply_event: Optional[asyncio.Event] = None
+        if QQ_QUEUE_WAIT_FOR_REPLY:
+            reply_event = asyncio.Event()
+            _qq_waiting_replies[item.stable_conversation_key] = reply_event
         try:
             await _submit_or_preempt_inbound(
                 bot=item.bot,
@@ -1297,16 +1303,18 @@ async def _qq_queue_worker_forever() -> None:
                 is_dm=item.is_dm,
                 platform_updates=item.platform_updates,
             )
-            try:
-                await asyncio.wait_for(reply_event.wait(), timeout=QQ_QUEUE_REPLY_TIMEOUT)
-            except asyncio.TimeoutError:
-                logger.warning("QQ queue reply wait timed out conversation=%s timeout=%ss", item.real_conversation_key, QQ_QUEUE_REPLY_TIMEOUT)
+            if reply_event is not None:
+                try:
+                    await asyncio.wait_for(reply_event.wait(), timeout=QQ_QUEUE_REPLY_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.warning("QQ queue reply wait timed out conversation=%s timeout=%ss", item.real_conversation_key, QQ_QUEUE_REPLY_TIMEOUT)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("failed to process QQ queue item conversation=%s", item.real_conversation_key)
         finally:
-            _qq_waiting_replies.pop(item.stable_conversation_key, None)
+            if reply_event is not None:
+                _qq_waiting_replies.pop(item.stable_conversation_key, None)
         if QQ_QUEUE_INTERVAL > 0:
             await asyncio.sleep(QQ_QUEUE_INTERVAL)
 
@@ -1860,7 +1868,7 @@ class TangQiuCallbacks:
 @driver.on_startup
 async def _startup() -> None:
     """NoneBot 启动时初始化 Clonoth SDK 与事件路由。"""
-    global _client, _session_state, _event_router, _router_task, _qq_queue_task, _callbacks, _bqbs
+    global _client, _session_state, _event_router, _router_task, _qq_queue_tasks, _callbacks, _bqbs
     if _router_task is not None and not _router_task.done():
         return
 
@@ -1896,15 +1904,23 @@ async def _startup() -> None:
         poll_interval=1.0,
     )
     _router_task = asyncio.create_task(_event_router.run())
-    if ENABLE_QQ_QUEUE and (_qq_queue_task is None or _qq_queue_task.done()):
-        _qq_queue_task = asyncio.create_task(_qq_queue_worker_forever())
+    if ENABLE_QQ_QUEUE and not any(not task.done() for task in _qq_queue_tasks):
+        _qq_queue_tasks = [asyncio.create_task(_qq_queue_worker_forever()) for _ in range(QQ_QUEUE_WORKERS)]
+        logger.info(
+            "QQ queue enabled: workers=%s interval=%ss wait_for_reply=%s reply_timeout=%ss preempt=%s",
+            QQ_QUEUE_WORKERS,
+            QQ_QUEUE_INTERVAL,
+            QQ_QUEUE_WAIT_FOR_REPLY,
+            QQ_QUEUE_REPLY_TIMEOUT,
+            ENABLE_PREEMPT,
+        )
     logger.info("Clonoth Agent QQ adapter started: %s", CLONOTH_BASE_URL)
 
 
 @driver.on_shutdown
 async def _shutdown() -> None:
     """NoneBot 关闭时停止事件路由并释放 HTTP 连接。"""
-    global _client, _event_router, _router_task, _qq_queue_task, _callbacks
+    global _client, _event_router, _router_task, _qq_queue_tasks, _callbacks
     if _event_router is not None:
         _event_router.stop()
     if _router_task is not None:
@@ -1912,11 +1928,13 @@ async def _shutdown() -> None:
         with contextlib.suppress(asyncio.CancelledError):
             await _router_task
         _router_task = None
-    if _qq_queue_task is not None:
-        _qq_queue_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await _qq_queue_task
-        _qq_queue_task = None
+    if _qq_queue_tasks:
+        for task in _qq_queue_tasks:
+            task.cancel()
+        for task in _qq_queue_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+        _qq_queue_tasks = []
     if _client is not None:
         await _client.close()
         _client = None

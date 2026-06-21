@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -347,27 +348,36 @@ class SchedulerThread:
                 # 回收超时的 running 状态 task（安全网，防止 worker 崩溃后 task 永久孤立）
                 _now_ts = datetime.now(timezone.utc)
                 _stale_cutoff = _now_ts - timedelta(minutes=10)
-                _stale_ids = [
-                    tid for tid, t in self._state.tasks.items()
-                    if t.status == TaskStatus.running
-                    and t.updated_at < _stale_cutoff
-                ]
-                for tid in _stale_ids:
+                try:
+                    _max_running_sec = max(300.0, float(os.getenv("CLONOTH_TASK_MAX_RUNNING_SECONDS", "21600")))
+                except Exception:
+                    _max_running_sec = 21600.0
+                _stale_ids: list[tuple[str, str]] = []
+                for tid, t in self._state.tasks.items():
+                    if t.status != TaskStatus.running:
+                        continue
+                    if t.updated_at < _stale_cutoff:
+                        _stale_min = int((_now_ts - t.updated_at).total_seconds() / 60)
+                        _stale_ids.append((tid, f"任务运行超时（{_stale_min} 分钟无响应，疑似 worker 崩溃）"))
+                        continue
+                    _age_sec = (_now_ts - t.created_at).total_seconds()
+                    if _age_sec > _max_running_sec:
+                        _stale_ids.append((tid, f"任务运行过久（{int(_age_sec)} 秒），已自动终止以防止僵死阻塞聊天"))
+                for tid, _reason in _stale_ids:
                     task = self._state.tasks.get(tid)
                     if task is None or task.status != TaskStatus.running:
                         continue
-                    _stale_min = int((_now_ts - task.updated_at).total_seconds() / 60)
                     task.status = TaskStatus.failed
                     task.result = {
                         "action": "fail",
                         "node_id": task.node_id or "",
-                        "error": f"任务运行超时（{_stale_min} 分钟无响应，疑似 worker 崩溃）",
+                        "error": _reason,
                     }
                     task.updated_at = _now_ts
                     task.lease_expires_at = None
                     self._state._event_task_snapshot("task_completed", task, component="supervisor")
                     self._state._route_completed_task_locked(task)
-                    log.warning(f"[scheduler] reaped stale running task {tid} (node={task.node_id}, stale {_stale_min}min)")
+                    log.warning(f"[scheduler] reaped stale running task {tid} (node={task.node_id}, reason={_reason})")
         except Exception as e:
             log.warning(f"[scheduler] cleanup error: {e}")
 

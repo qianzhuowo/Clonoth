@@ -84,6 +84,9 @@ class AdapterConfig:
     enable_qq_queue: bool
     qq_queue_interval: float
     qq_queue_reply_timeout: float
+    qq_queue_workers: int
+    qq_queue_wait_for_reply: bool
+    enable_preempt: bool
     allowed_groups: set[int]
     allowed_private_users: set[int]
     admin_users: set[int]
@@ -121,6 +124,21 @@ class AdapterConfig:
             enable_qq_queue=_env_bool("ONEBOT_ENABLE_QQ_QUEUE", True),
             qq_queue_interval=max(0.0, float(os.getenv("ONEBOT_QQ_QUEUE_INTERVAL", "5.0"))),
             qq_queue_reply_timeout=max(1.0, float(os.getenv("ONEBOT_QQ_QUEUE_REPLY_TIMEOUT", "600.0"))),
+            # [QQ parallel 2026-06-21] Why: a single queue worker that waits for a
+            # reply can let one zombie/stuck conversation block every later QQ
+            # message. How: allow multiple workers to drain the queue in parallel.
+            # Purpose: QQ bot remains responsive even when one request is slow.
+            qq_queue_workers=max(1, min(32, int(os.getenv("ONEBOT_QQ_QUEUE_WORKERS", "4")))),
+            # [QQ parallel 2026-06-21] Why: waiting for an outbound reply before
+            # draining the next queued QQ item lets one slow/stuck task serialize
+            # chat. How: make reply waiting opt-in. Purpose: true multi-task QQ
+            # parallelism by default.
+            qq_queue_wait_for_reply=_env_bool("ONEBOT_QQ_QUEUE_WAIT_FOR_REPLY", False),
+            # [QQ parallel 2026-06-21] Why: preempting a stale running task caused a
+            # new user message to be swallowed by the old stuck task. How: make
+            # preempt opt-in; default path always creates a fresh inbound task.
+            # Purpose: user chat continues in parallel while old tasks are reaped.
+            enable_preempt=_env_bool("ONEBOT_ENABLE_PREEMPT", False),
             allowed_groups=_env_int_set("ONEBOT_ALLOWED_GROUPS"),
             allowed_private_users=_env_int_set("ONEBOT_ALLOWED_PRIVATE_USERS"),
             admin_users=_env_int_set("ONEBOT_ADMIN_USERS"),
@@ -508,8 +526,10 @@ class ClonothOneBotAdapter:
                 item = self._qq_queue.popleft()
                 self._qq_queue_by_key.pop(item.merge_key, None)
 
-            reply_event = asyncio.Event()
-            self._qq_waiting_replies[item.conversation_key] = reply_event
+            reply_event: asyncio.Event | None = None
+            if self.config.qq_queue_wait_for_reply:
+                reply_event = asyncio.Event()
+                self._qq_waiting_replies[item.conversation_key] = reply_event
             try:
                 await self.submit_or_preempt(
                     channel=item.channel,
@@ -520,17 +540,19 @@ class ClonothOneBotAdapter:
                     target=item.target,
                     is_dm=item.is_dm,
                 )
-                try:
-                    await asyncio.wait_for(reply_event.wait(), timeout=self.config.qq_queue_reply_timeout)
-                    LOG.info("QQ queue item finished conversation=%s", item.conversation_key)
-                except asyncio.TimeoutError:
-                    LOG.warning("QQ queue reply wait timed out conversation=%s timeout=%ss", item.conversation_key, self.config.qq_queue_reply_timeout)
+                if reply_event is not None:
+                    try:
+                        await asyncio.wait_for(reply_event.wait(), timeout=self.config.qq_queue_reply_timeout)
+                        LOG.info("QQ queue item finished conversation=%s", item.conversation_key)
+                    except asyncio.TimeoutError:
+                        LOG.warning("QQ queue reply wait timed out conversation=%s timeout=%ss", item.conversation_key, self.config.qq_queue_reply_timeout)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 LOG.exception("failed to process QQ queue item conversation=%s", item.conversation_key)
             finally:
-                self._qq_waiting_replies.pop(item.conversation_key, None)
+                if reply_event is not None:
+                    self._qq_waiting_replies.pop(item.conversation_key, None)
 
             if self.config.qq_queue_interval > 0:
                 await asyncio.sleep(self.config.qq_queue_interval)
@@ -609,8 +631,9 @@ class ClonothOneBotAdapter:
         target: dict[str, Any],
         is_dm: bool,
     ) -> None:
-        if await self.try_preempt_running_task(conversation_key, text, attachments, target, is_dm=is_dm):
-            return
+        if self.config.enable_preempt:
+            if await self.try_preempt_running_task(conversation_key, text, attachments, target, is_dm=is_dm):
+                return
         await self.submit_inbound(
             channel=channel,
             conversation_key=conversation_key,
@@ -1661,17 +1684,26 @@ def create_app(adapter: ClonothOneBotAdapter) -> FastAPI:
     @app.on_event("startup")
     async def startup() -> None:
         app.state.poller = asyncio.create_task(adapter.poll_events_forever())
-        app.state.qq_queue_worker = asyncio.create_task(adapter.qq_queue_worker_forever()) if adapter.config.enable_qq_queue else None
+        app.state.qq_queue_workers = (
+            [asyncio.create_task(adapter.qq_queue_worker_forever()) for _ in range(adapter.config.qq_queue_workers)]
+            if adapter.config.enable_qq_queue
+            else []
+        )
         LOG.info("polling Clonoth events from %s", adapter.config.supervisor_url)
         if adapter.config.enable_qq_queue:
-            LOG.info("QQ queue enabled: global single queue, interval=%ss", adapter.config.qq_queue_interval)
+            LOG.info(
+                "QQ queue enabled: workers=%s interval=%ss wait_for_reply=%s reply_timeout=%ss preempt=%s",
+                adapter.config.qq_queue_workers,
+                adapter.config.qq_queue_interval,
+                adapter.config.qq_queue_wait_for_reply,
+                adapter.config.qq_queue_reply_timeout,
+                adapter.config.enable_preempt,
+            )
 
     @app.on_event("shutdown")
     async def shutdown() -> None:
-        tasks = [
-            getattr(app.state, "poller", None),
-            getattr(app.state, "qq_queue_worker", None),
-        ]
+        tasks = [getattr(app.state, "poller", None)]
+        tasks.extend(getattr(app.state, "qq_queue_workers", []) or [])
         for task in tasks:
             if task is None:
                 continue

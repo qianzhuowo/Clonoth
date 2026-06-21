@@ -18,10 +18,14 @@ rem Optional: QQ custom emoji name index. One name per line, order must match Na
 rem The bot can then send [QQ_EMOJI:name] as a custom emoji image.
 rem set "ONEBOT_CUSTOM_EMOJI_INDEX_PATH=data\bqbs.txt"
 
-rem QQ global queue: QQ group/private messages are processed one by one.
+rem QQ queue: default is parallel and does not wait for a reply before accepting the next item.
 set "ONEBOT_ENABLE_QQ_QUEUE=true"
 set "ONEBOT_QQ_QUEUE_INTERVAL=2"
 set "ONEBOT_QQ_QUEUE_REPLY_TIMEOUT=120"
+set "ONEBOT_QQ_QUEUE_WORKERS=4"
+set "ONEBOT_QQ_QUEUE_WAIT_FOR_REPLY=false"
+rem Preempt is opt-in. Keep false to prevent stale running tasks from swallowing new QQ messages.
+set "ONEBOT_ENABLE_PREEMPT=false"
 
 python platform\onebot11_adapter.py
 pause

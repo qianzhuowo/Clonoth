@@ -28,6 +28,44 @@ def _err(message: Any, **fields: Any) -> dict[str, Any]:
     return response
 
 
+def _platform_admin_can_manage_schedules(ctx: ToolContext) -> bool:
+    """Return whether the current platform user may manage schedules without approval.
+
+    [QQ schedule 2026-06-21] Why: create_schedule used the generic write_file
+    guard for data/schedules.yaml. In QQ chats this produced approval_requested
+    events and the task waited forever if the approval prompt was not surfaced.
+    How: trust the platform_auth.is_admin flag that adapters already derive from
+    server-side admin lists. Purpose: QQ admins can create/delete reminders as a
+    normal chat action without blocking on a second write_file approval.
+    """
+    auth = getattr(ctx, "platform_auth", None)
+    if not isinstance(auth, dict):
+        return False
+    platform = str(auth.get("platform") or "").strip().lower()
+    return platform in {"qq", "onebot", "onebot11"} and bool(auth.get("is_admin"))
+
+
+def _resolve_schedule_conversation_key(args: dict[str, Any], ctx: ToolContext, sid: str) -> str:
+    """Resolve the conversation key a schedule should fire back to.
+
+    [QQ schedule 2026-06-21] Why: models may pass conversation_key="scheduler:*"
+    while executing inside a QQ chat. That creates a schedule that fires into an
+    internal scheduler channel and cannot be delivered back to QQ. How: when the
+    current ToolContext is already a QQ conversation, prefer it over model-provided
+    scheduler/empty keys. Purpose: reminders created from QQ reliably return to
+    the originating QQ private/group chat.
+    """
+    arg_key = str(args.get("conversation_key") or "").strip()
+    ctx_key = str(getattr(ctx, "conversation_key", "") or "").strip()
+    if ctx_key.startswith(("qq_private:", "qq_group:")):
+        return ctx_key
+    if arg_key:
+        return arg_key
+    if ctx_key:
+        return ctx_key
+    return f"scheduler:{sid}"
+
+
 async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     """Create or update a scheduled task."""
     from supervisor.scheduler import load_schedules, save_schedules
@@ -57,21 +95,16 @@ async def create_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     if stype == "script" and not command:
         return _err("empty command (required for script type)")
 
-    conv_key = str(args.get("conversation_key") or "").strip()
-    if not conv_key:
-        # [2026-05-25] Auto-inherit from ToolContext (populated by supervisor
-        # task_context → engine RunContext → ToolContext, zero I/O overhead).
-        conv_key = str(getattr(ctx, "conversation_key", "") or "").strip()
-    if not conv_key:
-        conv_key = f"scheduler:{sid}"
+    conv_key = _resolve_schedule_conversation_key(args, ctx, sid)
     entry_node_id = str(args.get("entry_node_id") or "").strip()
     workflow_id = str(args.get("workflow_id") or "").strip()
     enabled = bool(args.get("enabled", True))
     once = bool(args.get("once", False))
 
-    _op, err = await request_guard(ctx, "write_file", {"path": "data/schedules.yaml", "schedule_id": sid})
-    if err is not None:
-        return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
+    if not _platform_admin_can_manage_schedules(ctx):
+        _op, err = await request_guard(ctx, "write_file", {"path": "data/schedules.yaml", "schedule_id": sid})
+        if err is not None:
+            return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
     schedules = load_schedules(ctx.workspace_root)
     entry: dict[str, Any] = {
@@ -125,9 +158,10 @@ async def delete_schedule(args: dict[str, Any], ctx: ToolContext) -> dict[str, A
     if not sid:
         return _err("empty schedule id")
 
-    _op, err = await request_guard(ctx, "write_file", {"path": "data/schedules.yaml", "delete_schedule": sid})
-    if err is not None:
-        return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
+    if not _platform_admin_can_manage_schedules(ctx):
+        _op, err = await request_guard(ctx, "write_file", {"path": "data/schedules.yaml", "delete_schedule": sid})
+        if err is not None:
+            return _err(err.get("error", "denied"), cancelled=bool(err.get("cancelled", False)))
 
     schedules = load_schedules(ctx.workspace_root)
     before = len(schedules)

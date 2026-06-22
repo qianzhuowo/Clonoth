@@ -10,20 +10,21 @@ At invocation this file runs as a subprocess:
   - Sensitive env vars are stripped
 """
 
-SPEC = {'description': '搜索 X/Twitter 上的帖子。通过 xAI Grok API 的 Responses API + x_search '
-                '工具实现，支持语义搜索和关键词搜索，返回帖子内容和链接引用。',
- 'input_schema': {'properties': {'api_key': {'description': 'xAI API key。若不传，则依次使用环境变量或 .env 中的 XAI_API_KEY、OPENAI_API_KEY',
-                                             'type': 'string'},
-                                 'max_tokens': {'default': 64000,
-                                                'description': '最大输出 token 数，默认 64000',
-                                                'type': 'integer'},
-                                 'model': {'default': 'grok-4.3',
-                                           'description': '使用的模型，默认 grok-4.3',
-                                           'type': 'string'},
-                                 'query': {'description': '搜索查询，用自然语言描述想搜什么', 'type': 'string'}},
-                  'required': ['query'],
-                  'type': 'object'},
- 'name': 'x_search'}
+SPEC = {
+    'description': (
+        '搜索 X/Twitter 上的帖子。调用时只需要填写 query 字段，例如：'
+        '{"query": "今天 AI 领域的热门推文"}。'
+        '需要更稳的自动搜索时优先使用 web_search。'
+    ),
+    'input_schema': {
+        'properties': {
+            'query': {'description': '搜索关键词或用户问题原文。必填。', 'type': 'string'}
+        },
+        'required': ['query'],
+        'type': 'object'
+    },
+    'name': 'x_search'
+}
 
 TIMEOUT_SEC = 130.0
 
@@ -32,11 +33,34 @@ if __name__ == "__main__":
     import json, sys
     _input = json.loads((sys.stdin.read() or "{}").lstrip("\ufeff"))
     def output(result): print(json.dumps(result, ensure_ascii=False)); sys.exit(0)
-    def fail(error):
+    def fail(error, hint=''):
         # [AutoC 2026-05-31] Why: x_search failures should remain readable after
-        # the engine prefers data.result. How: emit ok=false with data.result before
+        # the prefers data.result. How: emit ok=false with data.result before
         # exiting non-zero. Purpose: preserve specific API errors in tool history.
-        print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False)); sys.exit(1)
+        message = str(error)
+        if hint:
+            message = f"{message}\n修复建议：{hint}"
+        print(json.dumps({"ok": False, "error": message, "data": {"result": f"ERROR: {message}"}}, ensure_ascii=False)); sys.exit(1)
+
+    def extract_query(value):
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            return ' '.join(str(item).strip() for item in value if str(item).strip()).strip()
+        if not isinstance(value, dict):
+            return ''
+        for key in ['query', 'q', 'keyword', 'keywords', 'search', 'search_query', 'searchQuery', 'term', 'terms', 'text', 'content', 'prompt', 'question', 'input', 'message']:
+            if key in value:
+                extracted = extract_query(value.get(key))
+                if extracted:
+                    return extracted
+        for key in ['args', 'arguments', 'params', 'parameters', 'data', 'payload', 'request']:
+            if key in value:
+                extracted = extract_query(value.get(key))
+                if extracted:
+                    return extracted
+        return ''
+
     args = _input if isinstance(_input, dict) else {}
     import urllib.request
     import json
@@ -59,7 +83,12 @@ if __name__ == "__main__":
             return {}
         return values
     
-    query = args.get('query', '')
+    query = extract_query(_input)
+    if not query:
+        fail(
+            '缺少搜索关键词。',
+            '请重新调用 x_search，格式固定为：{"query": "要搜索的内容"}。如果已有用户问题，请把用户问题原文放入 query。'
+        )
     model = args.get('model', 'grok-4.3')
     max_tokens = args.get('max_tokens', 64000)
     api_key = str(args.get('api_key') or os.environ.get('XAI_API_KEY') or os.environ.get('OPENAI_API_KEY') or '').strip()

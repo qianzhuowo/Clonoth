@@ -13,63 +13,21 @@ At invocation this file runs as a subprocess:
 SPEC = {
     "name": "exa_search",
     "description": (
-        "使用 Exa API 进行联网搜索，适合通用网页搜索、资料检索和带来源引用的研究任务。"
-        "返回搜索结果摘要、URL 引用和结构化结果列表。需要 EXA_API_KEY 环境变量或 .env 配置，"
-        "也可在参数 api_key 中显式传入。"
+        "Exa 网页搜索工具。用于通用网页搜索、资料检索、新闻查询和带来源引用的研究任务。"
+        "调用时只需要填写 query 字段，例如：{\"query\": \"今天 AI 新闻\"}。"
+        "不要填写 api_key、base_url 等内部字段；需要更稳的自动搜索时优先使用 web_search。"
     ),
     "input_schema": {
         "type": "object",
         "properties": {
             "query": {
                 "type": "string",
-                "description": "搜索查询。可以使用自然语言描述要查找的信息。",
-            },
-            "api_key": {
-                "type": "string",
-                "description": "Exa API key。不传则使用环境变量或 .env 中的 EXA_API_KEY。",
-            },
-            "base_url": {
-                "type": "string",
-                "description": "Exa API base URL。不传则使用环境变量或 .env 中的 EXA_BASE_URL，默认 https://api.exa.ai。",
+                "description": "搜索关键词或用户问题原文。必填。",
             },
             "num_results": {
                 "type": "integer",
                 "default": 5,
-                "description": "返回结果数量，默认 5，最大 20。",
-            },
-            "search_type": {
-                "type": "string",
-                "default": "auto",
-                "enum": ["auto", "neural", "keyword"],
-                "description": "搜索类型。auto=自动选择，neural=语义搜索，keyword=关键词搜索。默认 auto。",
-            },
-            "include_domains": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "可选，仅搜索这些域名，例如 [\"example.com\"]。",
-            },
-            "exclude_domains": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "可选，排除这些域名。",
-            },
-            "start_published_date": {
-                "type": "string",
-                "description": "可选，限定发布日期起点，ISO 日期字符串，例如 2024-01-01T00:00:00.000Z。",
-            },
-            "end_published_date": {
-                "type": "string",
-                "description": "可选，限定发布日期终点，ISO 日期字符串。",
-            },
-            "use_autoprompt": {
-                "type": "boolean",
-                "default": True,
-                "description": "是否让 Exa 自动优化搜索查询，默认 true。",
-            },
-            "text_max_characters": {
-                "type": "integer",
-                "default": 1000,
-                "description": "每条结果最多返回的正文字符数，默认 1000，最大 5000。设为 0 可不请求正文。",
+                "description": "返回结果数量，默认 5，最大 10。",
             },
         },
         "required": ["query"],
@@ -92,8 +50,11 @@ if __name__ == "__main__":
         print(json.dumps(result, ensure_ascii=False))
         sys.exit(0)
 
-    def fail(error):
-        print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False))
+    def fail(error, hint=""):
+        message = str(error)
+        if hint:
+            message = f"{message}\n修复建议：{hint}"
+        print(json.dumps({"ok": False, "error": message, "data": {"result": f"ERROR: {message}"}}, ensure_ascii=False))
         sys.exit(1)
 
     def as_clean_string_list(value):
@@ -107,6 +68,39 @@ if __name__ == "__main__":
         except Exception:
             parsed = default
         return max(minimum, min(maximum, parsed))
+
+    def extract_query(value):
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            return " ".join(str(item).strip() for item in value if str(item).strip()).strip()
+        if not isinstance(value, dict):
+            return ""
+
+        query_keys = [
+            "query", "q", "keyword", "keywords", "search", "search_query", "searchQuery",
+            "term", "terms", "text", "content", "prompt", "question", "input", "message",
+        ]
+        for key in query_keys:
+            if key in value:
+                extracted = extract_query(value.get(key))
+                if extracted:
+                    return extracted
+
+        for key in ["args", "arguments", "params", "parameters", "data", "payload", "request"]:
+            if key in value:
+                extracted = extract_query(value.get(key))
+                if extracted:
+                    return extracted
+        return ""
+
+    def extract_int_alias(args, keys, default, minimum, maximum):
+        if not isinstance(args, dict):
+            return default
+        for key in keys:
+            if key in args:
+                return clamp_int(args.get(key), default, minimum, maximum)
+        return default
 
     def load_dotenv():
         env_path = os.path.join(os.getcwd(), ".env")
@@ -127,9 +121,12 @@ if __name__ == "__main__":
 
     args = _input if isinstance(_input, dict) else {}
 
-    query = str(args.get("query") or "").strip()
+    query = extract_query(_input)
     if not query:
-        fail("query is required")
+        fail(
+            "缺少搜索关键词。",
+            "请重新调用 exa_search，格式固定为：{\"query\": \"要搜索的内容\"}。如果已有用户问题，请把用户问题原文放入 query。",
+        )
 
     api_key = str(args.get("api_key") or os.environ.get("EXA_API_KEY") or "").strip()
     base_url = str(args.get("base_url") or os.environ.get("EXA_BASE_URL") or "").strip().rstrip("/")
@@ -145,7 +142,13 @@ if __name__ == "__main__":
         fail("No Exa API key available. Set EXA_API_KEY in the environment or .env, or pass api_key.")
     if not base_url:
         base_url = "https://api.exa.ai"
-    num_results = clamp_int(args.get("num_results", 5), 5, 1, 20)
+    num_results = extract_int_alias(
+        args,
+        ["num_results", "numResults", "max_results", "maxResults", "limit", "top_k", "topK", "count"],
+        5,
+        1,
+        20,
+    )
     search_type = str(args.get("search_type") or "auto").strip().lower()
     if search_type not in {"auto", "neural", "keyword"}:
         search_type = "auto"

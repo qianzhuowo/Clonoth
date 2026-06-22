@@ -107,7 +107,7 @@ class AdapterConfig:
             port=int(os.getenv("ONEBOT_ADAPTER_PORT", "8766")),
             ws_path=os.getenv("ONEBOT_WS_PATH", "/onebot/ws"),
             access_token=os.getenv("ONEBOT_ACCESS_TOKEN", ""),
-            entry_node_id=os.getenv("ONEBOT_ENTRY_NODE_ID", ""),
+            entry_node_id=os.getenv("ONEBOT_ENTRY_NODE_ID", os.getenv("CLONOTH_ENTRY_NODE", "qq.web_search")),
             poll_interval=float(os.getenv("ONEBOT_POLL_INTERVAL", "0.8")),
             workspace_root=workspace_root,
             state_file=Path(os.getenv("ONEBOT_STATE_FILE", str(workspace_root / "data" / "onebot11_adapter_state.json"))).resolve(),

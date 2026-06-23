@@ -6,3 +6,4 @@ python-dotenv>=1.0.0
 PyYAML>=6.0.1
 mcp>=1.9.0,<2
 textual>=0.85.0
+Pillow>=10.0.0

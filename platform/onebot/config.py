@@ -15,6 +15,32 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off", ""}
 
 
+def _env_int(name: str, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    raw = os.environ.get(name)
+    try:
+        value = int(str(raw).strip()) if raw is not None else int(default)
+    except Exception:
+        value = int(default)
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def _env_float(name: str, default: float, *, min_value: float | None = None, max_value: float | None = None) -> float:
+    raw = os.environ.get(name)
+    try:
+        value = float(str(raw).strip()) if raw is not None else float(default)
+    except Exception:
+        value = float(default)
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
 def _env_first(*names: str, default: str = "") -> str:
     """按优先级读取第一个非空环境变量。"""
     for name in names:
@@ -63,9 +89,20 @@ GROUP_TRIGGER = _env_first("ONEBOT_GROUP_TRIGGER", default="mention_only").lower
 TRIGGER_PREFIXES = tuple(p for p in os.environ.get("ONEBOT_TRIGGER_PREFIXES", "!,！,/，/").split(",") if p)
 
 # QQ 输出与上下文限制。
-GROUP_HISTORY_MAX = max(0, int(os.environ.get("ONEBOT_GROUP_HISTORY_MAX", "20")))
-HISTORY_TEXT_LIMIT = max(50, int(os.environ.get("ONEBOT_HISTORY_TEXT_LIMIT", "400")))
-QQ_MESSAGE_LIMIT = max(500, int(os.environ.get("ONEBOT_QQ_MESSAGE_LIMIT", "4300")))
+GROUP_HISTORY_MAX = _env_int("ONEBOT_GROUP_HISTORY_MAX", 20, min_value=0)
+HISTORY_TEXT_LIMIT = _env_int("ONEBOT_HISTORY_TEXT_LIMIT", 400, min_value=50)
+QQ_MESSAGE_LIMIT = _env_int("ONEBOT_QQ_MESSAGE_LIMIT", 4300, min_value=500)
+
+# QQ 图片/多模态输入配置。
+ENABLE_IMAGE_INPUT = _env_bool("ONEBOT_ENABLE_IMAGE_INPUT", True)
+IMAGE_MAX_BYTES = _env_int("ONEBOT_IMAGE_MAX_BYTES", 10 * 1024 * 1024, min_value=1024)
+IMAGE_DOWNLOAD_TIMEOUT = _env_float("ONEBOT_IMAGE_DOWNLOAD_TIMEOUT", 15.0, min_value=1.0)
+IMAGE_CACHE_TTL_SECONDS = _env_int("ONEBOT_IMAGE_CACHE_TTL_SECONDS", 24 * 3600, min_value=60)
+RECENT_IMAGE_MAX_ITEMS = _env_int("ONEBOT_RECENT_IMAGE_MAX_ITEMS", 20, min_value=1, max_value=200)
+RECENT_IMAGE_MAX_AGE_SECONDS = _env_float("ONEBOT_RECENT_IMAGE_MAX_AGE_SECONDS", 60.0, min_value=1.0)
+IMAGE_WAIT_AFTER_TEXT_SECONDS = _env_float("ONEBOT_IMAGE_WAIT_AFTER_TEXT_SECONDS", 2.5, min_value=0.0, max_value=10.0)
+IMAGE_PREFER_SAME_SENDER = _env_bool("ONEBOT_IMAGE_PREFER_SAME_SENDER", True)
+MAX_IMAGES_PER_TURN = _env_int("ONEBOT_MAX_IMAGES_PER_TURN", 4, min_value=1, max_value=16)
 
 # OneBot 扩展功能开关。
 ENABLE_REACTIONS = _env_bool("ONEBOT_ENABLE_REACTIONS", True)

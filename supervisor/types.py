@@ -64,6 +64,9 @@ class InboundMessageIn(BaseModel):
     # Platform-provided identity metadata. This is produced by trusted adapters
     # such as OneBot/Discord, not parsed from user text.
     platform_auth: dict[str, Any] = Field(default_factory=dict)
+    # Adapter-provided routing hints, e.g. has_image/channel/platform. These are
+    # trusted platform metadata and are used only for capability routing.
+    route_hints: dict[str, Any] = Field(default_factory=dict)
 
 
 class InboundMessageOut(BaseModel):
@@ -98,6 +101,7 @@ class InboundWorkItem(BaseModel):
     use_context: bool = True
     entry_node_id: str | None = None
     platform_auth: dict[str, Any] = Field(default_factory=dict)
+    route_hints: dict[str, Any] = Field(default_factory=dict)
 
 
 class InboundAckIn(BaseModel):

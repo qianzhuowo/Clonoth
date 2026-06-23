@@ -23,6 +23,45 @@ class TaskStoreMixin:
         cfg = load_runtime_config(self.workspace_root)
         return get_str(cfg, "shell.entry_node_id", "bootstrap.shell_orchestrator").strip() or "bootstrap.shell_orchestrator"
 
+    def _route_entry_node_for_capabilities(
+        self,
+        *,
+        cfg: dict[str, Any],
+        payload: dict[str, Any],
+        selected_entry_node: str,
+        default_node: str,
+        session_override: str,
+    ) -> str:
+        """Route multimodal inputs to a configured vision-capable entry node."""
+        if payload.get("dispatch_origin") or session_override:
+            return selected_entry_node
+        attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else []
+        has_image_attachment = any(
+            isinstance(a, dict) and str(a.get("type") or "") == "image"
+            for a in attachments
+        )
+        hints = payload.get("route_hints") if isinstance(payload.get("route_hints"), dict) else {}
+        has_image_hint = bool(hints.get("has_image"))
+        if not (has_image_attachment or has_image_hint):
+            return selected_entry_node
+
+        routing = cfg.get("routing") if isinstance(cfg.get("routing"), dict) else {}
+        vision = routing.get("vision") if isinstance(routing.get("vision"), dict) else {}
+        if not bool(vision.get("enabled", True)):
+            return selected_entry_node
+        channel = str(payload.get("channel") or hints.get("channel") or "").strip()
+        platform = str(hints.get("platform") or channel.split("_", 1)[0] or "").strip()
+        channels = vision.get("channels") if isinstance(vision.get("channels"), dict) else {}
+        channel_cfg = channels.get(channel) if isinstance(channels.get(channel), dict) else {}
+        platform_cfg = channels.get(platform) if isinstance(channels.get(platform), dict) else {}
+        node_id = str(
+            channel_cfg.get("entry_node_id")
+            or platform_cfg.get("entry_node_id")
+            or vision.get("entry_node_id")
+            or ""
+        ).strip()
+        return node_id or selected_entry_node or default_node
+
     def _task_terminal(self, task: Task) -> bool:
         return task.status in {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
 
@@ -250,6 +289,14 @@ class TaskStoreMixin:
                 or session_recorded
                 or default_node
             )
+        cfg = load_runtime_config(self.workspace_root)
+        entry_node = self._route_entry_node_for_capabilities(
+            cfg=cfg,
+            payload=payload,
+            selected_entry_node=entry_node,
+            default_node=default_node,
+            session_override=session_override,
+        )
         if session_info and not session_info.entry_node_id:
             # Why: newly-created sessions may not yet know their frontend-selected
             # entry node. How: once an inbound is actually routed, copy the node
@@ -289,12 +336,12 @@ class TaskStoreMixin:
         attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else None
         use_context = bool(payload.get("use_context", True))
         platform_auth = dict(payload.get("platform_auth") or {}) if isinstance(payload.get("platform_auth"), dict) else {}
+        route_hints = dict(payload.get("route_hints") or {}) if isinstance(payload.get("route_hints"), dict) else {}
         # Step 2（2026-04-16）：主节点切 ConversationStore。
         # flag 开启时不再注入 context_ref，engine 侧 runner.py 会从 data/conversations/{session_id}.jsonl
         # 加载 history，不再依赖 node_contexts snapshot。
         # flag 关闭时走旧路径，调用 _find_last_context_ref_locked 注入 snapshot ref。
         # _find_last_context_ref_locked 本体保留（兼容期回退路径仍需要）。
-        cfg = load_runtime_config(self.workspace_root)
         main_use_conv = bool(cfg.get("engine", {}).get("child_session", {}).get("main_session_enabled", True))
         if main_use_conv:
             last_ctx_ref = ""
@@ -389,6 +436,7 @@ class TaskStoreMixin:
                     "switched_from": default_node if session_override else "",
                     "use_context": use_context,
                     "platform_auth": platform_auth,
+                    "route_hints": route_hints,
                     # [2026-05-29 方案C第一步] 为什么：SDK 只读取 task_created
                     # 事件的 payload.input.task_context，不能依赖后续对 Task 的补写。
                     # 怎么改：把 dispatch 上下文模式和父频道 route key 写入

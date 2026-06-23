@@ -40,6 +40,7 @@ from .config import (
     CLONOTH_WORKSPACE,
     CONVERSATION_HASH_SECRET,
     ENABLE_AUTO_LIKE,
+    ENABLE_IMAGE_INPUT,
     ENABLE_PREEMPT,
     ENABLE_QQ_QUEUE,
     ENABLE_REACTIONS,
@@ -47,11 +48,19 @@ from .config import (
     GROUP_HISTORY_MAX,
     GROUP_TRIGGER,
     HISTORY_TEXT_LIMIT,
+    IMAGE_CACHE_TTL_SECONDS,
+    IMAGE_DOWNLOAD_TIMEOUT,
+    IMAGE_MAX_BYTES,
+    IMAGE_PREFER_SAME_SENDER,
+    IMAGE_WAIT_AFTER_TEXT_SECONDS,
+    MAX_IMAGES_PER_TURN,
     QQ_MESSAGE_LIMIT,
     QQ_QUEUE_INTERVAL,
     QQ_QUEUE_REPLY_TIMEOUT,
     QQ_QUEUE_WAIT_FOR_REPLY,
     QQ_QUEUE_WORKERS,
+    RECENT_IMAGE_MAX_AGE_SECONDS,
+    RECENT_IMAGE_MAX_ITEMS,
     REPLY_TO_TRIGGER,
     TRIGGER_PREFIXES,
     USER_PROFILES_PATH,
@@ -117,6 +126,19 @@ _real_conversation_keys: Dict[str, str] = {}
 _stable_conversation_keys: Dict[str, str] = {}
 _persisted_session_targets: Dict[str, Dict[str, Any]] = {}
 _last_bot: Optional[Bot] = None
+
+
+@dataclass
+class RecentImageEntry:
+    attachment: Dict[str, Any]
+    created_at: float
+    sender_id: str
+    message_id: str
+
+
+_recent_images: DefaultDict[str, Deque[RecentImageEntry]] = defaultdict(lambda: deque(maxlen=RECENT_IMAGE_MAX_ITEMS))
+_last_attachment_cleanup_at = 0.0
+
 
 @dataclass
 class QueuedInbound:
@@ -542,19 +564,33 @@ async def _get_reply_message(bot: Bot, reply_message_id: Any) -> Dict[str, Any] 
 
 
 
-def _guess_image_mime(url: str, content_type: str = "") -> str:
-    """根据 QQ 图片 URL 和下载响应头推断 Clonoth 需要的图片 MIME 类型。"""
-    # 2026-05-03 修改原因：OneBot 图片段通常只给临时 URL，不稳定提供文件名
-    # 或 MIME。这里按 URL 与 Content-Type 共同推断，目的是让 Clonoth 的
-    # 图片附件获得可识别的 mime_type；无法判断时按 JPEG 兜底。
-    url_lower = (url or "").lower()
-    content_type_lower = (content_type or "").lower()
-    if "png" in url_lower or "png" in content_type_lower:
+def _guess_image_mime(url: str, content_type: str = "", content: bytes = b"") -> str:
+    """根据响应头、文件头魔数和 URL 推断图片 MIME。"""
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct.startswith("image/"):
+        return ct
+    head = bytes(content[:16] or b"")
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
-    if "gif" in url_lower or "gif" in content_type_lower:
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head.startswith(b"GIF87a") or head.startswith(b"GIF89a"):
         return "image/gif"
-    if "webp" in url_lower or "webp" in content_type_lower:
+    if head.startswith(b"RIFF") and len(head) >= 12 and head[8:12] == b"WEBP":
         return "image/webp"
+    if head.startswith(b"BM"):
+        return "image/bmp"
+    url_lower = (url or "").split("?", 1)[0].split("#", 1)[0].lower()
+    if url_lower.endswith(".png"):
+        return "image/png"
+    if url_lower.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    if url_lower.endswith(".gif"):
+        return "image/gif"
+    if url_lower.endswith(".webp"):
+        return "image/webp"
+    if url_lower.endswith(".bmp"):
+        return "image/bmp"
     return "image/jpeg"
 
 
@@ -565,7 +601,7 @@ def _image_ext_from_url_or_mime(url: str, mime_type: str) -> str:
     # 映射后缀，目的是避免没有扩展名的 QQ 临时 URL 生成不可识别文件。
     clean_url_path = (url or "").split("?", 1)[0].split("#", 1)[0]
     ext = Path(clean_url_path).suffix.lower()
-    if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+    if ext in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}:
         return ext
     if mime_type == "image/png":
         return ".png"
@@ -573,7 +609,102 @@ def _image_ext_from_url_or_mime(url: str, mime_type: str) -> str:
         return ".gif"
     if mime_type == "image/webp":
         return ".webp"
+    if mime_type == "image/bmp":
+        return ".bmp"
     return ".jpg"
+
+
+def _attachment_error_text(error: str) -> str:
+    if error == "too_large":
+        return f"图片太大，已超过当前限制 {IMAGE_MAX_BYTES // 1024 // 1024}MB。"
+    if error == "download_failed":
+        return "我收到了图片，但下载失败了，可能是 QQ 临时链接已过期。"
+    if error == "unsupported_mime":
+        return "我收到了图片，但图片格式暂不支持。"
+    return "我收到了图片，但处理图片时失败了。"
+
+
+def _cleanup_old_qq_attachments(now: float | None = None) -> None:
+    """清理 OneBot 附件目录中过期图片；默认保留 1 天。"""
+    global _last_attachment_cleanup_at
+    if IMAGE_CACHE_TTL_SECONDS <= 0:
+        return
+    now = time.time() if now is None else now
+    if now - _last_attachment_cleanup_at < 3600:
+        return
+    _last_attachment_cleanup_at = now
+    root = Path(CLONOTH_WORKSPACE) / "data" / "attachments"
+    if not root.exists():
+        return
+    cutoff = now - IMAGE_CACHE_TTL_SECONDS
+    try:
+        for p in root.rglob("*"):
+            try:
+                if p.is_file() and p.stat().st_mtime < cutoff:
+                    p.unlink(missing_ok=True)
+            except Exception:
+                continue
+        dirs = [x for x in root.rglob("*") if x.is_dir()]
+        for d in sorted(dirs, key=lambda x: len(x.parts), reverse=True):
+            try:
+                d.rmdir()
+            except Exception:
+                pass
+    except Exception as exc:
+        logger.debug("QQ attachment cleanup skipped: %s", exc)
+
+
+def _remember_recent_images(conversation_key: str, event: Event, attachments: List[Dict[str, Any]]) -> None:
+    if not attachments:
+        return
+    sender_id = str(getattr(event, "user_id", "") or "")
+    message_id = str(getattr(event, "message_id", "") or "")
+    now = time.time()
+    q = _recent_images[conversation_key]
+    for att in attachments:
+        if str(att.get("type") or "") == "image" and att.get("path"):
+            q.append(RecentImageEntry(dict(att), now, sender_id, message_id))
+
+
+def _recent_images_for_text(conversation_key: str, event: Event) -> List[Dict[str, Any]]:
+    now = time.time()
+    sender_id = str(getattr(event, "user_id", "") or "")
+    entries = [
+        item for item in _recent_images.get(conversation_key, ())
+        if now - item.created_at <= RECENT_IMAGE_MAX_AGE_SECONDS
+    ]
+    if IMAGE_PREFER_SAME_SENDER:
+        same_sender = [item for item in entries if item.sender_id == sender_id]
+        if same_sender:
+            entries = same_sender
+    return [dict(item.attachment) for item in entries[-MAX_IMAGES_PER_TURN:]]
+
+
+def _text_looks_like_image_query(text: str) -> bool:
+    value = (text or "").strip().lower()
+    if not value:
+        return False
+    keywords = (
+        "图", "图片", "截图", "照片", "看下", "看看", "看一下", "识别", "读一下",
+        "ocr", "文字", "这是什么", "什么意思", "表情包", "image", "photo", "screenshot",
+    )
+    return any(k in value for k in keywords)
+
+
+async def _merge_recent_images_after_text(
+    *,
+    event: Event,
+    conversation_key: str,
+    user_text: str,
+    attachments: List[Dict[str, Any]],
+) -> None:
+    if attachments or not ENABLE_IMAGE_INPUT or not _text_looks_like_image_query(user_text):
+        return
+    if IMAGE_WAIT_AFTER_TEXT_SECONDS > 0:
+        await asyncio.sleep(IMAGE_WAIT_AFTER_TEXT_SECONDS)
+    recent = _recent_images_for_text(conversation_key, event)
+    if recent:
+        attachments.extend(recent)
 
 
 def _iter_qq_image_urls(message: Any) -> List[str]:
@@ -609,22 +740,24 @@ def _iter_qq_image_urls(message: Any) -> List[str]:
     return urls
 
 
-async def _image_sources_to_attachments(image_urls: List[str], conversation_key: str) -> list[dict]:
-    """下载 OneBot 图片 URL/path 列表，并返回 Clonoth 附件描述。"""
+async def _image_sources_to_attachments(image_urls: List[str], conversation_key: str) -> tuple[list[dict], list[str]]:
+    """下载 OneBot 图片 URL/path 列表，并返回 Clonoth 附件描述与用户可读错误。"""
     result: list[dict] = []
-    if not image_urls:
-        return result
+    errors: list[str] = []
+    if not ENABLE_IMAGE_INPUT or not image_urls:
+        return result, errors
 
+    _cleanup_old_qq_attachments()
     workspace = Path(CLONOTH_WORKSPACE)
     att_dir = workspace / "data" / "attachments" / conversation_key.replace(":", "_")
     try:
         att_dir.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
         logger.warning("collect QQ attachments cannot create directory %s: %s", att_dir, exc)
-        return result
+        return result, [_attachment_error_text("download_failed")]
 
-    async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-        for url in image_urls:
+    async with httpx.AsyncClient(timeout=IMAGE_DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
+        for url in image_urls[:MAX_IMAGES_PER_TURN]:
             try:
                 source = str(url or "").strip()
                 if not source:
@@ -644,8 +777,16 @@ async def _image_sources_to_attachments(image_urls: List[str], conversation_key:
                     content_type = response.headers.get("content-type", "")
                 if not content:
                     logger.warning("collect QQ image attachment skipped empty response: %s", source)
+                    errors.append(_attachment_error_text("download_failed"))
                     continue
-                mime_type = _guess_image_mime(source, content_type)
+                if len(content) > IMAGE_MAX_BYTES:
+                    logger.warning("collect QQ image attachment too large: %s bytes url=%s", len(content), source)
+                    errors.append(_attachment_error_text("too_large"))
+                    continue
+                mime_type = _guess_image_mime(source, content_type, content)
+                if not mime_type.startswith("image/"):
+                    errors.append(_attachment_error_text("unsupported_mime"))
+                    continue
                 ext = _image_ext_from_url_or_mime(source, mime_type)
                 filename = f"{os.urandom(16).hex()}{ext}"
                 file_path = att_dir / filename
@@ -656,13 +797,15 @@ async def _image_sources_to_attachments(image_urls: List[str], conversation_key:
                     "path": rel_path,
                     "mime_type": mime_type,
                     "name": f"image{ext}",
+                    "source": "onebot",
                 })
             except Exception as exc:
                 logger.warning("collect QQ image attachment failed: url=%s error=%s", url, exc)
-    return result
+                errors.append(_attachment_error_text("download_failed"))
+    return result, errors
 
 
-async def _collect_qq_attachments(event, conversation_key: str) -> list[dict]:
+async def _collect_qq_attachments(event, conversation_key: str) -> tuple[list[dict], list[str]]:
     """下载 QQ 当前消息中的图片，并返回 Clonoth 附件列表。引用消息由增强 reply 逻辑单独处理。"""
     try:
         image_urls = _iter_qq_image_urls(event.get_message())
@@ -729,7 +872,7 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
     raw_message = reply.get("raw_message")
     text = _message_to_text_generic(message, getattr(bot, "self_id", None)) or _message_to_text_generic(raw_message, getattr(bot, "self_id", None))
     images = _iter_qq_image_urls(message) or _iter_qq_image_urls(raw_message)
-    quoted_attachments = await _image_sources_to_attachments(images, conversation_key)
+    quoted_attachments, _quoted_errors = await _image_sources_to_attachments(images, conversation_key)
     for att in quoted_attachments:
         text = text.replace("[图片]", f"[图片: {att['path']}]", 1)
 
@@ -1208,6 +1351,12 @@ async def _submit_or_preempt_inbound(
             "platform": "qq",
             "user_id": str(getattr(event, "user_id", "")),
             "is_admin": _is_admin_user(getattr(event, "user_id", "")),
+        },
+        route_hints={
+            "platform": "qq",
+            "channel": channel,
+            "has_image": any(str(a.get("type") or "") == "image" for a in (attachments or [])),
+            "target_type": "private" if is_dm else "group",
         },
     )
     if not result.session_id or not result.accepted:
@@ -1953,6 +2102,19 @@ async def _handle_history(bot: Bot, event: GroupMessageEvent) -> None:
     _remember_message_for_reply_context(event)
     if str(event.user_id) != str(getattr(bot, "self_id", "")):
         _record_group_message(event, bot)
+        # QQ 客户端经常把“问图文本 + 图片”拆成两条事件；第二条纯图片
+        # 通常不会 @bot，因此不会进入 agent matcher。这里在低优先级历史
+        # matcher 中把非触发图片也下载并写入近期缓存，让前一条文本等待后
+        # 能合并到正确图片。
+        try:
+            image_urls = _iter_qq_image_urls(event.get_message())
+        except Exception:
+            image_urls = []
+        if image_urls:
+            real_conversation_key = f"qq_group:{int(event.group_id)}"
+            stable_conversation_key = _stable_conversation_key(real_conversation_key)
+            attachments, _errors = await _image_sources_to_attachments(image_urls, stable_conversation_key)
+            _remember_recent_images(stable_conversation_key, event, attachments)
 
 
 # Agent 入口 matcher。默认只处理 @Bot；也可通过 ONEBOT_GROUP_TRIGGER=prefix/all 切换触发策略。
@@ -1977,8 +2139,12 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     _record_group_message(event, bot, override_text=user_text)
     asyncio.create_task(_auto_like_user(bot, int(event.user_id)))
 
-    attachments = await _collect_qq_attachments(event, stable_conversation_key)
+    attachments, attachment_errors = await _collect_qq_attachments(event, stable_conversation_key)
+    _remember_recent_images(stable_conversation_key, event, attachments)
+    await _merge_recent_images_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
     inbound_text = await _build_inbound_text(event, bot, user_text, stable_conversation_key, attachments)
+    if attachment_errors:
+        inbound_text += "\n\n【图片处理提示】\n" + "\n".join(dict.fromkeys(attachment_errors))
     if attachments:
         for att in attachments:
             inbound_text = inbound_text.replace("[图片]", f"[图片: {att['path']}]", 1)
@@ -2060,8 +2226,12 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
 
     real_conversation_key = f"qq_private:{user_id}"
     stable_conversation_key = _stable_conversation_key(real_conversation_key)
-    attachments = await _collect_qq_attachments(event, stable_conversation_key)
+    attachments, attachment_errors = await _collect_qq_attachments(event, stable_conversation_key)
+    _remember_recent_images(stable_conversation_key, event, attachments)
+    await _merge_recent_images_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
     inbound_text = await _build_private_inbound_text(event, bot, user_text, stable_conversation_key, attachments)
+    if attachment_errors:
+        inbound_text += "\n\n【图片处理提示】\n" + "\n".join(dict.fromkeys(attachment_errors))
     if attachments:
         for att in attachments:
             inbound_text = inbound_text.replace("[图片]", f"[图片: {att['path']}]", 1)

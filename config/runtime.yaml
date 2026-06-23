@@ -61,6 +61,19 @@ providers:
   openai:
     timeout_sec: 600.0
 
+# Capability routing. When an inbound message contains image attachments, the
+# supervisor can route it to a vision-capable entry node. Empty entry_node_id
+# keeps the original channel entry node.
+routing:
+  vision:
+    enabled: true
+    entry_node_id: "qq.vision"
+    channels:
+      qq_group:
+        entry_node_id: "qq.vision"
+      qq_private:
+        entry_node_id: "qq.vision"
+
 meta:
   execute_command:
     default_timeout_sec: 90.0

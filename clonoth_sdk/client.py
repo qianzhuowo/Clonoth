@@ -116,6 +116,7 @@ class ClonothClient:
         use_context: bool = True,
         entry_node_id: str | None = None,
         platform_auth: dict[str, Any] | None = None,
+        route_hints: dict[str, Any] | None = None,
     ) -> InboundResult:
         """提交用户消息到 Supervisor。
 
@@ -151,6 +152,8 @@ class ClonothClient:
             payload["entry_node_id"] = entry_node_id
         if platform_auth:
             payload["platform_auth"] = dict(platform_auth)
+        if route_hints:
+            payload["route_hints"] = dict(route_hints)
 
         resp = await self._http().post(f"{self._base_url}/v1/inbound", json=payload)
         resp.raise_for_status()

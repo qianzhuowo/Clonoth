@@ -878,8 +878,17 @@ async def _execute_real_tools(
     # [2026-04-17] 移除 _max_inline / _rt_cfg：截断机制已废弃，不再需要读取 runtime config 中的
     # engine.tool_trace.max_inline_chars 配置项。
 
+    tool_names = [str(call.get("name") or call.get("tool_name") or "").strip() for call in real_tool_calls]
+    tool_names = [name for name in tool_names if name]
+    tool_names_text = "、".join(tool_names[:5])
+    if len(tool_names) > 5:
+        tool_names_text += f" 等 {len(tool_names)} 个工具"
+    progress_message = f"[{ls.node.id}] 执行 {len(real_tool_calls)} 个工具"
+    if tool_names_text:
+        progress_message += f"：{tool_names_text}"
+
     await ls.rctx.emit_event("handoff_progress", {
-        "message": f"[{ls.node.id}] 执行 {len(real_tool_calls)} 个工具",
+        "message": progress_message,
         "node_id": ls.node.id,
         "task_id": ls.rctx.task_id,
     })

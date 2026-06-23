@@ -34,7 +34,7 @@ SPEC = {
     },
 }
 
-TIMEOUT_SEC = 75.0
+TIMEOUT_SEC = 30.0
 
 
 if __name__ == "__main__":
@@ -152,7 +152,7 @@ if __name__ == "__main__":
     search_type = str(args.get("search_type") or "auto").strip().lower()
     if search_type not in {"auto", "neural", "keyword"}:
         search_type = "auto"
-    text_max_characters = clamp_int(args.get("text_max_characters", 1000), 1000, 0, 5000)
+    text_max_characters = clamp_int(args.get("text_max_characters", 800), 800, 0, 3000)
 
     payload = {
         "query": query,
@@ -193,7 +193,7 @@ if __name__ == "__main__":
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=65) as resp:
+        with urllib.request.urlopen(req, timeout=25) as resp:
             response_data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         try:

@@ -26,7 +26,7 @@ SPEC = {
     'name': 'x_search'
 }
 
-TIMEOUT_SEC = 130.0
+TIMEOUT_SEC = 60.0
 
 
 if __name__ == "__main__":
@@ -90,7 +90,11 @@ if __name__ == "__main__":
             '请重新调用 x_search，格式固定为：{"query": "要搜索的内容"}。如果已有用户问题，请把用户问题原文放入 query。'
         )
     model = args.get('model', 'grok-4.3')
-    max_tokens = args.get('max_tokens', 64000)
+    try:
+        max_tokens = int(args.get('max_tokens', 8000))
+    except Exception:
+        max_tokens = 8000
+    max_tokens = max(1000, min(16000, max_tokens))
     api_key = str(args.get('api_key') or os.environ.get('XAI_API_KEY') or os.environ.get('OPENAI_API_KEY') or '').strip()
     base_url = str(args.get('base_url') or os.environ.get('XAI_BASE_URL') or '').strip().rstrip('/')
 
@@ -124,7 +128,7 @@ if __name__ == "__main__":
     )
     
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        with urllib.request.urlopen(req, timeout=55) as resp:
             data = json.loads(resp.read().decode('utf-8'))
     except Exception as e:
         fail(f'API request failed: {e}')

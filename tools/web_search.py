@@ -39,7 +39,7 @@ SPEC = {
     },
 }
 
-TIMEOUT_SEC = 180.0
+TIMEOUT_SEC = 70.0
 
 
 if __name__ == "__main__":
@@ -47,6 +47,7 @@ if __name__ == "__main__":
     import os
     import subprocess
     import sys
+    import time
     from pathlib import Path
     from typing import Any
 
@@ -119,11 +120,32 @@ if __name__ == "__main__":
             parsed = default
         return max(minimum, min(maximum, parsed))
 
+    def clamp_float(value: Any, default: float, minimum: float, maximum: float) -> float:
+        try:
+            parsed = float(value)
+        except Exception:
+            parsed = default
+        return max(minimum, min(maximum, parsed))
+
     def extract_int_alias(args: dict[str, Any], keys: list[str], default: int, minimum: int, maximum: int) -> int:
         for key in keys:
             if key not in args:
                 continue
             return clamp_int(args.get(key), default, minimum, maximum)
+        return default
+
+    def extract_float_alias(args: dict[str, Any], keys: list[str], default: float, minimum: float, maximum: float) -> float:
+        for key in keys:
+            if key not in args:
+                continue
+            return clamp_float(args.get(key), default, minimum, maximum)
+        return default
+
+    def env_float(dotenv: dict[str, str], names: list[str], default: float, minimum: float, maximum: float) -> float:
+        for name in names:
+            raw = os.environ.get(name) or dotenv.get(name)
+            if str(raw or "").strip():
+                return clamp_float(raw, default, minimum, maximum)
         return default
 
     def normalize_source(args: dict[str, Any], query: str, dotenv: dict[str, str]) -> str:
@@ -167,27 +189,11 @@ if __name__ == "__main__":
             return "x"
         return "exa"
 
-    def run_child(tool_name: str, child_args: dict[str, Any]) -> dict[str, Any]:
-        script = TOOL_DIR / f"{tool_name}.py"
-        if not script.is_file():
-            return {"ok": False, "error": f"tool script not found: {tool_name}", "data": {"result": f"ERROR: tool script not found: {tool_name}"}}
-        try:
-            proc = subprocess.run(
-                [sys.executable, str(script)],
-                input=json.dumps(child_args, ensure_ascii=False),
-                text=True,
-                encoding="utf-8",
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=os.getcwd(),
-                timeout=150,
-            )
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "error": f"{tool_name} timeout", "data": {"result": f"ERROR: {tool_name} timeout"}}
-        except Exception as exc:
-            return {"ok": False, "error": f"{tool_name} execution failed: {exc}", "data": {"result": f"ERROR: {tool_name} execution failed: {exc}"}}
+    def child_error(tool_name: str, error: str) -> dict[str, Any]:
+        return {"ok": False, "error": error, "data": {"result": f"ERROR: {error}"}}
 
-        stdout = (proc.stdout or "").strip()
+    def parse_child_result(tool_name: str, returncode: int, stdout: str, stderr: str) -> dict[str, Any]:
+        stdout = (stdout or "").strip()
         try:
             parsed = json.loads(stdout)
             if isinstance(parsed, dict):
@@ -195,10 +201,92 @@ if __name__ == "__main__":
         except Exception:
             pass
 
-        err = (proc.stderr or "").strip()
-        text = stdout or err or f"{tool_name} exited with code {proc.returncode}"
-        ok = proc.returncode == 0
+        err = (stderr or "").strip()
+        text = stdout or err or f"{tool_name} exited with code {returncode}"
+        ok = returncode == 0
         return {"ok": ok, "error": "" if ok else text, "data": {"result": text}}
+
+    def start_child(tool_name: str, child_args: dict[str, Any]) -> tuple[subprocess.Popen[str] | None, dict[str, Any] | None]:
+        script = TOOL_DIR / f"{tool_name}.py"
+        if not script.is_file():
+            return None, child_error(tool_name, f"tool script not found: {tool_name}")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, str(script)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                cwd=os.getcwd(),
+            )
+            if proc.stdin is not None:
+                proc.stdin.write(json.dumps(child_args, ensure_ascii=False))
+                proc.stdin.close()
+            return proc, None
+        except Exception as exc:
+            return None, child_error(tool_name, f"{tool_name} execution failed: {exc}")
+
+    def collect_child(tool_name: str, proc: subprocess.Popen[str]) -> dict[str, Any]:
+        try:
+            stdout = proc.stdout.read() if proc.stdout is not None else ""
+            stderr = proc.stderr.read() if proc.stderr is not None else ""
+        except Exception as exc:
+            return child_error(tool_name, f"{tool_name} output read failed: {exc}")
+        return parse_child_result(tool_name, int(proc.returncode or 0), stdout, stderr)
+
+    def kill_child(tool_name: str, proc: subprocess.Popen[str], reason: str) -> dict[str, Any]:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        return child_error(tool_name, reason)
+
+    def run_children(calls: list[tuple[str, dict[str, Any]]], *, total_timeout_sec: float, child_timeout_sec: float) -> dict[str, dict[str, Any]]:
+        """Run one or more configured providers with an overall timeout.
+
+        Multiple providers are started together so source=both (or any auto/config
+        resolving to multiple providers) waits roughly for the slowest provider,
+        not the sum of all provider latencies.
+        """
+        results: dict[str, dict[str, Any]] = {}
+        running: dict[str, tuple[subprocess.Popen[str], float]] = {}
+        started = time.monotonic()
+        deadline = started + max(1.0, total_timeout_sec)
+
+        for tool_name, child_args in calls:
+            proc, immediate_result = start_child(tool_name, child_args)
+            if immediate_result is not None:
+                results[tool_name] = immediate_result
+            elif proc is not None:
+                running[tool_name] = (proc, time.monotonic())
+
+        while running:
+            now = time.monotonic()
+            for tool_name, (proc, child_started) in list(running.items()):
+                if proc.poll() is not None:
+                    results[tool_name] = collect_child(tool_name, proc)
+                    running.pop(tool_name, None)
+                    continue
+                if now - child_started >= child_timeout_sec:
+                    results[tool_name] = kill_child(tool_name, proc, f"{tool_name} timeout after {child_timeout_sec:.0f}s")
+                    running.pop(tool_name, None)
+
+            if not running:
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                for tool_name, (proc, _) in list(running.items()):
+                    results[tool_name] = kill_child(tool_name, proc, f"{tool_name} cancelled by web_search total timeout after {total_timeout_sec:.0f}s")
+                    running.pop(tool_name, None)
+                break
+            time.sleep(min(0.05, max(0.0, deadline - now)))
+
+        return results
 
     raw_input = json.loads((sys.stdin.read() or "{}").lstrip("\ufeff"))
     args = raw_input if isinstance(raw_input, dict) else {}
@@ -218,12 +306,26 @@ if __name__ == "__main__":
     )
     dotenv = load_dotenv()
     source = normalize_source(args, query, dotenv)
+    total_timeout_sec = extract_float_alias(
+        args,
+        ["total_timeout_sec", "totalTimeoutSec", "timeout_sec", "timeout", "deadline_sec"],
+        env_float(dotenv, ["WEB_SEARCH_TOTAL_TIMEOUT_SEC", "WEB_SEARCH_TIMEOUT_SEC"], 65.0, 5.0, float(TIMEOUT_SEC)),
+        5.0,
+        float(TIMEOUT_SEC),
+    )
+    child_timeout_sec = extract_float_alias(
+        args,
+        ["child_timeout_sec", "childTimeoutSec", "provider_timeout_sec", "providerTimeoutSec"],
+        env_float(dotenv, ["WEB_SEARCH_CHILD_TIMEOUT_SEC", "WEB_SEARCH_PROVIDER_TIMEOUT_SEC"], 60.0, 5.0, total_timeout_sec),
+        5.0,
+        total_timeout_sec,
+    )
 
     calls: list[tuple[str, dict[str, Any]]] = []
     if source in {"exa", "both"}:
         calls.append(("exa_search", {"query": query, "num_results": num_results}))
     if source in {"x", "both"}:
-        calls.append(("x_search", {"query": query, "max_tokens": 16000}))
+        calls.append(("x_search", {"query": query, "max_tokens": 8000}))
 
     if not calls:
         calls.append(("exa_search", {"query": query, "num_results": num_results}))
@@ -233,9 +335,10 @@ if __name__ == "__main__":
     citations: list[str] = []
     any_ok = False
 
-    for tool_name, child_args in calls:
-        result = run_child(tool_name, child_args)
-        child_results[tool_name] = result
+    child_results = run_children(calls, total_timeout_sec=total_timeout_sec, child_timeout_sec=child_timeout_sec)
+
+    for tool_name, _child_args in calls:
+        result = child_results.get(tool_name) or child_error(tool_name, f"{tool_name} did not return a result")
         data = result.get("data") if isinstance(result.get("data"), dict) else {}
         result_text = str(data.get("result") or result.get("error") or "").strip()
         label = "Exa 网页搜索" if tool_name == "exa_search" else "X/Twitter 搜索"
@@ -261,6 +364,8 @@ if __name__ == "__main__":
                 "source": source,
                 "citations": citations,
                 "providers": child_results,
+                "total_timeout_sec": total_timeout_sec,
+                "child_timeout_sec": child_timeout_sec,
             },
         })
 
@@ -272,5 +377,7 @@ if __name__ == "__main__":
             "source": source,
             "citations": citations,
             "providers": child_results,
+            "total_timeout_sec": total_timeout_sec,
+            "child_timeout_sec": child_timeout_sec,
         },
     })

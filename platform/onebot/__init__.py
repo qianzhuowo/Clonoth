@@ -114,6 +114,10 @@ _REACT_STAGE_ORDER = {
     "writing": 5,
 }
 _REACT_CLEANUP_EMOJIS = tuple(_REACT_STAGE_EMOJIS.values())
+_SEARCH_PROGRESS_FIRST_NOTICE = "已收到联网搜索请求，正在检索网页资料，可能需要几秒钟……"
+_SEARCH_PROGRESS_STILL_RUNNING_NOTICE = "还在联网搜索中，我会拿到结果后马上整理回复。"
+_SEARCH_PROGRESS_STILL_RUNNING_INTERVAL_SEC = 20.0
+_SEARCH_PROGRESS_KEYWORDS = ("web_search", "exa_search", "x_search")
 
 # 群聊上下文只保留最近 N 条。这样可以给入口节点提供社交语境，
 # 同时避免每次 inbound 发送过长历史。
@@ -1768,6 +1772,39 @@ async def _clear_message_reacts(bot: Bot, event: Any) -> None:
         await _set_message_react(bot, event, emoji_id, False)
 
 
+
+
+def _progress_mentions_search(record: str) -> bool:
+    """判断进度记录是否与联网搜索工具相关。"""
+    text = str(record or "").lower()
+    return any(keyword in text for keyword in _SEARCH_PROGRESS_KEYWORDS)
+
+
+async def _maybe_send_search_progress_notice(
+    bot: Bot,
+    target: Dict[str, Any],
+    platform_data: Dict[str, Any],
+) -> None:
+    """在 QQ 侧为长搜索任务发送低频可见进度提示。"""
+    now = time.time()
+    if not platform_data.get("_qq_search_notice_sent"):
+        platform_data["_qq_search_notice_sent"] = True
+        platform_data["_qq_search_notice_last_at"] = now
+        try:
+            await _send_qq_message(bot, target, _SEARCH_PROGRESS_FIRST_NOTICE)
+        except Exception:
+            logger.debug("send QQ search progress notice failed", exc_info=True)
+        return
+
+    last_at = float(platform_data.get("_qq_search_notice_last_at") or 0.0)
+    if now - last_at < _SEARCH_PROGRESS_STILL_RUNNING_INTERVAL_SEC:
+        return
+    platform_data["_qq_search_notice_last_at"] = now
+    try:
+        await _send_qq_message(bot, target, _SEARCH_PROGRESS_STILL_RUNNING_NOTICE)
+    except Exception:
+        logger.debug("send QQ search still-running notice failed", exc_info=True)
+
 class TangQiuCallbacks:
     """Clonoth SDK 的 QQ 平台回调实现。
 
@@ -1873,9 +1910,13 @@ class TangQiuCallbacks:
         if not bot:
             return
 
+        target = _target_from_platform_data(platform_data) or _target_from_conversation_key(trigger.conversation_key)
         has_tool_progress = any("执行" in record and "个工具" in record for record in state.progress_records)
-        if has_tool_progress:
+        has_search_progress = any(_progress_mentions_search(record) for record in state.progress_records)
+        if has_tool_progress or has_search_progress:
             await _switch_react_stage(bot, event, platform_data, "tool")
+            if has_search_progress and target:
+                await _maybe_send_search_progress_notice(bot, target, platform_data)
             return
         if state.stream_parts:
             await _switch_react_stage(bot, event, platform_data, "thinking")

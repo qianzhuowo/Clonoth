@@ -71,8 +71,9 @@ CLONOTH_BASE_URL = _env_first("CLONOTH_BASE_URL", "CLONOTH_SUPERVISOR_URL", defa
 # Clonoth 工作区根目录（用于 clonoth_sdk 导入和附件路径解析）
 CLONOTH_WORKSPACE = _env_first("CLONOTH_WORKSPACE", "ONEBOT_WORKSPACE_ROOT", default="/www/wwwroot/Clonoth")
 
-# 入口节点 ID。默认使用 QQ 专用的极简搜索入口，只暴露 web_search，避免 QQ Bot 误用复杂工具。
-ENTRY_NODE_ID = _env_first("CLONOTH_ENTRY_NODE", "ONEBOT_ENTRY_NODE_ID", default="qq.web_search")
+# 入口节点 ID。默认使用 QQ 综合入口，兼顾联网搜索、调度、重启和取消任务。
+# 如需搜索-only 安全窄入口，可显式设置 CLONOTH_ENTRY_NODE=qq.web_search。
+ENTRY_NODE_ID = _env_first("CLONOTH_ENTRY_NODE", "ONEBOT_ENTRY_NODE_ID", default="qq.orchestrator")
 
 # QQ 自定义表情名称索引文件路径（可选）。兼容独立 onebot11_adapter.py 的变量名。
 BQBS_PATH = _env_first("ONEBOT_CUSTOM_EMOJI_INDEX_PATH", "CLONOTH_BQBS_PATH", default="")

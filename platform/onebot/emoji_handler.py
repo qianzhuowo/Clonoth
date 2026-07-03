@@ -220,8 +220,13 @@ def _extract_list_payload(data: Any) -> List[Any]:
 async def fetch_custom_face_details(bot: Any, count: int = 200, *, force: bool = False) -> List[Any]:
     """获取 NapCat QQ 收藏表情详情列表。
 
-    优先使用 NapCat 源码中的 fetch_custom_face_detail；若运行端不支持该扩展，
-    回退到旧的 fetch_custom_face，以保持 go-cqhttp/Lagrange 等实现的兼容性。
+    仅使用 NapCat 的 fetch_custom_face_detail 详情接口，返回带
+    emojiId/resId/md5 等字段的详情对象；不再回退旧 fetch_custom_face。
+    旧接口只返回图片 URL，缺少命名/删除所需字段，会导致
+    命名表情/删除表情 无法执行，因此这里直接放弃回退。
+
+    如果当前 OneBot/NapCat 端不支持该接口，会抛出异常，由上层
+    给出“请确认 NapCat 支持 fetch_custom_face_detail”的明确提示。
     """
     key = id(bot)
     now = time.time()
@@ -229,15 +234,7 @@ async def fetch_custom_face_details(bot: Any, count: int = 200, *, force: bool =
     if not force and cached and now - cached[0] <= _CUSTOM_FACE_CACHE_TTL:
         return list(cached[1])
 
-    detail: Any = None
-    try:
-        detail = await bot.call_api("fetch_custom_face_detail", count=int(count))
-    except Exception:
-        try:
-            detail = await bot.call_api("fetch_custom_face")
-        except Exception:
-            detail = []
-
+    detail = await bot.call_api("fetch_custom_face_detail", count=int(count))
     faces = _extract_list_payload(detail)
     _custom_face_cache[key] = (now, faces)
     return list(faces)
@@ -504,7 +501,12 @@ async def list_custom_face_aliases(bot: Any, bqbs: List[str], count: int = 200) 
     seen: set[str] = set()
     for pos, face in enumerate(faces):
         explicit = _custom_face_explicit_name(face, pos, bqbs)
-        display = explicit or f"未命名#{pos + 1}"
+        if explicit:
+            display = explicit
+        elif isinstance(face, str):
+            display = f"未命名#{pos + 1}（仅URL，不可命名）"
+        else:
+            display = f"未命名#{pos + 1}"
         norm = _normalize_name(display)
         if display and norm not in seen:
             seen.add(norm)

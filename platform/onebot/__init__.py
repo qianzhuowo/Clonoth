@@ -1320,7 +1320,11 @@ async def _maybe_handle_custom_face_command(
         if not target or not desc:
             return "请指定要命名的表情和新名字，例如：命名表情 3 开心"
         # 若定位词是纯基础名且存在多个同名，不直接改，列序号让管理员指定具体一个。
-        siblings = await find_custom_faces_by_base_name(bot, target, _bqbs)
+        try:
+            siblings = await find_custom_faces_by_base_name(bot, target, _bqbs)
+        except Exception as exc:
+            logger.warning("find custom faces (rename) failed: %s", exc, exc_info=True)
+            return "命名表情失败：当前 OneBot/NapCat 可能不支持 fetch_custom_face_detail。请确认 NapCat 版本支持该详情接口。"
         if len(siblings) > 1:
             lines = []
             for s in siblings:
@@ -1333,7 +1337,16 @@ async def _maybe_handle_custom_face_command(
                 + f"\n请改用序号，例如：命名表情 {siblings[0]['index']} {desc}"
                 + "\n也可用 md5 或 resId 精确定位。"
             )
-        face = await resolve_custom_face(bot, target, _bqbs)
+        try:
+            face = await resolve_custom_face(bot, target, _bqbs)
+        except Exception as exc:
+            logger.warning("resolve custom face (rename) failed: %s", exc, exc_info=True)
+            return "命名表情失败：当前 OneBot/NapCat 可能不支持 fetch_custom_face_detail。请确认 NapCat 版本支持该详情接口。"
+        if face is not None and not isinstance(face, dict):
+            return (
+                f"找到了收藏表情：{target}，但当前 OneBot/NapCat 只返回图片 URL，没有 emojiId/resId/md5，无法命名。\n"
+                "请确认 NapCat 版本支持 fetch_custom_face_detail；仅旧 fetch_custom_face 返回的 URL 不能用于 set_custom_face_desc。"
+            )
         if not isinstance(face, dict):
             return f"没有找到收藏表情：{target}\n可先发送“表情详情列表 50”查看序号，再用“命名表情 <序号> <新名字>”。"
         ok, message = await _set_custom_face_desc(bot, face, desc)
@@ -1348,7 +1361,11 @@ async def _maybe_handle_custom_face_command(
             return "请指定要删除的表情名称，例如：删除表情 开心"
         # 若输入是纯基础名（不是序号/md5/resId 这类唯一定位），且存在多个同名，
         # 则不直接删除，改为列出同名项的序号，让管理员明确指定删哪个。
-        siblings = await find_custom_faces_by_base_name(bot, name, _bqbs)
+        try:
+            siblings = await find_custom_faces_by_base_name(bot, name, _bqbs)
+        except Exception as exc:
+            logger.warning("find custom faces (delete) failed: %s", exc, exc_info=True)
+            return "删除表情失败：当前 OneBot/NapCat 可能不支持 fetch_custom_face_detail。请确认 NapCat 版本支持该详情接口。"
         if len(siblings) > 1:
             lines = []
             for s in siblings:
@@ -1361,7 +1378,16 @@ async def _maybe_handle_custom_face_command(
                 + "\n请改用序号删除，例如：删除表情 " + str(siblings[0]["index"])
                 + "\n也可用 md5 或 resId 精确删除。"
             )
-        face = await resolve_custom_face(bot, name, _bqbs)
+        try:
+            face = await resolve_custom_face(bot, name, _bqbs)
+        except Exception as exc:
+            logger.warning("resolve custom face (delete) failed: %s", exc, exc_info=True)
+            return "删除表情失败：当前 OneBot/NapCat 可能不支持 fetch_custom_face_detail。请确认 NapCat 版本支持该详情接口。"
+        if face is not None and not isinstance(face, dict):
+            return (
+                f"找到了收藏表情：{name}，但当前 OneBot/NapCat 只返回图片 URL，没有 resId，无法删除。\n"
+                "请确认 NapCat 版本支持 fetch_custom_face_detail；仅旧 fetch_custom_face 返回的 URL 不能用于 delete_custom_face。"
+            )
         if not isinstance(face, dict):
             return f"没有找到收藏表情：{name}"
         res_id = face.get("resId") or face.get("res_id") or face.get("id")

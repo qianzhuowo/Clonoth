@@ -39,6 +39,9 @@ from .config import (
     CLONOTH_BASE_URL,
     CLONOTH_WORKSPACE,
     CONVERSATION_HASH_SECRET,
+    CUSTOM_FACE_METADATA_PATH,
+    CUSTOM_FACE_NAMES_PATH,
+    CUSTOM_FACE_PROMPT_LIMIT,
     ENABLE_AUTO_LIKE,
     ENABLE_FORWARD_MSG_INPUT,
     ENABLE_IMAGE_INPUT,
@@ -70,7 +73,23 @@ from .config import (
     USER_PROFILES_PATH,
     ONEBOT_STATE_FILE,
 )
-from .emoji_handler import load_bqbs, process_emojis, strip_output_markers
+from .emoji_handler import (
+    count_duplicate_face_names,
+    extract_named_custom_face_metadata,
+    extract_named_custom_face_names,
+    fetch_custom_face_details,
+    find_custom_faces_by_base_name,
+    invalidate_custom_face_cache,
+    list_custom_face_aliases,
+    load_bqbs,
+    load_custom_face_metadata,
+    load_custom_face_names,
+    process_emojis,
+    resolve_custom_face,
+    strip_output_markers,
+    write_custom_face_metadata,
+    write_custom_face_names,
+)
 
 # clonoth_sdk 安装在 ClonothZX 工作区内。插件加载时先加入 sys.path，
 # 目的是让 TangQiu 进程不需要额外安装同名包也能导入 SDK。
@@ -102,6 +121,13 @@ _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _QQ_EMOJI_MARK_RE = re.compile(r"\[QQ_EMOJI:(.+?)\]")
 _CQ_RE = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]*))?\]")
 _AT_QQ_RE = re.compile(r"\[(?:CQ:)?at[,:][^\]]*?qq=([^,\]\s]+)", re.IGNORECASE)
+_CUSTOM_FACE_LIST_RE = re.compile(r"^(?:表情列表|收藏表情列表|emoji列表|可用表情)(?:\s+(\d+))?$", re.IGNORECASE)
+_CUSTOM_FACE_DETAIL_LIST_RE = re.compile(r"^(?:表情详情列表|收藏表情详情|表情管理列表)(?:\s+(\d+))?$", re.IGNORECASE)
+_CUSTOM_FACE_SYNC_RE = re.compile(r"^(?:同步表情列表|刷新表情列表|更新表情列表)$", re.IGNORECASE)
+_CUSTOM_FACE_HELP_RE = re.compile(r"^(?:表情包帮助|表情帮助|表情包命令|表情命令帮助)$", re.IGNORECASE)
+_CUSTOM_FACE_ADD_RE = re.compile(r"^(?:收藏表情|添加表情|保存表情)\s+(.+?)\s*$", re.IGNORECASE)
+_CUSTOM_FACE_RENAME_RE = re.compile(r"^(?:命名表情|重命名表情|改名表情)\s+(\S+)\s+(.+?)\s*$", re.IGNORECASE)
+_CUSTOM_FACE_DELETE_RE = re.compile(r"^(?:删除表情|移除表情|取消收藏表情)\s+(.+?)\s*$", re.IGNORECASE)
 _SENSITIVE_ID_RE = re.compile(r"(?<!\d)\d{5,12}(?!\d)")
 # 2026-05-03 修改原因：QQ 端需要把 Clonoth 任务生命周期映射为离散 React 阶段。
 # 做法是集中维护阶段到 emoji_id 的映射和阶段顺序，目的在于后续回调只声明
@@ -194,6 +220,8 @@ _router_task: Optional[asyncio.Task] = None
 _qq_queue_tasks: List[asyncio.Task] = []
 _callbacks: Optional["TangQiuCallbacks"] = None
 _bqbs: List[str] = []
+_custom_face_names: List[str] = []
+_custom_face_metadata: List[Dict[str, Any]] = []
 
 
 def _is_group_allowed(group_id: int) -> bool:
@@ -988,6 +1016,390 @@ async def _collect_qq_attachments(event, conversation_key: str) -> tuple[list[di
     return await _image_sources_to_attachments(image_urls, conversation_key)
 
 
+def _attachment_abs_path(attachment: Dict[str, Any]) -> Path | None:
+    """把 Clonoth 附件描述解析成本地绝对路径，用于 NapCat add_custom_face。"""
+    raw = str(attachment.get("path") or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(CLONOTH_WORKSPACE) / raw
+    return path
+
+
+async def _collect_reply_image_attachments(bot: Bot, event: Event, conversation_key: str) -> tuple[list[dict], list[str]]:
+    """为“收藏表情”命令补充引用消息中的图片。"""
+    reply_message_id = _extract_reply_message_id(
+        event.get_message() if hasattr(event, "get_message") else None,
+        getattr(event, "raw_message", None),
+    )
+    if reply_message_id is None:
+        return [], []
+    reply_obj = await _get_reply_message(bot, reply_message_id)
+    if not reply_obj:
+        return [], []
+    image_urls: list[str] = []
+    for key in ("message", "raw_message"):
+        value = reply_obj.get(key)
+        if value:
+            image_urls.extend(_iter_qq_image_urls(value))
+    # 去重，避免同一引用图被重复下载。
+    image_urls = list(dict.fromkeys(image_urls))
+    return await _image_sources_to_attachments(image_urls, conversation_key)
+
+
+async def _custom_face_command_attachments(
+    *,
+    bot: Bot,
+    event: Event,
+    conversation_key: str,
+    current_attachments: List[Dict[str, Any]],
+) -> tuple[list[dict], list[str]]:
+    """为收藏表情命令选择图片：当前消息 > 引用消息 > 最近图片。"""
+    if current_attachments:
+        return current_attachments, []
+
+    reply_attachments, reply_errors = await _collect_reply_image_attachments(bot, event, conversation_key)
+    if reply_attachments:
+        return reply_attachments, reply_errors
+
+    recent = _recent_images_for_text(conversation_key, event)
+    if recent:
+        return recent, []
+    return [], reply_errors
+
+
+def _load_custom_face_names_file() -> List[str]:
+    """读取 AI 可见收藏表情名称文件。"""
+    return load_custom_face_names(CUSTOM_FACE_NAMES_PATH)
+
+
+def _load_custom_face_metadata_file() -> List[Dict[str, Any]]:
+    """读取程序内部使用的收藏表情元数据文件（md5/resId/emojiId/url 等）。"""
+    return load_custom_face_metadata(CUSTOM_FACE_METADATA_PATH)
+
+
+def _current_custom_face_names() -> List[str]:
+    """读取当前 AI 可见表情名，并同步进内存缓存。手动编辑文件后无需重启。"""
+    global _custom_face_names
+    _custom_face_names = _load_custom_face_names_file()
+    return list(_custom_face_names)
+
+
+def _current_custom_face_metadata() -> List[Dict[str, Any]]:
+    """读取当前收藏表情内部元数据，并同步进内存缓存。"""
+    global _custom_face_metadata
+    _custom_face_metadata = _load_custom_face_metadata_file()
+    return list(_custom_face_metadata)
+
+
+def _custom_face_prompt_block() -> str:
+    """构造注入给 AI 的 QQ 收藏表情使用说明。"""
+    current_names = _current_custom_face_names()
+    if CUSTOM_FACE_PROMPT_LIMIT <= 0 or not current_names:
+        return ""
+    names = current_names[:CUSTOM_FACE_PROMPT_LIMIT]
+    more = "" if len(current_names) <= CUSTOM_FACE_PROMPT_LIMIT else f"（另有 {len(current_names) - CUSTOM_FACE_PROMPT_LIMIT} 个未展示）"
+    return (
+        "【QQ可用收藏表情】\n"
+        "你可以在回复中用 [表情:名称] 发送 QQ 收藏表情。"
+        "只使用下列名称，不要臆造未列出的表情名。\n"
+        f"可用名称：{'、'.join(names)}{more}"
+    )
+
+
+async def _sync_custom_face_names_file(bot: Bot) -> List[str]:
+    """从 NapCat 收藏表情详情同步已命名表情到 AI 名称文件和内部元数据文件。
+
+    AI 名称文件只写去重后的基础名；内部元数据保留全部同名项（带 (1)/(2) 后缀）。
+    """
+    global _custom_face_names, _custom_face_metadata
+    faces = await fetch_custom_face_details(bot, force=True)
+    metadata = extract_named_custom_face_metadata(faces, _bqbs)
+    names = extract_named_custom_face_names(faces, _bqbs)
+    write_custom_face_names(CUSTOM_FACE_NAMES_PATH, names)
+    write_custom_face_metadata(CUSTOM_FACE_METADATA_PATH, metadata)
+    _custom_face_names = names
+    _custom_face_metadata = metadata
+    return names
+
+
+async def _set_custom_face_desc(bot: Bot, face: Dict[str, Any], desc: str) -> tuple[bool, str]:
+    """调用 NapCat set_custom_face_desc 给已有收藏表情设置描述。"""
+    emoji_id = face.get("emojiId") or face.get("emoji_id")
+    res_id = face.get("resId") or face.get("res_id") or face.get("id")
+    md5 = face.get("md5") or face.get("MD5")
+    if emoji_id is None or not res_id or not md5:
+        missing = []
+        if emoji_id is None:
+            missing.append("emoji_id")
+        if not res_id:
+            missing.append("res_id")
+        if not md5:
+            missing.append("md5")
+        return False, "找到了该表情，但缺少重命名所需字段：" + "、".join(missing)
+    try:
+        await bot.call_api(
+            "set_custom_face_desc",
+            emoji_id=emoji_id,
+            res_id=str(res_id),
+            md5=str(md5),
+            desc=desc,
+        )
+    except Exception as exc:
+        logger.warning("set_custom_face_desc failed: %s", exc, exc_info=True)
+        return False, "重命名收藏表情失败：当前 OneBot 实现可能不支持 set_custom_face_desc，或该表情资源信息已失效。"
+    invalidate_custom_face_cache(bot)
+    try:
+        await _sync_custom_face_names_file(bot)
+    except Exception:
+        logger.warning("sync custom face names after rename failed", exc_info=True)
+    return True, f"已将收藏表情重命名为：{desc}\n之后模型可用 [表情:{desc}] 调用。"
+
+
+async def _add_custom_face_from_attachment(bot: Bot, alias: str, attachment: Dict[str, Any]) -> str:
+    """调用 NapCat add_custom_face，并尽量把收藏描述设置为 alias。"""
+    path = _attachment_abs_path(attachment)
+    if path is None or not path.exists():
+        return "找不到要收藏的图片文件，请重新发送图片后再试。"
+
+    content = path.read_bytes()
+    md5 = hashlib.md5(content).hexdigest()
+    try:
+        await bot.call_api(
+            "add_custom_face",
+            file=str(path),
+            md5=md5,
+            file_name=path.name,
+            is_origin=True,
+        )
+    except Exception as exc:
+        logger.warning("add_custom_face failed: %s", exc, exc_info=True)
+        return (
+            "收藏表情失败：NapCat add_custom_face 调用失败。\n"
+            "提示：NapCat 要求 file 是 NapCat 运行环境可访问的本地路径；"
+            "如果 NoneBot 和 NapCat 分容器部署，请把 Clonoth data/attachments 挂载到相同路径。"
+        )
+
+    invalidate_custom_face_cache(bot)
+
+    # NapCat 修改描述需要 emoji_id + res_id + md5。add_custom_face 的返回不一定包含这些字段，
+    # 因此刷新列表后用 md5 反查新表情，再调用 set_custom_face_desc。
+    try:
+        await asyncio.sleep(0.8)
+        faces = await fetch_custom_face_details(bot, force=True)
+        target_face = None
+        for face in faces:
+            if isinstance(face, dict) and str(face.get("md5") or "").lower() == md5.lower():
+                target_face = face
+                break
+        if isinstance(target_face, dict):
+            emoji_id = target_face.get("emojiId") or target_face.get("emoji_id")
+            res_id = target_face.get("resId") or target_face.get("res_id")
+            if emoji_id is not None and res_id:
+                await bot.call_api(
+                    "set_custom_face_desc",
+                    emoji_id=emoji_id,
+                    res_id=str(res_id),
+                    md5=md5,
+                    desc=alias,
+                )
+                invalidate_custom_face_cache(bot)
+                try:
+                    await _sync_custom_face_names_file(bot)
+                except Exception:
+                    logger.warning("sync custom face names after add failed", exc_info=True)
+    except Exception:
+        # 描述设置失败不影响“已收藏”的主体结果，模型仍可用序号/md5/文件名兜底调用。
+        logger.warning("set_custom_face_desc after add_custom_face failed", exc_info=True)
+
+    return f"已尝试收藏表情：{alias}\n之后模型可用 [表情:{alias}] 调用；如描述设置失败，也可用“表情列表”查看实际名称。"
+
+
+async def _maybe_handle_custom_face_command(
+    *,
+    bot: Bot,
+    event: Event,
+    user_text: str,
+    conversation_key: str,
+    current_attachments: List[Dict[str, Any]],
+) -> str | None:
+    """处理 QQ 侧收藏表情管理命令；返回回复文本，None 表示不是命令。"""
+    text = (user_text or "").strip()
+    if not text:
+        return None
+
+    is_admin = _is_admin_user(getattr(event, "user_id", ""))
+
+    if _CUSTOM_FACE_HELP_RE.match(text):
+        if not is_admin:
+            return "表情包命令仅限 Clonoth 管理员使用。"
+        return (
+            "【表情包管理命令示例（仅管理员）】\n"
+            "1) 同步表情列表\n"
+            "   从 NapCat 收藏同步已命名表情到本地文件。\n"
+            "2) 表情列表 / 表情列表 50\n"
+            "   查看 AI 当前可用的表情名称。\n"
+            "3) 表情详情列表 / 表情详情列表 50\n"
+            "   查看收藏详情（含未命名项）与序号。\n"
+            "4) 收藏表情 开心\n"
+            "   收藏当前消息/引用/最近的一张图片，并命名为“开心”。\n"
+            "5) 命名表情 3 开心 或 重命名表情 3 开心\n"
+            "   给第 3 个收藏表情命名/改名（也可用 md5/resId/文件名定位）。\n"
+            "6) 删除表情 开心\n"
+            "   删除名为“开心”的收藏表情。\n"
+            "提示：AI 发送表情用 [表情:名称]；未命名表情不会给 AI 使用。"
+        )
+
+    # 以下写操作命令仅限管理员：同步 / 收藏 / 命名 / 删除。
+    if _CUSTOM_FACE_SYNC_RE.match(text):
+        if not is_admin:
+            return "同步表情列表仅限 Clonoth 管理员使用。"
+        try:
+            names = await _sync_custom_face_names_file(bot)
+        except Exception as exc:
+            logger.warning("sync custom face names failed: %s", exc, exc_info=True)
+            return "同步表情列表失败：当前 OneBot 实现可能不支持 fetch_custom_face_detail。"
+        if not names:
+            return f"已同步，但没有发现已命名收藏表情。未命名表情不会写入 AI 表情列表文件：{CUSTOM_FACE_NAMES_PATH}"
+        duplicates = count_duplicate_face_names(_custom_face_metadata)
+        total = len(_custom_face_metadata)
+        dup_note = ""
+        if duplicates:
+            dup_desc = "、".join(f"{name}(x{count})" for name, count in list(duplicates.items())[:20])
+            dup_note = (
+                f"\n⚠ 检测到 {len(duplicates)} 组同名表情：{dup_desc}\n"
+                "同名表情已全部保留，AI 名称列表仅显示一个基础名；发送时会在同名表情中随机选择一个。"
+            )
+        return (
+            f"已同步 {total} 个已命名收藏表情（AI 可见基础名 {len(names)} 个）。\n"
+            f"AI 名称文件：{CUSTOM_FACE_NAMES_PATH}\n"
+            f"内部元数据文件：{CUSTOM_FACE_METADATA_PATH}\n"
+            "AI 只看到名称文件里的基础名，md5/resId/emojiId 保存在元数据文件里。"
+            + dup_note
+        )
+
+    list_match = _CUSTOM_FACE_LIST_RE.match(text)
+    if list_match:
+        if not is_admin:
+            return "表情列表仅限 Clonoth 管理员使用。"
+        limit = int(list_match.group(1) or "30")
+        limit = max(1, min(100, limit))
+        names = _load_custom_face_names_file()
+        if not names:
+            return f"AI 表情列表文件为空：{CUSTOM_FACE_NAMES_PATH}\n可发送“同步表情列表”从 NapCat 写入已命名表情；未命名表情不会写入。"
+        shown = names[:limit]
+        lines = [f"{index}. {name}" for index, name in enumerate(shown, start=1)]
+        more = "" if len(names) <= limit else f"\n……还有 {len(names) - limit} 个，可发送“表情列表 {min(len(names), 100)}”查看更多。"
+        return "AI 可用收藏表情：\n" + "\n".join(lines) + more + "\n模型可用格式：[表情:名称]"
+
+    detail_match = _CUSTOM_FACE_DETAIL_LIST_RE.match(text)
+    if detail_match:
+        if not is_admin:
+            return "表情详情列表仅限 Clonoth 管理员使用。"
+        limit = int(detail_match.group(1) or "50")
+        limit = max(1, min(100, limit))
+        try:
+            names = await list_custom_face_aliases(bot, _bqbs, count=max(limit, 48))
+        except Exception as exc:
+            logger.warning("list custom face details failed: %s", exc, exc_info=True)
+            return "获取收藏表情详情失败：当前 OneBot 实现可能不支持 fetch_custom_face_detail。"
+        if not names:
+            return "当前没有可识别的收藏表情。"
+        shown = names[:limit]
+        lines = [f"{index}. {name}" for index, name in enumerate(shown, start=1)]
+        more = "" if len(names) <= limit else f"\n……还有 {len(names) - limit} 个，可发送“表情详情列表 {min(len(names), 100)}”查看更多。"
+        return "收藏表情详情（含未命名项）：\n" + "\n".join(lines) + more + "\n未命名表情可用：命名表情 <序号> <新名字>"
+
+    rename_match = _CUSTOM_FACE_RENAME_RE.match(text)
+    if rename_match:
+        if not is_admin:
+            return "命名/重命名表情仅限 Clonoth 管理员使用。"
+        target = rename_match.group(1).strip()
+        desc = rename_match.group(2).strip()
+        if not target or not desc:
+            return "请指定要命名的表情和新名字，例如：命名表情 3 开心"
+        # 若定位词是纯基础名且存在多个同名，不直接改，列序号让管理员指定具体一个。
+        siblings = await find_custom_faces_by_base_name(bot, target, _bqbs)
+        if len(siblings) > 1:
+            lines = []
+            for s in siblings:
+                extra = s.get("md5") or s.get("res_id") or s.get("file_name") or ""
+                extra_note = f"（md5:{str(extra)[:8]}）" if s.get("md5") else (f"（{extra}）" if extra else "")
+                lines.append(f"{s['index']}. {s['base_name']}{extra_note}")
+            return (
+                f"检测到 {len(siblings)} 个同名表情“{target}”，为避免改错，请指定要命名哪一个：\n"
+                + "\n".join(lines)
+                + f"\n请改用序号，例如：命名表情 {siblings[0]['index']} {desc}"
+                + "\n也可用 md5 或 resId 精确定位。"
+            )
+        face = await resolve_custom_face(bot, target, _bqbs)
+        if not isinstance(face, dict):
+            return f"没有找到收藏表情：{target}\n可先发送“表情详情列表 50”查看序号，再用“命名表情 <序号> <新名字>”。"
+        ok, message = await _set_custom_face_desc(bot, face, desc)
+        return message
+
+    delete_match = _CUSTOM_FACE_DELETE_RE.match(text)
+    if delete_match:
+        if not is_admin:
+            return "删除表情仅限 Clonoth 管理员使用。"
+        name = delete_match.group(1).strip()
+        if not name:
+            return "请指定要删除的表情名称，例如：删除表情 开心"
+        # 若输入是纯基础名（不是序号/md5/resId 这类唯一定位），且存在多个同名，
+        # 则不直接删除，改为列出同名项的序号，让管理员明确指定删哪个。
+        siblings = await find_custom_faces_by_base_name(bot, name, _bqbs)
+        if len(siblings) > 1:
+            lines = []
+            for s in siblings:
+                extra = s.get("md5") or s.get("res_id") or s.get("file_name") or ""
+                extra_note = f"（md5:{str(extra)[:8]}）" if s.get("md5") else (f"（{extra}）" if extra else "")
+                lines.append(f"{s['index']}. {s['base_name']}{extra_note}")
+            return (
+                f"检测到 {len(siblings)} 个同名表情“{name}”，为避免误删，请指定要删除哪一个：\n"
+                + "\n".join(lines)
+                + "\n请改用序号删除，例如：删除表情 " + str(siblings[0]["index"])
+                + "\n也可用 md5 或 resId 精确删除。"
+            )
+        face = await resolve_custom_face(bot, name, _bqbs)
+        if not isinstance(face, dict):
+            return f"没有找到收藏表情：{name}"
+        res_id = face.get("resId") or face.get("res_id") or face.get("id")
+        if not res_id:
+            return f"找到了表情 {name}，但没有 resId，无法删除。"
+        try:
+            await bot.call_api("delete_custom_face", res_id=str(res_id))
+            invalidate_custom_face_cache(bot)
+            try:
+                await _sync_custom_face_names_file(bot)
+            except Exception:
+                logger.warning("sync custom face names after delete failed", exc_info=True)
+            return f"已删除收藏表情：{name}"
+        except Exception as exc:
+            logger.warning("delete_custom_face failed: %s", exc, exc_info=True)
+            return "删除收藏表情失败：当前 OneBot 实现可能不支持 delete_custom_face，或 resId 已失效。"
+
+    add_match = _CUSTOM_FACE_ADD_RE.match(text)
+    if add_match:
+        if not is_admin:
+            return "收藏表情仅限 Clonoth 管理员使用。"
+        alias = add_match.group(1).strip()
+        if not alias:
+            return "请给表情起一个名字，例如：收藏表情 开心"
+        attachments, errors = await _custom_face_command_attachments(
+            bot=bot,
+            event=event,
+            conversation_key=conversation_key,
+            current_attachments=current_attachments,
+        )
+        if not attachments:
+            suffix = "\n" + "\n".join(dict.fromkeys(errors)) if errors else ""
+            return "没有找到可收藏的图片。请在同一条消息里带图，或引用/紧接着回复一张图片：收藏表情 名称" + suffix
+        return await _add_custom_face_from_attachment(bot, alias, attachments[0])
+
+    return None
+
+
 def _format_history_line(event: GroupMessageEvent, bot: Bot, override_text: str = "") -> str:
     """把群消息格式化为 tangqiu_main 提示词要求的历史行，并匿名化 QQ ID。"""
     text = _anonymize_text_for_ai(_compact_text(override_text or _message_to_text(event.get_message(), getattr(bot, "self_id", None))))
@@ -1351,6 +1763,9 @@ async def _build_inbound_text(event: GroupMessageEvent, bot: Bot, user_text: str
         attachments.extend(quoted_attachments)
     if reply_context:
         parts.extend(["", "【当前消息引用】", reply_context])
+    custom_face_prompt = _custom_face_prompt_block()
+    if custom_face_prompt:
+        parts.extend(["", custom_face_prompt])
 
     parts.extend([
         "",
@@ -1379,6 +1794,9 @@ async def _build_private_inbound_text(event: PrivateMessageEvent, bot: Bot, user
         attachments.extend(quoted_attachments)
     if reply_context:
         parts.extend(["", "【当前消息引用】", reply_context])
+    custom_face_prompt = _custom_face_prompt_block()
+    if custom_face_prompt:
+        parts.extend(["", custom_face_prompt])
     parts.extend([
         "",
         "【当前用户身份】",
@@ -1792,7 +2210,13 @@ async def _send_split_text(bot: Bot, target: Dict[str, Any], text: str) -> bool:
         part = _truncate_qq_text(raw_part.strip())
         if not part:
             continue
-        segments = await process_emojis(part, bot, _bqbs)
+        segments = await process_emojis(
+            part,
+            bot,
+            _bqbs,
+            _current_custom_face_names(),
+            _current_custom_face_metadata(),
+        )
         if not segments:
             continue
         msg = _message_from_processed_segments(segments)
@@ -2230,12 +2654,14 @@ class TangQiuCallbacks:
 @driver.on_startup
 async def _startup() -> None:
     """NoneBot 启动时初始化 Clonoth SDK 与事件路由。"""
-    global _client, _session_state, _event_router, _router_task, _qq_queue_tasks, _callbacks, _bqbs
+    global _client, _session_state, _event_router, _router_task, _qq_queue_tasks, _callbacks, _bqbs, _custom_face_names, _custom_face_metadata
     if _router_task is not None and not _router_task.done():
         return
 
     global _QQ_USER_PROFILES
-    _bqbs = load_bqbs(BQBS_PATH)
+    _bqbs = load_bqbs(BQBS_PATH) if BQBS_PATH else []
+    _custom_face_names = _load_custom_face_names_file()
+    _custom_face_metadata = _load_custom_face_metadata_file()
     _QQ_USER_PROFILES = _load_qq_user_profiles(USER_PROFILES_PATH)
     if _QQ_USER_PROFILES:
         logger.info("loaded %d QQ user profiles", len(_QQ_USER_PROFILES))
@@ -2355,6 +2781,15 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
 
     attachments, attachment_errors = await _collect_qq_attachments(event, stable_conversation_key)
     _remember_recent_images(stable_conversation_key, event, attachments)
+    custom_face_reply = await _maybe_handle_custom_face_command(
+        bot=bot,
+        event=event,
+        user_text=user_text,
+        conversation_key=stable_conversation_key,
+        current_attachments=attachments,
+    )
+    if custom_face_reply is not None:
+        await _agent_matcher.finish(custom_face_reply)
     await _merge_recent_images_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
     inbound_text = await _build_inbound_text(event, bot, user_text, stable_conversation_key, attachments)
     if attachment_errors:
@@ -2442,6 +2877,15 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     stable_conversation_key = _stable_conversation_key(real_conversation_key)
     attachments, attachment_errors = await _collect_qq_attachments(event, stable_conversation_key)
     _remember_recent_images(stable_conversation_key, event, attachments)
+    custom_face_reply = await _maybe_handle_custom_face_command(
+        bot=bot,
+        event=event,
+        user_text=user_text,
+        conversation_key=stable_conversation_key,
+        current_attachments=attachments,
+    )
+    if custom_face_reply is not None:
+        await _private_matcher.finish(custom_face_reply)
     await _merge_recent_images_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
     inbound_text = await _build_private_inbound_text(event, bot, user_text, stable_conversation_key, attachments)
     if attachment_errors:

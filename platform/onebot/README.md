@@ -31,7 +31,10 @@ pip install nonebot2 nonebot-adapter-onebot httpx
 | `CLONOTH_BASE_URL` | 否 | `http://127.0.0.1:8765` | Supervisor API 地址 |
 | `CLONOTH_WORKSPACE` | 否 | `/www/wwwroot/Clonoth` | 工作区路径，用于 SDK 导入和附件存储 |
 | `CLONOTH_ENTRY_NODE` | 否 | `qq.orchestrator` | QQ 入口节点 ID。默认使用综合入口，支持联网搜索、调度、重启、取消任务，并可委派项目/命令相关任务；如需搜索-only 安全窄入口，可显式设置为 `qq.web_search`。 |
-| `CLONOTH_BQBS_PATH` | 否 | 空 | QQ 自定义表情名称索引文件路径 |
+| `CLONOTH_QQ_CUSTOM_FACES_PATH` | 否 | `${CLONOTH_WORKSPACE}/config/qq_custom_faces.txt` | AI 可见的 QQ 收藏表情名称文件；一行一个名称，空行和 `#` 注释忽略。 |
+| `CLONOTH_QQ_CUSTOM_FACES_METADATA_PATH` | 否 | `${CLONOTH_WORKSPACE}/config/qq_custom_faces.json` | 内部元数据文件（name/md5/resId/emojiId/fileName/url）。AI 不读取，用于稳定匹配与直接发送。 |
+| `ONEBOT_CUSTOM_FACE_PROMPT_LIMIT` | 否 | `50` | 每轮注入给 AI 的表情名称上限；设为 `0` 可禁用注入。 |
+| `CLONOTH_BQBS_PATH` | 否 | 空 | 旧 `bqbs.txt` 顺序别名文件。默认不使用；只有配置 env 后才按收藏列表顺序补充别名。 |
 | `CLONOTH_ADMIN_QQ_USERS` | 是 | `[占位符],[占位符]` | Clonoth 审批管理员 QQ 号，逗号分隔。只有这些用户能通过私聊命令批准/拒绝审批 |
 | `CLONOTH_ALLOWED_GROUPS` | 是 | `[占位符]` | 允许接入的 QQ 群号，逗号分隔。默认占位符不会匹配任何真实群，避免空配置开放所有群 |
 | `CLONOTH_ALLOWED_PRIVATE_USERS` | 否 | `[私聊只允许已经通过好友请求的人]` | 允许私聊使用 Clonoth 的 QQ 用户，逗号分隔。默认仅允许好友私聊；管理员始终允许 |
@@ -93,9 +96,31 @@ nb run
 
 图片附件从 QQ 临时 URL 下载并保存到 `data/attachments/` 目录，与 Discord 适配器使用相同的路径格式。MIME 类型根据 URL 和响应头自动推断。
 
-### QQ 表情
+### QQ 收藏表情 / 表情包
 
-支持 QQ 自定义表情（face segment）的文本化。如果配置了 `CLONOTH_BQBS_PATH`，可将表情 ID 映射为可读名称。
+适配器支持 NapCat 的 QQ 收藏表情扩展 API：
+
+- 发送前会把模型输出的 `[表情:开心]`、`[emoji:开心]`、`[收藏表情:开心]`、旧格式 `[QQ_EMOJI:开心]` 自动转换成 OneBot `image` segment。
+- AI 默认只看到 `CLONOTH_QQ_CUSTOM_FACES_PATH` 指向的名称文件，默认路径为 `config/qq_custom_faces.txt`。文件一行一个名称，空行和 `#` 注释会被忽略，手动修改后无需重启即可生效。
+- 无名称收藏表情不会写入该文件，也不会注入给 AI，因此 AI 不会主动使用未命名表情。
+- 发送解析优先使用名称文件；`CLONOTH_BQBS_PATH` 默认不使用，只有显式配置 env 时才作为旧 `bqbs.txt` 顺序别名参与兼容匹配。
+- 除名称文件外，还会维护内部元数据文件 `config/qq_custom_faces.json`（含 `name/md5/resId/emojiId/fileName/url`）。这些字段不注入给 AI，仅用于把名称稳定映射到具体收藏表情，并在可能时直接用保存的 URL 发送，减少频繁调用 `fetch_custom_face_detail`。
+- 序号、md5、resId、emojiId 不写入 AI 可见的名称文件，避免模型误用；它们只保存在元数据文件里。
+- 表情详情优先通过 NapCat `fetch_custom_face_detail` 获取；如果运行端不支持，会回退尝试旧 `fetch_custom_face`。
+
+QQ 侧可直接管理收藏表情。以下命令全部仅限 `CLONOTH_ADMIN_QQ_USERS` 中的管理员使用；非管理员触发会被提示无权限，且不会消耗 LLM。命令中的数字参数（如 `50`）表示最多展示的条数，范围 1~100：
+
+| 命令 | 权限 | 说明 |
+|---|---|---|
+| `表情包帮助` | 仅管理员 | 输出全部表情包管理命令示例 |
+| `同步表情列表` | 仅管理员 | 从 NapCat 收藏表情详情同步“已命名表情”到 `config/qq_custom_faces.txt`；未命名表情会被跳过 |
+| `收藏表情 开心` | 仅管理员 | 将同一条消息、引用消息或最近一张图片添加到 QQ 收藏，并尽量把描述设置为“开心” |
+| `命名表情 3 开心` / `重命名表情 3 开心` | 仅管理员 | 给已有收藏表情设置/修改描述；第一个参数可用序号、md5、resId、文件名或旧描述；成功后会同步名称文件 |
+| `删除表情 开心` | 仅管理员 | 按名称/描述/resId/md5/序号删除收藏表情；成功后会同步名称文件 |
+| `表情列表` / `表情列表 50` | 仅管理员 | 查看当前名称文件中 AI 可用的表情名；`50` 表示最多展示 50 项（默认 30） |
+| `表情详情列表` / `表情详情列表 50` | 仅管理员 | 查看 NapCat 收藏表情详情列表，包含未命名项，便于按序号命名；`50` 表示最多展示 50 项（默认 50） |
+
+注意：NapCat 的 `add_custom_face` 要求 `file` 是 NapCat 运行环境能访问的本地路径。如果 NoneBot 与 NapCat 分容器/分机器部署，需要把 `CLONOTH_WORKSPACE/data/attachments` 挂载到 NapCat 中的相同路径，否则新增收藏会失败。已收藏表情的发送不需要本地路径，直接使用 `fetch_custom_face_detail` 取得的 URL/资源信息发送。
 
 ### 审批流程
 

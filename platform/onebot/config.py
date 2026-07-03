@@ -75,7 +75,20 @@ CLONOTH_WORKSPACE = _env_first("CLONOTH_WORKSPACE", "ONEBOT_WORKSPACE_ROOT", def
 # 如需搜索-only 安全窄入口，可显式设置 CLONOTH_ENTRY_NODE=qq.web_search。
 ENTRY_NODE_ID = _env_first("CLONOTH_ENTRY_NODE", "ONEBOT_ENTRY_NODE_ID", default="qq.orchestrator")
 
-# QQ 自定义表情名称索引文件路径（可选）。兼容独立 onebot11_adapter.py 的变量名。
+# QQ 收藏表情 AI 可见名称文件路径。默认使用该文件给 AI 注入可用表情名。
+CUSTOM_FACE_NAMES_PATH = _env_first(
+    "ONEBOT_CUSTOM_FACE_NAMES_PATH",
+    "CLONOTH_QQ_CUSTOM_FACES_PATH",
+    default=os.path.join(CLONOTH_WORKSPACE, "config", "qq_custom_faces.txt"),
+)
+CUSTOM_FACE_METADATA_PATH = _env_first(
+    "ONEBOT_CUSTOM_FACE_METADATA_PATH",
+    "CLONOTH_QQ_CUSTOM_FACES_METADATA_PATH",
+    default=os.path.join(CLONOTH_WORKSPACE, "config", "qq_custom_faces.json"),
+)
+CUSTOM_FACE_PROMPT_LIMIT = _env_int("ONEBOT_CUSTOM_FACE_PROMPT_LIMIT", 50, min_value=0, max_value=200)
+
+# 旧 bqbs.txt 顺序别名文件路径（可选）。默认不使用；仅配置 env 时参与兼容匹配/同步。
 BQBS_PATH = _env_first("ONEBOT_CUSTOM_EMOJI_INDEX_PATH", "CLONOTH_BQBS_PATH", default="")
 
 # QQ 用户身份/称呼配置文件路径（可选，支持 JSON/YAML）。只用于模型可见称呼，不授予权限。

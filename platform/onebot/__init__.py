@@ -1124,11 +1124,27 @@ async def _sync_custom_face_names_file(bot: Bot) -> List[str]:
     return names
 
 
+def _custom_face_value(face: Dict[str, Any], *keys: str) -> Any:
+    """按多个可能字段名取收藏表情字段；保留 0 这类合法值。"""
+    if not isinstance(face, dict):
+        return None
+    for key in keys:
+        if key not in face:
+            continue
+        value = face.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
+
+
 async def _set_custom_face_desc(bot: Bot, face: Dict[str, Any], desc: str) -> tuple[bool, str]:
     """调用 NapCat set_custom_face_desc 给已有收藏表情设置描述。"""
-    emoji_id = face.get("emojiId") or face.get("emoji_id") or face.get("emoId") or face.get("emoid")
-    res_id = face.get("resId") or face.get("res_id") or face.get("id")
-    md5 = face.get("md5") or face.get("MD5")
+    emoji_id = _custom_face_value(face, "emojiId", "emoji_id", "emoId", "emoid")
+    res_id = _custom_face_value(face, "resId", "res_id", "id")
+    md5 = _custom_face_value(face, "md5", "MD5")
     if emoji_id is None or not res_id or not md5:
         missing = []
         if emoji_id is None:
@@ -1194,8 +1210,8 @@ async def _add_custom_face_from_attachment(bot: Bot, alias: str, attachment: Dic
                 target_face = face
                 break
         if isinstance(target_face, dict):
-            emoji_id = target_face.get("emojiId") or target_face.get("emoji_id") or target_face.get("emoId") or target_face.get("emoid")
-            res_id = target_face.get("resId") or target_face.get("res_id")
+            emoji_id = _custom_face_value(target_face, "emojiId", "emoji_id", "emoId", "emoid")
+            res_id = _custom_face_value(target_face, "resId", "res_id")
             if emoji_id is not None and res_id:
                 await bot.call_api(
                     "set_custom_face_desc",

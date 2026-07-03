@@ -66,7 +66,7 @@ def _run(args: dict) -> dict:
         return {
             "ok": False,
             "error": "no symbol specified",
-            "data": {"result": "ERROR: 请提供 symbol 或 symbols。", "quotes": [], "failures": [], "warnings": [DISCLAIMER], "success_count": 0, "fail_count": 0},
+            "data": {"result": "ERROR: 请提供 symbol 或 symbols。", "quotes": [], "failures": [], "warnings": [], "success_count": 0, "fail_count": 0},
         }
 
     try:
@@ -86,7 +86,7 @@ def _run(args: dict) -> dict:
 
     resolved, failures = resolve_many(inputs, market_hint=market)
     quotes = []
-    warnings = [DISCLAIMER]
+    warnings = [DISCLAIMER] if DISCLAIMER else []
     if truncated_warning:
         warnings.insert(0, truncated_warning)
 

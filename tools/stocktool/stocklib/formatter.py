@@ -70,5 +70,6 @@ def format_result(quotes: list[dict], failures: list[dict], warnings: list[str])
     for warning in warnings:
         if warning and warning != DISCLAIMER:
             lines.append(f"提示：{warning}")
-    lines.append(DISCLAIMER)
+    if DISCLAIMER:
+        lines.append(DISCLAIMER)
     return "\n".join(lines).strip()

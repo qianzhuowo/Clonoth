@@ -311,7 +311,7 @@ def custom_face_metadata_item(face: Any, index: int, bqbs: List[str]) -> Dict[st
     item: Dict[str, Any] = {"name": name, "base_name": name, "index": index + 1}
     if isinstance(face, dict):
         item.update({
-            "emoji_id": _custom_face_field(face, "emojiId", "emoji_id"),
+            "emoji_id": _custom_face_field(face, "emojiId", "emoji_id", "emoId", "emoid"),
             "res_id": _custom_face_field(face, "resId", "res_id", "id"),
             "md5": _custom_face_field(face, "md5", "MD5"),
             "file_name": _custom_face_field(face, "fileName", "file_name"),
@@ -362,7 +362,7 @@ def _metadata_matches_face(meta: Dict[str, Any], face: Any) -> bool:
     for meta_key, face_keys in (
         ("md5", ("md5", "MD5")),
         ("res_id", ("resId", "res_id", "id")),
-        ("emoji_id", ("emojiId", "emoji_id")),
+        ("emoji_id", ("emojiId", "emoji_id", "emoId", "emoid")),
         ("file_name", ("fileName", "file_name")),
     ):
         expected = str(meta.get(meta_key) or "").strip()
@@ -432,7 +432,7 @@ def _custom_face_aliases(face: Any, index: int, bqbs: List[str], preferred_names
     if isinstance(face, dict):
         for key in (
             "desc", "description", "name", "title", "alias", "fileName", "file_name",
-            "emojiId", "emoji_id", "resId", "res_id", "md5",
+            "emojiId", "emoji_id", "emoId", "emoid", "resId", "res_id", "md5",
         ):
             value = face.get(key)
             if value is None:
@@ -549,6 +549,7 @@ async def find_custom_faces_by_base_name(
                 "face": face,
                 "md5": _custom_face_field(face, "md5", "MD5") if isinstance(face, dict) else "",
                 "res_id": _custom_face_field(face, "resId", "res_id", "id") if isinstance(face, dict) else "",
+                "emoji_id": _custom_face_field(face, "emojiId", "emoji_id", "emoId", "emoid") if isinstance(face, dict) else "",
                 "file_name": _custom_face_field(face, "fileName", "file_name") if isinstance(face, dict) else "",
             })
     return matches

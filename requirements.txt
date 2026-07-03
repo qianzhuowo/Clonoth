@@ -7,3 +7,7 @@ PyYAML>=6.0.1
 mcp>=1.9.0,<2
 textual>=0.85.0
 Pillow>=10.0.0
+akshare>=1.14.0
+pandas>=2.0.0
+requests>=2.31.0
+yfinance>=0.2.40

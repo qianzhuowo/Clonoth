@@ -624,8 +624,15 @@ class ToolRegistry:
 
         builtin_names = set(self._tool_specs.keys())
 
-        for py in self.tools_dir.glob("*.py"):
-            if py.name == "__init__.py":
+        # [AutoC 2026-06-24] Why: stocktool and future tool packs keep their
+        # public tool entrypoints in subdirectories such as tools/stocktool/.
+        # How: scan tools/**/*.py while preserving the existing top-level format,
+        # skipping package/private/disabled helper files. Purpose: allow grouped
+        # external tools without requiring thin wrappers in tools/ root.
+        for py in sorted(self.tools_dir.rglob("*.py")):
+            if py.name == "__init__.py" or py.name.startswith("_") or py.name.endswith(".disabled.py"):
+                continue
+            if any(part == "__pycache__" for part in py.parts):
                 continue
 
             spec, timeout_sec = _extract_tool_spec(py)

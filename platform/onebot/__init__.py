@@ -40,11 +40,15 @@ from .config import (
     CLONOTH_WORKSPACE,
     CONVERSATION_HASH_SECRET,
     ENABLE_AUTO_LIKE,
+    ENABLE_FORWARD_MSG_INPUT,
     ENABLE_IMAGE_INPUT,
     ENABLE_PREEMPT,
     ENABLE_QQ_QUEUE,
     ENABLE_REACTIONS,
     ENTRY_NODE_ID,
+    FORWARD_MSG_MAX_DEPTH,
+    FORWARD_MSG_MAX_MESSAGES,
+    FORWARD_MSG_TEXT_LIMIT,
     GROUP_HISTORY_MAX,
     GROUP_TRIGGER,
     HISTORY_TEXT_LIMIT,
@@ -91,6 +95,9 @@ _SPLIT_SIGNAL = "[SPLIT]"
 _HISTORY_MAX_LEN = GROUP_HISTORY_MAX
 _HISTORY_TEXT_LIMIT = HISTORY_TEXT_LIMIT
 _QQ_MESSAGE_LIMIT = QQ_MESSAGE_LIMIT
+_FORWARD_MSG_MAX_DEPTH = FORWARD_MSG_MAX_DEPTH
+_FORWARD_MSG_MAX_MESSAGES = FORWARD_MSG_MAX_MESSAGES
+_FORWARD_MSG_TEXT_LIMIT = FORWARD_MSG_TEXT_LIMIT
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 _QQ_EMOJI_MARK_RE = re.compile(r"\[QQ_EMOJI:(.+?)\]")
 _CQ_RE = re.compile(r"\[CQ:([^,\]]+)(?:,([^\]]*))?\]")
@@ -419,6 +426,8 @@ def _message_to_text(message: Message, bot_self_id: Any = None) -> str:
             parts.append("[语音]")
         elif seg_type == "video":
             parts.append("[视频]")
+        elif seg_type == "forward":
+            parts.append("[合并转发]")
         elif seg_type == "reply":
             continue
         elif seg_type:
@@ -455,6 +464,8 @@ def _message_to_text_generic(message: Any, bot_self_id: Any = None) -> str:
                 parts.append("[语音]")
             elif seg_type == "video":
                 parts.append("[视频]")
+            elif seg_type == "forward":
+                parts.append("[合并转发]")
             elif seg_type == "reply":
                 continue
             elif seg_type:
@@ -478,6 +489,162 @@ def _parse_cq_params(raw: str) -> Dict[str, str]:
     return out
 
 
+def _extract_forward_ids(message: Any) -> List[str]:
+    """从 OneBot forward segment / CQ forward 中提取合并转发 res_id。"""
+    forward_ids: List[str] = []
+
+    def pick_id(data: Dict[str, Any]) -> str:
+        for key in ("id", "res_id", "resId", "forward_id", "forwardId"):
+            value = data.get(key)
+            if value is not None and str(value).strip():
+                return str(value).strip()
+        return ""
+
+    try:
+        segments = list(message) if message is not None and not isinstance(message, str) else []
+    except Exception:
+        segments = []
+    for segment in segments:
+        seg_type, data = _segment_type_and_data(segment)
+        if seg_type != "forward":
+            continue
+        forward_id = pick_id(data)
+        if forward_id:
+            forward_ids.append(forward_id)
+
+    if isinstance(message, str):
+        for match in _CQ_RE.finditer(message):
+            if match.group(1) != "forward":
+                continue
+            forward_id = pick_id(_parse_cq_params(match.group(2) or ""))
+            if forward_id:
+                forward_ids.append(forward_id)
+
+    return forward_ids
+
+
+async def _get_forward_messages(bot: Bot, forward_id: str) -> List[Dict[str, Any]] | None:
+    """通过 NapCat get_forward_msg 读取合并转发消息列表。"""
+    if not forward_id:
+        return None
+    try:
+        data = await bot.call_api("get_forward_msg", id=forward_id)
+    except Exception:
+        logger.warning("get_forward_msg failed for forward_id=%s", forward_id, exc_info=True)
+        return None
+    if isinstance(data, list):
+        return [m for m in data if isinstance(m, dict)]
+    if not isinstance(data, dict):
+        return None
+    payload = data.get("data") if isinstance(data.get("data"), dict) else data
+    messages = payload.get("messages") if isinstance(payload, dict) else None
+    if isinstance(messages, list):
+        return [m for m in messages if isinstance(m, dict)]
+    return None
+
+
+def _format_forward_sender(sender: Any) -> tuple[str, str]:
+    if isinstance(sender, dict):
+        user_id = str(sender.get("user_id") or "")
+        name = _sanitize_name(str(sender.get("card") or sender.get("nickname") or user_id or "未知用户"))
+    else:
+        user_id = str(getattr(sender, "user_id", "") or "")
+        name = _sanitize_name(str(getattr(sender, "card", "") or getattr(sender, "nickname", "") or user_id or "未知用户"))
+    return name, (_anonymize_user_id(user_id) if user_id else "UserUnknown")
+
+
+def _truncate_forward_text(text: str) -> str:
+    text = (text or "").strip()
+    if len(text) <= _FORWARD_MSG_TEXT_LIMIT:
+        return text
+    return text[:_FORWARD_MSG_TEXT_LIMIT] + "\n…（合并转发内容过长，已截断）"
+
+
+async def _format_forward_msg(
+    bot: Bot,
+    forward_id: str,
+    bot_self_id: Any = None,
+    *,
+    depth: int,
+    visited: set[str],
+    remaining: List[int],
+) -> str:
+    """递归读取并格式化单个合并转发 res_id。"""
+    if not ENABLE_FORWARD_MSG_INPUT:
+        return f"[合并转发:id={forward_id}]"
+    if not forward_id:
+        return "[合并转发:缺少id]"
+    if depth <= 0:
+        return f"[合并转发:id={forward_id}, 已达到读取深度上限]"
+    if forward_id in visited:
+        return f"[合并转发:id={forward_id}, 已跳过循环引用]"
+    if remaining[0] <= 0:
+        return "[合并转发:已达到读取条数上限]"
+
+    visited.add(forward_id)
+    messages = await _get_forward_messages(bot, forward_id)
+    if messages is None:
+        visited.discard(forward_id)
+        return f"[合并转发:id={forward_id}, 读取失败]"
+
+    lines: List[str] = [f"【合并转发 id={forward_id}】"]
+    for index, item in enumerate(messages, start=1):
+        if remaining[0] <= 0:
+            lines.append("…（合并转发条数过多，已截断）")
+            break
+        remaining[0] -= 1
+        sender_name, sender_user = _format_forward_sender(item.get("sender"))
+        content = item.get("content") if item.get("content") is not None else item.get("message")
+        text = await _message_to_text_with_forward(
+            bot,
+            content,
+            bot_self_id,
+            depth=depth - 1,
+            visited=visited,
+            remaining=remaining,
+        )
+        text = _compact_text(text or "[暂不支持的消息类型]", limit=max(_HISTORY_TEXT_LIMIT, 1200))
+        lines.append(f"{index}. [{_format_hhmm(item.get('time'))}] {sender_name}({sender_user}): {text}")
+    lines.append("【合并转发结束】")
+    visited.discard(forward_id)
+    return _truncate_forward_text("\n".join(lines))
+
+
+async def _message_to_text_with_forward(
+    bot: Bot,
+    message: Any,
+    bot_self_id: Any = None,
+    *,
+    depth: int | None = None,
+    visited: set[str] | None = None,
+    remaining: List[int] | None = None,
+) -> str:
+    """把消息转为文本，并递归展开 NapCat/OneBot 合并转发记录。"""
+    text = _message_to_text_generic(message, bot_self_id)
+    if not ENABLE_FORWARD_MSG_INPUT:
+        return text
+    forward_ids = _extract_forward_ids(message)
+    if not forward_ids:
+        return text
+
+    depth_value = _FORWARD_MSG_MAX_DEPTH if depth is None else depth
+    visited_set = visited if visited is not None else set()
+    remaining_box = remaining if remaining is not None else [_FORWARD_MSG_MAX_MESSAGES]
+    expanded: List[str] = []
+    for forward_id in forward_ids:
+        expanded.append(await _format_forward_msg(
+            bot,
+            forward_id,
+            bot_self_id,
+            depth=depth_value,
+            visited=visited_set,
+            remaining=remaining_box,
+        ))
+    if not text:
+        return "\n".join(expanded).strip()
+    return (text + "\n" + "\n".join(expanded)).strip()
+
+
 def _format_cq_message(text: str) -> str:
     def repl(match: re.Match[str]) -> str:
         cq_type = match.group(1)
@@ -493,6 +660,8 @@ def _format_cq_message(text: str) -> str:
             return f"[QQ表情:{params.get('id', '')}]"
         if cq_type == "record":
             return "[语音]"
+        if cq_type == "forward":
+            return "[合并转发]"
         return match.group(0)
     return _CQ_RE.sub(repl, text)
 
@@ -874,7 +1043,9 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
 
     message = reply.get("message")
     raw_message = reply.get("raw_message")
-    text = _message_to_text_generic(message, getattr(bot, "self_id", None)) or _message_to_text_generic(raw_message, getattr(bot, "self_id", None))
+    text = await _message_to_text_with_forward(bot, message, getattr(bot, "self_id", None))
+    if not text:
+        text = await _message_to_text_with_forward(bot, raw_message, getattr(bot, "self_id", None))
     images = _iter_qq_image_urls(message) or _iter_qq_image_urls(raw_message)
     quoted_attachments, _quoted_errors = await _image_sources_to_attachments(images, conversation_key)
     for att in quoted_attachments:
@@ -1197,7 +1368,8 @@ async def _build_inbound_text(event: GroupMessageEvent, bot: Bot, user_text: str
 
 async def _build_private_inbound_text(event: PrivateMessageEvent, bot: Bot, user_text: str, conversation_key: str, attachments: List[Dict[str, Any]]) -> str:
     """组装提交给 tangqiu_main 的私聊 inbound 文本，并匿名化 QQ 用户号。"""
-    text = _anonymize_text_for_ai((user_text or _message_to_text(event.get_message(), getattr(bot, "self_id", None))).strip() or "你好")
+    fallback_text = await _message_to_text_with_forward(bot, event.get_message(), getattr(bot, "self_id", None))
+    text = _anonymize_text_for_ai((user_text or fallback_text).strip() or "你好")
     name = _anonymize_text_for_ai(_sender_display_name(event.sender, event.user_id))
     user = _anonymize_user_id(event.user_id)
     now = dt.datetime.now(_CST).strftime("%Y-%m-%d %H:%M CST")
@@ -2142,7 +2314,8 @@ async def _handle_history(bot: Bot, event: GroupMessageEvent) -> None:
     """记录非触发消息，供后续 @Bot 请求作为群聊上下文。"""
     _remember_message_for_reply_context(event)
     if str(event.user_id) != str(getattr(bot, "self_id", "")):
-        _record_group_message(event, bot)
+        expanded_text = await _message_to_text_with_forward(bot, event.get_message(), getattr(bot, "self_id", None))
+        _record_group_message(event, bot, override_text=expanded_text)
         # QQ 客户端经常把“问图文本 + 图片”拆成两条事件；第二条纯图片
         # 通常不会 @bot，因此不会进入 agent matcher。这里在低优先级历史
         # matcher 中把非触发图片也下载并写入近期缓存，让前一条文本等待后
@@ -2175,7 +2348,7 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     group_id = int(event.group_id)
     real_conversation_key = f"qq_group:{group_id}"
     stable_conversation_key = _stable_conversation_key(real_conversation_key)
-    user_text = _message_to_text(event.get_message(), getattr(bot, "self_id", None)).strip() or "你好"
+    user_text = (await _message_to_text_with_forward(bot, event.get_message(), getattr(bot, "self_id", None))).strip() or "你好"
     user_text = _strip_trigger_prefix(user_text)
     _record_group_message(event, bot, override_text=user_text)
     asyncio.create_task(_auto_like_user(bot, int(event.user_id)))
@@ -2237,7 +2410,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
 
     _remember_message_for_reply_context(event)
     user_id = int(event.user_id)
-    user_text = _message_to_text(event.get_message(), getattr(bot, "self_id", None)).strip() or "你好"
+    user_text = (await _message_to_text_with_forward(bot, event.get_message(), getattr(bot, "self_id", None))).strip() or "你好"
 
     approval_command = _parse_approval_command(user_text)
     if approval_command is not None:

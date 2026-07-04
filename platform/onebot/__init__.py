@@ -199,6 +199,8 @@ _qq_waiting_replies: Dict[str, asyncio.Event] = {}
 _auto_like_today: Dict[int, str] = {}
 _reply_message_cache: Dict[str, Dict[str, Any]] = {}
 _reply_message_cache_order: Deque[str] = deque()
+_sent_reply_cache: Dict[str, float] = {}
+_sent_reply_cache_order: Deque[str] = deque()
 _route_state_lock = asyncio.Lock()
 _anon_users: Dict[str, str] = {}
 _anon_groups: Dict[str, str] = {}
@@ -2223,10 +2225,48 @@ def _mark_qq_reply_finished(conversation_key: str) -> None:
             event.set()
 
 
+def _message_dedup_text(message: Any) -> str:
+    """生成用于 QQ 发送幂等判断的稳定文本。"""
+    try:
+        if isinstance(message, Message):
+            return str(message)
+    except Exception:
+        pass
+    return str(message or "")
+
+
+def _should_skip_duplicate_send(target: Dict[str, Any], message: Any, *, ttl: float = 30.0) -> bool:
+    """短时间内跳过同一会话的完全相同消息，防止事件重放/双路径重复发送。"""
+    target_type = str(target.get("type") or "")
+    target_id = str(target.get("group_id") if target_type == "group" else target.get("user_id") or "")
+    body = _message_dedup_text(message).strip()
+    if not target_type or not target_id or not body:
+        return False
+    digest = hashlib.sha256(f"{target_type}:{target_id}:{body}".encode("utf-8", "ignore")).hexdigest()
+    now = time.time()
+    while _sent_reply_cache_order:
+        old = _sent_reply_cache_order[0]
+        ts = _sent_reply_cache.get(old, 0.0)
+        if now - ts <= ttl and len(_sent_reply_cache_order) <= 512:
+            break
+        _sent_reply_cache_order.popleft()
+        if ts and now - ts > ttl:
+            _sent_reply_cache.pop(old, None)
+    ts = _sent_reply_cache.get(digest)
+    if ts and now - ts <= ttl:
+        logger.warning("skip duplicate QQ send target=%s:%s digest=%s", target_type, target_id, digest[:10])
+        return True
+    _sent_reply_cache[digest] = now
+    _sent_reply_cache_order.append(digest)
+    return False
+
+
 async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any) -> None:
     """按 QQ 会话类型选择 OneBot 发送接口。"""
     # 2026-05-01 修改原因：私聊回复必须调用 send_private_msg，群聊回复继续调用
     # send_group_msg。通过 target 分发，回调发送文本和附件时不再硬编码群聊接口。
+    if _should_skip_duplicate_send(target, message):
+        return
     if target.get("type") == "private":
         user_id = target.get("user_id")
         if user_id is None:
@@ -2510,7 +2550,10 @@ class TangQiuCallbacks:
         if reactions:
             await self.add_reactions(trigger, reactions)
         if text:
-            await _send_split_text(bot, target, text)
+            if await _send_split_text(bot, target, text):
+                conv_key = target.get("conversation_key")
+                if conv_key:
+                    _mark_qq_reply_finished(str(conv_key))
 
     async def send_to_channel(
         self,

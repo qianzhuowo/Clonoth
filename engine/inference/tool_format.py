@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import html
 import json
 import logging
 import re
@@ -379,6 +380,14 @@ class JsonToolFormatter(ToolFormatter):
         r'<<<TOOL_CALL>>>\s*(\{.*)',
         re.DOTALL,
     )
+    _DSML_INVOKE_PATTERN = re.compile(
+        r'<[｜|]{2}DSML[｜|]{2}invoke\s+name=["\']([^"\']+)["\'][^>]*>(.*?)(?=<[｜|]{2}DSML[｜|]{2}invoke\s+name=|$)',
+        re.DOTALL | re.IGNORECASE,
+    )
+    _DSML_PARAM_PATTERN = re.compile(
+        r'<[｜|]{2}DSML[｜|]{2}parameter\s+name=["\']([^"\']+)["\'][^>]*>(.*?)(?=<[｜|]{2}DSML[｜|]{2}parameter\s+name=|</[｜|]{2}DSML[｜|]{2}invoke>|$)',
+        re.DOTALL | re.IGNORECASE,
+    )
 
     # ------------------------------------------------------------------
     #  inject_tool_definitions
@@ -525,7 +534,7 @@ class JsonToolFormatter(ToolFormatter):
 
         for match in self._TOOL_CALL_PATTERN.finditer(response.text):
             raw_json = match.group(1)
-            parsed = self._try_parse_json(raw_json)
+            parsed = self._try_parse_json(raw_json) or self._repair_tool_call_json(raw_json)
             if parsed is None:
                 continue
             name = parsed.get("name")
@@ -540,12 +549,12 @@ class JsonToolFormatter(ToolFormatter):
                 arguments=arguments,
             ))
 
-        # 回退：检测到开始标记但没有结束标记
+        # 回退：检测到开始标记但没有结束标记，或 JSON 被截断/漏转义。
         if not calls:
             match = self._TOOL_CALL_UNCLOSED.search(response.text)
             if match:
                 raw_json = match.group(1).strip()
-                parsed = self._try_parse_json(raw_json)
+                parsed = self._try_parse_json(raw_json) or self._repair_tool_call_json(raw_json)
                 if parsed and parsed.get("name"):
                     arguments = parsed.get("arguments", {})
                     if not isinstance(arguments, dict):
@@ -556,12 +565,153 @@ class JsonToolFormatter(ToolFormatter):
                         arguments=arguments,
                     ))
 
+        # 回退：部分模型会输出 DeepSeek/DSML 风格的伪 XML 工具调用，
+        # 例如 <｜｜DSML｜｜invoke name="finish">...。将其后纠正为统一工具调用。
+        if not calls:
+            calls.extend(self._parse_dsml_tool_calls(response.text))
+
+        # 最后兜底：模型把 JSON 工具块写坏但仍可识别 name/text 时，
+        # 直接纠正为 finish/reply 等工具调用，避免 QQ 端吞回复。
+        if not calls:
+            repaired = self._repair_tool_call_json(response.text)
+            if repaired and repaired.get("name"):
+                arguments = repaired.get("arguments", {})
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                calls.append(ParsedToolCall(
+                    id=f"jt_{uuid.uuid4().hex[:8]}",
+                    name=str(repaired["name"]),
+                    arguments=arguments,
+                ))
+
         # 自由正文不合成为 reply：正文保留在 build_assistant_message 存储的
         # assistant 消息 content 中，LLM 下轮可见，用户不可见。
         # 原 Fix 2 在此处把正文合成为 reply tool_call 追加到 calls 尾部，
         # 导致模型已显式调用 reply 时产生重复消息，现已删除。
 
         return calls
+
+    @classmethod
+    def _parse_dsml_tool_calls(cls, text: str) -> list[ParsedToolCall]:
+        """解析模型偶发输出的 DSML/伪 XML 工具调用。
+
+        该格式不是 Clonoth 协议的一部分，但弱模型或兼容端点可能把工具调用
+        渲染成 ``<｜｜DSML｜｜invoke name="finish">`` 文本。这里做保守后纠正：
+        只在能识别 invoke name 时生成工具调用；parameter 块解析为 arguments。
+        """
+        if "DSML" not in text:
+            return []
+        calls: list[ParsedToolCall] = []
+        for match in cls._DSML_INVOKE_PATTERN.finditer(text):
+            name = str(match.group(1) or "").strip()
+            body = match.group(2) or ""
+            if not name:
+                continue
+            args: dict[str, Any] = {}
+            for pm in cls._DSML_PARAM_PATTERN.finditer(body):
+                key = str(pm.group(1) or "").strip()
+                value = cls._strip_dsml_markup(pm.group(2) or "")
+                if key:
+                    args[key] = value
+            if not args and name in {"finish", "ask", "reply"}:
+                fallback_text = cls._strip_dsml_markup(body)
+                if fallback_text:
+                    args["text"] = fallback_text
+            calls.append(ParsedToolCall(
+                id=f"jt_{uuid.uuid4().hex[:8]}",
+                name=name,
+                arguments=args,
+            ))
+        return calls
+
+    @staticmethod
+    def _strip_dsml_markup(text: str) -> str:
+        text = re.sub(r'</?[｜|]{2}DSML[｜|]{2}[^>]*>', '', text or '', flags=re.IGNORECASE)
+        return html.unescape(text).strip()
+
+    @classmethod
+    def _repair_tool_call_json(cls, text: str) -> dict[str, Any] | None:
+        """从损坏/截断的工具 JSON 中尽量恢复 name 与常用参数。
+
+        主要覆盖 QQ 现场出现的两类问题：
+        - ``<<<TOOL_CALL>>>`` 后 JSON 少了结尾 ``}}`` / ``<<<END_TOOL_CALL>>>``；
+        - ``arguments.text`` 很长时被截断或含未转义换行，json.loads 失败。
+        """
+        if not text:
+            return None
+        raw = text.strip()
+        tag_index = raw.find(cls.CALL_OPEN_TAG)
+        if tag_index >= 0:
+            raw = raw[tag_index + len(cls.CALL_OPEN_TAG):]
+        end_index = raw.find(cls.CALL_CLOSE_TAG)
+        if end_index >= 0:
+            raw = raw[:end_index]
+        brace_index = raw.find("{")
+        if brace_index >= 0:
+            raw = raw[brace_index:]
+        name_match = re.search(r'"name"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw, re.DOTALL)
+        if not name_match:
+            return None
+        try:
+            name = json.loads('"' + name_match.group(1) + '"')
+        except Exception:
+            name = name_match.group(1)
+        args: dict[str, Any] = {}
+        for key in ("text", "summary", "target", "query", "message"):
+            value = cls._extract_broken_json_string(raw, key)
+            if value is not None:
+                args[key] = value
+        # 对终止/回复工具，若 text 参数缺失，尝试把工具块前的自由正文作为可见回复。
+        if name in {"finish", "ask", "reply"} and not str(args.get("text") or "").strip():
+            plain = cls._remove_tool_markers(text).strip()
+            if plain:
+                args["text"] = plain
+        if not args and name not in {"finish", "ask", "reply"}:
+            return None
+        log.warning("JsonToolFormatter: repaired malformed tool call as %s", name)
+        return {"name": name, "arguments": args}
+
+    @staticmethod
+    def _extract_broken_json_string(raw: str, key: str) -> str | None:
+        pattern = re.compile(r'"' + re.escape(key) + r'"\s*:\s*"', re.DOTALL)
+        match = pattern.search(raw)
+        if not match:
+            return None
+        start = match.end()
+        chars: list[str] = []
+        escaped = False
+        i = start
+        while i < len(raw):
+            ch = raw[i]
+            if escaped:
+                chars.append('\\' + ch)
+                escaped = False
+                i += 1
+                continue
+            if ch == "\\":
+                escaped = True
+                i += 1
+                continue
+            if ch == '"':
+                # 正常闭合；但若后面不像 JSON 分隔符，可能是正文里的裸引号，继续保留。
+                tail = raw[i + 1:].lstrip()
+                if not tail or tail.startswith((",", "}", "]")):
+                    break
+            chars.append(ch)
+            i += 1
+        value = "".join(chars).strip()
+        try:
+            return json.loads('"' + value.replace('"', '\\"') + '"')
+        except Exception:
+            return value
+
+    @classmethod
+    def _remove_tool_markers(cls, text: str) -> str:
+        plain = cls._TOOL_CALL_PATTERN.sub("", text or "")
+        plain = cls._TOOL_CALL_UNCLOSED.sub("", plain)
+        plain = re.sub(r'<[｜|]{2}DSML[｜|]{2}tool_calls>\s*', '', plain, flags=re.IGNORECASE)
+        plain = re.sub(r'</?[｜|]{2}DSML[｜|]{2}[^>]*>', '', plain, flags=re.IGNORECASE)
+        return html.unescape(plain)
 
     @staticmethod
     def _try_parse_json(text: str) -> dict[str, Any] | None:
@@ -590,9 +740,7 @@ class JsonToolFormatter(ToolFormatter):
         """从响应中提取纯文本，去除工具调用块。"""
         if not response.text:
             return None
-        plain = self._TOOL_CALL_PATTERN.sub("", response.text).strip()
-        # 也清理未闭合的块
-        plain = self._TOOL_CALL_UNCLOSED.sub("", plain).strip()
+        plain = self._remove_tool_markers(response.text).strip()
         return plain if plain else None
 
     # ------------------------------------------------------------------

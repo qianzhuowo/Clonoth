@@ -455,6 +455,38 @@ export function updateSchedulesRaw(token: string, yaml: string): Promise<any> {
   return writeRawConfig('/admin/config/schedules/raw', token, yaml);
 }
 
+export interface NodeFileInfo {
+  name: string;
+  path: string;
+  kind: 'node' | 'fragment';
+  suffix: string;
+  is_example: boolean;
+  base_name: string;
+  size: number;
+  updated_at: number;
+}
+
+export async function getNodeFiles(token: string): Promise<NodeFileInfo[]> {
+  const resp = await apiFetch('/admin/config/node-files', { headers: authHeaders(token) });
+  return resp.json();
+}
+
+export function getNodeFileRaw(token: string, filename: string): Promise<string> {
+  return readRawConfig(`/admin/config/node-files/${pathPart(filename)}/raw`, token);
+}
+
+export function updateNodeFileRaw(token: string, filename: string, content: string): Promise<any> {
+  return writeRawConfig(`/admin/config/node-files/${pathPart(filename)}/raw`, token, content);
+}
+
+export async function makeNodeFileExample(token: string, filename: string): Promise<{ ok: boolean; created: boolean; path: string }> {
+  const resp = await apiFetch(`/admin/config/node-files/${pathPart(filename)}/make-example`, {
+    method: 'POST',
+    headers: authHeaders(token),
+  });
+  return resp.json();
+}
+
 export function getNodeRaw(token: string, nodeId: string): Promise<string> {
   return readRawConfig(`/admin/config/nodes/${pathPart(nodeId)}/raw`, token);
 }
@@ -513,6 +545,61 @@ export async function deleteTool(token: string, name: string): Promise<any> {
     headers: authHeaders(token),
   });
   return resp.json();
+}
+
+// ── Drawtools ──
+
+export interface DrawtoolsRawFile {
+  content: string;
+  exists?: boolean;
+  using_example?: boolean;
+  path?: string;
+  example_path?: string;
+}
+
+export interface DrawtoolsBundle {
+  settings: DrawtoolsRawFile;
+  character_tags: DrawtoolsRawFile;
+  prompts: Record<string, DrawtoolsRawFile>;
+}
+
+export async function getDrawtoolsBundle(token: string): Promise<DrawtoolsBundle> {
+  const resp = await apiFetch('/admin/config/drawtools', { headers: authHeaders(token) });
+  return resp.json();
+}
+
+export async function initDrawtoolsConfigs(token: string): Promise<{ ok: boolean; created: string[] }> {
+  const resp = await apiFetch('/admin/config/drawtools/init', { method: 'POST', headers: authHeaders(token) });
+  return resp.json();
+}
+
+export function getDrawtoolsSettingsRaw(token: string): Promise<string> {
+  return readRawConfig('/admin/config/drawtools/settings/raw', token);
+}
+
+export function updateDrawtoolsSettingsRaw(token: string, content: string): Promise<any> {
+  return writeRawConfig('/admin/config/drawtools/settings/raw', token, content);
+}
+
+export function getDrawtoolsCharactersRaw(token: string): Promise<string> {
+  return readRawConfig('/admin/config/drawtools/characters/raw', token);
+}
+
+export function updateDrawtoolsCharactersRaw(token: string, content: string): Promise<any> {
+  return writeRawConfig('/admin/config/drawtools/characters/raw', token, content);
+}
+
+export async function cleanupDrawtoolsAttachments(token: string): Promise<any> {
+  const resp = await apiFetch('/admin/config/drawtools/cleanup', { method: 'POST', headers: authHeaders(token) });
+  return resp.json();
+}
+
+export function getDrawtoolsPromptRaw(token: string, name: string): Promise<string> {
+  return readRawConfig(`/admin/config/drawtools/prompts/${pathPart(name)}/raw`, token);
+}
+
+export function updateDrawtoolsPromptRaw(token: string, name: string, content: string): Promise<any> {
+  return writeRawConfig(`/admin/config/drawtools/prompts/${pathPart(name)}/raw`, token, content);
 }
 
 export async function getSkills(token: string): Promise<AdminSkill[]> {

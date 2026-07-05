@@ -189,7 +189,14 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(root) if isinstance(root, Path) else None,
-                env=_safe_subprocess_env(),
+                env={
+                    **_safe_subprocess_env(),
+                    "CLONOTH_SUPERVISOR_URL": str(getattr(ctx, "supervisor_url", "") or ""),
+                    "CLONOTH_SESSION_ID": str(getattr(ctx, "session_id", "") or ""),
+                    "CLONOTH_PARENT_SESSION_ID": str(getattr(ctx, "parent_session_id", "") or ""),
+                    "CLONOTH_TASK_ID": str(getattr(ctx, "task_id", "") or ""),
+                    "CLONOTH_NODE_ID": str(getattr(ctx, "node_id", "") or ""),
+                },
                 # Fix: run in new session so os.killpg can kill the entire
                 # process tree, preventing orphaned grandchildren from holding
                 # pipe fds and causing communicate() to hang forever.

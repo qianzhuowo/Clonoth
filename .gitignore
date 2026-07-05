@@ -23,3 +23,13 @@ pip-wheel-metadata/
 # private skills
 secret_skills/
 tests/
+
+# drawtools user runtime configs (keep *.example.* templates versioned)
+/tools/drawtools/settings.yaml
+/tools/drawtools/character_tags.yaml
+/tools/drawtools/prompts/novelai/top-system.md
+/tools/drawtools/prompts/novelai/output-format.md
+/tools/drawtools/prompts/novelai/tag-guide.md
+
+# user node configs / fragments that may be created from examples
+/config/nodes/_persona.md

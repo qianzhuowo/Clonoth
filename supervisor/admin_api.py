@@ -178,6 +178,169 @@ def create_admin_router(workspace_root: Path) -> APIRouter:
             p.unlink()
         return {"ok": True}
 
+    # ----- Node files: YAML nodes and Markdown fragments under config/nodes/ -----
+    @router.get("/node-files")
+    def list_node_files() -> list[dict[str, Any]]:
+        nodes_dir = workspace_root / "config" / "nodes"
+        if not nodes_dir.exists():
+            return []
+        res: list[dict[str, Any]] = []
+        for f in sorted([*nodes_dir.glob("*.yaml"), *nodes_dir.glob("*.yml"), *nodes_dir.glob("*.md")]):
+            if not f.is_file():
+                continue
+            name = f.name
+            stem = f.stem
+            is_example = ".example" in name or stem.endswith("_example")
+            base_name = name.replace(".example.yaml", ".yaml").replace(".example.yml", ".yml").replace(".example.md", ".md")
+            res.append({
+                "name": name,
+                "path": str(f.relative_to(workspace_root).as_posix()),
+                "kind": "fragment" if f.suffix == ".md" else "node",
+                "suffix": f.suffix,
+                "is_example": is_example,
+                "base_name": base_name,
+                "size": f.stat().st_size,
+                "updated_at": f.stat().st_mtime,
+            })
+        return res
+
+    @router.get("/node-files/{filename}/raw")
+    def get_node_file_raw(filename: str) -> dict[str, str]:
+        if not (filename.endswith(".yaml") or filename.endswith(".yml") or filename.endswith(".md")):
+            raise HTTPException(status_code=400, detail="Only .yaml/.yml/.md files are allowed")
+        p = _safe_path(workspace_root / "config" / "nodes", filename)
+        return _read_text(p)
+
+    @router.put("/node-files/{filename}/raw")
+    def update_node_file_raw(filename: str, payload: RawContent) -> dict[str, Any]:
+        if not (filename.endswith(".yaml") or filename.endswith(".yml") or filename.endswith(".md")):
+            raise HTTPException(status_code=400, detail="Only .yaml/.yml/.md files are allowed")
+        p = _safe_path(workspace_root / "config" / "nodes", filename)
+        return _write_text(p, payload.content)
+
+    @router.post("/node-files/{filename}/make-example")
+    def make_node_file_example(filename: str) -> dict[str, Any]:
+        if not (filename.endswith(".yaml") or filename.endswith(".yml") or filename.endswith(".md")):
+            raise HTTPException(status_code=400, detail="Only .yaml/.yml/.md files are allowed")
+        src = _safe_path(workspace_root / "config" / "nodes", filename)
+        if not src.exists():
+            raise HTTPException(status_code=404, detail="Source file not found")
+        if filename.endswith(".yaml"):
+            example_name = filename[:-5] + ".example.yaml"
+        elif filename.endswith(".yml"):
+            example_name = filename[:-4] + ".example.yml"
+        else:
+            example_name = filename[:-3] + ".example.md"
+        dst = _safe_path(workspace_root / "config" / "nodes", example_name)
+        if dst.exists():
+            return {"ok": True, "created": False, "path": str(dst.relative_to(workspace_root).as_posix())}
+        shutil.copyfile(src, dst)
+        return {"ok": True, "created": True, "path": str(dst.relative_to(workspace_root).as_posix())}
+
+    # ----- Drawtools (NovelAI image generation) -----
+    def _drawtools_dir() -> Path:
+        return workspace_root / "tools" / "drawtools"
+
+    def _drawtools_prompt_dir() -> Path:
+        return _drawtools_dir() / "prompts" / "novelai"
+
+    def _drawtools_read_with_example(path: Path, example_path: Path) -> dict[str, Any]:
+        target = path if path.exists() else example_path
+        if not target.exists():
+            return {"content": "", "exists": False, "using_example": False}
+        return {
+            "content": target.read_text(encoding="utf-8"),
+            "exists": path.exists(),
+            "using_example": not path.exists() and example_path.exists(),
+            "path": str(path.relative_to(workspace_root).as_posix()),
+            "example_path": str(example_path.relative_to(workspace_root).as_posix()),
+        }
+
+    def _drawtools_write(path: Path, content: str) -> dict[str, Any]:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        return {"ok": True, "path": str(path.relative_to(workspace_root).as_posix())}
+
+    @router.get("/drawtools")
+    def get_drawtools_bundle() -> dict[str, Any]:
+        base = _drawtools_dir()
+        prompt_dir = _drawtools_prompt_dir()
+        return {
+            "settings": _drawtools_read_with_example(base / "settings.yaml", base / "settings.example.yaml"),
+            "character_tags": _drawtools_read_with_example(base / "character_tags.yaml", base / "character_tags.example.yaml"),
+            "prompts": {
+                "top_system": _drawtools_read_with_example(prompt_dir / "top-system.md", prompt_dir / "top-system.example.md"),
+                "output_format": _drawtools_read_with_example(prompt_dir / "output-format.md", prompt_dir / "output-format.example.md"),
+                "tag_guide": _drawtools_read_with_example(prompt_dir / "tag-guide.md", prompt_dir / "tag-guide.example.md"),
+            },
+        }
+
+    @router.post("/drawtools/init")
+    def init_drawtools_configs() -> dict[str, Any]:
+        created: list[str] = []
+        pairs = [
+            (_drawtools_dir() / "settings.example.yaml", _drawtools_dir() / "settings.yaml"),
+            (_drawtools_dir() / "character_tags.example.yaml", _drawtools_dir() / "character_tags.yaml"),
+            (_drawtools_prompt_dir() / "top-system.example.md", _drawtools_prompt_dir() / "top-system.md"),
+            (_drawtools_prompt_dir() / "output-format.example.md", _drawtools_prompt_dir() / "output-format.md"),
+            (_drawtools_prompt_dir() / "tag-guide.example.md", _drawtools_prompt_dir() / "tag-guide.md"),
+        ]
+        for src, dst in pairs:
+            if dst.exists() or not src.exists():
+                continue
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+            created.append(str(dst.relative_to(workspace_root).as_posix()))
+        return {"ok": True, "created": created}
+
+    @router.get("/drawtools/settings/raw")
+    def get_drawtools_settings_raw() -> dict[str, Any]:
+        return _drawtools_read_with_example(_drawtools_dir() / "settings.yaml", _drawtools_dir() / "settings.example.yaml")
+
+    @router.put("/drawtools/settings/raw")
+    def update_drawtools_settings_raw(payload: RawContent) -> dict[str, Any]:
+        return _drawtools_write(_drawtools_dir() / "settings.yaml", payload.content)
+
+    @router.get("/drawtools/characters/raw")
+    def get_drawtools_characters_raw() -> dict[str, Any]:
+        return _drawtools_read_with_example(_drawtools_dir() / "character_tags.yaml", _drawtools_dir() / "character_tags.example.yaml")
+
+    @router.put("/drawtools/characters/raw")
+    def update_drawtools_characters_raw(payload: RawContent) -> dict[str, Any]:
+        return _drawtools_write(_drawtools_dir() / "character_tags.yaml", payload.content)
+
+    @router.get("/drawtools/prompts/{name}/raw")
+    def get_drawtools_prompt_raw(name: str) -> dict[str, Any]:
+        mapping = {
+            "top-system": ("top-system.md", "top-system.example.md"),
+            "output-format": ("output-format.md", "output-format.example.md"),
+            "tag-guide": ("tag-guide.md", "tag-guide.example.md"),
+        }
+        if name not in mapping:
+            raise HTTPException(status_code=404, detail="Unknown prompt template")
+        actual, example = mapping[name]
+        return _drawtools_read_with_example(_drawtools_prompt_dir() / actual, _drawtools_prompt_dir() / example)
+
+    @router.put("/drawtools/prompts/{name}/raw")
+    def update_drawtools_prompt_raw(name: str, payload: RawContent) -> dict[str, Any]:
+        mapping = {
+            "top-system": "top-system.md",
+            "output-format": "output-format.md",
+            "tag-guide": "tag-guide.md",
+        }
+        if name not in mapping:
+            raise HTTPException(status_code=404, detail="Unknown prompt template")
+        return _drawtools_write(_drawtools_prompt_dir() / mapping[name], payload.content)
+
+    @router.post("/drawtools/cleanup")
+    def cleanup_drawtools_attachments() -> dict[str, Any]:
+        import sys as _sys
+        drawtools = _drawtools_dir()
+        if str(drawtools) not in _sys.path:
+            _sys.path.insert(0, str(drawtools))
+        from cleanup import cleanup_novelai_attachments  # type: ignore
+        return cleanup_novelai_attachments(force=True)
+
     # ----- Runtime config -----
     # ----- Config (data/config.yaml) -----
     @router.get("/config/raw")

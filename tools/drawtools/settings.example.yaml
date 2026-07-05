@@ -1,0 +1,96 @@
+api:
+  base_url: https://image.novelai.net
+  api_key_env: NOVELAI_API_KEY
+  api_key: ''
+  timeout_sec: 130
+# 生成队列 / 重试设置
+# request_delay_sec: 每张图生成请求结束后，队列释放前额外等待秒数，用于降低 429 风险。
+# retry_wait_sec: 429/5xx/连接失败后的等待秒数。
+# retry_max_attempts: 最大重试次数；默认 5 表示失败后最多再试 5 次。
+# lock_timeout_sec: 等待全局 NovelAI 队列锁的最长秒数。
+generation:
+  request_delay_sec: 0
+  retry_wait_sec: 3
+  retry_max_attempts: 5
+  lock_timeout_sec: 3600
+# 附件清理设置。清理对象：data/attachments/novelai 下的生成图。
+# retention_days: 删除超过 N 天的旧图。
+# max_total_mb: 若目录总容量超过该值，按修改时间从旧到新继续删除，直到低于上限。
+# cleanup_interval_sec: 自动清理最小间隔；生成图片时会顺带触发一次轻量检查。
+storage:
+  cleanup_enabled: true
+  retention_days: 7
+  max_total_mb: 2048
+  cleanup_interval_sec: 3600
+params:
+  selected_preset_id: default-v45-full
+  size_options:
+    横图:
+      width: 1216
+      height: 832
+    竖图:
+      width: 832
+      height: 1216
+    方图:
+      width: 1024
+      height: 1024
+  presets:
+  - id: default-v45-full
+    name: 默认 (V4.5 Full)
+    positive_prefix: best quality, amazing quality, very aesthetic, absurdres
+    negative_prefix: lowres, bad anatomy, bad hands, missing fingers, extra digits,
+      fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts,
+      signature, watermark, username, blurry
+    max_images: 4
+    max_characters_per_image: 4
+    params:
+      model: nai-diffusion-4-5-full
+      sampler: k_euler_ancestral
+      scheduler: karras
+      steps: 28
+      scale: 6
+      seed: -1
+      qualityToggle: true
+      ucPreset: 0
+      autoSmea: false
+      cfg_rescale: 0
+      variety_boost: false
+      sm: false
+      sm_dyn: false
+      decrisper: false
+  - id: cute-v45
+    name: 可爱风
+    positive_prefix: best quality, amazing quality, very aesthetic, absurdres, cute
+      anime style, soft lighting, pastel colors, delicate eyes
+    negative_prefix: lowres, bad anatomy, bad hands, missing fingers, extra digits,
+      fewer digits, cropped, worst quality, low quality, watermark, blurry
+    max_images: 4
+    max_characters_per_image: 4
+    params:
+      model: nai-diffusion-4-5-full
+      sampler: k_euler_ancestral
+      scheduler: karras
+      steps: 28
+      scale: 5.5
+      seed: -1
+      qualityToggle: true
+      ucPreset: 0
+      autoSmea: false
+      cfg_rescale: 0
+      variety_boost: false
+      sm: false
+      sm_dyn: false
+      decrisper: false
+character_tags:
+  path: tools/drawtools/character_tags.yaml
+  auto_search_unknown: true
+llm:
+  provider: openai
+  model_env: DRAW_PLANNER_MODEL
+  api_key_env: DRAW_PLANNER_API_KEY
+  base_url_env: DRAW_PLANNER_BASE_URL
+  use_stream: false
+prompts:
+  top_system_path: tools/drawtools/prompts/novelai/top-system.md
+  output_format_path: tools/drawtools/prompts/novelai/output-format.md
+  tag_guide_path: tools/drawtools/prompts/novelai/tag-guide.md

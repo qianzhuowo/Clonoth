@@ -9,6 +9,7 @@ import { ClientSettingsPage } from './pages/ClientSettingsPage';
 import { GeneralSettingsPage } from './pages/GeneralSettingsPage';
 import { ModelSettingsPage } from './pages/ModelSettingsPage';
 import { NodeSettingsPage } from './pages/NodeSettingsPage';
+import { NodeFilesSettingsPage } from './pages/NodeFilesSettingsPage';
 import { AdvancedSettingsPage } from './pages/AdvancedSettingsPage';
 import { AgentsSettingsPage } from './pages/AgentsSettingsPage';
 import { ApprovalsSettingsPage } from './pages/ApprovalsSettingsPage';
@@ -17,6 +18,7 @@ import { McpSettingsPage } from './pages/McpSettingsPage';
 import { SkillsSettingsPage } from './pages/SkillsSettingsPage';
 import { SystemSettingsPage } from './pages/SystemSettingsPage';
 import { ToolsSettingsPage } from './pages/ToolsSettingsPage';
+import { DrawtoolsSettingsPage } from './pages/DrawtoolsSettingsPage';
 import {
   AgentsSettingsRightPanel,
   AutomationSettingsRightPanel,
@@ -64,11 +66,13 @@ export const settingsTabs: SettingsTabDefinition[] = [
   { id: 'system', label: '系统', icon: 'settings_power', order: 4, Page: SystemSettingsPage },
   { id: 'approvals', label: '审批', icon: 'approval', order: 5, Page: ApprovalsSettingsPage },
   { id: 'agents', label: '节点', icon: 'smart_toy', order: 6, Page: AgentsSettingsPage, RightPanel: AgentsSettingsRightPanel },
-  { id: 'tools', label: '工具', icon: 'build', order: 7, Page: ToolsSettingsPage, RightPanel: ToolsSettingsRightPanel },
-  { id: 'skills', label: '技能', icon: 'menu_book', order: 8, Page: SkillsSettingsPage, RightPanel: SkillsSettingsRightPanel },
-  { id: 'mcp', label: 'MCP', icon: 'cable', order: 9, Page: McpSettingsPage, RightPanel: McpSettingsRightPanel },
-  { id: 'automation', label: '自动化', icon: 'schedule', order: 10, Page: AutomationSettingsPage, RightPanel: AutomationSettingsRightPanel },
-  { id: 'advanced', label: '高级', icon: 'code', order: 11, Page: AdvancedSettingsPage },
+  { id: 'node-files', label: '节点文件', icon: 'folder_managed', order: 7, Page: NodeFilesSettingsPage },
+  { id: 'tools', label: '工具', icon: 'build', order: 8, Page: ToolsSettingsPage, RightPanel: ToolsSettingsRightPanel },
+  { id: 'drawtools', label: '绘图', icon: 'palette', order: 9, Page: DrawtoolsSettingsPage },
+  { id: 'skills', label: '技能', icon: 'menu_book', order: 10, Page: SkillsSettingsPage, RightPanel: SkillsSettingsRightPanel },
+  { id: 'mcp', label: 'MCP', icon: 'cable', order: 11, Page: McpSettingsPage, RightPanel: McpSettingsRightPanel },
+  { id: 'automation', label: '自动化', icon: 'schedule', order: 12, Page: AutomationSettingsPage, RightPanel: AutomationSettingsRightPanel },
+  { id: 'advanced', label: '高级', icon: 'code', order: 13, Page: AdvancedSettingsPage },
 ].sort((a, b) => a.order - b.order);
 
 export function getSettingsTab(tabId: string): SettingsTabDefinition {

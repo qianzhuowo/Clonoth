@@ -589,6 +589,7 @@ class EventRouter:
             trigger = self._state.consume_trigger(src_seq)
             main_state = self._state.remove_main_state(src_seq)
             text = strip_protocol_markers((p.get("text") or "").strip())
+            attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
             attachments = p.get("attachments") or []
             try:
                 await self._cb.send_reply(
@@ -650,9 +651,12 @@ class EventRouter:
             main_state = self._state.get_main_state(src_seq)
             if main_state:
                 main_state.stream_parts.clear()
-            if text:
+            if text or attachments:
                 try:
-                    await self._cb.send_intermediate_reply(trigger, text)
+                    if attachments:
+                        await self._cb.send_to_channel(trigger.conversation_key, text, attachments, node_id=node_id)
+                    else:
+                        await self._cb.send_intermediate_reply(trigger, text)
                 except Exception as e:
                     logger.error("send_intermediate_reply failed: %s", e)
             return
@@ -674,10 +678,11 @@ class EventRouter:
         # Fallback: 通过 session_conv_map 发送到频道
         conv_key = self._state.get_conversation_key(event.session_id) or ""
         text = strip_protocol_markers((p.get("text") or "").strip())
-        if text:
+        attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
+        if text or attachments:
             try:
                 await self._cb.send_to_channel(
-                    conv_key, text, [], node_id=node_id,
+                    conv_key, text, attachments, node_id=node_id,
                 )
             except Exception as e:
                 logger.error(

@@ -103,11 +103,20 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     # reply: 非终止，发送中间消息
     if pseudo_call.name == "reply":
         reply_text = str(args.get("text") or "").strip()
-        if reply_text:
+        selected_atts = []
+        selected_paths = args.get("attachment_paths")
+        if isinstance(selected_paths, list) and selected_paths:
+            selected_atts = _select_attachments(
+                ls.collected_attachments, selected_paths,
+                workspace_root=ls.rctx.workspace_root,
+                session_id=ls.rctx.session_id,
+            )
+        if reply_text or selected_atts:
             await ls.rctx.emit_event("intermediate_reply", {
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
                 "text": reply_text,
+                "attachments": selected_atts,
             })
             _emit_pseudo_tool_result(ls, pseudo_call, "ok")
         return None

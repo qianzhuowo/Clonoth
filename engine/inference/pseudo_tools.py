@@ -311,6 +311,11 @@ def _reply_spec() -> dict:
                         "type": "string",
                         "description": "The message content the user will read.",
                     },
+                    "attachment_paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional attachment paths produced by previous tools to send with this interim reply.",
+                    },
                 },
                 "required": ["text"],
             },

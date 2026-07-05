@@ -29,12 +29,26 @@ def _expand_includes(text: str, nodes_dir: Path, *, depth: int = 0) -> str:
         filename = m.group(1).strip()
         if not filename:
             return m.group(0)
-        fp = (nodes_dir / filename).resolve()
-        # 安全检查：不能逃逸出 nodes_dir
-        try:
-            fp.relative_to(nodes_dir.resolve())
-        except ValueError:
-            return m.group(0)
+        if filename.startswith("drawtools/"):
+            workspace_root = nodes_dir.parent.parent
+            rel = filename[len("drawtools/"):].lstrip("/")
+            fp = (workspace_root / "tools" / "drawtools" / rel).resolve()
+            allowed_root = (workspace_root / "tools" / "drawtools").resolve()
+            try:
+                fp.relative_to(allowed_root)
+            except ValueError:
+                return m.group(0)
+            if not fp.exists() and fp.suffix:
+                example = fp.with_name(f"{fp.stem}.example{fp.suffix}")
+                if example.exists():
+                    fp = example
+        else:
+            fp = (nodes_dir / filename).resolve()
+            # 安全检查：不能逃逸出 nodes_dir
+            try:
+                fp.relative_to(nodes_dir.resolve())
+            except ValueError:
+                return m.group(0)
         try:
             content = fp.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):

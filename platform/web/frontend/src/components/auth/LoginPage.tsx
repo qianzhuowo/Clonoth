@@ -7,7 +7,8 @@ import { Button } from '../common';
 
 export const LoginPage = () => {
   const { adminToken, setAdminToken, setAuthenticated, setAvailableNodes, setEntryNodeId, entryNodeId } = useSettingsStore();
-  const [tokenInput, setTokenInput] = useState('');
+  const urlToken = new URLSearchParams(window.location.search).get('token') || '';
+  const [tokenInput, setTokenInput] = useState(urlToken);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
   const [autoVerifying, setAutoVerifying] = useState(!!adminToken);
@@ -26,15 +27,17 @@ export const LoginPage = () => {
     } catch { /* ignore */ }
   };
 
-  // Auto-verify saved token on mount
+  // Auto-verify saved token on mount. URL token is supported for server manager deep links.
   useEffect(() => {
-    if (!adminToken) { setAutoVerifying(false); return; }
-    checkAdminAuth(adminToken).then(async ok => {
+    const tokenToVerify = urlToken || adminToken;
+    if (!tokenToVerify) { setAutoVerifying(false); return; }
+    checkAdminAuth(tokenToVerify).then(async ok => {
       if (ok) {
+        setAdminToken(tokenToVerify);
         setAuthenticated(true);
-        await loadNodes(adminToken);
+        await loadNodes(tokenToVerify);
       } else {
-        setAdminToken(null);
+        if (!urlToken) setAdminToken(null);
       }
       setAutoVerifying(false);
     });

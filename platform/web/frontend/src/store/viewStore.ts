@@ -16,10 +16,13 @@ export interface ViewState {
 }
 
 const DEFAULT_SETTINGS_TAB = 'general';
+const query = new URLSearchParams(window.location.search);
+const initialViewMode: ViewMode = query.get('view') === 'settings' ? 'settings' : 'chat';
+const initialSettingsTab = query.get('tab') || DEFAULT_SETTINGS_TAB;
 
 export const useViewStore = create<ViewState>((set) => ({
-  viewMode: 'chat',
-  activeSettingsTab: DEFAULT_SETTINGS_TAB,
+  viewMode: initialViewMode,
+  activeSettingsTab: initialSettingsTab,
 
   openSettings: (tab) => set({
     // [2026-06-01] Opening settings optionally selects the requested tab first.

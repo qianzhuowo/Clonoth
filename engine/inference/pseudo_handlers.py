@@ -129,11 +129,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     if pseudo_call.name == "preempt_task":
         return await _handle_pseudo_preempt_task(ls, pseudo_call, args)
 
-    # [2026-05-04] dispatch:{target_id}: 非终止，固定目标异步委派。
-    # Why: dynamic per-target tools remove the target parameter from the schema.
-    # How: extract target_id from the tool name and pass it to the shared dispatch
-    # sender. Purpose: keep supervisor API behavior identical while making target
-    # selection happen at tool registration time.
     _fixed_dispatch_target = _dispatch_target_from_tool_name(pseudo_call.name)
     if _fixed_dispatch_target:
         return await _handle_pseudo_dispatch(ls, {**args, "target": _fixed_dispatch_target}, pseudo_call)
@@ -142,21 +137,9 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
 
     if pseudo_call.name in ("finish", "ask"):
         # [2026-05-07] 正常 finish 重新按真实 API 工具处理。
-        # 原因：provider 原生工具协议要求 assistant.tool_call 后面保留普通 tool_result，
-        # 若把 finish 改写成普通 assistant 文本，会破坏下一轮历史配对。
-        # 做法：与 reply、真实业务工具一样写入 content="ok" 的 tool_result，并允许影子持久化。
-        # 目的：ConversationStore、snapshot、provider replay 都能看到完整 finish 工具轮。
-        # [AutoC 2026-05-31] Why: ask is Phase 0's sibling terminal tool and must
-        # preserve the same provider pairing and persistence behavior. How: handle
-        # finish and ask in one branch but choose ACTION_ASK for ask. Purpose: keep
-        # later topology routing able to distinguish clarification requests.
         terminal_name = str(pseudo_call.name or "").strip()
         result_text = str(args.get("text") or "").strip()
-        # [2026-05-29] 空串 finish 硬拒绝：模型把交付内容写在 free prose 里用户永远看不到。
-        # [AutoC 2026-05-31] Why: empty ask would similarly terminate without a
-        # visible question. How: reuse the non-empty text guard and tailor the
-        # rejection to the actual terminal tool name. Purpose: prevent silent
-        # terminal actions with no user/caller-visible payload.
+
         if not result_text:
             _emit_pseudo_tool_result(
                 ls, pseudo_call,
@@ -179,6 +162,8 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                     workspace_root=ls.rctx.workspace_root,
                     session_id=ls.rctx.session_id,
                 )
+            elif ls.tool_produced_attachments:
+                final_atts = list(ls.tool_produced_attachments)
         result_payload = {
             "summary": summary_text,
             "text": result_text,
@@ -200,11 +185,6 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         ctx_ref = _persist_ctx(ls, step + 1)
         switch_target = str(args.get("target") or "").strip()
         switch_text = str(args.get("text") or "").strip()
-        # [Fork/Merge 2026-05-17] Why: switch_node changes the entry node for
-        # future inbound messages, which are keyed by the parent conversation
-        # session, not the temporary branch runtime session. How: prefer
-        # rctx.parent_session_id for the supervisor endpoint. Purpose: node
-        # switching remains effective after the current branch is merged/cleaned.
         route_session_id = getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id
         try:
             await ls.rctx.http.post(
@@ -375,11 +355,6 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
 
     # 获取父 session 信息
     parent_session_id = getattr(ls.rctx, "parent_session_id", "") or ls.rctx.session_id
-    # [2026-05-29 方案C第一步] 为什么：conversation_key 同时承担存储身份和
-    # 路由可见性时，嵌套 dispatch 会生成多层 agent: 前缀，EventRouter 只能反解析
-    # 字符串来找父频道。怎么改：优先读取 task_context.route_conversation_key，
-    # 没有时才使用当前 task 的原 conversation_key。目的：所有嵌套子任务都保留
-    # 根父频道的原始 conversation_key，后续 SDK 可直接按结构化字段路由。
     parent_conv_key = str(
         ls.rctx.task_context.get("route_conversation_key")
         or ls.rctx.task_context.get("conversation_key")
@@ -409,10 +384,6 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         "dispatch_origin": {
             "parent_session_id": parent_session_id,
             "caller_node_id": ls.node.id,
-            # [2026-05-29 方案C第一步] 为什么：审批和子进度事件只带子 session，
-            # 旧 SDK 只能从 agent: conversation_key 反解析父频道，容易误判或丢事件。
-            # 怎么改：把父频道的原始 conversation_key 与上下文模式随 dispatch_origin
-            # 一起下发。目的：task_created 事件可直接携带路由元数据，无需字符串猜测。
             "parent_conversation_key": parent_conv_key,
             "context_mode": ctx_mode,
         },

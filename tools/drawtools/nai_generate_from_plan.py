@@ -123,8 +123,8 @@ if __name__ == "__main__":
             att = data.get("attachments") or parsed.get("attachments") or []
             if isinstance(att, list):
                 attachments.extend(att)
-                if att:
-                    emit_intermediate(f"第 {task['index']} 张完成", att)
+            # 逐张自动发图不能依赖工具子进程直接 POST
+            # 让 QQ/OneBot、Web 等平台都从同一条附件路由发送图片。
             results.append({
                 "index": task["index"],
                 "anchor": task.get("anchor", ""),

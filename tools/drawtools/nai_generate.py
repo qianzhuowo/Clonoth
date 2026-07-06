@@ -211,12 +211,9 @@ if __name__ == "__main__":
                     "legacy_uc": False,
                 },
                 "negative_prompt": negative_prompt,
-                "retry_max_attempts": retry_max_attempts,
-                "retry_wait_sec": retry_wait_sec,
-                "request_delay_sec": request_delay_sec,
-                "cleanup": cleanup_result,
             },
         }
+
 
     workspace_root = Path.cwd()
     out_dir = workspace_root / "data" / "attachments" / "novelai"

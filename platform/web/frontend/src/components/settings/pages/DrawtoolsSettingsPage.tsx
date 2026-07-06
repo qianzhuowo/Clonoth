@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type TextareaHTMLAttributes } from 'react';
 import yaml from 'js-yaml';
 
 import {
@@ -15,6 +15,46 @@ import {
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Button } from '../../common';
 import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, SelectInput, StatusText, TextInput } from './settingsPagePrimitives';
+
+const presetTextAreaClass = 'w-full resize-y overflow-hidden border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-sm leading-5 text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
+
+function autoResizeTextArea(target: HTMLTextAreaElement) {
+  target.style.height = 'auto';
+  target.style.height = `${Math.max(target.scrollHeight, 72)}px`;
+}
+
+function AutoResizeTextarea(props: TextareaHTMLAttributes<HTMLTextAreaElement>) {
+  const ref = useRef<HTMLTextAreaElement | null>(null);
+
+  useEffect(() => {
+    if (ref.current) autoResizeTextArea(ref.current);
+  }, [props.defaultValue, props.value]);
+
+  return (
+    <textarea
+      {...props}
+      className={`${presetTextAreaClass} ${props.className || ''}`}
+      onInput={(event) => {
+        autoResizeTextArea(event.currentTarget);
+        props.onInput?.(event);
+      }}
+      ref={ref}
+    />
+  );
+}
+
+function makePresetId(name: string, presets: any[]): string {
+  const base = (name || 'preset')
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '_')
+    .replace(/^_+|_+$/g, '') || 'preset';
+  const used = new Set(presets.map((preset: any) => String(preset?.id || '')));
+  if (!used.has(base)) return base;
+  let index = 2;
+  while (used.has(`${base}_${index}`)) index += 1;
+  return `${base}_${index}`;
+}
 
 type SectionKey = 'settings' | 'characters' | 'node' | 'top-system' | 'output-format' | 'tag-guide';
 
@@ -87,6 +127,7 @@ export const DrawtoolsSettingsPage = () => {
   const [nodeRaw, setNodeRaw] = useState('');
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
+  const [presetsExpanded, setPresetsExpanded] = useState(false);
 
   const settingsObj = useMemo(() => parseYamlObject(bundle?.settings?.content || ''), [bundle]);
   const presets = Array.isArray(settingsObj?.params?.presets) ? settingsObj.params.presets : [];
@@ -94,7 +135,8 @@ export const DrawtoolsSettingsPage = () => {
   const api = settingsObj?.api || {};
   const generation = settingsObj?.generation || {};
   const storage = settingsObj?.storage || {};
-  const selectedPreset = presets.find((preset: any) => String(preset?.id || '') === selectedPresetId) || presets[0] || {};
+  const effectiveSelectedPresetId = selectedPresetId || String(presets[0]?.id || '');
+  const selectedPreset = presets.find((preset: any) => String(preset?.id || '') === effectiveSelectedPresetId) || presets[0] || {};
 
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
@@ -193,10 +235,59 @@ export const DrawtoolsSettingsPage = () => {
     void saveSettingsObject(next, `已切换默认预设：${presetId}`);
   };
 
+  const addPreset = () => {
+    const displayName = window.prompt('新预设名称：', '新绘图预设');
+    if (!displayName) return;
+    const next = parseYamlObject(bundle?.settings?.content || '');
+    const list = Array.isArray(next?.params?.presets) ? [...next.params.presets] : [];
+    const id = makePresetId(displayName, list);
+    const sourceParams = selectedPreset?.params && typeof selectedPreset.params === 'object' ? selectedPreset.params : {};
+    const created = {
+      id,
+      name: displayName.trim() || id,
+      aliases: [],
+      positive_prefix: String(selectedPreset?.positive_prefix || ''),
+      negative_prefix: String(selectedPreset?.negative_prefix || ''),
+      params: {
+        model: sourceParams.model || 'nai-diffusion-4-5-full',
+        sampler: sourceParams.sampler || 'k_euler_ancestral',
+        scheduler: sourceParams.scheduler || 'karras',
+        steps: sourceParams.steps ?? 28,
+        scale: sourceParams.scale ?? 6,
+        cfg_rescale: sourceParams.cfg_rescale ?? 0,
+        ucPreset: sourceParams.ucPreset ?? 0,
+        qualityToggle: sourceParams.qualityToggle ?? true,
+        autoSmea: sourceParams.autoSmea ?? false,
+        variety_boost: sourceParams.variety_boost ?? false,
+      },
+    };
+    list.push(created);
+    next.params = { ...(next.params || {}), presets: list, selected_preset_id: id };
+    void saveSettingsObject(next, `已新增预设：${created.name}`);
+  };
+
+  const renameSelectedPreset = () => {
+    if (!selectedPreset?.id) { setMessage('请先选择一个预设'); return; }
+    const name = window.prompt('预设新名称：', String(selectedPreset.name || selectedPreset.id));
+    if (!name) return;
+    updateSelectedPresetField('name', name.trim() || String(selectedPreset.id));
+  };
+
+  const deleteSelectedPreset = () => {
+    if (!selectedPreset?.id) { setMessage('请先选择一个预设'); return; }
+    if (!window.confirm(`确定删除预设「${selectedPreset.name || selectedPreset.id}」？`)) return;
+    const next = parseYamlObject(bundle?.settings?.content || '');
+    const list = Array.isArray(next?.params?.presets) ? next.params.presets : [];
+    const filtered = list.filter((preset: any) => String(preset?.id || '') !== String(selectedPreset.id));
+    const nextSelectedId = String(filtered[0]?.id || '');
+    next.params = { ...(next.params || {}), presets: filtered, selected_preset_id: nextSelectedId };
+    void saveSettingsObject(next, `已删除预设：${selectedPreset.name || selectedPreset.id}`);
+  };
+
   const updateSelectedPresetParam = (key: string, value: string | boolean) => {
     const next = parseYamlObject(bundle?.settings?.content || '');
     const list = Array.isArray(next?.params?.presets) ? next.params.presets : [];
-    const idx = list.findIndex((preset: any) => String(preset?.id || '') === selectedPresetId);
+    const idx = list.findIndex((preset: any) => String(preset?.id || '') === effectiveSelectedPresetId);
     if (idx < 0) { setMessage('请先选择一个预设'); return; }
     const numeric = typeof value === 'string' ? Number(value) : NaN;
     list[idx] = {
@@ -210,10 +301,10 @@ export const DrawtoolsSettingsPage = () => {
     void saveSettingsObject(next, `已保存预设参数：${key}`);
   };
 
-  const updateSelectedPresetField = (key: string, value: string) => {
+  const updateSelectedPresetField = (key: string, value: string | string[]) => {
     const next = parseYamlObject(bundle?.settings?.content || '');
     const list = Array.isArray(next?.params?.presets) ? next.params.presets : [];
-    const idx = list.findIndex((preset: any) => String(preset?.id || '') === selectedPresetId);
+    const idx = list.findIndex((preset: any) => String(preset?.id || '') === effectiveSelectedPresetId);
     if (idx < 0) { setMessage('请先选择一个预设'); return; }
     list[idx] = { ...list[idx], [key]: value };
     next.params = { ...(next.params || {}), presets: list };
@@ -295,14 +386,30 @@ export const DrawtoolsSettingsPage = () => {
           <Card title="画师串 / 预设" description="绘图节点只看见预设名称，具体参数由工具层自动拼接。">
             <div className="mb-3 max-w-xs">
               <FieldLabel>当前默认预设</FieldLabel>
-              <SelectInput onChange={(event) => switchPreset(event.currentTarget.value)} value={selectedPresetId}>
+              <SelectInput onChange={(event) => switchPreset(event.currentTarget.value)} value={effectiveSelectedPresetId}>
                 {presets.map((preset: any) => <option key={preset.id} value={preset.id}>{preset.name || preset.id}</option>)}
               </SelectInput>
             </div>
+            <div className="mb-3 flex flex-wrap gap-2">
+              <Button onClick={addPreset} variant="primary">+ 新增预设</Button>
+              <Button disabled={!selectedPreset?.id} onClick={renameSelectedPreset}>重命名当前预设</Button>
+              <Button disabled={!selectedPreset?.id} onClick={deleteSelectedPreset} variant="danger">删除当前预设</Button>
+            </div>
             {selectedPreset?.id && (
               <div className="mb-4 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3">
-                <h3 className="mb-3 font-mono text-xs font-semibold">当前预设快捷编辑：{selectedPreset.name || selectedPreset.id}</h3>
+                <div className="mb-3 flex flex-wrap items-start justify-between gap-2">
+                  <h3 className="font-mono text-xs font-semibold">当前预设快捷编辑：{selectedPreset.name || selectedPreset.id}</h3>
+                  <span className="font-mono text-[0.65rem] text-[var(--duties-tertiary)]">id: {selectedPreset.id}</span>
+                </div>
                 <div className="grid gap-3 md:grid-cols-3">
+                  <div>
+                    <FieldLabel>预设名称</FieldLabel>
+                    <TextInput key={`preset-name-${selectedPreset.id}`} defaultValue={String(selectedPreset.name || '')} onBlur={(event) => updateSelectedPresetField('name', event.currentTarget.value)} placeholder="显示给绘图节点和用户看的名称" />
+                  </div>
+                  <div>
+                    <FieldLabel>别名（逗号分隔）</FieldLabel>
+                    <TextInput key={`preset-aliases-${selectedPreset.id}`} defaultValue={Array.isArray(selectedPreset.aliases) ? selectedPreset.aliases.join(', ') : ''} onBlur={(event) => updateSelectedPresetField('aliases', event.currentTarget.value.split(',').map((item) => item.trim()).filter(Boolean))} placeholder="可选：中文名、短名" />
+                  </div>
                   <div>
                     <FieldLabel>绘图模型</FieldLabel>
                     <SelectInput onChange={(event) => updateSelectedPresetParam('model', event.currentTarget.value)} value={String(selectedPreset.params?.model || 'nai-diffusion-4-5-full')}>
@@ -323,11 +430,11 @@ export const DrawtoolsSettingsPage = () => {
                   </div>
                   <div>
                     <FieldLabel>Steps</FieldLabel>
-                    <TextInput defaultValue={String(selectedPreset.params?.steps ?? 28)} onBlur={(event) => updateSelectedPresetParam('steps', event.currentTarget.value)} type="number" />
+                    <TextInput key={`steps-${selectedPreset.id}`} defaultValue={String(selectedPreset.params?.steps ?? 28)} onBlur={(event) => updateSelectedPresetParam('steps', event.currentTarget.value)} type="number" />
                   </div>
                   <div>
                     <FieldLabel>CFG / Scale</FieldLabel>
-                    <TextInput defaultValue={String(selectedPreset.params?.scale ?? 6)} onBlur={(event) => updateSelectedPresetParam('scale', event.currentTarget.value)} type="number" />
+                    <TextInput key={`scale-${selectedPreset.id}`} defaultValue={String(selectedPreset.params?.scale ?? 6)} onBlur={(event) => updateSelectedPresetParam('scale', event.currentTarget.value)} type="number" />
                   </div>
                   <div>
                     <FieldLabel>负面预设</FieldLabel>
@@ -352,26 +459,53 @@ export const DrawtoolsSettingsPage = () => {
                   </label>
                   <div>
                     <FieldLabel>CFG 重缩放</FieldLabel>
-                    <TextInput defaultValue={String(selectedPreset.params?.cfg_rescale ?? 0)} onBlur={(event) => updateSelectedPresetParam('cfg_rescale', event.currentTarget.value)} step="0.05" type="number" />
+                    <TextInput key={`cfg-rescale-${selectedPreset.id}`} defaultValue={String(selectedPreset.params?.cfg_rescale ?? 0)} onBlur={(event) => updateSelectedPresetParam('cfg_rescale', event.currentTarget.value)} step="0.05" type="number" />
                   </div>
                   <div className="md:col-span-3">
                     <FieldLabel>正面前缀</FieldLabel>
-                    <TextInput defaultValue={String(selectedPreset.positive_prefix || '')} onBlur={(event) => updateSelectedPresetField('positive_prefix', event.currentTarget.value)} />
+                    <AutoResizeTextarea
+                      defaultValue={String(selectedPreset.positive_prefix || '')}
+                      key={`positive-prefix-${selectedPreset.id}`}
+                      onBlur={(event) => updateSelectedPresetField('positive_prefix', event.currentTarget.value)}
+                      placeholder="会自动拼接到正面提示词前方；支持多行编辑"
+                      rows={3}
+                    />
                   </div>
                   <div className="md:col-span-3">
                     <FieldLabel>负面前缀</FieldLabel>
-                    <TextInput defaultValue={String(selectedPreset.negative_prefix || '')} onBlur={(event) => updateSelectedPresetField('negative_prefix', event.currentTarget.value)} />
+                    <AutoResizeTextarea
+                      defaultValue={String(selectedPreset.negative_prefix || '')}
+                      key={`negative-prefix-${selectedPreset.id}`}
+                      onBlur={(event) => updateSelectedPresetField('negative_prefix', event.currentTarget.value)}
+                      placeholder="会自动拼接到负面提示词前方；支持多行编辑"
+                      rows={3}
+                    />
                   </div>
                 </div>
               </div>
             )}
-            <div className="space-y-2">
-              {presets.map((preset: any) => (
-                <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3" key={preset.id}>
-                  <div className="font-mono text-xs font-semibold">{preset.name || preset.id} {preset.id === selectedPresetId ? '· 当前默认' : ''}</div>
-                  <p className="mt-1 text-xs text-[var(--duties-secondary)]">id: {preset.id} · model: {preset.params?.model} · sampler: {preset.params?.sampler} · scheduler: {preset.params?.scheduler} · CFG: {preset.params?.scale} · steps: {preset.params?.steps}</p>
+            <div>
+              <button
+                className="mb-2 flex w-full items-center justify-between border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 text-left font-mono text-xs font-semibold text-[var(--duties-text)] hover:border-[var(--duties-text)]"
+                onClick={() => setPresetsExpanded((value) => !value)}
+                type="button"
+              >
+                <span>预设列表（{presets.length} 个）</span>
+                <span>{presetsExpanded ? '收起 ▲' : '展开 ▼'}</span>
+              </button>
+              {presetsExpanded && (
+                <div className="max-h-80 space-y-2 overflow-y-auto pr-1">
+                  {presets.map((preset: any) => (
+                    <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3" key={preset.id}>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="font-mono text-xs font-semibold">{preset.name || preset.id} {String(preset.id) === effectiveSelectedPresetId ? '· 当前默认' : ''}</div>
+                        <Button onClick={() => switchPreset(String(preset.id))}>设为默认/编辑</Button>
+                      </div>
+                      <p className="mt-1 text-xs text-[var(--duties-secondary)]">id: {preset.id} · model: {preset.params?.model} · sampler: {preset.params?.sampler} · scheduler: {preset.params?.scheduler} · CFG: {preset.params?.scale} · steps: {preset.params?.steps}</p>
+                    </div>
+                  ))}
                 </div>
-              ))}
+              )}
             </div>
           </Card>
 

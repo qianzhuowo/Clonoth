@@ -85,6 +85,36 @@ const NAI_SAMPLERS = [
 ];
 
 const NAI_SCHEDULERS = ['karras', 'exponential', 'polyexponential'];
+const CHARACTER_TYPES = [
+  { value: 'girl', label: 'girl / 女性' },
+  { value: 'boy', label: 'boy / 男性' },
+  { value: 'animal', label: 'animal / 动物' },
+  { value: 'creature', label: 'creature / 生物' },
+  { value: 'object', label: 'object / 物品' },
+  { value: 'custom', label: 'custom / 自定义' },
+];
+
+function normalizeCharacterOutfits(outfits: any): { name: string; tags: string }[] {
+  return (Array.isArray(outfits) ? outfits : [])
+    .map((outfit: any) => ({
+      name: String(outfit?.name || '').trim(),
+      tags: String(outfit?.tags || '').trim(),
+    }))
+    .filter((outfit) => outfit.name || outfit.tags);
+}
+
+function characterSearchText(character: any): string {
+  return [
+    character?.name,
+    ...(Array.isArray(character?.aliases) ? character.aliases : []),
+    character?.danbooru,
+    character?.type,
+    character?.appearance,
+    character?.negative_tags,
+    character?.negativeTags,
+    ...normalizeCharacterOutfits(character?.outfits).flatMap((outfit) => [outfit.name, outfit.tags]),
+  ].filter(Boolean).join(' ').toLowerCase();
+}
 
 function parseYamlObject(text: string): any {
   try {
@@ -128,6 +158,8 @@ export const DrawtoolsSettingsPage = () => {
   const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
   const [presetsExpanded, setPresetsExpanded] = useState(false);
+  const [characterQuery, setCharacterQuery] = useState('');
+  const [editingCharacterIndex, setEditingCharacterIndex] = useState<number | null>(null);
 
   const settingsObj = useMemo(() => parseYamlObject(bundle?.settings?.content || ''), [bundle]);
   const presets = Array.isArray(settingsObj?.params?.presets) ? settingsObj.params.presets : [];
@@ -135,6 +167,12 @@ export const DrawtoolsSettingsPage = () => {
   const api = settingsObj?.api || {};
   const generation = settingsObj?.generation || {};
   const storage = settingsObj?.storage || {};
+  const characterObj = useMemo(() => parseYamlObject(bundle?.character_tags?.content || ''), [bundle]);
+  const characters = Array.isArray(characterObj?.characters) ? characterObj.characters : [];
+  const normalizedCharacterQuery = characterQuery.trim().toLowerCase();
+  const filteredCharacters = normalizedCharacterQuery
+    ? characters.map((character: any, index: number) => ({ character, index })).filter(({ character }) => characterSearchText(character).includes(normalizedCharacterQuery))
+    : characters.map((character: any, index: number) => ({ character, index }));
   const effectiveSelectedPresetId = selectedPresetId || String(presets[0]?.id || '');
   const selectedPreset = presets.find((preset: any) => String(preset?.id || '') === effectiveSelectedPresetId) || presets[0] || {};
 
@@ -196,6 +234,17 @@ export const DrawtoolsSettingsPage = () => {
       await load();
     } catch (error) {
       setMessage(error instanceof Error ? error.message : '保存设置失败');
+    }
+  };
+
+  const saveCharacterObject = async (next: any, okText: string) => {
+    if (!adminToken) return;
+    try {
+      await updateDrawtoolsCharactersRaw(adminToken, stringifyYaml(next));
+      setMessage(okText);
+      await load();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : '保存角色标签库失败');
     }
   };
 
@@ -309,6 +358,85 @@ export const DrawtoolsSettingsPage = () => {
     list[idx] = { ...list[idx], [key]: value };
     next.params = { ...(next.params || {}), presets: list };
     void saveSettingsObject(next, `已保存预设字段：${key}`);
+  };
+
+  const makeCharacterObject = () => {
+    const next = parseYamlObject(bundle?.character_tags?.content || '');
+    if (!Array.isArray(next.characters)) next.characters = [];
+    return next;
+  };
+
+  const addCharacter = () => {
+    const name = window.prompt('新角色名称：', '新角色');
+    if (!name) return;
+    const next = makeCharacterObject();
+    next.characters.push({
+      name: name.trim() || '新角色',
+      aliases: [],
+      danbooru: '',
+      type: 'girl',
+      appearance: '',
+      outfits: [],
+    });
+    setEditingCharacterIndex(next.characters.length - 1);
+    void saveCharacterObject(next, `已新增角色：${name.trim() || '新角色'}`);
+  };
+
+  const renameCharacter = (index: number) => {
+    const current = characters[index];
+    if (!current) return;
+    const name = window.prompt('角色新名称：', String(current.name || ''));
+    if (!name) return;
+    const next = makeCharacterObject();
+    if (!next.characters[index]) return;
+    next.characters[index] = { ...next.characters[index], name: name.trim() || String(current.name || '新角色') };
+    void saveCharacterObject(next, `已重命名角色：${name.trim() || current.name}`);
+  };
+
+  const deleteCharacter = (index: number) => {
+    const current = characters[index];
+    if (!current) return;
+    if (!window.confirm(`确定删除角色「${current.name || `#${index + 1}`}」？`)) return;
+    const next = makeCharacterObject();
+    next.characters.splice(index, 1);
+    setEditingCharacterIndex(null);
+    void saveCharacterObject(next, `已删除角色：${current.name || `#${index + 1}`}`);
+  };
+
+  const updateCharacterField = (index: number, key: string, value: string | string[]) => {
+    const next = makeCharacterObject();
+    if (!next.characters[index]) return;
+    next.characters[index] = { ...next.characters[index], [key]: value };
+    void saveCharacterObject(next, `已保存角色字段：${key}`);
+  };
+
+  const addCharacterOutfit = (index: number) => {
+    const next = makeCharacterObject();
+    if (!next.characters[index]) return;
+    const outfits = normalizeCharacterOutfits(next.characters[index].outfits);
+    outfits.push({ name: '新服装', tags: '' });
+    next.characters[index] = { ...next.characters[index], outfits };
+    setEditingCharacterIndex(index);
+    void saveCharacterObject(next, '已添加角色服装');
+  };
+
+  const deleteCharacterOutfit = (characterIndex: number, outfitIndex: number) => {
+    const next = makeCharacterObject();
+    if (!next.characters[characterIndex]) return;
+    const outfits = normalizeCharacterOutfits(next.characters[characterIndex].outfits);
+    outfits.splice(outfitIndex, 1);
+    next.characters[characterIndex] = { ...next.characters[characterIndex], outfits };
+    void saveCharacterObject(next, '已删除角色服装');
+  };
+
+  const updateCharacterOutfit = (characterIndex: number, outfitIndex: number, key: 'name' | 'tags', value: string) => {
+    const next = makeCharacterObject();
+    if (!next.characters[characterIndex]) return;
+    const outfits = normalizeCharacterOutfits(next.characters[characterIndex].outfits);
+    if (!outfits[outfitIndex]) return;
+    outfits[outfitIndex] = { ...outfits[outfitIndex], [key]: value };
+    next.characters[characterIndex] = { ...next.characters[characterIndex], outfits };
+    void saveCharacterObject(next, `已保存服装${key === 'name' ? '名称' : '标签'}`);
   };
 
   return (
@@ -506,6 +634,109 @@ export const DrawtoolsSettingsPage = () => {
                   ))}
                 </div>
               )}
+            </div>
+          </Card>
+
+          <Card title="角色标签库" description="管理绘图分析节点可参考的固定角色外貌、别名、Danbooru tag 和服装标签。保存后写入 character_tags.yaml。">
+            <div className="mb-3 grid gap-2 md:grid-cols-[1fr_auto_auto]">
+              <TextInput onChange={(event) => setCharacterQuery(event.currentTarget.value)} placeholder="搜索角色名称、别名、Danbooru、外貌、服装..." value={characterQuery} />
+              <Button onClick={() => setCharacterQuery('')}>清空搜索</Button>
+              <Button onClick={addCharacter} variant="primary">+ 新增角色</Button>
+            </div>
+            <div className="mb-3 grid gap-2 text-xs text-[var(--duties-secondary)] md:grid-cols-4">
+              <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">总角色：{characters.length}</div>
+              <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">搜索结果：{filteredCharacters.length}</div>
+              <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">已填外貌：{characters.filter((character: any) => String(character?.appearance || '').trim()).length}</div>
+              <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">含服装：{characters.filter((character: any) => normalizeCharacterOutfits(character?.outfits).length).length}</div>
+            </div>
+            {!characters.length && <p className="text-sm text-[var(--duties-secondary)]">暂无角色配置，点击“新增角色”开始建立标签库。</p>}
+            {!!characters.length && !filteredCharacters.length && <p className="text-sm text-[var(--duties-secondary)]">没有匹配的角色，试试调整搜索关键词。</p>}
+            <div className="space-y-3">
+              {filteredCharacters.map(({ character, index }: { character: any; index: number }) => {
+                const isEditing = editingCharacterIndex === index;
+                const outfits = normalizeCharacterOutfits(character?.outfits);
+                const aliases = Array.isArray(character?.aliases) ? character.aliases : [];
+                return (
+                  <div className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-3" key={`${character?.name || 'character'}-${index}`}>
+                    <div className="flex flex-wrap items-start justify-between gap-2">
+                      <div>
+                        <div className="font-mono text-sm font-semibold">{character?.name || `未命名角色 ${index + 1}`}</div>
+                        <p className="mt-1 text-xs text-[var(--duties-secondary)]">
+                          type: {character?.type || 'girl'} · aliases: {aliases.length || 0} · danbooru: {character?.danbooru || '—'} · outfits: {outfits.length}
+                        </p>
+                      </div>
+                      <div className="flex flex-wrap gap-2">
+                        <Button onClick={() => setEditingCharacterIndex(isEditing ? null : index)}>{isEditing ? '收起编辑' : '编辑'}</Button>
+                        <Button onClick={() => renameCharacter(index)}>重命名</Button>
+                        <Button onClick={() => deleteCharacter(index)} variant="danger">删除</Button>
+                      </div>
+                    </div>
+                    {!isEditing && (
+                      <div className="mt-3 space-y-2 text-xs text-[var(--duties-secondary)]">
+                        {character?.appearance ? <p><span className="font-semibold text-[var(--duties-text)]">外貌：</span>{character.appearance}</p> : <p>⚠️ 尚未填写外貌标签</p>}
+                        {!!outfits.length && <p><span className="font-semibold text-[var(--duties-text)]">服装：</span>{outfits.map((outfit) => outfit.name || '未命名服装').join('、')}</p>}
+                      </div>
+                    )}
+                    {isEditing && (
+                      <div className="mt-4 grid gap-3 md:grid-cols-2">
+                        <div>
+                          <FieldLabel>角色名称</FieldLabel>
+                          <TextInput key={`char-name-${index}`} defaultValue={String(character?.name || '')} onBlur={(event) => updateCharacterField(index, 'name', event.currentTarget.value)} />
+                        </div>
+                        <div>
+                          <FieldLabel>类型</FieldLabel>
+                          <SelectInput onChange={(event) => updateCharacterField(index, 'type', event.currentTarget.value)} value={String(character?.type || 'girl')}>
+                            {CHARACTER_TYPES.map((type) => <option key={type.value} value={type.value}>{type.label}</option>)}
+                          </SelectInput>
+                        </div>
+                        <div>
+                          <FieldLabel>别名（逗号分隔）</FieldLabel>
+                          <TextInput key={`char-aliases-${index}`} defaultValue={aliases.join(', ')} onBlur={(event) => updateCharacterField(index, 'aliases', event.currentTarget.value.split(/[,，]/).map((item) => item.trim()).filter(Boolean))} placeholder="小名、英文名、昵称..." />
+                        </div>
+                        <div>
+                          <FieldLabel>Danbooru Tag</FieldLabel>
+                          <TextInput key={`char-danbooru-${index}`} defaultValue={String(character?.danbooru || '')} onBlur={(event) => updateCharacterField(index, 'danbooru', event.currentTarget.value)} placeholder="hatsune_miku" />
+                        </div>
+                        <div className="md:col-span-2">
+                          <FieldLabel>外貌标签 appearance</FieldLabel>
+                          <AutoResizeTextarea key={`char-appearance-${index}`} defaultValue={String(character?.appearance || '')} onBlur={(event) => updateCharacterField(index, 'appearance', event.currentTarget.value)} placeholder="long hair, blue eyes, white dress..." rows={3} />
+                        </div>
+                        <div className="md:col-span-2">
+                          <FieldLabel>负向标签（可选）</FieldLabel>
+                          <AutoResizeTextarea key={`char-negative-${index}`} defaultValue={String(character?.negative_tags || character?.negativeTags || '')} onBlur={(event) => updateCharacterField(index, 'negative_tags', event.currentTarget.value)} placeholder="需要避免的角色特征..." rows={2} />
+                        </div>
+                        <div className="md:col-span-2">
+                          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                            <FieldLabel>角色服装</FieldLabel>
+                            <Button onClick={() => addCharacterOutfit(index)}>+ 添加服装</Button>
+                          </div>
+                          {!outfits.length && <p className="mb-2 text-xs text-[var(--duties-secondary)]">未配置服装时可留空；添加后会在生图规划时作为服装参考发送给 AI。</p>}
+                          <div className="space-y-2">
+                            {outfits.map((outfit, outfitIndex) => (
+                              <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-3" key={`${outfit.name || 'outfit'}-${outfitIndex}`}>
+                                <div className="mb-2 flex items-center justify-between gap-2">
+                                  <div className="font-mono text-xs font-semibold">服装 {outfitIndex + 1}</div>
+                                  <Button onClick={() => deleteCharacterOutfit(index, outfitIndex)} variant="danger">删除服装</Button>
+                                </div>
+                                <div className="grid gap-2 md:grid-cols-3">
+                                  <div>
+                                    <FieldLabel>服装名称</FieldLabel>
+                                    <TextInput key={`outfit-name-${index}-${outfitIndex}`} defaultValue={outfit.name} onBlur={(event) => updateCharacterOutfit(index, outfitIndex, 'name', event.currentTarget.value)} placeholder="常服、礼服、战斗服..." />
+                                  </div>
+                                  <div className="md:col-span-2">
+                                    <FieldLabel>服装 TAG</FieldLabel>
+                                    <AutoResizeTextarea key={`outfit-tags-${index}-${outfitIndex}`} defaultValue={outfit.tags} onBlur={(event) => updateCharacterOutfit(index, outfitIndex, 'tags', event.currentTarget.value)} placeholder="white shirt, pleated skirt, ribbon..." rows={2} />
+                                  </div>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           </Card>
 

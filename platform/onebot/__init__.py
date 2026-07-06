@@ -2416,9 +2416,15 @@ async def _send_split_text(bot: Bot, target: Dict[str, Any], text: str) -> bool:
     return sent_any
 
 
-def _resolve_attachment_path(attachment: Dict[str, Any]) -> Optional[Path]:
-    """把 Clonoth 附件 dict 解析为本地路径。"""
-    raw_path = attachment.get("original_path") or attachment.get("path") or attachment.get("file")
+def _resolve_attachment_path(attachment: Any) -> Optional[Path]:
+    """把 Clonoth 附件解析为本地路径，兼容 dict 与字符串路径。"""
+    # OneBot 适配层同时接受 dict 和 str，并统一解析 file://、绝对路径和工作区相对路径
+    if isinstance(attachment, dict):
+        raw_path = attachment.get("original_path") or attachment.get("path") or attachment.get("file")
+    elif isinstance(attachment, str):
+        raw_path = attachment
+    else:
+        raw_path = None
     if not raw_path:
         return None
     raw_text = str(raw_path)
@@ -2426,6 +2432,16 @@ def _resolve_attachment_path(attachment: Dict[str, Any]) -> Optional[Path]:
         raw_text = raw_text[7:]
     path = Path(raw_text)
     return path if path.is_absolute() else Path(CLONOTH_WORKSPACE) / path
+
+
+def _attachment_filename(attachment: Any) -> str:
+    """从附件对象中提取展示文件名。"""
+    if isinstance(attachment, dict):
+        return str(attachment.get("name") or attachment.get("filename") or "")
+    if isinstance(attachment, str):
+        text = attachment[7:] if attachment.startswith("file://") else attachment
+        return Path(text).name
+    return ""
 
 
 async def _send_attachment_path(bot: Bot, target: Dict[str, Any], path: Path, filename: str = "") -> None:
@@ -2462,19 +2478,21 @@ async def _send_attachment_path(bot: Bot, target: Dict[str, Any], path: Path, fi
         await _send_qq_message(bot, target, f"Clonoth 生成了文件：{display_name}（上传失败）")
 
 
-async def _send_attachments(bot: Bot, target: Dict[str, Any], attachments: List[Dict[str, Any]]) -> None:
+async def _send_attachments(bot: Bot, target: Dict[str, Any], attachments: List[Any]) -> None:
     """发送 Clonoth 返回的附件列表。"""
     for attachment in attachments:
         path = _resolve_attachment_path(attachment)
-        filename = str(attachment.get("name") or attachment.get("filename") or "")
+        filename = _attachment_filename(attachment)
         if path is None:
             if filename:
                 await _send_qq_message(bot, target, f"Clonoth 生成了文件：{filename}")
+            else:
+                logger.warning("skip unsupported QQ attachment payload: %r", attachment)
             continue
         await _send_attachment_path(bot, target, path, filename=filename)
 
 
-async def _send_text_and_attachments(bot: Bot, target: Dict[str, Any], text: str, attachments: List[Dict[str, Any]]) -> None:
+async def _send_text_and_attachments(bot: Bot, target: Dict[str, Any], text: str, attachments: List[Any]) -> None:
     """统一发送最终文本与附件，并仅在群聊中把最终文本写回群历史。"""
     conv_key = target.get("conversation_key")
     # 2026-05-01 修改原因：私聊没有群历史缓存，不应写入 _group_history；群聊

@@ -590,7 +590,6 @@ class EventRouter:
             main_state = self._state.remove_main_state(src_seq)
             text = strip_protocol_markers((p.get("text") or "").strip())
             attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
-            attachments = p.get("attachments") or []
             try:
                 await self._cb.send_reply(
                     trigger, text, attachments, main_state=main_state,
@@ -608,7 +607,7 @@ class EventRouter:
 
         conv_key = self._state.get_conversation_key(event.session_id) or ""
         text = strip_protocol_markers((p.get("text") or "").strip())
-        attachments = p.get("attachments") or []
+        attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
         if not text and not attachments:
             return
 
@@ -647,6 +646,7 @@ class EventRouter:
             trigger = self._state.get_trigger(src_seq)
             trigger.refresh()
             text = strip_protocol_markers((p.get("text") or "").strip())
+            attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
             # 清空流式 buffer（中间回复已包含完整内容）
             main_state = self._state.get_main_state(src_seq)
             if main_state:

@@ -85,6 +85,9 @@ const NAI_SAMPLERS = [
 ];
 
 const NAI_SCHEDULERS = ['karras', 'exponential', 'polyexponential'];
+
+type CharacterListItem = { character: any; index: number };
+
 const CHARACTER_TYPES = [
   { value: 'girl', label: 'girl / 女性' },
   { value: 'boy', label: 'boy / 男性' },
@@ -169,10 +172,11 @@ export const DrawtoolsSettingsPage = () => {
   const storage = settingsObj?.storage || {};
   const characterObj = useMemo(() => parseYamlObject(bundle?.character_tags?.content || ''), [bundle]);
   const characters = Array.isArray(characterObj?.characters) ? characterObj.characters : [];
+  const characterItems: CharacterListItem[] = characters.map((character: any, index: number) => ({ character, index }));
   const normalizedCharacterQuery = characterQuery.trim().toLowerCase();
-  const filteredCharacters = normalizedCharacterQuery
-    ? characters.map((character: any, index: number) => ({ character, index })).filter(({ character }) => characterSearchText(character).includes(normalizedCharacterQuery))
-    : characters.map((character: any, index: number) => ({ character, index }));
+  const filteredCharacters: CharacterListItem[] = normalizedCharacterQuery
+    ? characterItems.filter((item: CharacterListItem) => characterSearchText(item.character).includes(normalizedCharacterQuery))
+    : characterItems;
   const effectiveSelectedPresetId = selectedPresetId || String(presets[0]?.id || '');
   const selectedPreset = presets.find((preset: any) => String(preset?.id || '') === effectiveSelectedPresetId) || presets[0] || {};
 
@@ -652,7 +656,7 @@ export const DrawtoolsSettingsPage = () => {
             {!characters.length && <p className="text-sm text-[var(--duties-secondary)]">暂无角色配置，点击“新增角色”开始建立标签库。</p>}
             {!!characters.length && !filteredCharacters.length && <p className="text-sm text-[var(--duties-secondary)]">没有匹配的角色，试试调整搜索关键词。</p>}
             <div className="space-y-3">
-              {filteredCharacters.map(({ character, index }: { character: any; index: number }) => {
+              {filteredCharacters.map(({ character, index }: CharacterListItem) => {
                 const isEditing = editingCharacterIndex === index;
                 const outfits = normalizeCharacterOutfits(character?.outfits);
                 const aliases = Array.isArray(character?.aliases) ? character.aliases : [];

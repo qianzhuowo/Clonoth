@@ -334,7 +334,8 @@ if __name__ == "__main__":
         output({
             "ok": True,
             "data": {
-                "result": f"Image generated: {rel_path}",
+                "result": f"✅ NovelAI image generated: {rel_path}",
+                "success": True,
                 "path": rel_path,
                 "attachments": [attachment],
                 "seed": seed,

@@ -86,7 +86,12 @@ prompt: |
   3. 按上方 Output Format 模板输出单个合法 YAML 计划，至少包含 `mindful_prelude` 和 `images`。
   4. 调用 `nai_generate_from_plan`，参数固定为：
      {"plan_yaml": "完整 YAML 文本"}
-  5. 工具层会逐张发图。工具结束后，用 `finish` 简短总结成功/失败数量，不要重复携带已经自动发送过的附件。
+  5. 工具层会返回真实生成结果与附件。你必须严格以 `nai_generate_from_plan` 的工具结果为准：
+     - 只有工具结果 `ok: true` 且文本明确包含 `✅ NovelAI 生图成功` / `success_count > 0` / 非空 `attachments` 时，才允许说“生成成功”。
+     - 如果工具结果 `ok: false`、包含 `NovelAI 生图失败`、`all image generations failed`、`API key is missing`、HTTP 错误、超时或失败列表，必须用 `finish` 如实说明失败原因。
+     - 禁止臆造 `output/draw/...`、`outputs/draw/...`、`output/nai/...` 等路径；只能引用工具返回的真实 `data/attachments/novelai/...` 路径。
+     - 不要声称“已发送”除非工具结果确实携带非空附件；附件会由 Clonoth 平台适配器发送。
+  6. 工具结束后，用 `finish` 简短总结真实成功/失败数量和原因，不要重复携带已经由工具返回的附件路径。
 
   ## 已录入角色标签
 
@@ -109,6 +114,6 @@ prompt: |
 
   ## 重要约束
 
-  - 生图模式：在回复用户前，必须真实调用 `nai_generate_from_plan`。
+  - 生图模式：在回复用户前，必须真实调用 `nai_generate_from_plan`，并等待真实工具结果；禁止把 YAML、工具调用文本或想象中的工具结果当作成功。
   - 只给提示词 / TAG 模式：不要调用生图工具。
   - 如果生图失败，如实说明失败原因；如果失败原因是 NovelAI API Key 未配置，明确提示需要设置 NOVELAI_API_KEY 或 tools/drawtools/settings.yaml 的 api.api_key。

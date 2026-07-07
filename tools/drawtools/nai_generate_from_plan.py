@@ -117,14 +117,20 @@ if __name__ == "__main__":
             )
             parsed = json.loads((proc.stdout or "").strip() or "{}")
             if proc.returncode != 0 or parsed.get("ok") is False:
-                failures.append({"index": task["index"], "error": parsed.get("error") or proc.stderr or f"exit {proc.returncode}"})
+                parsed_data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+                error_text = parsed.get("error") or parsed_data.get("result") or proc.stderr or f"exit {proc.returncode}"
+                failures.append({"index": task["index"], "error": str(error_text)})
                 continue
             data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
             att = data.get("attachments") or parsed.get("attachments") or []
+            image_path = str(data.get("path") or "").strip()
             if isinstance(att, list):
                 attachments.extend(att)
             # 逐张自动发图不能依赖工具子进程直接 POST
             # 让 QQ/OneBot、Web 等平台都从同一条附件路由发送图片。
+            if not image_path and not att:
+                failures.append({"index": task["index"], "error": "NovelAI 工具返回成功但没有图片路径或附件"})
+                continue
             results.append({
                 "index": task["index"],
                 "anchor": task.get("anchor", ""),
@@ -133,25 +139,30 @@ if __name__ == "__main__":
                 "height": task["height"],
                 "preset_id": task.get("preset_id", ""),
                 "preset_name": task.get("preset_name", ""),
-                "path": data.get("path"),
+                "path": image_path,
                 "seed": data.get("seed"),
             })
         except Exception as exc:
             failures.append({"index": task["index"], "error": str(exc)})
 
     if not results:
-        fail(f"all image generations failed: {failures}")
+        failure_text = "; ".join(f"#{f['index']} {f['error']}" for f in failures) or "unknown error"
+        fail(f"NovelAI 生图失败：{failure_text}")
 
-    lines = [f"已生成 {len(results)} 张图。"]
+    lines = [f"✅ NovelAI 生图成功：{len(results)} 张。"]
+    lines.append("图片附件已返回给 Clonoth，将由平台适配器发送；真实路径如下：")
     for item in results:
-        lines.append(f"- #{item['index']} {item['size_label']} {item.get('path') or ''}")
+        lines.append(f"- #{item['index']} {item['size_label']} {item.get('path') or '(无路径)'}")
     if failures:
-        lines.append(f"失败 {len(failures)} 张：" + "; ".join(f"#{f['index']} {f['error']}" for f in failures))
+        lines.append("⚠️ 部分图片失败：" + "; ".join(f"#{f['index']} {f['error']}" for f in failures))
 
     output({
         "ok": True,
         "data": {
             "result": "\n".join(lines),
+            "success": True,
+            "success_count": len(results),
+            "failure_count": len(failures),
             "images": results,
             "failures": failures,
             "attachments": attachments,

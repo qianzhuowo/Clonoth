@@ -60,6 +60,9 @@ def safe_subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
     for k in list(env.keys()):
         ku = k.upper()
+
+        if ku == "NOVELAI_API_KEY":
+            continue
         if ku in _SENSITIVE_ENV_KEYS_UPPER:
             env.pop(k, None)
             continue

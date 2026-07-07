@@ -145,6 +145,13 @@ ONEBOT_STATE_FILE = _env_first(
     default=os.path.join(CLONOTH_WORKSPACE, "data", "onebot_plugin_state.json"),
 )
 
+# 引用消息附件索引缓存：保存 message_id -> 已落盘图片附件路径，用于 get_msg 失败时兜底转发。
+# 与路由状态分离，避免 onebot_plugin_state.json 被临时缓存污染。
+REPLY_ATTACHMENT_CACHE_FILE = _env_first(
+    "ONEBOT_REPLY_ATTACHMENT_CACHE_FILE",
+    default=os.path.join(CLONOTH_WORKSPACE, "data", "cache", "onebot_reply_attachments.json"),
+)
+
 # QQ 审批管理员白名单。只有这些 QQ 用户能批准/拒绝 Clonoth 审批请求。
 _raw_admin_users = _env_first("CLONOTH_ADMIN_QQ_USERS", "ONEBOT_ADMIN_USERS", default="[占位符],[占位符]")
 ADMIN_QQ_USERS: list[int] = _parse_qq_id_list(_raw_admin_users)

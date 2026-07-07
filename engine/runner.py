@@ -741,9 +741,34 @@ def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
     bridges that gap so system nodes (turn_summarizer, compactor, etc.)
     correctly suppress switch_node injection.
     """
-    ctx = input_data.get("task_context") if isinstance(input_data.get("task_context"), dict) else {}
+    raw_ctx = input_data.get("task_context") if isinstance(input_data.get("task_context"), dict) else {}
+    ctx = dict(raw_ctx)
     if input_data.get("_system_task"):
         ctx["is_system_task"] = True
+
+    # [2026-07-07] Why: async dispatch_result rows may carry child-generated
+    # attachments (for example NovelAI images) as the *current inbound payload*.
+    # If the caller node finishes with only text, those attachments are otherwise
+    # treated like ordinary user input images and never reach the platform adapter.
+    # How: expose dispatch-result metadata and its current inbound attachments to
+    # pseudo_handlers via task_context. Purpose: finish() can auto-forward child
+    # result files without echoing normal user-supplied images.
+    for key in (
+        "inbound_message_type",
+        "inbound_summary",
+        "inbound_child_session_id",
+        "inbound_child_task_id",
+        "inbound_child_node_id",
+        "inbound_caller_node_id",
+    ):
+        value = str(input_data.get(key) or "").strip()
+        if value:
+            ctx[key] = value
+    if bool(input_data.get("inbound_attachments_outbound_sent")):
+        ctx["inbound_attachments_outbound_sent"] = True
+    inbound_attachments = input_data.get("attachments")
+    if isinstance(inbound_attachments, list) and inbound_attachments:
+        ctx["inbound_attachments"] = list(inbound_attachments)
     return ctx
 
 

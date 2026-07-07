@@ -713,12 +713,7 @@ class TaskRouterMixin:
                 self._event_task_snapshot("task_resumed", caller)
                 return
 
-        # 没有 suspended caller
-        # [2026-05-28] 新路径：通过 inbound dispatch_origin 回调。
-        # 为什么：异步 dispatch 统一走 inbound 后，子任务完成时通过 _dispatch_origin
-        #   中记录的 parent_session_id 将结果注入回调用方 session。
-        # 怎么改：在旧 _async_dispatch 判断之前新增 _dispatch_origin 检查。
-        # 目的：支持新路径的同时保持旧路径向后兼容。
+
         if task.input.get("_dispatch_origin"):
             self._inject_dispatch_result_via_origin_locked(task, fallback_result)
             # [2026-05-28] fresh/fork session 清理：conversation_key 带 uuid 的
@@ -755,6 +750,55 @@ class TaskRouterMixin:
         )
 
 
+    def _emit_dispatch_attachment_outbound_locked(
+        self,
+        *,
+        session_id: str,
+        conversation_key: str,
+        task: Task,
+        attachments: list[Any] | None,
+    ) -> bool:
+        """Emit child-generated attachments as a standard outbound_message.
+
+        """
+        if not session_id or not attachments:
+            return False
+        if session_id not in self.sessions:
+            return False
+        node_id = str(task.node_id or task.tool_name or "").strip()
+        payload: dict[str, Any] = {
+            "text": "",
+            "attachments": list(attachments),
+            "message_type": "dispatch_attachment",
+            "action_type": "dispatch_attachment",
+            "child_task_id": task.task_id,
+            "child_node_id": node_id,
+        }
+        child_session_id = str(task.input.get("child_session_id") or "").strip()
+        if child_session_id:
+            payload["child_session_id"] = child_session_id
+        if node_id:
+            payload["node_id"] = node_id
+        if conversation_key:
+            # Helpful for adapter restarts or state loss; SDK still falls back to
+            # session_id → conversation_key mapping for older outbound events.
+            payload["conversation_key"] = conversation_key
+        evt = self.eventlog.append(
+            session_id=session_id,
+            component="supervisor",
+            type_="outbound_message",
+            payload=payload,
+        )
+        try:
+            self._apply_outbound_message(
+                seq=int(evt.get("seq", 0) or 0),
+                session_id=session_id,
+                payload=payload,
+            )
+        except Exception as exc:
+            log.warning("dispatch attachment outbound apply failed: %s", exc)
+        return True
+
     # ------------------------------------------------------------------ #
     #  异步 dispatch 结果注入
     # ------------------------------------------------------------------ #
@@ -770,18 +814,11 @@ class TaskRouterMixin:
 
         此方法在 self._lock 内调用，不可调用会再次获取 _lock 的公开方法。
         """
-        # [AutoC 2026-06-04] Why: dispatch result payloads must be language-neutral
-        # and should not store presentation text. How: keep the child finish text and
-        # summary as raw fields, then emit caller/child ids as structured metadata.
-        # Purpose: the LLM and each client can render their own localized wrapper
-        # without parsing or persisting backend-generated Chinese prose.
+
         result_text = str(fallback_result.get("text") or "").strip()
         result_summary = str(fallback_result.get("summary") or "").strip()
         caller_node = str(task.input.get("_caller_node_id") or "").strip()
-        # [AutoC 2026-06-03] Why: the web callback card needs a stable target for
-        # child-session navigation. How: read the child session created for the
-        # completed dispatch task from task.input. Purpose: clients do not need to
-        # infer the child transcript from localized notification text.
+
         child_session_id = str(task.input.get("child_session_id") or "").strip()
 
         result_atts = (
@@ -790,10 +827,7 @@ class TaskRouterMixin:
             else None
         )
 
-        # [Fork/Merge 2026-05-17] Why: async dispatch tasks may originate from a
-        # branch, but their completion should inject a new inbound into the parent
-        # conversation. How: use the same route helper as outbound/hook paths.
-        # Purpose: async results do not target a deleted branch session.
+
         route_session_id = self._route_session_id_for_task_locked(task)
         session_info = self.sessions.get(route_session_id)
         if not session_info:
@@ -817,28 +851,30 @@ class TaskRouterMixin:
         conv_key = session_info.conversation_key
         channel = session_info.channel
         msg_id = f"async_dispatch:{task.task_id}"
+        attachments_outbound_sent = self._emit_dispatch_attachment_outbound_locked(
+            session_id=route_session_id,
+            conversation_key=conv_key,
+            task=task,
+            attachments=result_atts,
+        ) if result_atts else False
 
         payload: dict[str, Any] = {
             "channel": channel,
             "conversation_key": conv_key,
             "message_id": msg_id,
-            # [AutoC 2026-06-04] Why: payload.text must be the child node's raw finish
-            # result, not a localized notification wrapper. How: place summary and ids
-            # in sibling structured fields. Purpose: ConversationStore preserves the
-            # actual child output while renderers build their own presentation layer.
+
             "text": result_text,
             "summary": result_summary,
-            # [AutoC 2026-06-04] Why: dispatch callbacks need a stable structured
-            # contract after removing localized wrapper assembly. How: emit caller, child node, child
-            # task, and child session identifiers under explicit child_* names. Purpose:
-            # clients and LLM prompts no longer infer metadata from natural language.
+ 
             "message_type": "dispatch_result",
             "caller_node_id": caller_node,
             "child_node_id": task.node_id,
             "child_task_id": task.task_id,
             "child_session_id": child_session_id,
         }
-        if result_atts:
+        if attachments_outbound_sent:
+            payload["attachments_outbound_sent"] = True
+        elif result_atts:
             payload["attachments"] = result_atts
 
         # eventlog 有独立锁，不会与 self._lock 死锁
@@ -906,10 +942,6 @@ class TaskRouterMixin:
         if target_session_id in self._cancelled_sessions:
             return
 
-        # [AutoC 2026-06-04] Why: dispatch_origin callbacks share the new
-        # language-neutral dispatch_result contract. How: keep raw child result text
-        # and summary separate from caller/child ids. Purpose: this path cannot persist
-        # backend-localized notification text while the legacy path has been cleaned.
         result_text = str(fallback_result.get("text") or "").strip()
         result_summary = str(fallback_result.get("summary") or "").strip()
 
@@ -923,27 +955,28 @@ class TaskRouterMixin:
         conv_key = session_info.conversation_key
         channel = session_info.channel
         msg_id = f"dispatch_origin:{task.task_id}"
+        attachments_outbound_sent = self._emit_dispatch_attachment_outbound_locked(
+            session_id=target_session_id,
+            conversation_key=conv_key,
+            task=task,
+            attachments=result_atts,
+        ) if result_atts else False
 
         payload: dict[str, Any] = {
             "channel": channel,
             "conversation_key": conv_key,
             "message_id": msg_id,
-            # [AutoC 2026-06-04] Why: payload.text must remain the raw child result in
-            # the dispatch_origin path too. How: move summary and routing information
-            # into structured fields. Purpose: frontend cards and LLM prompts can render
-            # localized context without storing it in backend payload text.
             "text": result_text,
             "summary": result_summary,
-            # [AutoC 2026-06-04] Why: task_id/node_id were ambiguous after callbacks
-            # became user-visible messages. How: emit explicit child_* metadata plus the
-            # caller id. Purpose: clients know these ids describe the completed child.
             "message_type": "dispatch_result",
             "caller_node_id": caller_node,
             "child_node_id": task.node_id,
             "child_task_id": task.task_id,
             "child_session_id": child_session_id,
         }
-        if result_atts:
+        if attachments_outbound_sent:
+            payload["attachments_outbound_sent"] = True
+        elif result_atts:
             payload["attachments"] = result_atts
 
         evt = self.eventlog.append(
@@ -994,9 +1027,8 @@ class TaskRouterMixin:
             self.session_generations.pop(_dispatch_sid, None)
             self._cancelled_sessions.discard(_dispatch_sid)
             self._session_context_usage.pop(_dispatch_sid, None)
-            # [AutoC 2026-05-30] Why: fresh/fork dispatch session 完成后是临时
-            # 会话，不应在 sessions.json 中留下 reset=true 记录。How: 改为物理删除
-            # registry 条目。Purpose: 阻止 agent:* 派生 session 持续堆积。
+
+            # 阻止 agent:* 派生 session 持续堆积。
             self._session_store.remove_session(_dispatch_sid)
         except Exception as e:
             log.warning("cleanup dispatch session %s failed: %s", _dispatch_sid[:12], e)
@@ -1101,15 +1133,11 @@ class TaskRouterMixin:
         if not child_sid:
             return
 
-        # [AutoC 2026-05-30] Why: action=dispatch 会把 task 改成 suspended，
-        # 该 caller 后续还要继续使用自己的 child session。How: 只处理终态
-        # task。Purpose: 避免 finally 在挂起路径误删仍活跃的 child session。
+        # 避免 finally 在挂起路径误删仍活跃的 child session。
         if not self._task_terminal(task):
             return
 
-        # [AutoC 2026-05-30] Why: task.input 中的 context_mode 可能为空或滞后，
-        # sessions.json registry 才是 child session 的持久来源。How: 优先读取
-        # registry，缺失时才回退 task.input。Purpose: 避免误删 accumulate 会话。
+        # 优先读取registry，缺失时才回退 task.input。避免误删 accumulate 会话。
         entry = self._session_store._registry.get(child_sid)
         registry_mode = str(entry.get("context_mode") or "").strip() if isinstance(entry, dict) else ""
         input_mode = str(task.input.get("context_mode") or "").strip()
@@ -1166,11 +1194,7 @@ class TaskRouterMixin:
         _main_conv_enabled = bool(
             _rc.get("engine", {}).get("child_session", {}).get("main_session_enabled", True)
         )
-        # [AutoC 2026-05-13] Why: child_session_id and branch session ids are
-        # temporary copies, so compacting them does not shrink the parent history.
-        # How: prefer the explicit target saved during dispatch, then the caller's
-        # parent_session_id, and only then the caller session. Purpose: supervisor
-        # result application matches engine-side parent-first target selection.
+ 
         target_sid_for_conv = str(
             caller.input.get("_compact_target_session_id")
             or caller.input.get("target_session_id")
@@ -1341,22 +1365,14 @@ class TaskRouterMixin:
         for seg in to_remove_segments:
             to_remove.extend(seg)
 
-        # P6.5 Metadata Preservation: 收集被压缩掉的消息所属的 source_task_id，
+        # 收集被压缩掉的消息所属的 source_task_id，
         # 存入 summary 消息的 meta 中。L2 snip_history 据此判断哪些 task 已被
         # LLM 压缩过，避免因 ID 丢失而反复 fall through 到 LLM compact。
         # [2026-04-26] 累积继承：旧 compact_summary 被再次压缩时，
         # 继承其 meta.compressed_task_ids，防止历史 ID 丢失。
-        # [AutoC 2026-05-13] Why: metadata must describe removed task segments,
-        # not an arbitrary message prefix. How: iterate over to_remove from the
-        # segment split above and access Message fields by attribute. Purpose:
-        # keep compressed_task_ids accurate after task-granular retention.
         _ctid_set: set[str] = set()
         for _rm in to_remove:
             _rm_meta = _rm.meta if isinstance(getattr(_rm, "meta", None), dict) else {}
-            # [2026-05-17] Why: compact_summary is not a real task id and should
-            # not be recorded as a compressed task. How: inherit its historical
-            # compressed_task_ids but skip the compact_summary source id itself.
-            # Purpose: L2 snip metadata remains about real tasks only.
             _rm_tid = str(_rm_meta.get("source_task_id", "") or getattr(_rm, "source_task_id", "") or "")
             if _rm_tid and _rm_tid != "compact_summary":
                 _ctid_set.add(_rm_tid)
@@ -1426,20 +1442,13 @@ class TaskRouterMixin:
             return result
 
         store.replace_all(target_session_id, new_messages)
-        # [AutoC 2026-05-13] Why: active branches forked before parent compact
-        # keep their own old prefix and would otherwise resume or merge from an
-        # uncompressed copy. How: after the parent rewrite succeeds, mirror a
-        # simplified prefix compaction into active branch sessions. Purpose:
-        # branch histories stay bounded while preserving branch-local tails.
+
         self._sync_compact_to_branches(target_session_id, summary_msg, to_keep)
         return result
 
     def _clone_compact_summary_message(self, summary_msg: Any) -> Any:
         """Clone a compact summary message for a branch session."""
-        # [AutoC 2026-05-13] Why: parent and branch JSONL files should not share
-        # the same Message id even when they carry the same summary content. How:
-        # create a new Message with copied content and metadata. Purpose: future
-        # message-id based matching can distinguish parent and branch records.
+
         from uuid import uuid4
         from datetime import datetime, timezone
         from engine.conversation_store import Message, MessageType
@@ -1459,12 +1468,7 @@ class TaskRouterMixin:
         self, target_session_id: str, summary_msg: Any, to_keep: list[Any],
     ) -> None:
         """Synchronize a successful parent compact into active branch sessions."""
-        # [AutoC 2026-05-13] Why: already-forked branch sessions keep the old
-        # uncompressed parent prefix after the parent JSONL is compacted. How:
-        # find active entry branches for the parent and compact only their forked
-        # prefix, while separately compacting ordinary active child sessions under
-        # the same parent. Purpose: keep branch stores small without dropping
-        # branch-local messages that still need to merge back.
+ 
         from engine.conversation_store import ConversationStore
 
         target = str(target_session_id or "").strip()

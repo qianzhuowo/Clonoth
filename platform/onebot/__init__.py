@@ -72,6 +72,7 @@ from .config import (
     TRIGGER_PREFIXES,
     USER_PROFILES_PATH,
     ONEBOT_STATE_FILE,
+    REPLY_ATTACHMENT_CACHE_FILE,
 )
 from .emoji_handler import (
     count_duplicate_face_names,
@@ -178,6 +179,13 @@ class RecentImageEntry:
     message_id: str
 
 
+@dataclass
+class ProactiveTarget:
+    target_type: str
+    target_id: int
+    label: str
+
+
 _recent_images: DefaultDict[str, Deque[RecentImageEntry]] = defaultdict(lambda: deque(maxlen=RECENT_IMAGE_MAX_ITEMS))
 _last_attachment_cleanup_at = 0.0
 
@@ -205,6 +213,9 @@ _qq_waiting_replies: Dict[str, asyncio.Event] = {}
 _auto_like_today: Dict[int, str] = {}
 _reply_message_cache: Dict[str, Dict[str, Any]] = {}
 _reply_message_cache_order: Deque[str] = deque()
+# 持久化的“message_id -> 本地附件”索引。用于 NapCat get_msg 取不到引用消息时，
+# 仍能转发此前已经下载到 Clonoth 的图片/表情包。只保存路径和少量路由元数据。
+_reply_attachment_cache: Dict[str, Dict[str, Any]] = {}
 _sent_reply_cache: Dict[str, float] = {}
 _sent_reply_cache_order: Deque[str] = deque()
 _route_state_lock = asyncio.Lock()
@@ -870,9 +881,84 @@ def _remember_recent_images(conversation_key: str, event: Event, attachments: Li
     message_id = str(getattr(event, "message_id", "") or "")
     now = time.time()
     q = _recent_images[conversation_key]
+    image_atts: list[dict[str, Any]] = []
     for att in attachments:
         if str(att.get("type") or "") == "image" and att.get("path"):
-            q.append(RecentImageEntry(dict(att), now, sender_id, message_id))
+            att_copy = dict(att)
+            image_atts.append(att_copy)
+            q.append(RecentImageEntry(att_copy, now, sender_id, message_id))
+    if image_atts and message_id:
+        _remember_reply_attachments(message_id, conversation_key, sender_id, image_atts, created_at=now)
+
+
+def _remember_reply_attachments(
+    message_id: Any,
+    conversation_key: str,
+    sender_id: str,
+    attachments: List[Dict[str, Any]],
+    *,
+    created_at: float | None = None,
+) -> None:
+    """持久化引用消息附件索引，供后续主动转发兜底使用。"""
+    mid = str(message_id or "").strip()
+    if not mid or not attachments:
+        return
+    now = time.time() if created_at is None else float(created_at)
+    image_atts = [dict(att) for att in attachments if isinstance(att, dict) and att.get("path")]
+    if not image_atts:
+        return
+    _reply_attachment_cache[mid] = {
+        "conversation_key": str(conversation_key or ""),
+        "sender_id": str(sender_id or ""),
+        "created_at": now,
+        "attachments": image_atts[:MAX_IMAGES_PER_TURN],
+    }
+    _trim_reply_attachment_cache()
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_save_reply_attachment_cache())
+    except Exception:
+        pass
+
+
+def _trim_reply_attachment_cache() -> None:
+    if not _reply_attachment_cache:
+        return
+    now = time.time()
+    cutoff = now - max(IMAGE_CACHE_TTL_SECONDS, 60)
+    for mid, item in list(_reply_attachment_cache.items()):
+        try:
+            created_at = float(item.get("created_at") or 0.0)
+        except Exception:
+            created_at = 0.0
+        if created_at and created_at < cutoff:
+            _reply_attachment_cache.pop(mid, None)
+    while len(_reply_attachment_cache) > 1000:
+        oldest = min(
+            _reply_attachment_cache,
+            key=lambda key: float(_reply_attachment_cache.get(key, {}).get("created_at") or 0.0),
+        )
+        _reply_attachment_cache.pop(oldest, None)
+
+
+def _forward_nodes_from_cached_reply(bot: Bot, reply_message_id: Any) -> list[dict[str, Any]]:
+    mid = str(reply_message_id or "").strip()
+    if not mid:
+        return []
+    item = _reply_attachment_cache.get(mid)
+    if not isinstance(item, dict):
+        return []
+    attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
+    if not attachments:
+        return []
+    node = _make_forward_node(
+        bot,
+        "",
+        [dict(att) for att in attachments if isinstance(att, dict)],
+        nickname="引用图片",
+        user_id=item.get("sender_id") or getattr(bot, "self_id", "") or "10000",
+    )
+    return [node] if node else []
 
 
 def _recent_images_for_text(conversation_key: str, event: Event) -> List[Dict[str, Any]]:
@@ -917,13 +1003,14 @@ async def _merge_recent_images_after_text(
 
 
 def _iter_qq_image_urls(message: Any) -> List[str]:
-    """从 OneBot Message、segment list 或 CQ 字符串中提取 image 下载地址。"""
+    """从 OneBot Message、segment list 或 CQ 字符串中提取 image/表情图片下载地址。"""
     urls: List[str] = []
     if message is None:
         return urls
+    image_segment_types = {"image", "mface", "marketface"}
     if isinstance(message, str):
         for match in _CQ_RE.finditer(message):
-            if match.group(1) != "image":
+            if match.group(1) not in image_segment_types:
                 continue
             params = _parse_cq_params(match.group(2) or "")
             src = str(params.get("url") or params.get("path") or params.get("file") or "").strip()
@@ -941,7 +1028,7 @@ def _iter_qq_image_urls(message: Any) -> List[str]:
         else:
             seg_type = getattr(segment, "type", "")
             data = getattr(segment, "data", {}) or {}
-        if seg_type != "image":
+        if seg_type not in image_segment_types:
             continue
         url = str(data.get("url") or data.get("path") or data.get("file") or "").strip()
         if url:
@@ -1509,6 +1596,488 @@ async def _maybe_handle_custom_face_command(
     return None
 
 
+# ---------------------------------------------------------------------------
+# 管理员主动发送 / 合并转发命令
+# ---------------------------------------------------------------------------
+
+_PROACTIVE_PRIVATE_KINDS = {"私聊", "好友", "private", "pm", "user"}
+_PROACTIVE_GROUP_KINDS = {"群聊", "群", "group"}
+
+
+def _normalize_target_ref(text: str) -> str:
+    """把管理员输入的目标名规整为可匹配 token，不写入模型上下文。"""
+    return re.sub(r"[\s_\-—]+", "", str(text or "").strip().lower())
+
+
+def _proactive_help_text() -> str:
+    return (
+        "【管理员主动发送 / 转发命令】\n"
+        "权限：仅 CLONOTH_ADMIN_QQ_USERS 中的管理员可用；命令在 QQ 适配器本地处理，不进入普通模型上下文。\n"
+        "目标：使用联系人显示名/好友备注/群名/配置别名；目标列表不会展示真实 QQ 号。\n\n"
+        "1) 查看可用目标\n"
+        "   主动目标 / 主动目标 私聊 / 主动目标 群\n"
+        "2) 主动发文本（可在同条消息附图，图片会一起发送）\n"
+        "   私信 <联系人名> <内容>\n"
+        "   群发 <群名> <内容>\n"
+        "   发送 私聊 <联系人名> <内容>\n"
+        "   发送 群 <群名> <内容>\n"
+        "3) 主动发本地文件（路径限制在 Clonoth 工作区内，推荐 data/attachments/）\n"
+        "   发文件 私聊 <联系人名> data/attachments/xxx.png\n"
+        "   发文件 群 <群名> data/attachments/xxx.zip 展示文件名.zip\n"
+        "4) 合并转发\n"
+        "   合并转发 私聊 <联系人名> <内容>\n"
+        "   合并转发 群 <群名> <内容>\n"
+        "   也可以引用一条消息/合并转发卡片后发送：合并转发 群 <群名>\n"
+        "   文本中用单独一行 --- 可拆成多条转发 node。"
+    )
+
+
+def _parse_proactive_command(text: str) -> dict[str, str] | None:
+    """解析管理员主动发送/转发命令。
+
+    返回字段：action(send/file/forward/list/help), target_type(private/group), target_ref, body。
+    目标名按单个 token 解析；如群名含空格，请在配置里设置无空格别名/显示名。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    lowered = raw.lower()
+    if raw in {"主动发送帮助", "主动转发帮助", "通知帮助", "转发帮助"}:
+        return {"action": "help"}
+    parts = raw.split()
+    if not parts:
+        return None
+    head = parts[0]
+    if head in {"主动目标", "通知目标", "转发目标", "目标列表"}:
+        kind = parts[1] if len(parts) >= 2 else ""
+        return {"action": "list", "target_type": _canonical_proactive_target_type(kind)}
+    if head in {"私信", "私聊通知"} and len(parts) >= 3:
+        return {"action": "send", "target_type": "private", "target_ref": parts[1], "body": raw.split(None, 2)[2]}
+    if head in {"群发", "群通知"} and len(parts) >= 3:
+        return {"action": "send", "target_type": "group", "target_ref": parts[1], "body": raw.split(None, 2)[2]}
+    if head in {"发送", "通知", "主动发送"} and len(parts) >= 4:
+        target_type = _canonical_proactive_target_type(parts[1])
+        if target_type:
+            return {"action": "send", "target_type": target_type, "target_ref": parts[2], "body": raw.split(None, 3)[3]}
+    if head in {"发文件", "发送文件"} and len(parts) >= 4:
+        target_type = _canonical_proactive_target_type(parts[1])
+        if target_type:
+            body = raw.split(None, 3)[3]
+            return {"action": "file", "target_type": target_type, "target_ref": parts[2], "body": body}
+    if head in {"合并转发", "转发"} and len(parts) >= 3:
+        target_type = _canonical_proactive_target_type(parts[1])
+        if target_type:
+            body = raw.split(None, 3)[3] if len(parts) >= 4 else ""
+            return {"action": "forward", "target_type": target_type, "target_ref": parts[2], "body": body}
+    if head in {"转发到", "转发给", "合并转发到", "合并转发给"} and len(parts) >= 3:
+        target_type = _canonical_proactive_target_type(parts[1])
+        if target_type:
+            body = raw.split(None, 3)[3] if len(parts) >= 4 else ""
+            return {"action": "forward", "target_type": target_type, "target_ref": parts[2], "body": body}
+    # English aliases for admins that copy/paste commands.
+    if lowered.startswith("send ") and len(parts) >= 4:
+        target_type = _canonical_proactive_target_type(parts[1])
+        if target_type:
+            return {"action": "send", "target_type": target_type, "target_ref": parts[2], "body": raw.split(None, 3)[3]}
+    if lowered.startswith("forward ") and len(parts) >= 3:
+        target_type = _canonical_proactive_target_type(parts[1])
+        if target_type:
+            body = raw.split(None, 3)[3] if len(parts) >= 4 else ""
+            return {"action": "forward", "target_type": target_type, "target_ref": parts[2], "body": body}
+    return None
+
+
+def _canonical_proactive_target_type(kind: str) -> str:
+    token = str(kind or "").strip().lower()
+    if not token:
+        return ""
+    if token in _PROACTIVE_PRIVATE_KINDS:
+        return "private"
+    if token in _PROACTIVE_GROUP_KINDS:
+        return "group"
+    return ""
+
+
+def _target_display_label(target_type: str, name: str) -> str:
+    prefix = "私聊" if target_type == "private" else "群聊"
+    return f"{prefix}「{_sanitize_name(name, max_len=40)}」"
+
+
+def _profile_aliases_for_user(user_id: Any) -> list[str]:
+    profile = _qq_user_profile(user_id)
+    aliases: list[str] = []
+    for key in ("display_name", "address_as", "title"):
+        value = str(profile.get(key) or "").strip()
+        if value:
+            aliases.append(value)
+    return aliases
+
+
+async def _safe_call_onebot_list(bot: Bot, api_name: str) -> list[dict[str, Any]]:
+    try:
+        data = await bot.call_api(api_name)
+    except Exception:
+        logger.debug("OneBot list API failed: %s", api_name, exc_info=True)
+        return []
+    payload = data.get("data") if isinstance(data, dict) and isinstance(data.get("data"), list) else data
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
+
+
+async def _private_target_candidates(bot: Bot) -> list[ProactiveTarget]:
+    """获取管理员可主动私聊的目标；返回值不包含真实 QQ 字符串展示。"""
+    friend_rows = await _safe_call_onebot_list(bot, "get_friend_list") if ALLOW_PRIVATE_FRIENDS else []
+    friend_ids: set[int] = set()
+    names_by_id: dict[int, list[str]] = defaultdict(list)
+    for row in friend_rows:
+        try:
+            uid = int(row.get("user_id"))
+        except Exception:
+            continue
+        friend_ids.add(uid)
+        for key in ("remark", "nickname", "card"):
+            name = str(row.get(key) or "").strip()
+            if name:
+                names_by_id[uid].append(name)
+    allowed_ids = set(ADMIN_QQ_USERS) | set(ALLOWED_PRIVATE_USERS) | friend_ids
+    # 只把 profile 作为别名来源；是否允许发送仍由 allowed_ids/friend list 决定。
+    for raw_uid in _QQ_USER_PROFILES:
+        try:
+            uid = int(raw_uid)
+        except Exception:
+            continue
+        if uid in allowed_ids:
+            names_by_id[uid].extend(_profile_aliases_for_user(uid))
+    candidates: list[ProactiveTarget] = []
+    for uid in sorted(allowed_ids):
+        aliases = [a for a in dict.fromkeys(names_by_id.get(uid, []) + _profile_aliases_for_user(uid)) if a]
+        label = aliases[0] if aliases else f"User{len(candidates) + 1}"
+        candidates.append(ProactiveTarget("private", uid, label))
+    return candidates
+
+
+async def _group_target_candidates(bot: Bot) -> list[ProactiveTarget]:
+    rows = await _safe_call_onebot_list(bot, "get_group_list")
+    allowed = set(ALLOWED_GROUPS)
+    candidates: list[ProactiveTarget] = []
+    seen: set[int] = set()
+    for row in rows:
+        try:
+            gid = int(row.get("group_id"))
+        except Exception:
+            continue
+        if allowed and gid not in allowed:
+            continue
+        seen.add(gid)
+        name = str(row.get("group_name") or row.get("group_remark") or "").strip()
+        candidates.append(ProactiveTarget("group", gid, _sanitize_name(name or f"Group{len(candidates) + 1}", max_len=40)))
+    # 若 get_group_list 不可用，也允许配置白名单群通过“当前群/群名缓存”之外的显式候选参与解析。
+    for gid in allowed:
+        if gid not in seen:
+            candidates.append(ProactiveTarget("group", int(gid), _anonymize_group_id(gid)))
+    return candidates
+
+
+def _candidate_alias_tokens(target: ProactiveTarget) -> set[str]:
+    tokens = {_normalize_target_ref(target.label)}
+    if target.target_type == "private":
+        for alias in _profile_aliases_for_user(target.target_id):
+            tokens.add(_normalize_target_ref(alias))
+    elif target.target_type == "group":
+        tokens.add(_normalize_target_ref(_anonymize_group_id(target.target_id)))
+    return {t for t in tokens if t}
+
+
+async def _resolve_proactive_target(bot: Bot, event: Event, target_type: str, ref: str) -> tuple[ProactiveTarget | None, str]:
+    ref_text = str(ref or "").strip()
+    if not ref_text:
+        return None, "缺少目标名称。"
+    ref_norm = _normalize_target_ref(ref_text)
+    # 管理员显式输入 id 时允许解析，但目标列表/模型上下文不会展示真实 QQ 号。
+    explicit = ref_text
+    for prefix in ("qq:", "user:", "u:", "群:", "group:", "g:"):
+        if explicit.lower().startswith(prefix):
+            explicit = explicit[len(prefix):]
+            break
+    if explicit.isdigit():
+        target_id = int(explicit)
+        if target_type == "group":
+            if ALLOWED_GROUPS and target_id not in ALLOWED_GROUPS:
+                return None, "该群不在允许的主动群聊目标中。请先加入 CLONOTH_ALLOWED_GROUPS。"
+            return ProactiveTarget("group", target_id, _anonymize_group_id(target_id)), ""
+        allowed_private_ids = {t.target_id for t in await _private_target_candidates(bot)}
+        if target_id not in allowed_private_ids:
+            return None, "该私聊目标不在好友/管理员/允许私聊白名单中。"
+        return ProactiveTarget("private", target_id, _qq_profile_display_name(target_id) or _anonymize_user_id(target_id)), ""
+
+    if target_type == "group" and ref_norm in {_normalize_target_ref("当前群"), _normalize_target_ref("本群")} and isinstance(event, GroupMessageEvent):
+        gid = int(event.group_id)
+        if ALLOWED_GROUPS and gid not in ALLOWED_GROUPS:
+            return None, "当前群不在允许的主动群聊目标中。"
+        return ProactiveTarget("group", gid, "当前群"), ""
+
+    candidates = await (_private_target_candidates(bot) if target_type == "private" else _group_target_candidates(bot))
+    matches = [target for target in candidates if ref_norm in _candidate_alias_tokens(target)]
+    if len(matches) == 1:
+        return matches[0], ""
+    if not matches:
+        kind = "私聊" if target_type == "private" else "群聊"
+        return None, f"没有找到{kind}目标：{ref_text}\n可发送“主动目标 {kind}”查看可用名称。"
+    labels = "、".join(_sanitize_name(m.label, max_len=24) for m in matches[:10])
+    return None, f"目标名称不唯一：{ref_text}\n匹配到：{labels}\n请在配置中设置唯一显示名，或使用管理员显式 id 前缀。"
+
+
+async def _proactive_target_list_text(bot: Bot, target_type: str = "") -> str:
+    sections: list[str] = []
+    if target_type in ("", "private"):
+        privates = await _private_target_candidates(bot)
+        names = [_sanitize_name(t.label, max_len=30) for t in privates if t.label]
+        sections.append("【可主动私聊目标】\n" + ("、".join(names[:80]) if names else "（无；需好友列表、管理员或允许私聊白名单）"))
+    if target_type in ("", "group"):
+        groups = await _group_target_candidates(bot)
+        names = [_sanitize_name(t.label, max_len=30) for t in groups if t.label]
+        sections.append("【可主动群聊目标】\n" + ("、".join(names[:80]) if names else "（无；需配置 CLONOTH_ALLOWED_GROUPS 或 get_group_list 可用）"))
+    return "\n\n".join(sections) + "\n\n提示：目标列表不展示真实 QQ 号；普通模型上下文也不会接触这些真实 id。"
+
+
+def _target_to_send_dict(target: ProactiveTarget) -> Dict[str, Any]:
+    if target.target_type == "private":
+        return {"type": "private", "user_id": target.target_id}
+    return {"type": "group", "group_id": target.target_id}
+
+
+def _attachment_path_under_workspace(raw_path: str) -> Path | None:
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("file://"):
+        raw = raw[7:]
+    path = Path(raw)
+    if not path.is_absolute():
+        path = Path(CLONOTH_WORKSPACE) / path
+    try:
+        resolved = path.resolve()
+        workspace = Path(CLONOTH_WORKSPACE).resolve()
+        if workspace not in resolved.parents and resolved != workspace:
+            return None
+    except Exception:
+        return None
+    return resolved
+
+
+def _parse_file_send_body(body: str) -> tuple[Dict[str, Any] | None, str]:
+    parts = str(body or "").strip().split(maxsplit=1)
+    if not parts:
+        return None, "缺少文件路径。"
+    path = _attachment_path_under_workspace(parts[0])
+    if path is None:
+        return None, "文件路径必须位于 Clonoth 工作区内。"
+    if not path.exists() or not path.is_file():
+        return None, f"文件不存在：{parts[0]}"
+    display_name = parts[1].strip() if len(parts) > 1 else path.name
+    rel_path = str(path)
+    try:
+        rel_path = str(path.relative_to(Path(CLONOTH_WORKSPACE).resolve()))
+    except Exception:
+        pass
+    return {"type": "file", "path": rel_path, "name": display_name}, ""
+
+
+def _forward_media_text(message: Any, bot_self_id: Any = None) -> str:
+    """为合并转发提取文本，去掉会重复出现的图片/表情占位符。"""
+    text = _message_to_text_generic(message, bot_self_id)
+    if _iter_qq_image_urls(message):
+        # 合并转发 node 会单独携带 image segment；这里去掉模型可读占位，避免
+        # 转发卡片里出现“[图片]”文字后面又跟真实图片。
+        text = re.sub(r"\[(?:图片|mface|marketface|表情包|动画表情)\]", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _forward_content_segments(text: str = "", attachments: list[dict[str, Any]] | None = None, image_urls: list[str] | None = None) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    if text:
+        segments.append({"type": "text", "data": {"text": str(text)}})
+    for url in image_urls or []:
+        if url:
+            segments.append({"type": "image", "data": {"file": str(url)}})
+    for att in attachments or []:
+        path = _resolve_attachment_path(att)
+        if path and path.exists() and path.suffix.lower() in _IMAGE_SUFFIXES:
+            segments.append({"type": "image", "data": {"file": f"file://{str(path.resolve())}"}})
+        elif att:
+            name = _attachment_filename(att) or "附件"
+            segments.append({"type": "text", "data": {"text": f"[附件: {name}]"}})
+    return segments
+
+
+def _make_forward_node(bot: Bot, text: str = "", attachments: list[dict[str, Any]] | None = None, *, nickname: str = "Clonoth 通知", user_id: Any = None, image_urls: list[str] | None = None) -> dict[str, Any] | None:
+    content = _forward_content_segments(text, attachments, image_urls)
+    if not content:
+        return None
+    return {
+        "type": "node",
+        "data": {
+            "user_id": str(user_id or getattr(bot, "self_id", "") or "10000"),
+            "nickname": _sanitize_name(nickname, max_len=32),
+            "content": content,
+        },
+    }
+
+
+async def _forward_messages_to_nodes(bot: Bot, messages: list[dict[str, Any]], conversation_key: str) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    for item in messages[:_FORWARD_MSG_MAX_MESSAGES]:
+        sender = item.get("sender") if isinstance(item.get("sender"), dict) else {}
+        sender_id = sender.get("user_id") or item.get("user_id") or getattr(bot, "self_id", "")
+        nickname = sender.get("card") or sender.get("nickname") or "转发消息"
+        content = item.get("content") if item.get("content") is not None else item.get("message")
+        text = _forward_media_text(content, getattr(bot, "self_id", None))
+        image_urls = _iter_qq_image_urls(content)
+        attachments: list[dict[str, Any]] = []
+        if image_urls:
+            attachments, _errors = await _image_sources_to_attachments(image_urls, conversation_key)
+        node = _make_forward_node(bot, text, attachments, nickname=nickname, user_id=sender_id)
+        if node:
+            nodes.append(node)
+    return nodes
+
+
+async def _forward_nodes_from_reply(bot: Bot, event: Event, conversation_key: str) -> list[dict[str, Any]]:
+    reply_message_id = _extract_reply_message_id(
+        event.get_message() if hasattr(event, "get_message") else None,
+        getattr(event, "raw_message", None),
+    )
+    reply_obj = getattr(event, "reply", None)
+    reply: Dict[str, Any] | None = None
+    if reply_obj is not None:
+        # NapCat/NoneBot 的私聊引用有时无法再通过 get_msg 取回，但事件本身
+        # 已携带 reply 对象；主动转发优先使用事件内 reply，避免“引用了但无内容”。
+        reply = {
+            "message": getattr(reply_obj, "message", None),
+            "raw_message": getattr(reply_obj, "raw_message", None),
+            "sender": getattr(reply_obj, "sender", None),
+            "user_id": getattr(reply_obj, "user_id", None),
+            "time": getattr(reply_obj, "time", None),
+        }
+    if (not reply or reply.get("message") is None) and reply_message_id is not None:
+        cached = _reply_message_cache.get(str(reply_message_id))
+        if cached:
+            reply = cached
+    if (not reply or reply.get("message") is None) and reply_message_id is not None:
+        reply = await _get_reply_message(bot, reply_message_id)
+    if not reply:
+        cached_nodes = _forward_nodes_from_cached_reply(bot, reply_message_id)
+        if cached_nodes:
+            return cached_nodes
+        logger.info("forward reply skipped: no reply object/id=%s", reply_message_id)
+        return []
+    message = reply.get("message") if reply.get("message") is not None else reply.get("raw_message")
+    forward_ids = _extract_forward_ids(message)
+    if forward_ids:
+        nodes: list[dict[str, Any]] = []
+        for forward_id in forward_ids[:3]:
+            messages = await _get_forward_messages(bot, forward_id)
+            if messages:
+                nodes.extend(await _forward_messages_to_nodes(bot, messages, conversation_key))
+        if nodes:
+            return nodes
+    sender = reply.get("sender") if isinstance(reply.get("sender"), dict) else {}
+    sender_id = sender.get("user_id") or reply.get("user_id") or getattr(bot, "self_id", "")
+    nickname = sender.get("card") or sender.get("nickname") or "引用消息"
+    text = _forward_media_text(message, getattr(bot, "self_id", None))
+    image_urls = _iter_qq_image_urls(message)
+    attachments: list[dict[str, Any]] = []
+    if image_urls:
+        attachments, _errors = await _image_sources_to_attachments(image_urls, conversation_key)
+        if attachments and reply_message_id is not None:
+            _remember_reply_attachments(reply_message_id, conversation_key, str(sender_id or ""), attachments)
+    if not attachments and reply_message_id is not None:
+        cached_nodes = _forward_nodes_from_cached_reply(bot, reply_message_id)
+        if cached_nodes:
+            return cached_nodes
+    node = _make_forward_node(bot, text, attachments, nickname=nickname, user_id=sender_id)
+    return [node] if node else []
+
+
+async def _send_forward_nodes(bot: Bot, target: ProactiveTarget, nodes: list[dict[str, Any]]) -> None:
+    if target.target_type == "group":
+        await bot.call_api("send_group_forward_msg", group_id=int(target.target_id), messages=nodes)
+    else:
+        await bot.call_api("send_private_forward_msg", user_id=int(target.target_id), messages=nodes)
+
+
+async def _maybe_handle_proactive_command(
+    *,
+    bot: Bot,
+    event: Event,
+    user_text: str,
+    conversation_key: str,
+    current_attachments: List[Dict[str, Any]],
+) -> str | None:
+    """处理管理员主动私聊/群聊发送和合并转发命令。"""
+    command = _parse_proactive_command(user_text)
+    if command is None:
+        return None
+    if not _is_admin_user(getattr(event, "user_id", "")):
+        # 不向非管理员暴露“主动发送/转发”能力、目标列表或命令名称。
+        return "该请求不可用。"
+    action = command.get("action") or ""
+    if action == "help":
+        return _proactive_help_text()
+    if action == "list":
+        return await _proactive_target_list_text(bot, command.get("target_type") or "")
+
+    target_type = command.get("target_type") or ""
+    target, error = await _resolve_proactive_target(bot, event, target_type, command.get("target_ref") or "")
+    if target is None:
+        return error or "目标解析失败。"
+    send_target = _target_to_send_dict(target)
+    label = _target_display_label(target.target_type, target.label)
+
+    if action == "send":
+        body = str(command.get("body") or "").strip()
+        if not body and not current_attachments:
+            return "发送内容为空。"
+        await _send_text_and_attachments(bot, send_target, body, current_attachments or [])
+        return f"已发送到{label}。"
+
+    if action == "file":
+        attachment, file_error = _parse_file_send_body(command.get("body") or "")
+        if attachment is None:
+            return file_error
+        await _send_attachments(bot, send_target, [attachment])
+        return f"已向{label}发送文件：{attachment.get('name') or attachment.get('path')}"
+
+    if action == "forward":
+        body = str(command.get("body") or "").strip()
+        nodes: list[dict[str, Any]] = []
+        if body:
+            chunks = [chunk.strip() for chunk in re.split(r"\n\s*---\s*\n", body) if chunk.strip()]
+            for chunk in chunks or [body]:
+                node = _make_forward_node(bot, chunk, current_attachments if not nodes else None)
+                if node:
+                    nodes.append(node)
+        if not nodes:
+            nodes = await _forward_nodes_from_reply(bot, event, conversation_key)
+        if not nodes and current_attachments:
+            node = _make_forward_node(bot, "", current_attachments)
+            if node:
+                nodes.append(node)
+        if not nodes:
+            return "没有可转发内容。请提供文本，或引用一条消息/合并转发卡片。"
+        try:
+            await _send_forward_nodes(bot, target, nodes)
+        except Exception as exc:
+            logger.warning("send forward message failed: %s", exc, exc_info=True)
+            return "合并转发发送失败：当前 OneBot/NapCat 可能不支持该接口，或目标不可达。"
+        return f"已向{label}发送合并转发（{len(nodes)} 条 node）。"
+
+    return None
+
+
+
 def _format_history_line(event: GroupMessageEvent, bot: Bot, override_text: str = "") -> str:
     """把群消息格式化为 tangqiu_main 提示词要求的历史行，并匿名化 QQ ID。"""
     text = _anonymize_text_for_ai(_compact_text(override_text or _message_to_text(event.get_message(), getattr(bot, "self_id", None))))
@@ -1722,6 +2291,80 @@ async def _save_route_state() -> None:
             tmp.replace(path)
         except Exception:
             logger.warning("failed to save OneBot route state: %s", path, exc_info=True)
+
+
+def _load_reply_attachment_cache() -> None:
+    """加载独立的引用消息附件索引缓存。"""
+    path = Path(REPLY_ATTACHMENT_CACHE_FILE)
+    source_path = path
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning("failed to load OneBot reply attachment cache: %s", path, exc_info=True)
+            return
+    else:
+        # 兼容拆分前短暂写入 onebot_plugin_state.json 的旧字段；加载后下一次保存会
+        # 写入独立 cache 文件，route state 后续保存也不会再包含 reply_attachments。
+        legacy_path = Path(ONEBOT_STATE_FILE)
+        if not legacy_path.exists():
+            return
+        try:
+            legacy_data = json.loads(legacy_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(legacy_data, dict) or not isinstance(legacy_data.get("reply_attachments"), dict):
+            return
+        data = {"reply_attachments": legacy_data.get("reply_attachments")}
+        source_path = legacy_path
+    if not isinstance(data, dict):
+        return
+    payload = data.get("reply_attachments") if isinstance(data.get("reply_attachments"), dict) else data
+    if not isinstance(payload, dict):
+        return
+    now = time.time()
+    cutoff = now - max(IMAGE_CACHE_TTL_SECONDS, 60)
+    loaded = 0
+    for mid, item in payload.items():
+        if not isinstance(item, dict):
+            continue
+        try:
+            created_at = float(item.get("created_at") or 0.0)
+        except Exception:
+            created_at = 0.0
+        attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
+        if not attachments or (created_at and created_at < cutoff):
+            continue
+        _reply_attachment_cache[str(mid)] = {
+            "conversation_key": str(item.get("conversation_key") or ""),
+            "sender_id": str(item.get("sender_id") or ""),
+            "created_at": created_at or now,
+            "attachments": [dict(att) for att in attachments if isinstance(att, dict)],
+        }
+        loaded += 1
+    _trim_reply_attachment_cache()
+    if loaded:
+        logger.info("loaded %d OneBot reply attachment cache entries from %s", loaded, source_path)
+
+
+async def _save_reply_attachment_cache() -> None:
+    """保存引用消息附件索引到独立缓存文件。"""
+    async with _route_state_lock:
+        _trim_reply_attachment_cache()
+        path = Path(REPLY_ATTACHMENT_CACHE_FILE)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "version": 1,
+                "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "ttl_seconds": IMAGE_CACHE_TTL_SECONDS,
+                "reply_attachments": dict(_reply_attachment_cache),
+            }
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+        except Exception:
+            logger.warning("failed to save OneBot reply attachment cache: %s", path, exc_info=True)
 
 
 async def _remember_route_state(
@@ -2362,11 +3005,11 @@ def _should_skip_duplicate_send(target: Dict[str, Any], message: Any, *, ttl: fl
     return False
 
 
-async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any) -> None:
+async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any, *, dedupe: bool = True) -> None:
     """按 QQ 会话类型选择 OneBot 发送接口。"""
     # 2026-05-01 修改原因：私聊回复必须调用 send_private_msg，群聊回复继续调用
     # send_group_msg。通过 target 分发，回调发送文本和附件时不再硬编码群聊接口。
-    if _should_skip_duplicate_send(target, message):
+    if dedupe and _should_skip_duplicate_send(target, message):
         return
     if target.get("type") == "private":
         user_id = target.get("user_id")
@@ -2448,12 +3091,21 @@ async def _send_attachment_path(bot: Bot, target: Dict[str, Any], path: Path, fi
     """图片附件发送为图片消息；非图片附件通过 NapCat 文件上传 API 发送。"""
     display_name = filename or path.name
     if path.exists() and path.suffix.lower() in _IMAGE_SUFFIXES:
+        file_path = str(path.resolve())
         try:
-            await _send_qq_message(bot, target, MessageSegment.image(file=path))
+            await _send_qq_message(bot, target, MessageSegment.image(file=file_path))
             return
-        except Exception:
-            # 部分 OneBot 实现不接受 Path 对象；失败后改用字符串路径重试以增强兼容性。
-            await _send_qq_message(bot, target, MessageSegment.image(file=str(path)))
+        except Exception as exc:
+            # 部分 OneBot 实现对本地路径格式较挑剔；失败后改用 file:// URI 重试。
+            # 注意首发失败时去重缓存已经记录过该图片，重试必须绕过去重，否则会被
+            # 当成重复消息直接跳过，导致「生成完成但图片没发出去」。
+            logger.warning("图片发送失败，改用 file:// 重试 (%s): %s", display_name, exc, exc_info=True)
+            await _send_qq_message(
+                bot,
+                target,
+                MessageSegment.image(file=f"file://{file_path}"),
+                dedupe=False,
+            )
             return
     # [2026-05-08] 非图片附件通过 NapCat upload_group_file / upload_private_file 发送
     if not path.exists():
@@ -2870,6 +3522,7 @@ async def _startup() -> None:
     if _QQ_USER_PROFILES:
         logger.info("loaded %d QQ user profiles", len(_QQ_USER_PROFILES))
     _load_route_state()
+    _load_reply_attachment_cache()
     _client = ClonothClient(CLONOTH_BASE_URL)
     _session_state = SessionState()
     for sid, target in list(_persisted_session_targets.items()):
@@ -2997,6 +3650,15 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     )
     if custom_face_reply is not None:
         await _agent_matcher.finish(custom_face_reply)
+    proactive_reply = await _maybe_handle_proactive_command(
+        bot=bot,
+        event=event,
+        user_text=user_text,
+        conversation_key=stable_conversation_key,
+        current_attachments=attachments,
+    )
+    if proactive_reply is not None:
+        await _agent_matcher.finish(proactive_reply)
     await _merge_recent_images_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
     draw_direct_prompt = _parse_direct_draw_command(user_text)
     entry_node_id = DRAW_NODE_ID if draw_direct_prompt is not None else ""
@@ -3099,6 +3761,15 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     )
     if custom_face_reply is not None:
         await _private_matcher.finish(custom_face_reply)
+    proactive_reply = await _maybe_handle_proactive_command(
+        bot=bot,
+        event=event,
+        user_text=user_text,
+        conversation_key=stable_conversation_key,
+        current_attachments=attachments,
+    )
+    if proactive_reply is not None:
+        await _private_matcher.finish(proactive_reply)
     await _merge_recent_images_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
     draw_direct_prompt = _parse_direct_draw_command(user_text)
     entry_node_id = DRAW_NODE_ID if draw_direct_prompt is not None else ""

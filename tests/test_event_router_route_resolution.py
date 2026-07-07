@@ -48,6 +48,7 @@ class _FakeCallbacks:
         self.approvals: list[dict[str, Any]] = []
         self.child_creations: list[dict[str, Any]] = []
         self.child_updates: list[str] = []
+        self.channel_sends: list[dict[str, Any]] = []
 
     async def show_approval_ui(
         self,
@@ -95,8 +96,13 @@ class _FakeCallbacks:
     async def send_intermediate_reply(self, *args: Any, **kwargs: Any) -> None:
         return None
 
-    async def send_to_channel(self, *args: Any, **kwargs: Any) -> None:
-        return None
+    async def send_to_channel(self, conversation_key: str, text: str, attachments: list[Any], **kwargs: Any) -> None:
+        self.channel_sends.append({
+            "conversation_key": conversation_key,
+            "text": text,
+            "attachments": attachments,
+            "kwargs": kwargs,
+        })
 
     async def delete_status_message(self, *args: Any, **kwargs: Any) -> None:
         return None
@@ -144,7 +150,7 @@ def _router(state: SessionState, callbacks: _FakeCallbacks | None = None) -> Eve
 
 def test_dispatch_child_session_uses_structured_parent_conversation_key() -> None:
     state = SessionState()
-    state.register_session("discord:1491668801836548166", "parent-session")
+    state.register_session("discord:test-parent-channel", "parent-session")
     state.register_session("agent:coder:agent:scout:discord:wrong", "child-session")
     router = _router(state)
 
@@ -157,12 +163,12 @@ def test_dispatch_child_session_uses_structured_parent_conversation_key() -> Non
             "_dispatch_origin": {
                 "parent_session_id": "parent-session",
                 "caller_node_id": "scout",
-                "parent_conversation_key": "discord:1491668801836548166",
+                "parent_conversation_key": "discord:test-parent-channel",
                 "context_mode": "accumulate",
             },
             "task_context": {
                 "conversation_key": "agent:coder:agent:scout:discord:wrong",
-                "route_conversation_key": "discord:1491668801836548166",
+                "route_conversation_key": "discord:test-parent-channel",
                 "dispatch_context_mode": "accumulate",
             },
         },
@@ -173,13 +179,13 @@ def test_dispatch_child_session_uses_structured_parent_conversation_key() -> Non
     # Purpose: approvals and progress from child sessions resolve to the parent channel.
     router._register_dispatch_child_session(_event("task_created", session_id="branch-session", payload=payload), payload)
 
-    assert state.get_conversation_key("child-session") == "discord:1491668801836548166"
-    assert state.get_conversation_key("branch-session") == "discord:1491668801836548166"
+    assert state.get_conversation_key("child-session") == "discord:test-parent-channel"
+    assert state.get_conversation_key("branch-session") == "discord:test-parent-channel"
 
 
 def test_unowned_approval_is_not_marked_handled() -> None:
     state = SessionState()
-    state.session_conv_map["qq-child-session"] = "qq:12345"
+    state.session_conv_map["qq-child-session"] = "qq:test-external-channel"
     callbacks = _FakeCallbacks()
     router = _router(state, callbacks)
     event = _event(
@@ -201,7 +207,7 @@ def test_unowned_approval_is_not_marked_handled() -> None:
 
 def test_unowned_child_progress_is_skipped_before_state_creation() -> None:
     state = SessionState()
-    state.session_conv_map["qq-child-session"] = "qq:12345"
+    state.session_conv_map["qq-child-session"] = "qq:test-external-channel"
     callbacks = _FakeCallbacks()
     router = _router(state, callbacks)
     event = _event(
@@ -223,7 +229,7 @@ def test_unowned_child_progress_is_skipped_before_state_creation() -> None:
 
 def test_owned_child_progress_uses_parent_conversation_key() -> None:
     state = SessionState()
-    state.session_conv_map["child-session"] = "discord:1491668801836548166"
+    state.session_conv_map["child-session"] = "discord:test-parent-channel"
     callbacks = _FakeCallbacks()
     router = _router(state, callbacks)
     event = _event(
@@ -239,5 +245,33 @@ def test_owned_child_progress_uses_parent_conversation_key() -> None:
 
     asyncio.run(router._handle_handoff_progress(event))
 
-    assert callbacks.child_creations[0]["conversation_key"] == "discord:1491668801836548166"
+    assert callbacks.child_creations[0]["conversation_key"] == "discord:test-parent-channel"
     assert callbacks.child_creations[0]["session_id"] == "child-session"
+
+
+def test_outbound_fallback_prefers_payload_conversation_key() -> None:
+    """Core-emitted dispatch attachment events can route after adapter state loss."""
+    state = SessionState()
+    callbacks = _FakeCallbacks()
+    router = _router(state, callbacks)
+    attachment = {"type": "image", "path": "data/attachments/novelai/example.png"}
+    event = _event(
+        "outbound_message",
+        session_id="parent-session-without-local-map",
+        payload={
+            "conversation_key": "discord:test-parent-channel",
+            "text": "",
+            "attachments": [attachment],
+            "message_type": "dispatch_attachment",
+            "node_id": "draw.novelai_planner",
+        },
+    )
+
+    asyncio.run(router._handle_outbound_message(event))
+
+    assert callbacks.channel_sends == [{
+        "conversation_key": "discord:test-parent-channel",
+        "text": "",
+        "attachments": [attachment],
+        "kwargs": {"node_id": "draw.novelai_planner"},
+    }]

@@ -49,6 +49,21 @@ def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
     return result
 
 
+def _dispatch_result_input_attachments(ls: _LoopState) -> list[dict]:
+    """Return current inbound attachments from an async dispatch_result task."""
+    task_context = getattr(ls.rctx, "task_context", {}) or {}
+    if not isinstance(task_context, dict):
+        return []
+    if str(task_context.get("inbound_message_type") or "").strip() != "dispatch_result":
+        return []
+    if bool(task_context.get("inbound_attachments_outbound_sent")):
+        return []
+    attachments = task_context.get("inbound_attachments")
+    if not isinstance(attachments, list):
+        return []
+    return [att for att in attachments if isinstance(att, dict)]
+
+
 def _emit_pseudo_tool_result(
     ls: _LoopState,
     pseudo_call,
@@ -164,6 +179,15 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
                 )
             elif ls.tool_produced_attachments:
                 final_atts = list(ls.tool_produced_attachments)
+            else:
+                # [2026-07-07] Async dispatch_result attachments are child output
+                # (e.g. NovelAI generated images), not normal user-uploaded input.
+                # The caller LLM often replies with a textual summary like "image
+                # generated" without explicitly passing attachment_paths, which used
+                # to drop the file before it reached QQ/Discord. Auto-forward only
+                # for dispatch_result payloads so ordinary image-analysis turns do
+                # not echo the user's pictures back.
+                final_atts = _dispatch_result_input_attachments(ls)
         result_payload = {
             "summary": summary_text,
             "text": result_text,

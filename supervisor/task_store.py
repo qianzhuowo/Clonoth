@@ -298,10 +298,6 @@ class TaskStoreMixin:
             session_override=session_override,
         )
         if session_info and not session_info.entry_node_id:
-            # Why: newly-created sessions may not yet know their frontend-selected
-            # entry node. How: once an inbound is actually routed, copy the node
-            # into memory and sessions.json. Purpose: later restarts can reproduce
-            # the same route even if the callback payload has no entry_node_id.
             session_info.entry_node_id = entry_node
             self._session_store.update_entry_node(session_id, entry_node)
         # Record the actual entry node used for this session (for getActiveNode API)
@@ -310,10 +306,8 @@ class TaskStoreMixin:
         if not self.session_generations.get(session_id):
             self.session_generations[session_id] = generation
         self._cancelled_sessions.discard(session_id)
-        # [2026-05-28] fork 处理：dispatch 的 fork 模式下，将调用方历史复制到目标 session。
-        # 为什么：fork context_mode 语义是"从父会话的上下文开始"，目标 session 初始时
-        #   应含有父历史。怎么改：在创建 entry branch 之前检查 dispatch_fork_from_session，
-        #   如果目标 session 当前为空则从源 session fork 一份。
+        # dispatch 的 fork 模式下，将调用方历史复制到目标 session。
+
         # 目的：fork 模式下目标节点启动时能看到调用方的对话上下文。
         _fork_from = str(payload.get("dispatch_fork_from_session") or "").strip()
         if _fork_from:
@@ -325,9 +319,6 @@ class TaskStoreMixin:
                 except Exception as _fork_err:
                     logger.warning("dispatch fork from %s to %s failed: %s", _fork_from[:12], session_id[:12], _fork_err)
         # [Fork/Merge 2026-05-12] 每条 inbound 都创建独立入口分支。
-        # 原因：同一主 session 的新消息不再抢占旧入口 task，而是并发运行在各自
-        # branch session 上。做法：在 supervisor 持锁期间 fork ConversationStore，
-        # 并把 fork 基准写入 task.input。目的：task 结束时能按 base_count merge 回主 session。
         branch_session_id, fork_meta = self._create_entry_branch_locked(session_id, inbound_seq)
         branch_base_count = int(fork_meta.get("base_count") or 0)
         self._cancelled_sessions.discard(branch_session_id)
@@ -353,45 +344,34 @@ class TaskStoreMixin:
             _dispatch_origin = {}
         _dispatch_context_mode = str(payload.get("dispatch_context_mode") or "").strip()
         _dispatch_parent_conv_key = str(_dispatch_origin.get("parent_conversation_key") or "").strip()
-        # [AutoC 2026-06-03] Why: inbound payload metadata is otherwise lost before
-        # runner writes the user row into ConversationStore. How: copy only selected
-        # structured fields under inbound_* names so they cannot be confused with the
-        # task's own child_session_id routing fields. Purpose: dispatch_result history
-        # rows can keep message_type and child-session navigation metadata.
+
         inbound_metadata: dict[str, Any] = {}
         _inbound_message_type = str(payload.get("message_type") or "").strip()
         if _inbound_message_type:
             inbound_metadata["inbound_message_type"] = _inbound_message_type
         _inbound_summary = str(payload.get("summary") or "").strip()
         if _inbound_summary:
-            # [AutoC 2026-06-04] Why: dispatch result summaries now live beside raw
-            # text instead of inside backend presentation prose. How: copy summary into
-            # runner input under an inbound_* key. Purpose: runner can build the LLM-only
-            # English prefix without changing the ConversationStore content field.
+
             inbound_metadata["inbound_summary"] = _inbound_summary
         _inbound_child_session_id = str(payload.get("child_session_id") or "").strip()
         if _inbound_child_session_id:
             inbound_metadata["inbound_child_session_id"] = _inbound_child_session_id
         _inbound_child_task_id = str(payload.get("child_task_id") or payload.get("task_id") or "").strip()
         if _inbound_child_task_id:
-            # [AutoC 2026-06-04] Why: callback task ids now describe the completed
-            # child task, not the newly-created inbound handling task. How: prefer the
-            # explicit child_task_id while accepting legacy task_id during replay.
-            # Purpose: runner and frontend metadata use the unambiguous child_* name.
+
             inbound_metadata["inbound_child_task_id"] = _inbound_child_task_id
         _inbound_child_node_id = str(payload.get("child_node_id") or payload.get("node_id") or "").strip()
         if _inbound_child_node_id:
-            # [AutoC 2026-06-04] Why: callback node ids point at the finished child
-            # node. How: map child_node_id, with legacy node_id fallback, to runner
-            # input. Purpose: the LLM prefix and persisted meta use the same child id.
+
             inbound_metadata["inbound_child_node_id"] = _inbound_child_node_id
         _inbound_caller_node_id = str(payload.get("caller_node_id") or "").strip()
         if _inbound_caller_node_id:
             inbound_metadata["inbound_caller_node_id"] = _inbound_caller_node_id
-        # [2026-05-29 方案C第一步] 为什么：dispatch 子任务的父频道不能再靠
-        # agent: 字符串反解析。怎么改：在入口 task input 生成前准备结构化
-        # dispatch 元数据，并把 parent_conversation_key 同步到 task_context。
-        # 目的：task_created 快照一产生就包含 SDK 路由所需字段。
+        if bool(payload.get("attachments_outbound_sent")):
+
+            inbound_metadata["inbound_attachments_outbound_sent"] = True
+
+        # task_created 快照一产生就包含 SDK 路由所需字段。
         if _dispatch_origin:
             if _dispatch_context_mode:
                 _dispatch_origin.setdefault("context_mode", _dispatch_context_mode)
@@ -413,10 +393,6 @@ class TaskStoreMixin:
                 "schedule_id": str(payload.get("schedule_id") or ""),
                 "active_tasks_summary": active_tasks_summary,
                 "attachments": attachments or [],
-                # [Fork/Merge 2026-05-12] 入口分支元数据随 task 持久化。
-                # 原因：完成路由只拿到 Task 快照，不能依赖易失内存索引判断 merge 目标。
-                # 做法：记录 parent、branch 与 fork base_count/base_last_id。目的：finish、fail、
-                # cancel 终态都能独立完成 merge，并保持没有这些字段的旧 task 正常工作。
                 "parent_session_id": session_id,
                 "branch_session_id": branch_session_id,
                 "base_count": branch_base_count,

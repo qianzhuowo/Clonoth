@@ -605,7 +605,7 @@ class EventRouter:
             logger.debug("Skip system node outbound: %s", node_id)
             return
 
-        conv_key = self._state.get_conversation_key(event.session_id) or ""
+        conv_key = str(p.get("conversation_key") or "").strip() or self._state.get_conversation_key(event.session_id) or ""
         text = strip_protocol_markers((p.get("text") or "").strip())
         attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
         if not text and not attachments:

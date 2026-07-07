@@ -9,7 +9,9 @@ planner node -> YAML(scene/chars/costume/uc/center/size_label) -> this tool -> N
 SPEC = {
     "name": "nai_generate_from_plan",
     "description": "读取绘图分析节点输出的 YAML 计划，格式化为 NovelAI V4/V4.5 prompt 与角色级 caption，并逐张调用 NovelAI 生图。",
-    "async_mode": True,
+
+    # 等待真实工具结果。成功才返回附件；失败就把 HTTP/key/超时原因直接交给模型和用户，不再出现双分支假成功。
+    "async_mode": False,
     "input_schema": {
         "type": "object",
         "properties": {

@@ -118,6 +118,11 @@ IMAGE_WAIT_AFTER_TEXT_SECONDS = _env_float("ONEBOT_IMAGE_WAIT_AFTER_TEXT_SECONDS
 IMAGE_PREFER_SAME_SENDER = _env_bool("ONEBOT_IMAGE_PREFER_SAME_SENDER", True)
 MAX_IMAGES_PER_TURN = _env_int("ONEBOT_MAX_IMAGES_PER_TURN", 4, min_value=1, max_value=16)
 
+# QQ 文件/附件输入配置。用于管理员自然语言转发“这文件/上面的文件”等请求。
+ENABLE_FILE_INPUT = _env_bool("ONEBOT_ENABLE_FILE_INPUT", True)
+FILE_MAX_BYTES = _env_int("ONEBOT_FILE_MAX_BYTES", 50 * 1024 * 1024, min_value=1024)
+MAX_FILES_PER_TURN = _env_int("ONEBOT_MAX_FILES_PER_TURN", 3, min_value=1, max_value=16)
+
 # OneBot 扩展功能开关。
 ENABLE_REACTIONS = _env_bool("ONEBOT_ENABLE_REACTIONS", True)
 REPLY_TO_TRIGGER = _env_bool("ONEBOT_REPLY_TO_TRIGGER", True)
@@ -135,6 +140,18 @@ QQ_QUEUE_WAIT_FOR_REPLY = _env_bool("ONEBOT_QQ_QUEUE_WAIT_FOR_REPLY", False)
 ENABLE_PREEMPT = _env_bool("ONEBOT_ENABLE_PREEMPT", False)
 ENABLE_AUTO_LIKE = _env_bool("ONEBOT_ENABLE_AUTO_LIKE", False)
 AUTO_LIKE_TIMES = max(1, min(20, int(os.environ.get("ONEBOT_AUTO_LIKE_TIMES", "10"))))
+
+# QQ 自然语言转发 Bridge Server 配置。
+# AI 通过 qq_forward 工具（子进程）经本地 HTTP Bridge 调用 QQ Bot 进程完成
+# “把上面聊到的 xxx 私发给我 / 合并转发到群 xxx”等多选多条消息转发任务。
+# 真实 QQ 群号/QQ 号只留在 Bot 进程内，模型上下文只接触匿名下标/关键词。
+ENABLE_FORWARD_BRIDGE = _env_bool("ONEBOT_ENABLE_FORWARD_BRIDGE", True)
+FORWARD_BRIDGE_HOST = _env_first("ONEBOT_FORWARD_BRIDGE_HOST", default="127.0.0.1")
+FORWARD_BRIDGE_PORT = _env_int("ONEBOT_FORWARD_BRIDGE_PORT", 8769, min_value=1, max_value=65535)
+# Bridge 共享令牌，防止本机其他进程随意调用转发能力。工具通过环境变量拿到同一令牌。
+FORWARD_BRIDGE_TOKEN = os.environ.get("ONEBOT_FORWARD_BRIDGE_TOKEN", "").strip()
+# 单次转发允许挑选的最大消息条数，避免刷屏或超出 OneBot 限制。
+FORWARD_BRIDGE_MAX_MESSAGES = _env_int("ONEBOT_FORWARD_BRIDGE_MAX_MESSAGES", 30, min_value=1, max_value=200)
 
 # 提交给 Supervisor 的 QQ conversation_key 使用稳定哈希，真实群号/QQ 号只保留在插件本地路由里。
 CONVERSATION_HASH_SECRET = os.environ.get("ONEBOT_CONVERSATION_HASH_SECRET", "").strip()

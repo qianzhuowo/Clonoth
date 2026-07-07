@@ -25,8 +25,8 @@ from typing import Any, DefaultDict, Deque, Dict, List, Optional
 
 import httpx
 import yaml
-from nonebot import get_bot, get_driver, on_message
-from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, Message, MessageSegment, PrivateMessageEvent
+from nonebot import get_bot, get_driver, on_message, on_notice
+from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, GroupUploadNoticeEvent, Message, MessageSegment, PrivateMessageEvent
 from nonebot.rule import Rule, to_me
 
 from .config import (
@@ -43,7 +43,13 @@ from .config import (
     CUSTOM_FACE_NAMES_PATH,
     CUSTOM_FACE_PROMPT_LIMIT,
     ENABLE_AUTO_LIKE,
+    ENABLE_FILE_INPUT,
+    ENABLE_FORWARD_BRIDGE,
     ENABLE_FORWARD_MSG_INPUT,
+    FORWARD_BRIDGE_HOST,
+    FORWARD_BRIDGE_MAX_MESSAGES,
+    FORWARD_BRIDGE_PORT,
+    FORWARD_BRIDGE_TOKEN,
     ENABLE_IMAGE_INPUT,
     ENABLE_PREEMPT,
     ENABLE_QQ_QUEUE,
@@ -60,6 +66,8 @@ from .config import (
     IMAGE_MAX_BYTES,
     IMAGE_PREFER_SAME_SENDER,
     IMAGE_WAIT_AFTER_TEXT_SECONDS,
+    FILE_MAX_BYTES,
+    MAX_FILES_PER_TURN,
     MAX_IMAGES_PER_TURN,
     QQ_MESSAGE_LIMIT,
     QQ_QUEUE_INTERVAL,
@@ -186,7 +194,25 @@ class ProactiveTarget:
     label: str
 
 
+@dataclass
+class GroupContentRecord:
+    """保留最近群消息的结构化副本，供管理员自然语言转发筛选。"""
+
+    formatted_line: str
+    text: str
+    sender_name: str
+    sender_id: str
+    timestamp: float
+    message_id: str = ""
+    attachments: List[Dict[str, Any]] | None = None
+
+
 _recent_images: DefaultDict[str, Deque[RecentImageEntry]] = defaultdict(lambda: deque(maxlen=RECENT_IMAGE_MAX_ITEMS))
+_group_content_records: DefaultDict[int, Deque[GroupContentRecord]] = defaultdict(lambda: deque(maxlen=max(_HISTORY_MAX_LEN, 20)))
+# [2026-07-07] 按会话记录 Bot 最近发出/生成的附件（如生图插件产出的图片），
+# 供 qq_forward “把刚才生成的那张图发给 xx”等自然语言请求检索。
+# 只保存工作区内本地路径与显示名，不涉及真实 QQ 号。
+_recent_sent_attachments: DefaultDict[str, Deque[Dict[str, Any]]] = defaultdict(lambda: deque(maxlen=max(RECENT_IMAGE_MAX_ITEMS, 20)))
 _last_attachment_cleanup_at = 0.0
 
 
@@ -473,6 +499,9 @@ def _message_to_text(message: Message, bot_self_id: Any = None) -> str:
             parts.append("[语音]")
         elif seg_type == "video":
             parts.append("[视频]")
+        elif seg_type == "file":
+            name = str(data.get("name") or data.get("file_name") or data.get("file") or "").strip()
+            parts.append(f"[文件:{_sanitize_name(Path(name).name if name else '附件', max_len=80)}]")
         elif seg_type == "forward":
             parts.append("[合并转发]")
         elif seg_type == "reply":
@@ -511,6 +540,9 @@ def _message_to_text_generic(message: Any, bot_self_id: Any = None) -> str:
                 parts.append("[语音]")
             elif seg_type == "video":
                 parts.append("[视频]")
+            elif seg_type == "file":
+                name = str(data.get("name") or data.get("file_name") or data.get("file") or "").strip()
+                parts.append(f"[文件:{_sanitize_name(Path(name).name if name else '附件', max_len=80)}]")
             elif seg_type == "forward":
                 parts.append("[合并转发]")
             elif seg_type == "reply":
@@ -707,6 +739,9 @@ def _format_cq_message(text: str) -> str:
             return f"[QQ表情:{params.get('id', '')}]"
         if cq_type == "record":
             return "[语音]"
+        if cq_type == "file":
+            name = params.get("name") or params.get("file") or params.get("file_name") or "附件"
+            return f"[文件:{_sanitize_name(Path(str(name)).name, max_len=80)}]"
         if cq_type == "forward":
             return "[合并转发]"
         return match.group(0)
@@ -891,6 +926,43 @@ def _remember_recent_images(conversation_key: str, event: Event, attachments: Li
         _remember_reply_attachments(message_id, conversation_key, sender_id, image_atts, created_at=now)
 
 
+def _recent_attachments_for_natural_forward(
+    conversation_key: str,
+    event: Event,
+    *,
+    include_images: bool = True,
+    include_files: bool = True,
+) -> List[Dict[str, Any]]:
+    """为“这张图/上面的文件”选择最近可转发附件。"""
+    now = time.time()
+    sender_id = str(getattr(event, "user_id", "") or "")
+    entries = [
+        item for item in _recent_images.get(conversation_key, ())
+        if now - item.created_at <= RECENT_IMAGE_MAX_AGE_SECONDS
+    ]
+    if IMAGE_PREFER_SAME_SENDER:
+        same_sender = [item for item in entries if item.sender_id == sender_id]
+        if same_sender:
+            entries = same_sender
+    attachments: list[dict[str, Any]] = []
+    if include_images:
+        attachments.extend(dict(item.attachment) for item in entries[-MAX_IMAGES_PER_TURN:])
+
+    if include_files and isinstance(event, GroupMessageEvent):
+        file_limit = max(1, MAX_FILES_PER_TURN)
+        for record in reversed(_group_content_records.get(int(event.group_id), ())):
+            if now - record.timestamp > max(RECENT_IMAGE_MAX_AGE_SECONDS, 600):
+                continue
+            for att in reversed(record.attachments or []):
+                if str(att.get("type") or "") == "file" and att.get("path"):
+                    attachments.append(dict(att))
+                    if sum(1 for a in attachments if str(a.get("type") or "") == "file") >= file_limit:
+                        break
+            if sum(1 for a in attachments if str(a.get("type") or "") == "file") >= file_limit:
+                break
+    return attachments
+
+
 def _remember_reply_attachments(
     message_id: Any,
     conversation_key: str,
@@ -1036,6 +1108,153 @@ def _iter_qq_image_urls(message: Any) -> List[str]:
     return urls
 
 
+def _safe_attachment_name(name: str, default: str = "attachment") -> str:
+    """清理 QQ 文件名，避免路径穿越和控制字符进入附件目录。"""
+    raw = Path(str(name or "").replace("\\", "/")).name.strip().strip(". ")
+    raw = re.sub(r"[\x00-\x1f\x7f]", "", raw)
+    raw = re.sub(r"[<>:\"/\\|?*]+", "_", raw)
+    if not raw:
+        raw = default
+    return raw[:120]
+
+
+def _iter_qq_file_sources(message: Any) -> List[Dict[str, Any]]:
+    """从 OneBot file 段中提取可下载/可复制的普通文件来源。"""
+    sources: List[Dict[str, Any]] = []
+    if message is None:
+        return sources
+
+    def add_from_data(data: Dict[str, Any]) -> None:
+        src = str(data.get("url") or data.get("path") or data.get("file") or "").strip()
+        name = str(data.get("name") or data.get("file_name") or data.get("filename") or "").strip()
+        if not name and src:
+            name = Path(src.split("?", 1)[0].split("#", 1)[0]).name
+        if not src and not name:
+            return
+        size_raw = data.get("size") or data.get("file_size") or data.get("filesize")
+        try:
+            size = int(size_raw) if size_raw is not None and str(size_raw).strip() else 0
+        except Exception:
+            size = 0
+        sources.append({"source": src, "name": _safe_attachment_name(name, "file"), "size": size})
+
+    if isinstance(message, str):
+        for match in _CQ_RE.finditer(message):
+            if match.group(1) != "file":
+                continue
+            add_from_data(_parse_cq_params(match.group(2) or ""))
+        return sources
+
+    try:
+        segments = list(message)
+    except Exception:
+        return sources
+    for segment in segments:
+        if isinstance(segment, dict):
+            seg_type = str(segment.get("type") or "")
+            data = segment.get("data") if isinstance(segment.get("data"), dict) else {}
+        else:
+            seg_type = getattr(segment, "type", "")
+            data = getattr(segment, "data", {}) or {}
+        if seg_type == "file":
+            add_from_data(data)
+    return sources
+
+
+def _file_attachment_error_text(error: str) -> str:
+    if error == "too_large":
+        return f"文件太大，已超过当前限制 {FILE_MAX_BYTES // 1024 // 1024}MB。"
+    if error == "no_source":
+        return "我收到了文件消息，但当前 OneBot 事件没有提供可下载链接。"
+    if error == "download_failed":
+        return "我收到了文件，但下载失败了，可能是 QQ 临时链接已过期。"
+    return "我收到了文件，但处理文件时失败了。"
+
+
+async def _read_file_source_bytes(client: httpx.AsyncClient, source: str) -> tuple[bytes, str]:
+    """读取 QQ 文件来源；支持 URL、file:// 和本地路径，并限制最大字节数。"""
+    if source.startswith("file://"):
+        local = Path(source[7:])
+        if local.stat().st_size > FILE_MAX_BYTES:
+            raise ValueError("too_large")
+        return local.read_bytes(), "application/octet-stream"
+    if re.match(r"^[a-zA-Z]:[\\/]", source) or source.startswith("/"):
+        local = Path(source)
+        if local.stat().st_size > FILE_MAX_BYTES:
+            raise ValueError("too_large")
+        return local.read_bytes(), "application/octet-stream"
+
+    content = bytearray()
+    content_type = "application/octet-stream"
+    async with client.stream("GET", source) as response:
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", content_type)
+        async for chunk in response.aiter_bytes():
+            if not chunk:
+                continue
+            content.extend(chunk)
+            if len(content) > FILE_MAX_BYTES:
+                raise ValueError("too_large")
+    return bytes(content), content_type
+
+
+async def _file_sources_to_attachments(file_sources: List[Dict[str, Any]], conversation_key: str) -> tuple[list[dict], list[str]]:
+    """下载/复制 OneBot 普通文件，返回 Clonoth 附件描述。"""
+    result: list[dict] = []
+    errors: list[str] = []
+    if not ENABLE_FILE_INPUT or not file_sources:
+        return result, errors
+
+    _cleanup_old_qq_attachments()
+    workspace = Path(CLONOTH_WORKSPACE)
+    att_dir = workspace / "data" / "attachments" / conversation_key.replace(":", "_")
+    try:
+        att_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning("collect QQ file attachment cannot create directory %s: %s", att_dir, exc)
+        return result, [_file_attachment_error_text("download_failed")]
+
+    async with httpx.AsyncClient(timeout=IMAGE_DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
+        for item in file_sources[:MAX_FILES_PER_TURN]:
+            source = str(item.get("source") or "").strip()
+            name = _safe_attachment_name(str(item.get("name") or "file"), "file")
+            try:
+                size = int(item.get("size") or 0)
+            except Exception:
+                size = 0
+            if size and size > FILE_MAX_BYTES:
+                errors.append(_file_attachment_error_text("too_large"))
+                continue
+            if not source:
+                errors.append(_file_attachment_error_text("no_source"))
+                continue
+            try:
+                content, content_type = await _read_file_source_bytes(client, source)
+                if not content:
+                    errors.append(_file_attachment_error_text("download_failed"))
+                    continue
+                if len(content) > FILE_MAX_BYTES:
+                    errors.append(_file_attachment_error_text("too_large"))
+                    continue
+                target_name = f"{os.urandom(8).hex()}_{name}"
+                file_path = att_dir / target_name
+                file_path.write_bytes(content)
+                rel_path = file_path.relative_to(workspace).as_posix()
+                result.append({
+                    "type": "file",
+                    "path": rel_path,
+                    "mime_type": content_type or "application/octet-stream",
+                    "name": name,
+                    "source": "onebot",
+                })
+            except ValueError as exc:
+                errors.append(_file_attachment_error_text(str(exc) or "download_failed"))
+            except Exception as exc:
+                logger.warning("collect QQ file attachment failed: source=%s error=%s", source, exc)
+                errors.append(_file_attachment_error_text("download_failed"))
+    return result, errors
+
+
 async def _image_sources_to_attachments(image_urls: List[str], conversation_key: str) -> tuple[list[dict], list[str]]:
     """下载 OneBot 图片 URL/path 列表，并返回 Clonoth 附件描述与用户可读错误。"""
     result: list[dict] = []
@@ -1102,13 +1321,21 @@ async def _image_sources_to_attachments(image_urls: List[str], conversation_key:
 
 
 async def _collect_qq_attachments(event, conversation_key: str) -> tuple[list[dict], list[str]]:
-    """下载 QQ 当前消息中的图片，并返回 Clonoth 附件列表。引用消息由增强 reply 逻辑单独处理。"""
+    """下载 QQ 当前消息中的图片/普通文件，并返回 Clonoth 附件列表。引用消息由增强 reply 逻辑单独处理。"""
+    message = event.get_message() if hasattr(event, "get_message") else None
     try:
-        image_urls = _iter_qq_image_urls(event.get_message())
+        image_urls = _iter_qq_image_urls(message)
     except Exception as exc:
-        logger.warning("collect QQ attachments skipped current message: %s", exc)
+        logger.warning("collect QQ image attachments skipped current message: %s", exc)
         image_urls = []
-    return await _image_sources_to_attachments(image_urls, conversation_key)
+    try:
+        file_sources = _iter_qq_file_sources(message)
+    except Exception as exc:
+        logger.warning("collect QQ file attachments skipped current message: %s", exc)
+        file_sources = []
+    image_attachments, image_errors = await _image_sources_to_attachments(image_urls, conversation_key)
+    file_attachments, file_errors = await _file_sources_to_attachments(file_sources, conversation_key)
+    return image_attachments + file_attachments, image_errors + file_errors
 
 
 def _attachment_abs_path(attachment: Dict[str, Any]) -> Path | None:
@@ -2008,6 +2235,258 @@ async def _send_forward_nodes(bot: Bot, target: ProactiveTarget, nodes: list[dic
         await bot.call_api("send_private_forward_msg", user_id=int(target.target_id), messages=nodes)
 
 
+_NATURAL_PROACTIVE_VERBS = ("转发", "发送", "发给", "发到", "私发", "私信", "私聊", "群发", "合并发送", "合并转发")
+_NATURAL_HISTORY_WORDS = ("上面", "上文", "前面", "刚才", "之前", "聊到", "会议", "内容", "消息", "聊天记录")
+_NATURAL_IMAGE_WORDS = ("图片", "照片", "截图", "这图", "这张图", "这图片")
+_NATURAL_FILE_WORDS = ("文件", "附件", "文档", "压缩包")
+
+
+def _contains_any(text: str, words: tuple[str, ...]) -> bool:
+    return any(word in text for word in words)
+
+
+def _extract_natural_query(text: str) -> str:
+    """从自然语言转发请求中抽取“关于 xxx”的筛选关键词。"""
+    value = str(text or "").strip()
+    for pattern in (
+        r"(?:关于|有关|涉及|提到|聊到)\s*(.+?)\s*的(?:消息|内容|聊天记录|会议内容|文件|图片)",
+        r"(?:关于|有关|涉及|提到|聊到)\s*([^，。,.；;]+)",
+    ):
+        match = re.search(pattern, value)
+        if match:
+            query = match.group(1).strip()
+            query = re.sub(r"(?:私发|私信|私聊|发送|转发|发给|发到|给|到).*$", "", query).strip()
+            return query[:80]
+    if "会议" in value:
+        return "会议"
+    return ""
+
+
+async def _natural_target_from_text(bot: Bot, event: Event, text: str) -> tuple[str, str]:
+    """解析自然语言中的主动发送目标，返回 target_type/target_ref。"""
+    value = str(text or "").strip()
+    if not value:
+        return "", ""
+    normalized = _normalize_target_ref(value)
+
+    if re.search(r"(?:私发|私信|私聊|发送|发|转发)(?:给|到)?\s*(?:我|自己)(?:$|[，。,.；;\s])|给(?:我|自己)(?:$|[，。,.；;\s])", value):
+        return "private", f"qq:{getattr(event, 'user_id', '')}"
+    if isinstance(event, GroupMessageEvent) and any(word in value for word in ("当前群", "本群", "这个群", "此群")):
+        return "group", "当前群"
+
+    explicit_match = re.search(r"((?:qq|user|u|群|group|g)[:：]\s*\d{5,12})", value, re.IGNORECASE)
+    if explicit_match:
+        token = explicit_match.group(1).replace("：", ":").replace(" ", "")
+        target_type = "group" if token.lower().startswith(("群:", "group:", "g:")) else "private"
+        return target_type, token
+
+    group_candidates = await _group_target_candidates(bot)
+    private_candidates = await _private_target_candidates(bot)
+
+    group_mark_match = re.search(r"(?:群聊|群|发送到群|发到群|转发到群|合并发送到群)\s*([\w\-\u4e00-\u9fff]+)", value)
+    if group_mark_match:
+        ref = group_mark_match.group(1).strip()
+        if ref:
+            return "group", ref
+
+    private_mark_match = re.search(r"(?:私发给|私信给|私聊给|发给|发送给|转发给|给)\s*([\w\-\u4e00-\u9fff]+)", value)
+    if private_mark_match:
+        ref = private_mark_match.group(1).strip()
+        if ref and ref not in {"我", "自己"}:
+            return "private", ref
+
+    for target in sorted(group_candidates, key=lambda item: len(item.label or ""), reverse=True):
+        for alias in _candidate_alias_tokens(target):
+            if alias and alias in normalized and ("群" in value or "发到" in value or "发送到" in value):
+                return "group", target.label
+    for target in sorted(private_candidates, key=lambda item: len(item.label or ""), reverse=True):
+        for alias in _candidate_alias_tokens(target):
+            if alias and alias in normalized:
+                return "private", target.label
+    return "", ""
+
+
+async def _parse_natural_proactive_command(bot: Bot, event: Event, text: str) -> dict[str, Any] | None:
+    """把管理员自然语言转发请求规整为 proactive command。
+
+    这里故意采用本地规则解析，避免把真实 QQ 目标和副作用能力暴露给普通模型。
+    """
+    raw = str(text or "").strip()
+    if not raw or not _contains_any(raw, _NATURAL_PROACTIVE_VERBS):
+        return None
+    target_type, target_ref = await _natural_target_from_text(bot, event, raw)
+    if not target_type or not target_ref:
+        return None
+
+    wants_history = _contains_any(raw, _NATURAL_HISTORY_WORDS)
+    wants_image = _contains_any(raw, _NATURAL_IMAGE_WORDS)
+    wants_file = _contains_any(raw, _NATURAL_FILE_WORDS)
+    query = _extract_natural_query(raw)
+    selector = "history" if wants_history or query else "attachments" if wants_image or wants_file else "current"
+    action = "forward" if "合并转发" in raw else "send"
+    return {
+        "action": action,
+        "target_type": target_type,
+        "target_ref": target_ref,
+        "body": "",
+        "natural": "1",
+        "selector": selector,
+        "query": query,
+        "include_images": "1" if wants_image or selector == "attachments" else "",
+        "include_files": "1" if wants_file else "",
+        "raw_text": raw,
+    }
+
+
+def _filter_attachments_by_kind(
+    attachments: List[Dict[str, Any]],
+    *,
+    include_images: bool,
+    include_files: bool,
+) -> List[Dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    for att in attachments or []:
+        if not isinstance(att, dict):
+            continue
+        kind = str(att.get("type") or "")
+        if kind == "image" and include_images:
+            selected.append(dict(att))
+        elif kind == "file" and include_files:
+            selected.append(dict(att))
+        elif include_images and include_files:
+            selected.append(dict(att))
+    return selected
+
+
+def _natural_history_selection(event: Event, command: dict[str, Any]) -> tuple[str, List[Dict[str, Any]]]:
+    if not isinstance(event, GroupMessageEvent):
+        return "", []
+    query = str(command.get("query") or "").strip().lower()
+    include_images = bool(command.get("include_images"))
+    include_files = bool(command.get("include_files"))
+    records = list(_group_content_records.get(int(event.group_id), ()))
+    if not records:
+        return "", []
+    selected: list[GroupContentRecord]
+    if query:
+        selected = [record for record in records if query in record.text.lower() or query in record.formatted_line.lower()]
+    else:
+        selected = records[-min(10, len(records)):]
+    selected = selected[-20:]
+    body = "\n".join(record.formatted_line for record in selected if record.formatted_line).strip()
+    attachments: list[dict[str, Any]] = []
+    if include_images or include_files:
+        for record in selected:
+            attachments.extend(_filter_attachments_by_kind(
+                record.attachments or [],
+                include_images=include_images,
+                include_files=include_files,
+            ))
+    return _truncate_qq_text(body), attachments
+
+
+async def _collect_reply_attachments_for_natural(
+    bot: Bot,
+    event: Event,
+    conversation_key: str,
+    *,
+    include_images: bool,
+    include_files: bool,
+) -> List[Dict[str, Any]]:
+    reply_message_id = _extract_reply_message_id(
+        event.get_message() if hasattr(event, "get_message") else None,
+        getattr(event, "raw_message", None),
+    )
+    reply_obj = getattr(event, "reply", None)
+    reply: Dict[str, Any] | None = None
+    if reply_obj is not None:
+        reply = {
+            "message": getattr(reply_obj, "message", None),
+            "raw_message": getattr(reply_obj, "raw_message", None),
+        }
+    if (not reply or reply.get("message") is None) and reply_message_id is not None:
+        reply = _reply_message_cache.get(str(reply_message_id))
+    if (not reply or reply.get("message") is None) and reply_message_id is not None:
+        reply = await _get_reply_message(bot, reply_message_id)
+    attachments: list[dict[str, Any]] = []
+    if reply:
+        message = reply.get("message") if reply.get("message") is not None else reply.get("raw_message")
+        if include_images:
+            image_atts, _image_errors = await _image_sources_to_attachments(_iter_qq_image_urls(message), conversation_key)
+            attachments.extend(image_atts)
+        if include_files:
+            file_atts, _file_errors = await _file_sources_to_attachments(_iter_qq_file_sources(message), conversation_key)
+            attachments.extend(file_atts)
+    if not attachments and include_images and reply_message_id is not None:
+        cached = _reply_attachment_cache.get(str(reply_message_id))
+        if isinstance(cached, dict):
+            attachments.extend(dict(att) for att in cached.get("attachments") or [] if isinstance(att, dict))
+    return attachments
+
+
+async def _natural_command_payload(
+    *,
+    bot: Bot,
+    event: Event,
+    conversation_key: str,
+    command: dict[str, Any],
+    current_attachments: List[Dict[str, Any]],
+) -> tuple[str, List[Dict[str, Any]], str]:
+    selector = str(command.get("selector") or "current")
+    include_images = bool(command.get("include_images"))
+    include_files = bool(command.get("include_files"))
+    if not include_images and not include_files:
+        include_images = selector != "history"
+        include_files = selector != "history" or (selector == "history" and "文件" in str(command.get("raw_text") or ""))
+
+    if selector == "history":
+        body, attachments = _natural_history_selection(event, command)
+        if include_files and not any(str(att.get("type") or "") == "file" for att in attachments):
+            attachments.extend(_recent_attachments_for_natural_forward(
+                conversation_key,
+                event,
+                include_images=False,
+                include_files=True,
+            ))
+        if include_images and not any(str(att.get("type") or "") == "image" for att in attachments):
+            attachments.extend(_recent_attachments_for_natural_forward(
+                conversation_key,
+                event,
+                include_images=True,
+                include_files=False,
+            ))
+        if not body and str(command.get("query") or ""):
+            return "", [], f"没有在上文中找到关于“{_sanitize_name(command.get('query'), max_len=40)}”的消息。"
+        if not body:
+            return "", [], "没有可发送的上文内容。"
+        return body, attachments, ""
+
+    attachments = _filter_attachments_by_kind(
+        current_attachments,
+        include_images=include_images,
+        include_files=include_files,
+    )
+    if not attachments:
+        attachments = await _collect_reply_attachments_for_natural(
+            bot,
+            event,
+            conversation_key,
+            include_images=include_images,
+            include_files=include_files,
+        )
+    if not attachments:
+        attachments = _recent_attachments_for_natural_forward(
+            conversation_key,
+            event,
+            include_images=include_images,
+            include_files=include_files,
+        )
+    if selector == "attachments" and not attachments:
+        want = "文件" if include_files and not include_images else "图片/附件"
+        return "", [], f"没有找到可发送的{want}。请在同一条消息里带上，或引用/紧接着回复对应内容。"
+    return str(command.get("body") or "").strip(), attachments, ""
+
+
 async def _maybe_handle_proactive_command(
     *,
     bot: Bot,
@@ -2016,11 +2495,14 @@ async def _maybe_handle_proactive_command(
     conversation_key: str,
     current_attachments: List[Dict[str, Any]],
 ) -> str | None:
-    """处理管理员主动私聊/群聊发送和合并转发命令。"""
+    """处理管理员主动私聊/群聊发送、文件发送、合并转发和自然语言转发请求。"""
     command = _parse_proactive_command(user_text)
+    is_admin = _is_admin_user(getattr(event, "user_id", ""))
+    if command is None and is_admin:
+        command = await _parse_natural_proactive_command(bot, event, user_text)
     if command is None:
         return None
-    if not _is_admin_user(getattr(event, "user_id", "")):
+    if not is_admin:
         # 不向非管理员暴露“主动发送/转发”能力、目标列表或命令名称。
         return "该请求不可用。"
     action = command.get("action") or ""
@@ -2037,10 +2519,22 @@ async def _maybe_handle_proactive_command(
     label = _target_display_label(target.target_type, target.label)
 
     if action == "send":
-        body = str(command.get("body") or "").strip()
-        if not body and not current_attachments:
+        if command.get("natural"):
+            body, attachments, payload_error = await _natural_command_payload(
+                bot=bot,
+                event=event,
+                conversation_key=conversation_key,
+                command=command,
+                current_attachments=current_attachments,
+            )
+            if payload_error:
+                return payload_error
+        else:
+            body = str(command.get("body") or "").strip()
+            attachments = current_attachments or []
+        if not body and not attachments:
             return "发送内容为空。"
-        await _send_text_and_attachments(bot, send_target, body, current_attachments or [])
+        await _send_text_and_attachments(bot, send_target, body, attachments)
         return f"已发送到{label}。"
 
     if action == "file":
@@ -2051,18 +2545,30 @@ async def _maybe_handle_proactive_command(
         return f"已向{label}发送文件：{attachment.get('name') or attachment.get('path')}"
 
     if action == "forward":
-        body = str(command.get("body") or "").strip()
+        if command.get("natural"):
+            body, payload_attachments, payload_error = await _natural_command_payload(
+                bot=bot,
+                event=event,
+                conversation_key=conversation_key,
+                command=command,
+                current_attachments=current_attachments,
+            )
+            if payload_error:
+                return payload_error
+        else:
+            body = str(command.get("body") or "").strip()
+            payload_attachments = current_attachments or []
         nodes: list[dict[str, Any]] = []
         if body:
             chunks = [chunk.strip() for chunk in re.split(r"\n\s*---\s*\n", body) if chunk.strip()]
             for chunk in chunks or [body]:
-                node = _make_forward_node(bot, chunk, current_attachments if not nodes else None)
+                node = _make_forward_node(bot, chunk, payload_attachments if not nodes else None)
                 if node:
                     nodes.append(node)
         if not nodes:
             nodes = await _forward_nodes_from_reply(bot, event, conversation_key)
-        if not nodes and current_attachments:
-            node = _make_forward_node(bot, "", current_attachments)
+        if not nodes and payload_attachments:
+            node = _make_forward_node(bot, "", payload_attachments)
             if node:
                 nodes.append(node)
         if not nodes:
@@ -2086,11 +2592,28 @@ def _format_history_line(event: GroupMessageEvent, bot: Bot, override_text: str 
     return f"[{_format_hhmm(getattr(event, 'time', None))}] {name}({user}): {text}"
 
 
-def _record_group_message(event: GroupMessageEvent, bot: Bot, override_text: str = "") -> None:
+def _record_group_message(
+    event: GroupMessageEvent,
+    bot: Bot,
+    override_text: str = "",
+    attachments: List[Dict[str, Any]] | None = None,
+) -> None:
     """记录群最近消息；@Bot 触发消息由 Agent matcher 手动记录，避免被 block 跳过。"""
     text = override_text or _message_to_text(event.get_message(), getattr(bot, "self_id", None))
     if text.strip():
-        _group_history[int(event.group_id)].append(_format_history_line(event, bot, override_text=text))
+        line = _format_history_line(event, bot, override_text=text)
+        group_id = int(event.group_id)
+        _group_history[group_id].append(line)
+        sender_id = str(getattr(event, "user_id", "") or "")
+        _group_content_records[group_id].append(GroupContentRecord(
+            formatted_line=line,
+            text=_compact_text(text, limit=max(_HISTORY_TEXT_LIMIT, 1200)),
+            sender_name=_sender_display_name(getattr(event, "sender", None), sender_id),
+            sender_id=sender_id,
+            timestamp=float(getattr(event, "time", None) or time.time()),
+            message_id=str(getattr(event, "message_id", "") or ""),
+            attachments=[dict(att) for att in (attachments or []) if isinstance(att, dict)],
+        ))
 
 
 def _record_bot_reply(group_id: int, text: str) -> None:
@@ -2101,7 +2624,17 @@ def _record_bot_reply(group_id: int, text: str) -> None:
     text = _QQ_EMOJI_MARK_RE.sub(lambda m: f"[表情:{m.group(1)}]", text)
     text = _anonymize_text_for_ai(_compact_text(text))
     if text:
-        _group_history[int(group_id)].append(f"[{dt.datetime.now(_CST).strftime('%H:%M')}] Bot: {text}")
+        line = f"[{dt.datetime.now(_CST).strftime('%H:%M')}] Bot: {text}"
+        _group_history[int(group_id)].append(line)
+        _group_content_records[int(group_id)].append(GroupContentRecord(
+            formatted_line=line,
+            text=text,
+            sender_name="Bot",
+            sender_id="",
+            timestamp=time.time(),
+            message_id="",
+            attachments=[],
+        ))
 
 
 async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) -> tuple[str, List[Dict[str, Any]]]:
@@ -3144,6 +3677,68 @@ async def _send_attachments(bot: Bot, target: Dict[str, Any], attachments: List[
         await _send_attachment_path(bot, target, path, filename=filename)
 
 
+def _sent_attachment_bucket_key(target: Dict[str, Any]) -> str:
+    """为最近发送附件索引生成稳定的会话桶 key。
+
+    优先用 group_id/user_id（Bot 进程内部值），避免 real/stable conversation_key
+    不一致导致记录与查询对不上。
+    """
+    ttype = str(target.get("type") or "")
+    if ttype == "group" and target.get("group_id") is not None:
+        return f"group:{int(target['group_id'])}"
+    if ttype == "private" and target.get("user_id") is not None:
+        return f"private:{int(target['user_id'])}"
+    conv_key = str(target.get("conversation_key") or "")
+    return f"conv:{conv_key}" if conv_key else ""
+
+
+def _record_sent_attachments(target: Dict[str, Any], attachments: List[Any]) -> None:
+    """把 Bot 发出/生成的附件记入会话级最近附件索引，供 qq_forward 后续检索。
+
+    Why: 生图插件产出的图片文件名随机，用户说“把刚才那张图发给 xx”时
+    AI 无从得知具体路径。How: 发送时把已解析的本地路径 + 显示名 + 时间戳
+    按会话桶缓存。Purpose: 让后续转发能按“最近生成/发送”定位图片。
+    """
+    bucket = _sent_attachment_bucket_key(target)
+    if not bucket or not attachments:
+        return
+    now = time.time()
+    for attachment in attachments:
+        path = _resolve_attachment_path(attachment)
+        if path is None:
+            continue
+        try:
+            resolved = str(path.resolve())
+        except Exception:
+            resolved = str(path)
+        name = _attachment_filename(attachment) or path.name
+        is_image = path.suffix.lower() in _IMAGE_SUFFIXES
+        _recent_sent_attachments[bucket].append({
+            "path": resolved,
+            "name": name,
+            "type": "image" if is_image else "file",
+            "timestamp": now,
+        })
+
+
+def _recent_sent_attachment_records(bucket_key: str, *, only_images: bool = False) -> list[dict[str, Any]]:
+    """返回会话最近发出/生成的附件（旧→新），可选只要图片，并过滤不存在的文件。"""
+    bucket = str(bucket_key or "")
+    if not bucket:
+        return []
+    records: list[dict[str, Any]] = []
+    for item in _recent_sent_attachments.get(bucket, ()):  # type: ignore[arg-type]
+        if not isinstance(item, dict):
+            continue
+        if only_images and str(item.get("type") or "") != "image":
+            continue
+        raw = str(item.get("path") or "").strip()
+        if not raw or not Path(raw).exists():
+            continue
+        records.append(dict(item))
+    return records
+
+
 async def _send_text_and_attachments(bot: Bot, target: Dict[str, Any], text: str, attachments: List[Any]) -> None:
     """统一发送最终文本与附件，并仅在群聊中把最终文本写回群历史。"""
     conv_key = target.get("conversation_key")
@@ -3156,6 +3751,7 @@ async def _send_text_and_attachments(bot: Bot, target: Dict[str, Any], text: str
                 _record_bot_reply(int(group_id), text)
     if attachments:
         await _send_attachments(bot, target, attachments)
+        _record_sent_attachments(target, attachments)
     if conv_key:
         _mark_qq_reply_finished(str(conv_key))
 
@@ -3507,6 +4103,498 @@ class TangQiuCallbacks:
         return None
 
 
+# ---------------------------------------------------------------------------
+#  QQ 自然语言转发 Bridge Server
+#
+#  Why: 让 AI（qq.orchestrator 节点）能用自然语言“帮我把上面聊到的 xxx 私发给我 /
+#  合并转发到群 xxx / 转发这张图给 xx / 提醒 xx 明天带笔记本”，并支持多选多条聊天
+#  消息一次性合并转发。
+#  How: qq_forward 外部工具在 Engine 子进程中运行，经本地 HTTP Bridge 调用运行在
+#  QQ Bot 进程内的以下处理器；真正的 QQ 群号/QQ 号只留在 Bot 进程，模型上下文只看到
+#  匿名下标/关键词，避免把副作用能力和真实目标暴露给普通模型。
+# ---------------------------------------------------------------------------
+
+_forward_bridge_runner: Any = None
+_forward_bridge_site: Any = None
+_forward_bridge_started: bool = False
+
+
+def _forward_bridge_session_target(session_id: str) -> Dict[str, Any] | None:
+    """根据 Engine 传来的 session_id 找回该会话对应的真实 QQ 目标。"""
+    sid = str(session_id or "").strip()
+    if not sid:
+        return None
+    for source in (_session_targets, _persisted_session_targets):
+        target = source.get(sid)
+        if isinstance(target, dict) and target:
+            return dict(target)
+    return None
+
+
+def _forward_bridge_origin_group_id(session_id: str) -> int | None:
+    target = _forward_bridge_session_target(session_id)
+    if not target:
+        return None
+    if str(target.get("type") or "") == "group" and target.get("group_id") is not None:
+        try:
+            return int(target.get("group_id"))
+        except Exception:
+            return None
+    return None
+
+
+def _forward_bridge_origin_user_id(session_id: str) -> int | None:
+    """当前会话触发者 QQ 号，用于把内容“私发给我”。"""
+    target = _forward_bridge_session_target(session_id)
+    if not target:
+        return None
+    if target.get("user_id") is not None:
+        try:
+            return int(target.get("user_id"))
+        except Exception:
+            return None
+    return None
+
+
+def _forward_bridge_list_messages(session_id: str, query: str = "", limit: int = 30) -> list[dict[str, Any]]:
+    """列出当前会话（群）最近消息，供 AI 按下标/关键词多选转发。
+
+    返回的 index 从 1 开始；只包含匿名后可展示给模型的字段。
+    """
+    group_id = _forward_bridge_origin_group_id(session_id)
+    if group_id is None:
+        return []
+    records = list(_group_content_records.get(int(group_id), ()))
+    if not records:
+        return []
+    query_norm = str(query or "").strip().lower()
+    limit = max(1, min(int(limit or 30), FORWARD_BRIDGE_MAX_MESSAGES))
+    items: list[dict[str, Any]] = []
+    for offset, record in enumerate(records):
+        line = record.formatted_line or ""
+        text = record.text or ""
+        if query_norm and query_norm not in line.lower() and query_norm not in text.lower():
+            continue
+        att_kinds = sorted({str(att.get("type") or "") for att in (record.attachments or []) if isinstance(att, dict)})
+        items.append({
+            "index": offset + 1,
+            "preview": _compact_text(line or text, limit=200),
+            "sender": _anonymize_text_for_ai(record.sender_name or ""),
+            "has_image": "image" in att_kinds,
+            "has_file": "file" in att_kinds,
+        })
+    # 只回传最近 limit 条，保留时间顺序（旧→新）。
+    return items[-limit:]
+
+
+def _forward_bridge_origin_bucket_key(session_id: str) -> str:
+    """把来源会话映射为“最近发送/生成附件”索引的桶 key。"""
+    target = _forward_bridge_session_target(session_id)
+    if not target:
+        return ""
+    return _sent_attachment_bucket_key(target)
+
+
+def _forward_bridge_list_recent(session_id: str, *, only_images: bool = True, limit: int = 20) -> list[dict[str, Any]]:
+    """列出本会话最近由 Bot 发出/生成的附件（如生图产出的图片），带 index 下标。"""
+    bucket = _forward_bridge_origin_bucket_key(session_id)
+    records = _recent_sent_attachment_records(bucket, only_images=only_images)
+    limit = max(1, min(int(limit or 20), FORWARD_BRIDGE_MAX_MESSAGES))
+    records = records[-limit:]
+    items: list[dict[str, Any]] = []
+    for offset, rec in enumerate(records):
+        items.append({
+            "index": offset + 1,
+            "name": _sanitize_name(rec.get("name") or Path(str(rec.get("path") or "")).name, max_len=60),
+            "type": str(rec.get("type") or "file"),
+        })
+    return items
+
+
+def _forward_bridge_pick_recent_attachments(
+    session_id: str,
+    *,
+    indices: list[int] | None,
+    only_images: bool = False,
+) -> list[dict[str, Any]]:
+    """按下标从最近发送/生成附件里挑选；无下标时默认取最新一个。
+
+    返回可直接发送的附件 dict（带绝对 path + name + type）。
+    """
+    bucket = _forward_bridge_origin_bucket_key(session_id)
+    records = _recent_sent_attachment_records(bucket, only_images=only_images)
+    if not records:
+        return []
+    selected: list[dict[str, Any]]
+    if indices:
+        selected = []
+        for raw in indices:
+            try:
+                idx = int(raw)
+            except Exception:
+                continue
+            if 1 <= idx <= len(records):
+                selected.append(records[idx - 1])
+        if not selected:
+            selected = [records[-1]]
+    else:
+        selected = [records[-1]]
+    attachments: list[dict[str, Any]] = []
+    for rec in selected:
+        attachments.append({
+            "type": str(rec.get("type") or "file"),
+            "path": str(rec.get("path") or ""),
+            "name": str(rec.get("name") or ""),
+        })
+    return attachments
+
+
+def _forward_bridge_pick_records(
+    session_id: str,
+    *,
+    indices: list[int] | None,
+    query: str,
+) -> list[GroupContentRecord]:
+    group_id = _forward_bridge_origin_group_id(session_id)
+    if group_id is None:
+        return []
+    records = list(_group_content_records.get(int(group_id), ()))
+    if not records:
+        return []
+    if indices:
+        picked: list[GroupContentRecord] = []
+        for raw in indices:
+            try:
+                idx = int(raw)
+            except Exception:
+                continue
+            if 1 <= idx <= len(records):
+                picked.append(records[idx - 1])
+        if picked:
+            return picked
+    query_norm = str(query or "").strip().lower()
+    if query_norm:
+        matched = [r for r in records if query_norm in (r.formatted_line or "").lower() or query_norm in (r.text or "").lower()]
+        if matched:
+            return matched[-FORWARD_BRIDGE_MAX_MESSAGES:]
+    return records[-min(10, len(records)):]
+
+
+async def _forward_bridge_resolve_target(
+    bot: Bot,
+    session_id: str,
+    target_type: str,
+    target_ref: str,
+) -> tuple[ProactiveTarget | None, str]:
+    """把工具给出的目标（含 self/current 语义）解析为真实 ProactiveTarget。"""
+    target_type = str(target_type or "").strip().lower()
+    ref = str(target_ref or "").strip()
+    if target_type == "self" or ref in {"我", "自己", "me", "self"}:
+        uid = _forward_bridge_origin_user_id(session_id)
+        if uid is None:
+            return None, "无法确定当前用户，无法私发给你。"
+        return ProactiveTarget("private", uid, _qq_profile_display_name(uid) or _anonymize_user_id(uid)), ""
+    if target_type == "current" or ref in {"当前群", "本群", "这个群", "此群"}:
+        gid = _forward_bridge_origin_group_id(session_id)
+        if gid is None:
+            return None, "当前会话不是群聊，无法发送到本群。"
+        if ALLOWED_GROUPS and gid not in ALLOWED_GROUPS:
+            return None, "当前群不在允许的主动群聊目标中。"
+        return ProactiveTarget("group", gid, "当前群"), ""
+    # 其余交给既有的目标解析（支持显式 id 前缀与配置的显示名/别名）。
+    resolve_type = "group" if target_type == "group" else "private"
+    return await _resolve_proactive_target(bot, None, resolve_type, ref)
+
+
+async def _forward_bridge_records_to_nodes(
+    bot: Bot,
+    records: list[GroupContentRecord],
+    conversation_key: str,
+    *,
+    include_images: bool,
+    include_files: bool,
+) -> list[dict[str, Any]]:
+    nodes: list[dict[str, Any]] = []
+    for record in records[:FORWARD_BRIDGE_MAX_MESSAGES]:
+        text = record.text or record.formatted_line or ""
+        attachments: list[dict[str, Any]] = []
+        if include_images or include_files:
+            attachments = _filter_attachments_by_kind(
+                record.attachments or [],
+                include_images=include_images,
+                include_files=include_files,
+            )
+        node = _make_forward_node(
+            bot,
+            text,
+            attachments,
+            nickname=record.sender_name or "转发消息",
+            user_id=record.sender_id or getattr(bot, "self_id", None),
+        )
+        if node:
+            nodes.append(node)
+    return nodes
+
+
+def _forward_bridge_resolve_files(raw_paths: Any, display_names: Any = None) -> tuple[list[dict[str, Any]], list[str]]:
+    """把工具传来的仓库相对/绝对路径解析为可发送的 file 附件。
+
+    Why: 管理员“把仓库里的 xx 文件发出来”需要把工作区内文件发到 QQ。
+    How: 复用 _attachment_path_under_workspace 限定在工作区内，防止目录穿越。
+    Purpose: 只允许发送工作区内存在的普通文件，逐个回报错误。
+    """
+    paths: list[str] = []
+    if isinstance(raw_paths, str):
+        paths = [raw_paths]
+    elif isinstance(raw_paths, list):
+        paths = [str(item) for item in raw_paths if str(item).strip()]
+    names: list[str] = []
+    if isinstance(display_names, str):
+        names = [display_names]
+    elif isinstance(display_names, list):
+        names = [str(item) for item in display_names]
+
+    attachments: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for idx, raw in enumerate(paths):
+        raw = str(raw or "").strip()
+        if not raw:
+            continue
+        path = _attachment_path_under_workspace(raw)
+        if path is None:
+            errors.append(f"{raw}：路径必须位于 Clonoth 工作区内。")
+            continue
+        if not path.exists() or not path.is_file():
+            errors.append(f"{raw}：文件不存在。")
+            continue
+        rel_path = str(path)
+        try:
+            rel_path = str(path.relative_to(Path(CLONOTH_WORKSPACE).resolve()))
+        except Exception:
+            pass
+        display_name = names[idx].strip() if idx < len(names) and str(names[idx]).strip() else path.name
+        attachments.append({"type": "file", "path": rel_path, "name": display_name})
+    return attachments, errors
+
+
+async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
+    """执行一次自然语言转发/发送/提醒请求。仅在 Bot 进程内运行。"""
+    try:
+        bot = get_bot()
+    except Exception:
+        return {"ok": False, "error": "QQ Bot 尚未连接，无法执行转发。"}
+    session_id = str(payload.get("session_id") or "").strip()
+    action = str(payload.get("action") or "forward").strip().lower()
+    target_type = str(payload.get("target_type") or "").strip().lower()
+    target_ref = str(payload.get("target_ref") or "").strip()
+    extra_text = _truncate_qq_text(str(payload.get("text") or "").strip())
+    query = str(payload.get("query") or "").strip()
+    include_images = bool(payload.get("include_images", True))
+    include_files = bool(payload.get("include_files", True))
+    raw_indices = payload.get("message_indices")
+    indices: list[int] = []
+    if isinstance(raw_indices, list):
+        for item in raw_indices:
+            try:
+                indices.append(int(item))
+            except Exception:
+                continue
+    # “最近生成/发出的图片”系列参数：use_recent 启用；recent_indices 按下标挑选。
+    use_recent = bool(payload.get("use_recent", False))
+    raw_recent = payload.get("recent_indices")
+    recent_indices: list[int] = []
+    if isinstance(raw_recent, list):
+        for item in raw_recent:
+            try:
+                recent_indices.append(int(item))
+            except Exception:
+                continue
+    if recent_indices:
+        use_recent = True
+
+    target, error = await _forward_bridge_resolve_target(bot, session_id, target_type, target_ref)
+    if target is None:
+        return {"ok": False, "error": error or "目标解析失败。"}
+    send_target = _target_to_send_dict(target)
+    label = _target_display_label(target.target_type, target.label)
+    conversation_key = f"qq_forward:{target.target_type}:{target.target_id}"
+
+    # 纯提醒/通知：不涉及历史挑选，直接发一段文本。
+    if action == "remind":
+        body = extra_text
+        if not body:
+            return {"ok": False, "error": "提醒内容为空。"}
+        await _send_text_and_attachments(bot, send_target, body, [])
+        return {"ok": True, "result": f"已向{label}发送提醒。"}
+
+    # 发送工作区文件：“把仓库里的 xx 文件发出来”。支持一次多个文件。
+    if action == "file":
+        attachments, file_errors = _forward_bridge_resolve_files(
+            payload.get("file_paths"),
+            payload.get("file_names"),
+        )
+        # 允许 op=file 时不给 file_paths、而是从最近生成/发出的附件里挑（use_recent）。
+        if not attachments and use_recent:
+            recent_atts = _forward_bridge_pick_recent_attachments(
+                session_id,
+                indices=recent_indices,
+                only_images=False,
+            )
+            attachments = _forward_bridge_resolve_files(
+                [att.get("path") for att in recent_atts],
+                [att.get("name") for att in recent_atts],
+            )[0]
+        if not attachments:
+            hint = "；".join(file_errors) if file_errors else "请在 file_paths 里给出工作区内的文件路径，或用 use_recent 发送最近生成的图片。"
+            return {"ok": False, "error": f"没有可发送的文件：{hint}"}
+        if extra_text:
+            await _send_text_and_attachments(bot, send_target, extra_text, [])
+        await _send_attachments(bot, send_target, attachments)
+        names = "、".join(_sanitize_name(att.get("name") or att.get("path"), max_len=40) for att in attachments)
+        result = f"已向{label}发送 {len(attachments)} 个文件：{names}"
+        if file_errors:
+            result += "\n（部分文件未发送：" + "；".join(file_errors) + "）"
+        return {"ok": True, "result": result}
+
+    # use_recent：把“最近生成/发出的图片”作为附件直接发送（不依赖群历史）。
+    if use_recent and action in {"send", "forward"}:
+        recent_atts = _forward_bridge_pick_recent_attachments(
+            session_id,
+            indices=recent_indices,
+            only_images=False,
+        )
+        recent_atts = _forward_bridge_resolve_files(
+            [att.get("path") for att in recent_atts],
+            [att.get("name") for att in recent_atts],
+        )[0]
+        if not recent_atts:
+            return {"ok": False, "error": "没有找到最近生成/发送的图片。可先用 op=recent 查看可选图片。"}
+        await _send_text_and_attachments(bot, send_target, extra_text, recent_atts)
+        return {"ok": True, "result": f"已向{label}发送 {len(recent_atts)} 张最近生成/发送的图片。"}
+
+    records = _forward_bridge_pick_records(session_id, indices=indices, query=query)
+
+    if action == "send":
+        # 直接把挑选到的消息拼成一段文本 + 附件发送（非合并转发卡片）。
+        lines = [r.formatted_line or r.text for r in records if (r.formatted_line or r.text)]
+        body = "\n".join(part for part in ([extra_text] if extra_text else []) + lines).strip()
+        attachments: list[dict[str, Any]] = []
+        if include_images or include_files:
+            for r in records:
+                attachments.extend(_filter_attachments_by_kind(
+                    r.attachments or [],
+                    include_images=include_images,
+                    include_files=include_files,
+                ))
+        if not body and not attachments:
+            return {"ok": False, "error": "没有可发送的内容。"}
+        await _send_text_and_attachments(bot, send_target, _truncate_qq_text(body), attachments)
+        return {"ok": True, "result": f"已发送到{label}（{len(records)} 条消息）。"}
+
+    # 默认 action == "forward"：合并转发卡片，支持多选多条消息。
+    nodes = await _forward_bridge_records_to_nodes(
+        bot,
+        records,
+        conversation_key,
+        include_images=include_images,
+        include_files=include_files,
+    )
+    if extra_text:
+        head = _make_forward_node(bot, extra_text, None, nickname="Clonoth 通知")
+        if head:
+            nodes.insert(0, head)
+    if not nodes:
+        return {"ok": False, "error": "没有可转发的消息。请先用 list 查看上文消息并给出 message_indices 或 query。"}
+    try:
+        await _send_forward_nodes(bot, target, nodes)
+    except Exception as exc:
+        logger.warning("qq_forward bridge send forward failed: %s", exc, exc_info=True)
+        return {"ok": False, "error": "合并转发发送失败：当前 OneBot/NapCat 可能不支持该接口，或目标不可达。"}
+    return {"ok": True, "result": f"已向{label}发送合并转发（{len(nodes)} 条）。"}
+
+
+def _forward_bridge_check_token(request: "Any") -> bool:
+    if not FORWARD_BRIDGE_TOKEN:
+        return True
+    return request.headers.get("X-Forward-Token", "") == FORWARD_BRIDGE_TOKEN
+
+
+async def _forward_bridge_http_handler(request: "Any") -> "Any":
+    from aiohttp import web  # 局部导入，未启用 Bridge 时不强依赖 aiohttp。
+
+    if not _forward_bridge_check_token(request):
+        return web.json_response({"ok": False, "error": "invalid token"}, status=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
+    if not isinstance(payload, dict):
+        return web.json_response({"ok": False, "error": "invalid payload"}, status=400)
+    op = str(payload.get("op") or "").strip().lower()
+    try:
+        if op == "list":
+            messages = _forward_bridge_list_messages(
+                str(payload.get("session_id") or ""),
+                query=str(payload.get("query") or ""),
+                limit=int(payload.get("limit") or FORWARD_BRIDGE_MAX_MESSAGES),
+            )
+            return web.json_response({"ok": True, "messages": messages})
+        if op == "recent":
+            recent = _forward_bridge_list_recent(
+                str(payload.get("session_id") or ""),
+                only_images=bool(payload.get("only_images", True)),
+                limit=int(payload.get("limit") or 20),
+            )
+            return web.json_response({"ok": True, "recent": recent})
+        if op in {"forward", "send", "remind", "file", ""}:
+            if op:
+                payload.setdefault("action", op)
+            result = await _forward_bridge_execute(payload)
+            status = 200 if result.get("ok") else 400
+            return web.json_response(result, status=status)
+        return web.json_response({"ok": False, "error": f"unknown op: {op}"}, status=400)
+    except Exception as exc:
+        logger.warning("qq_forward bridge handler error: %s", exc, exc_info=True)
+        return web.json_response({"ok": False, "error": str(exc)}, status=500)
+
+
+async def _start_forward_bridge() -> None:
+    """在 QQ Bot 进程内启动 qq_forward Bridge Server。"""
+    global _forward_bridge_runner, _forward_bridge_site, _forward_bridge_started
+    if _forward_bridge_started or not ENABLE_FORWARD_BRIDGE:
+        return
+    try:
+        from aiohttp import web
+    except Exception:
+        logger.warning("qq_forward bridge disabled: aiohttp 未安装。")
+        return
+    app = web.Application()
+    app.router.add_post("/qq_forward", _forward_bridge_http_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, FORWARD_BRIDGE_HOST, FORWARD_BRIDGE_PORT)
+    await site.start()
+    _forward_bridge_runner = runner
+    _forward_bridge_site = site
+    _forward_bridge_started = True
+    logger.info(
+        "qq_forward bridge server started: http://%s:%s/qq_forward (token=%s)",
+        FORWARD_BRIDGE_HOST,
+        FORWARD_BRIDGE_PORT,
+        "set" if FORWARD_BRIDGE_TOKEN else "none",
+    )
+
+
+async def _stop_forward_bridge() -> None:
+    global _forward_bridge_runner, _forward_bridge_site, _forward_bridge_started
+    if _forward_bridge_runner is not None:
+        with contextlib.suppress(Exception):
+            await _forward_bridge_runner.cleanup()
+    _forward_bridge_runner = None
+    _forward_bridge_site = None
+    _forward_bridge_started = False
+
+
 @driver.on_startup
 async def _startup() -> None:
     """NoneBot 启动时初始化 Clonoth SDK 与事件路由。"""
@@ -3559,6 +4647,8 @@ async def _startup() -> None:
             QQ_QUEUE_REPLY_TIMEOUT,
             ENABLE_PREEMPT,
         )
+    with contextlib.suppress(Exception):
+        await _start_forward_bridge()
     logger.info("Clonoth Agent QQ adapter started: %s", CLONOTH_BASE_URL)
 
 
@@ -3585,6 +4675,7 @@ async def _shutdown() -> None:
         _client = None
     _event_router = None
     _callbacks = None
+    await _stop_forward_bridge()
     logger.info("Clonoth Agent QQ adapter stopped")
 
 
@@ -3598,20 +4689,53 @@ async def _handle_history(bot: Bot, event: GroupMessageEvent) -> None:
     _remember_message_for_reply_context(event)
     if str(event.user_id) != str(getattr(bot, "self_id", "")):
         expanded_text = await _message_to_text_with_forward(bot, event.get_message(), getattr(bot, "self_id", None))
-        _record_group_message(event, bot, override_text=expanded_text)
         # QQ 客户端经常把“问图文本 + 图片”拆成两条事件；第二条纯图片
         # 通常不会 @bot，因此不会进入 agent matcher。这里在低优先级历史
-        # matcher 中把非触发图片也下载并写入近期缓存，让前一条文本等待后
-        # 能合并到正确图片。
-        try:
-            image_urls = _iter_qq_image_urls(event.get_message())
-        except Exception:
-            image_urls = []
-        if image_urls:
-            real_conversation_key = f"qq_group:{int(event.group_id)}"
-            stable_conversation_key = _stable_conversation_key(real_conversation_key)
-            attachments, _errors = await _image_sources_to_attachments(image_urls, stable_conversation_key)
-            _remember_recent_images(stable_conversation_key, event, attachments)
+        # matcher 中把非触发附件也下载并写入近期缓存，让后续自然语言转发
+        # 和图片提问能选到对应内容。
+        real_conversation_key = f"qq_group:{int(event.group_id)}"
+        stable_conversation_key = _stable_conversation_key(real_conversation_key)
+        attachments, _errors = await _collect_qq_attachments(event, stable_conversation_key)
+        _remember_recent_images(stable_conversation_key, event, attachments)
+        _record_group_message(event, bot, override_text=expanded_text, attachments=attachments)
+
+
+# 群文件上传通知记录器。部分 OneBot 实现把普通文件作为 notice 上报，而不是 message file 段。
+_group_upload_matcher = on_notice(priority=99, block=False)
+
+
+@_group_upload_matcher.handle()
+async def _handle_group_upload_notice(bot: Bot, event: Event) -> None:
+    if not isinstance(event, GroupUploadNoticeEvent):
+        return
+    if not _is_group_allowed(int(event.group_id)):
+        return
+    _remember_message_for_reply_context(event)
+    real_conversation_key = f"qq_group:{int(event.group_id)}"
+    stable_conversation_key = _stable_conversation_key(real_conversation_key)
+    file_info = getattr(event, "file", None)
+    if not isinstance(file_info, dict):
+        file_info = {}
+    source = str(file_info.get("url") or file_info.get("path") or file_info.get("file") or "").strip()
+    name = _safe_attachment_name(str(file_info.get("name") or file_info.get("file_name") or file_info.get("filename") or "文件"), "file")
+    size = file_info.get("size") or file_info.get("file_size") or file_info.get("filesize") or 0
+    attachments, _errors = await _file_sources_to_attachments([
+        {"source": source, "name": name, "size": size},
+    ], stable_conversation_key)
+    display_text = f"[文件:{name}]"
+    sender_id = str(getattr(event, "user_id", "") or "")
+    name_raw = _sender_display_name(getattr(event, "sender", None), sender_id)
+    line = f"[{_format_hhmm(getattr(event, 'time', None))}] {_anonymize_text_for_ai(name_raw)}({_anonymize_user_id(sender_id)}): {display_text}"
+    _group_history[int(event.group_id)].append(line)
+    _group_content_records[int(event.group_id)].append(GroupContentRecord(
+        formatted_line=line,
+        text=display_text,
+        sender_name=name_raw,
+        sender_id=sender_id,
+        timestamp=float(getattr(event, "time", None) or time.time()),
+        message_id=str(getattr(event, "message_id", "") or ""),
+        attachments=attachments,
+    ))
 
 
 # Agent 入口 matcher。默认只处理 @Bot；也可通过 ONEBOT_GROUP_TRIGGER=prefix/all 切换触发策略。
@@ -3633,7 +4757,6 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     stable_conversation_key = _stable_conversation_key(real_conversation_key)
     user_text = (await _message_to_text_with_forward(bot, event.get_message(), getattr(bot, "self_id", None))).strip() or "你好"
     user_text = _strip_trigger_prefix(user_text)
-    _record_group_message(event, bot, override_text=user_text)
     asyncio.create_task(_auto_like_user(bot, int(event.user_id)))
 
     attachments, attachment_errors = await _collect_qq_attachments(event, stable_conversation_key)
@@ -3660,6 +4783,7 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     if proactive_reply is not None:
         await _agent_matcher.finish(proactive_reply)
     await _merge_recent_images_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
+    _record_group_message(event, bot, override_text=user_text, attachments=attachments)
     draw_direct_prompt = _parse_direct_draw_command(user_text)
     entry_node_id = DRAW_NODE_ID if draw_direct_prompt is not None else ""
     inbound_text = await _build_draw_direct_inbound_text(event, draw_direct_prompt, False) if draw_direct_prompt is not None else await _build_inbound_text(event, bot, user_text, stable_conversation_key, attachments)

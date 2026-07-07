@@ -25,6 +25,9 @@ from .state import SupervisorState
 from .types import TaskStatus
 
 
+PORT_IN_USE_EXIT_CODE = 98
+
+
 def main() -> None:
     # [2026-05-14] override=True: .env 文件值覆盖继承的环境变量。
     # 多实例部署时，每个实例读自己 cwd 下的 .env，互不干扰。
@@ -69,8 +72,11 @@ def main() -> None:
             _s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             _s.bind((args.host, args.port))
     except OSError as e:
-        _log(f"[supervisor] 端口 {args.host}:{args.port} 已被占用: {e}")
-        return
+        _log(
+            f"[supervisor] 端口 {args.host}:{args.port} 已被占用: {e}; "
+            f"退出码={PORT_IN_USE_EXIT_CODE}，请先停止已有实例或改用 systemd 管理的唯一实例"
+        )
+        sys.exit(PORT_IN_USE_EXIT_CODE)
 
     events_path = data_dir / "events.jsonl"
     config_path = data_dir / "config.yaml"

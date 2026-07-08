@@ -8,6 +8,7 @@ Clonoth 主动发出的中间回复会展示给 QQ；工具调用、进度日志
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import datetime as dt
 import hashlib
@@ -3359,11 +3360,20 @@ async def _send_attachment_path(bot: Bot, target: Dict[str, Any], path: Path, fi
             )
             return
     # [2026-05-08] 非图片附件通过 NapCat upload_group_file / upload_private_file 发送
+    # [2026-07-08] 改用 base64:// 传输文件内容，避免把宿主机绝对路径交给 NapCat：
+    # NapCat 运行在 Docker 容器内，只挂载了部分目录，直接传本地路径会因容器内
+    # 找不到文件而报 retcode=1200「识别URL失败」。base64 内联可彻底绕开路径/挂载问题。
     if not path.exists():
         await _send_qq_message(bot, target, f"Clonoth 生成了文件：{display_name}（文件不存在）")
         return
     try:
-        file_str = str(path.resolve())
+        try:
+            raw_bytes = path.read_bytes()
+            file_str = "base64://" + base64.b64encode(raw_bytes).decode("ascii")
+        except Exception as read_exc:
+            # 读取失败时退回本地绝对路径（例如文件已被移动/权限问题）
+            logger.warning("文件读取失败，退回本地路径 (%s): %s", display_name, read_exc)
+            file_str = str(path.resolve())
         if target.get("type") == "group":
             group_id = target.get("group_id")
             if group_id is not None:

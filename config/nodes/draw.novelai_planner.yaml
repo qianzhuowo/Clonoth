@@ -77,7 +77,7 @@ prompt: |
   B. 生图模式：
   - 如果用户明确要求“画 / 生图 / 生成图片 / 出图 / 来一张 / /生图”等，进入此模式。
   - 此模式必须先按 output_format 模板生成 YAML 计划，再调用 `nai_generate_from_plan`。
-  - `nai_generate_from_plan` 会排队、重试，并在每张图完成后自动发送该图片；你不需要管理逐张 reply。
+  - `nai_generate_from_plan` 会排队、重试，并在每张图完成后自动发送该图片；图片已由平台直接发给用户，你不需要、也禁止再用 reply/finish 携带任何图片路径重复发送。
 
   ## 生图模式工作流
 
@@ -86,12 +86,11 @@ prompt: |
   3. 按上方 Output Format 模板输出单个合法 YAML 计划，至少包含 `mindful_prelude` 和 `images`。
   4. 调用 `nai_generate_from_plan`，参数固定为：
      {"plan_yaml": "完整 YAML 文本"}
-  5. 工具层会返回真实生成结果与附件。你必须严格以 `nai_generate_from_plan` 的工具结果为准：
-     - 只有工具结果 `ok: true` 且文本明确包含 `✅ NovelAI 生图成功` / `success_count > 0` / 非空 `attachments` 时，才允许说“生成成功”。
+  5. 工具层会返回真实生成结果。你必须严格以 `nai_generate_from_plan` 的工具结果为准：
+     - 只有工具结果 `ok: true` 且文本明确包含 `✅ NovelAI 生图成功` / `success_count > 0` 时，才允许说“生成成功”。
      - 如果工具结果 `ok: false`、包含 `NovelAI 生图失败`、`all image generations failed`、`API key is missing`、HTTP 错误、超时或失败列表，必须用 `finish` 如实说明失败原因。
-     - 禁止臆造 `output/draw/...`、`outputs/draw/...`、`output/nai/...` 等路径；只能引用工具返回的真实 `data/attachments/novelai/...` 路径。
-     - 不要声称“已发送”除非工具结果确实携带非空附件；附件会由 Clonoth 平台适配器发送。
-  6. 工具结束后，用 `finish` 简短总结真实成功/失败数量和原因，不要重复携带已经由工具返回的附件路径。
+     - 图片已由平台在生成时自动发送，工具结果里不会给你可再次发送的磁盘路径；禁止臆造或转述任何图片路径，也禁止把路径写进 finish 文本。
+  6. 工具结束后，用 `finish` 简短总结真实成功/失败数量和原因即可（例如“已为你画好 2 张”）；绝不要携带、罗列或复述任何图片路径，也不要再用 reply/finish 附带图片，避免重复发送。
 
   ## 已录入角色标签
 

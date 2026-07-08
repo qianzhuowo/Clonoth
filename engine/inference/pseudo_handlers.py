@@ -64,6 +64,49 @@ def _dispatch_result_input_attachments(ls: _LoopState) -> list[dict]:
     return [att for att in attachments if isinstance(att, dict)]
 
 
+def _dispatch_result_attachments_already_sent(ls: _LoopState) -> bool:
+    """Return True if this turn's dispatch_result attachments were already
+    auto-forwarded to the platform by the supervisor (dispatch_attachment).
+
+    [2026-07-08] Why: async draw children (NovelAI) return generated images that
+    the supervisor already delivers once via dispatch_attachment. The caller LLM
+    is then handed a dispatch_result whose text used to leak the real disk paths,
+    tempting it to call reply(attachment_paths=...) and send the SAME images a
+    second time. How: expose the "already sent" flag so reply/finish can drop
+    those paths. Purpose: never send the same generated image twice.
+    """
+    task_context = getattr(ls.rctx, "task_context", {}) or {}
+    if not isinstance(task_context, dict):
+        return False
+    if str(task_context.get("inbound_message_type") or "").strip() != "dispatch_result":
+        return False
+    return bool(task_context.get("inbound_attachments_outbound_sent"))
+
+
+def _reject_already_sent_dispatch_paths(ls: _LoopState, selected_paths: Any) -> list:
+    """Drop attachment paths on a dispatch_result turn whose files the supervisor
+    already auto-forwarded to the platform.
+
+    [2026-07-08 v2] Why the earlier file-name match failed: when
+    ``attachments_outbound_sent`` is True the supervisor deliberately omits the
+    attachments from the dispatch_result inbound payload, so
+    ``task_context.inbound_attachments`` is empty and there was nothing to match
+    against — every path leaked through and got re-sent. On top of that,
+    ``_select_attachments`` re-saves the file under a new ``branch_xxx`` path, so
+    even a populated name set would not reliably line up with what actually goes
+    out. How: on any dispatch_result turn where the images were already sent, the
+    caller must not hand-send *any* attachment through reply()/finish(); drop the
+    whole selection. Purpose: a single generated image is delivered exactly once.
+    """
+    if not isinstance(selected_paths, list) or not selected_paths:
+        return selected_paths if isinstance(selected_paths, list) else []
+    if not _dispatch_result_attachments_already_sent(ls):
+        return selected_paths
+    # Images for this dispatch_result were already delivered via
+    # dispatch_attachment; refuse to re-send anything the caller selected.
+    return []
+
+
 def _emit_pseudo_tool_result(
     ls: _LoopState,
     pseudo_call,
@@ -120,6 +163,9 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         reply_text = str(args.get("text") or "").strip()
         selected_atts = []
         selected_paths = args.get("attachment_paths")
+        # [2026-07-08] Drop paths already auto-forwarded via dispatch_attachment,
+        # so the caller LLM cannot re-send generated draw images a second time.
+        selected_paths = _reject_already_sent_dispatch_paths(ls, selected_paths)
         if isinstance(selected_paths, list) and selected_paths:
             selected_atts = _select_attachments(
                 ls.collected_attachments, selected_paths,
@@ -171,6 +217,9 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         final_atts = []
         if terminal_name == "finish":
             _selected_paths = args.get("attachment_paths")
+            # [2026-07-08] Drop paths already auto-forwarded via dispatch_attachment
+            # (async draw images), so finish() cannot re-send the same files.
+            _selected_paths = _reject_already_sent_dispatch_paths(ls, _selected_paths)
             if isinstance(_selected_paths, list) and _selected_paths:
                 final_atts = _select_attachments(
                     ls.collected_attachments, _selected_paths,

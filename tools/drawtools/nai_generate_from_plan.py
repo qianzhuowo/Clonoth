@@ -151,10 +151,16 @@ if __name__ == "__main__":
         failure_text = "; ".join(f"#{f['index']} {f['error']}" for f in failures) or "unknown error"
         fail(f"NovelAI 生图失败：{failure_text}")
 
+    # [2026-07-08] 修复重复发图：
+    #   图片附件在子任务完成时已由 supervisor 的 dispatch_attachment 直接发送给平台，
+    #   这里绝不能再暴露真实磁盘路径、也不能诱导上游 LLM 用 reply(attachment_paths=...)
+    #   重新发送，否则会造成同一批图片发送两次（生图直发 + LLM 重发）。
+    #   因此成功文案只描述“已自动发送、无需再发”，路径细节仅保留在结构化 images 字段里
+    #   供程序使用，不再拼进 result 文本喂给模型。
     lines = [f"✅ NovelAI 生图成功：{len(results)} 张。"]
-    lines.append("图片附件已返回给 Clonoth，将由平台适配器发送；真实路径如下：")
+    lines.append("图片已自动发送给用户，无需再次发送，也不要调用 reply/finish 携带这些图片路径。")
     for item in results:
-        lines.append(f"- #{item['index']} {item['size_label']} {item.get('path') or '(无路径)'}")
+        lines.append(f"- #{item['index']} {item['size_label']} 已发送")
     if failures:
         lines.append("⚠️ 部分图片失败：" + "; ".join(f"#{f['index']} {f['error']}" for f in failures))
 

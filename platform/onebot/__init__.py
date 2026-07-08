@@ -926,43 +926,6 @@ def _remember_recent_images(conversation_key: str, event: Event, attachments: Li
         _remember_reply_attachments(message_id, conversation_key, sender_id, image_atts, created_at=now)
 
 
-def _recent_attachments_for_natural_forward(
-    conversation_key: str,
-    event: Event,
-    *,
-    include_images: bool = True,
-    include_files: bool = True,
-) -> List[Dict[str, Any]]:
-    """为“这张图/上面的文件”选择最近可转发附件。"""
-    now = time.time()
-    sender_id = str(getattr(event, "user_id", "") or "")
-    entries = [
-        item for item in _recent_images.get(conversation_key, ())
-        if now - item.created_at <= RECENT_IMAGE_MAX_AGE_SECONDS
-    ]
-    if IMAGE_PREFER_SAME_SENDER:
-        same_sender = [item for item in entries if item.sender_id == sender_id]
-        if same_sender:
-            entries = same_sender
-    attachments: list[dict[str, Any]] = []
-    if include_images:
-        attachments.extend(dict(item.attachment) for item in entries[-MAX_IMAGES_PER_TURN:])
-
-    if include_files and isinstance(event, GroupMessageEvent):
-        file_limit = max(1, MAX_FILES_PER_TURN)
-        for record in reversed(_group_content_records.get(int(event.group_id), ())):
-            if now - record.timestamp > max(RECENT_IMAGE_MAX_AGE_SECONDS, 600):
-                continue
-            for att in reversed(record.attachments or []):
-                if str(att.get("type") or "") == "file" and att.get("path"):
-                    attachments.append(dict(att))
-                    if sum(1 for a in attachments if str(a.get("type") or "") == "file") >= file_limit:
-                        break
-            if sum(1 for a in attachments if str(a.get("type") or "") == "file") >= file_limit:
-                break
-    return attachments
-
-
 def _remember_reply_attachments(
     message_id: Any,
     conversation_key: str,
@@ -2235,107 +2198,9 @@ async def _send_forward_nodes(bot: Bot, target: ProactiveTarget, nodes: list[dic
         await bot.call_api("send_private_forward_msg", user_id=int(target.target_id), messages=nodes)
 
 
-_NATURAL_PROACTIVE_VERBS = ("转发", "发送", "发给", "发到", "私发", "私信", "私聊", "群发", "合并发送", "合并转发")
-_NATURAL_HISTORY_WORDS = ("上面", "上文", "前面", "刚才", "之前", "聊到", "会议", "内容", "消息", "聊天记录")
-_NATURAL_IMAGE_WORDS = ("图片", "照片", "截图", "这图", "这张图", "这图片")
-_NATURAL_FILE_WORDS = ("文件", "附件", "文档", "压缩包")
-
-
-def _contains_any(text: str, words: tuple[str, ...]) -> bool:
-    return any(word in text for word in words)
-
-
-def _extract_natural_query(text: str) -> str:
-    """从自然语言转发请求中抽取“关于 xxx”的筛选关键词。"""
-    value = str(text or "").strip()
-    for pattern in (
-        r"(?:关于|有关|涉及|提到|聊到)\s*(.+?)\s*的(?:消息|内容|聊天记录|会议内容|文件|图片)",
-        r"(?:关于|有关|涉及|提到|聊到)\s*([^，。,.；;]+)",
-    ):
-        match = re.search(pattern, value)
-        if match:
-            query = match.group(1).strip()
-            query = re.sub(r"(?:私发|私信|私聊|发送|转发|发给|发到|给|到).*$", "", query).strip()
-            return query[:80]
-    if "会议" in value:
-        return "会议"
-    return ""
-
-
-async def _natural_target_from_text(bot: Bot, event: Event, text: str) -> tuple[str, str]:
-    """解析自然语言中的主动发送目标，返回 target_type/target_ref。"""
-    value = str(text or "").strip()
-    if not value:
-        return "", ""
-    normalized = _normalize_target_ref(value)
-
-    if re.search(r"(?:私发|私信|私聊|发送|发|转发)(?:给|到)?\s*(?:我|自己)(?:$|[，。,.；;\s])|给(?:我|自己)(?:$|[，。,.；;\s])", value):
-        return "private", f"qq:{getattr(event, 'user_id', '')}"
-    if isinstance(event, GroupMessageEvent) and any(word in value for word in ("当前群", "本群", "这个群", "此群")):
-        return "group", "当前群"
-
-    explicit_match = re.search(r"((?:qq|user|u|群|group|g)[:：]\s*\d{5,12})", value, re.IGNORECASE)
-    if explicit_match:
-        token = explicit_match.group(1).replace("：", ":").replace(" ", "")
-        target_type = "group" if token.lower().startswith(("群:", "group:", "g:")) else "private"
-        return target_type, token
-
-    group_candidates = await _group_target_candidates(bot)
-    private_candidates = await _private_target_candidates(bot)
-
-    group_mark_match = re.search(r"(?:群聊|群|发送到群|发到群|转发到群|合并发送到群)\s*([\w\-\u4e00-\u9fff]+)", value)
-    if group_mark_match:
-        ref = group_mark_match.group(1).strip()
-        if ref:
-            return "group", ref
-
-    private_mark_match = re.search(r"(?:私发给|私信给|私聊给|发给|发送给|转发给|给)\s*([\w\-\u4e00-\u9fff]+)", value)
-    if private_mark_match:
-        ref = private_mark_match.group(1).strip()
-        if ref and ref not in {"我", "自己"}:
-            return "private", ref
-
-    for target in sorted(group_candidates, key=lambda item: len(item.label or ""), reverse=True):
-        for alias in _candidate_alias_tokens(target):
-            if alias and alias in normalized and ("群" in value or "发到" in value or "发送到" in value):
-                return "group", target.label
-    for target in sorted(private_candidates, key=lambda item: len(item.label or ""), reverse=True):
-        for alias in _candidate_alias_tokens(target):
-            if alias and alias in normalized:
-                return "private", target.label
-    return "", ""
-
-
-async def _parse_natural_proactive_command(bot: Bot, event: Event, text: str) -> dict[str, Any] | None:
-    """把管理员自然语言转发请求规整为 proactive command。
-
-    这里故意采用本地规则解析，避免把真实 QQ 目标和副作用能力暴露给普通模型。
-    """
-    raw = str(text or "").strip()
-    if not raw or not _contains_any(raw, _NATURAL_PROACTIVE_VERBS):
-        return None
-    target_type, target_ref = await _natural_target_from_text(bot, event, raw)
-    if not target_type or not target_ref:
-        return None
-
-    wants_history = _contains_any(raw, _NATURAL_HISTORY_WORDS)
-    wants_image = _contains_any(raw, _NATURAL_IMAGE_WORDS)
-    wants_file = _contains_any(raw, _NATURAL_FILE_WORDS)
-    query = _extract_natural_query(raw)
-    selector = "history" if wants_history or query else "attachments" if wants_image or wants_file else "current"
-    action = "forward" if "合并转发" in raw else "send"
-    return {
-        "action": action,
-        "target_type": target_type,
-        "target_ref": target_ref,
-        "body": "",
-        "natural": "1",
-        "selector": selector,
-        "query": query,
-        "include_images": "1" if wants_image or selector == "attachments" else "",
-        "include_files": "1" if wants_file else "",
-        "raw_text": raw,
-    }
+# 注意：自然语言转发（“把 xx 转发给 xx”等）不再在 Bot 入口做本地正则拦截，
+# 避免把本应交给 AI（qq.orchestrator）分析“哪些条目需要转发”的请求误譍为
+# 本地转发指令。这类需求原样进入 Agent，由其调用 qq_forward 工具完成。
 
 
 def _filter_attachments_by_kind(
@@ -2358,135 +2223,6 @@ def _filter_attachments_by_kind(
     return selected
 
 
-def _natural_history_selection(event: Event, command: dict[str, Any]) -> tuple[str, List[Dict[str, Any]]]:
-    if not isinstance(event, GroupMessageEvent):
-        return "", []
-    query = str(command.get("query") or "").strip().lower()
-    include_images = bool(command.get("include_images"))
-    include_files = bool(command.get("include_files"))
-    records = list(_group_content_records.get(int(event.group_id), ()))
-    if not records:
-        return "", []
-    selected: list[GroupContentRecord]
-    if query:
-        selected = [record for record in records if query in record.text.lower() or query in record.formatted_line.lower()]
-    else:
-        selected = records[-min(10, len(records)):]
-    selected = selected[-20:]
-    body = "\n".join(record.formatted_line for record in selected if record.formatted_line).strip()
-    attachments: list[dict[str, Any]] = []
-    if include_images or include_files:
-        for record in selected:
-            attachments.extend(_filter_attachments_by_kind(
-                record.attachments or [],
-                include_images=include_images,
-                include_files=include_files,
-            ))
-    return _truncate_qq_text(body), attachments
-
-
-async def _collect_reply_attachments_for_natural(
-    bot: Bot,
-    event: Event,
-    conversation_key: str,
-    *,
-    include_images: bool,
-    include_files: bool,
-) -> List[Dict[str, Any]]:
-    reply_message_id = _extract_reply_message_id(
-        event.get_message() if hasattr(event, "get_message") else None,
-        getattr(event, "raw_message", None),
-    )
-    reply_obj = getattr(event, "reply", None)
-    reply: Dict[str, Any] | None = None
-    if reply_obj is not None:
-        reply = {
-            "message": getattr(reply_obj, "message", None),
-            "raw_message": getattr(reply_obj, "raw_message", None),
-        }
-    if (not reply or reply.get("message") is None) and reply_message_id is not None:
-        reply = _reply_message_cache.get(str(reply_message_id))
-    if (not reply or reply.get("message") is None) and reply_message_id is not None:
-        reply = await _get_reply_message(bot, reply_message_id)
-    attachments: list[dict[str, Any]] = []
-    if reply:
-        message = reply.get("message") if reply.get("message") is not None else reply.get("raw_message")
-        if include_images:
-            image_atts, _image_errors = await _image_sources_to_attachments(_iter_qq_image_urls(message), conversation_key)
-            attachments.extend(image_atts)
-        if include_files:
-            file_atts, _file_errors = await _file_sources_to_attachments(_iter_qq_file_sources(message), conversation_key)
-            attachments.extend(file_atts)
-    if not attachments and include_images and reply_message_id is not None:
-        cached = _reply_attachment_cache.get(str(reply_message_id))
-        if isinstance(cached, dict):
-            attachments.extend(dict(att) for att in cached.get("attachments") or [] if isinstance(att, dict))
-    return attachments
-
-
-async def _natural_command_payload(
-    *,
-    bot: Bot,
-    event: Event,
-    conversation_key: str,
-    command: dict[str, Any],
-    current_attachments: List[Dict[str, Any]],
-) -> tuple[str, List[Dict[str, Any]], str]:
-    selector = str(command.get("selector") or "current")
-    include_images = bool(command.get("include_images"))
-    include_files = bool(command.get("include_files"))
-    if not include_images and not include_files:
-        include_images = selector != "history"
-        include_files = selector != "history" or (selector == "history" and "文件" in str(command.get("raw_text") or ""))
-
-    if selector == "history":
-        body, attachments = _natural_history_selection(event, command)
-        if include_files and not any(str(att.get("type") or "") == "file" for att in attachments):
-            attachments.extend(_recent_attachments_for_natural_forward(
-                conversation_key,
-                event,
-                include_images=False,
-                include_files=True,
-            ))
-        if include_images and not any(str(att.get("type") or "") == "image" for att in attachments):
-            attachments.extend(_recent_attachments_for_natural_forward(
-                conversation_key,
-                event,
-                include_images=True,
-                include_files=False,
-            ))
-        if not body and str(command.get("query") or ""):
-            return "", [], f"没有在上文中找到关于“{_sanitize_name(command.get('query'), max_len=40)}”的消息。"
-        if not body:
-            return "", [], "没有可发送的上文内容。"
-        return body, attachments, ""
-
-    attachments = _filter_attachments_by_kind(
-        current_attachments,
-        include_images=include_images,
-        include_files=include_files,
-    )
-    if not attachments:
-        attachments = await _collect_reply_attachments_for_natural(
-            bot,
-            event,
-            conversation_key,
-            include_images=include_images,
-            include_files=include_files,
-        )
-    if not attachments:
-        attachments = _recent_attachments_for_natural_forward(
-            conversation_key,
-            event,
-            include_images=include_images,
-            include_files=include_files,
-        )
-    if selector == "attachments" and not attachments:
-        want = "文件" if include_files and not include_images else "图片/附件"
-        return "", [], f"没有找到可发送的{want}。请在同一条消息里带上，或引用/紧接着回复对应内容。"
-    return str(command.get("body") or "").strip(), attachments, ""
-
-
 async def _maybe_handle_proactive_command(
     *,
     bot: Bot,
@@ -2495,11 +2231,15 @@ async def _maybe_handle_proactive_command(
     conversation_key: str,
     current_attachments: List[Dict[str, Any]],
 ) -> str | None:
-    """处理管理员主动私聊/群聊发送、文件发送、合并转发和自然语言转发请求。"""
+    """处理管理员主动私聊/群聊发送、文件发送、合并转发等显式命令请求。
+
+    注意：这里只处理带明确命令前缀（如“合并转发/私信/群发/转发到”）的结构化命令。
+    自然语言转发需求（例如“把上面聊到的 xxx 转发给我”）不在此拦截，而是原样交给
+    AI（qq.orchestrator 节点）分析，由其调用 qq_forward 工具挑选并转发对应条目，
+    避免与“让 QQ Bot 分析哪些条目需要转发”的初衷冲突。
+    """
     command = _parse_proactive_command(user_text)
     is_admin = _is_admin_user(getattr(event, "user_id", ""))
-    if command is None and is_admin:
-        command = await _parse_natural_proactive_command(bot, event, user_text)
     if command is None:
         return None
     if not is_admin:
@@ -2519,19 +2259,8 @@ async def _maybe_handle_proactive_command(
     label = _target_display_label(target.target_type, target.label)
 
     if action == "send":
-        if command.get("natural"):
-            body, attachments, payload_error = await _natural_command_payload(
-                bot=bot,
-                event=event,
-                conversation_key=conversation_key,
-                command=command,
-                current_attachments=current_attachments,
-            )
-            if payload_error:
-                return payload_error
-        else:
-            body = str(command.get("body") or "").strip()
-            attachments = current_attachments or []
+        body = str(command.get("body") or "").strip()
+        attachments = current_attachments or []
         if not body and not attachments:
             return "发送内容为空。"
         await _send_text_and_attachments(bot, send_target, body, attachments)
@@ -2545,19 +2274,8 @@ async def _maybe_handle_proactive_command(
         return f"已向{label}发送文件：{attachment.get('name') or attachment.get('path')}"
 
     if action == "forward":
-        if command.get("natural"):
-            body, payload_attachments, payload_error = await _natural_command_payload(
-                bot=bot,
-                event=event,
-                conversation_key=conversation_key,
-                command=command,
-                current_attachments=current_attachments,
-            )
-            if payload_error:
-                return payload_error
-        else:
-            body = str(command.get("body") or "").strip()
-            payload_attachments = current_attachments or []
+        body = str(command.get("body") or "").strip()
+        payload_attachments = current_attachments or []
         nodes: list[dict[str, Any]] = []
         if body:
             chunks = [chunk.strip() for chunk in re.split(r"\n\s*---\s*\n", body) if chunk.strip()]

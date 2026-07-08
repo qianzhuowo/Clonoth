@@ -4341,6 +4341,10 @@ async def _startup() -> None:
         base_url=CLONOTH_BASE_URL,
         entry_node_id=ENTRY_NODE_ID,
         conversation_key_prefix="qq_group",
+        # [AutoC] QQ 私聊会话键前缀为 qq_private，需一并声明归属，
+        # 否则私聊触发的 approval_requested 会因前缀不匹配被 SDK 丢弃，
+        # 导致管理员收不到审批、任务空等到超时。
+        extra_conversation_key_prefixes=["qq_private"],
         workspace_root=Path(CLONOTH_WORKSPACE),
         # QQ 侧不再自动审批内部操作；所有 approval_requested 都必须由
         # CLONOTH_ADMIN_QQ_USERS 中的管理员私聊明确同意后才会放行。

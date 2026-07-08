@@ -349,9 +349,11 @@ class SchedulerThread:
                 _now_ts = datetime.now(timezone.utc)
                 _stale_cutoff = _now_ts - timedelta(minutes=10)
                 try:
-                    _max_running_sec = max(300.0, float(os.getenv("CLONOTH_TASK_MAX_RUNNING_SECONDS", "21600")))
+                    # [AutoC] 默认任务硬上限统一为 1 小时（3600s），与审批超时对齐；
+                    # 可由 CLONOTH_TASK_MAX_RUNNING_SECONDS 覆盖。
+                    _max_running_sec = max(300.0, float(os.getenv("CLONOTH_TASK_MAX_RUNNING_SECONDS", "3600")))
                 except Exception:
-                    _max_running_sec = 21600.0
+                    _max_running_sec = 3600.0
                 _stale_ids: list[tuple[str, str]] = []
                 for tid, t in self._state.tasks.items():
                     if t.status != TaskStatus.running:

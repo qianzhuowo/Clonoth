@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,6 +27,10 @@ class ToolContext:
     parent_session_id: str = ""
     conversation_key: str = ""
     approval_poll_interval_sec: float = 0.5
+    # [AutoC] 审批等待超时上限（秒）。超时后自动按 deny 处理，避免任务无人
+    # 审批时长期挂在 running 状态，直到硬上限才被 scheduler 回收。
+    # 默认 3600s（1 小时），可由 CLONOTH_APPROVAL_TIMEOUT_SECONDS 覆盖。
+    approval_timeout_sec: float = 3600.0
     # [AutoC 2026-05-31] Why: request_guard runs inside a ToolContext after the
     # engine has selected a concrete tool call. How: carry the active provider
     # tool_call_id and node_id on the context. Purpose: policy approvals can be
@@ -99,6 +104,19 @@ class ToolContext:
             pass
         return False
 
+    def _resolve_approval_timeout_sec(self) -> float:
+        """审批等待超时上限。优先 env，其次数据类字段；<=0 表示不超时。"""
+        raw = os.getenv("CLONOTH_APPROVAL_TIMEOUT_SECONDS")
+        if raw is not None:
+            try:
+                return float(raw)
+            except Exception:
+                pass
+        try:
+            return float(self.approval_timeout_sec)
+        except Exception:
+            return 3600.0
+
     async def wait_for_approval(self, approval_id: str, poll_interval: float | None = None) -> dict[str, Any]:
         import time as _time
         interval = float(poll_interval) if poll_interval is not None else float(self.approval_poll_interval_sec or 0.5)
@@ -107,6 +125,9 @@ class ToolContext:
         _last_renew = 0.0  # monotonic timestamp of last lease renewal
         _RENEW_INTERVAL = 30.0  # renew lease every 30s during approval wait
         _RENEW_LEASE_SEC = 300.0  # request 5-minute lease to survive long waits
+        # [AutoC] 审批等待超时兜底：无人审批时不再无限等待，避免任务挂到硬上限。
+        _timeout_sec = self._resolve_approval_timeout_sec()
+        _wait_started = _time.monotonic()
         while True:
             if await self.check_cancelled():
                 return {"approval_id": approval_id, "status": "cancelled"}
@@ -115,6 +136,24 @@ class ToolContext:
             approval = r.json()
             if approval.get("status") != "pending":
                 return approval
+            # [AutoC] 超时自动拒绝：先请求 supervisor 落库 deny，再返回 deny 结果，
+            # 保证审批状态与任务结果一致，避免残留 pending。
+            if _timeout_sec > 0 and (_time.monotonic() - _wait_started) >= _timeout_sec:
+                _timeout_comment = f"approval timed out after {int(_timeout_sec)}s with no decision; auto-denied"
+                try:
+                    await self.http.post(
+                        f"{self.supervisor_url}/v1/approvals/{approval_id}",
+                        json={"decision": "deny", "comment": _timeout_comment},
+                    )
+                except Exception:
+                    pass  # best-effort；即便落库失败也返回 deny，让工具侧终止等待
+                return {
+                    "approval_id": approval_id,
+                    "status": "denied",
+                    "decision": "deny",
+                    "timed_out": True,
+                    "comment": _timeout_comment,
+                }
             # Renew task lease during approval wait to prevent zombie reaper timeout.
             # This is defense-in-depth alongside the heartbeat in engine/runner.py.
             _now_mono = _time.monotonic()

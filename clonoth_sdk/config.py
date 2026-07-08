@@ -29,6 +29,10 @@ class BotConfig:
     secret: str | None = None
     entry_node_id: str = ""
     conversation_key_prefix: str = ""
+    # [AutoC] 同一适配器可能拥有多个会话前缀（如 QQ 同时有 qq_group 与
+    # qq_private）。归属判定除主前缀外，还接受这里列出的附加前缀，避免
+    # 私聊触发的审批因前缀不匹配被 SDK 静默丢弃、任务空等到超时。
+    extra_conversation_key_prefixes: list[str] = field(default_factory=list)
     poll_interval: float = 0.8
     max_history: int = 50
     workspace_root: Path | None = None

@@ -370,8 +370,19 @@ class EventRouter:
         conv_key = str(conv_key or "").strip()
         if not conv_key:
             return False
-        prefix = self._config.conversation_key_prefix or ""
-        return not prefix or conv_key.startswith(prefix + ":")
+        # [AutoC] 归属判定支持主前缀 + 附加前缀。任一前缀匹配即视为本适配器拥有；
+        # 主前缀为空时保持旧的“接受全部”兼容行为。
+        prefixes: list[str] = []
+        main_prefix = self._config.conversation_key_prefix or ""
+        if main_prefix:
+            prefixes.append(main_prefix)
+        for extra in (getattr(self._config, "extra_conversation_key_prefixes", None) or []):
+            extra = str(extra or "").strip()
+            if extra and extra not in prefixes:
+                prefixes.append(extra)
+        if not prefixes:
+            return True
+        return any(conv_key.startswith(p + ":") for p in prefixes)
 
     def _structured_parent_conversation_key(self, payload: dict) -> str:
         """Read structured parent route key from dispatch metadata if present."""

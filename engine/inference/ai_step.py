@@ -836,7 +836,7 @@ async def _run_async_tool(
                     elif isinstance(a, str):
                         attachments.append(a)
 
-        payload: dict = {"message": preempt_text}
+        payload: dict = {"message": preempt_text, "tool_name": tool_name, "task_id": task_id}
         if attachments:
             payload["attachment_paths"] = attachments
 

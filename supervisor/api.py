@@ -352,7 +352,14 @@ def create_app(
         st: SupervisorState = app.state.state
         if session_id not in st.sessions:
             raise HTTPException(status_code=404, detail="session not found")
-        result = st.inject_async_result(session_id, text=msg, attachments=atts)
+        result = st.inject_async_result(
+            session_id,
+            text=msg,
+            attachments=atts,
+            node_id=str(body.get("node_id") or ""),
+            task_id=str(body.get("task_id") or ""),
+            tool_name=str(body.get("tool_name") or ""),
+        )
         if not result.get("ok"):
             raise HTTPException(status_code=500, detail=result.get("error", "unknown"))
         return result

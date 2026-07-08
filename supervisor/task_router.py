@@ -1033,7 +1033,16 @@ class TaskRouterMixin:
         except Exception as e:
             log.warning("cleanup dispatch session %s failed: %s", _dispatch_sid[:12], e)
 
-    def inject_async_result(self, session_id: str, text: str, attachments: list | None = None) -> dict[str, Any]:
+    def inject_async_result(
+        self,
+        session_id: str,
+        text: str,
+        attachments: list | None = None,
+        *,
+        node_id: str = "",
+        task_id: str = "",
+        tool_name: str = "",
+    ) -> dict[str, Any]:
         """注入异步工具结果到 session，并创建新的 inbound 分支。
 
         [Fork/Merge 2026-05-12] 旧的 running/suspended 自动 preempt 回退被移除。
@@ -1046,6 +1055,41 @@ class TaskRouterMixin:
                 return {"ok": False, "error": "session not found"}
 
             result_atts = list(attachments or [])
+            event_node_id = str(node_id or tool_name or "").strip()
+            event_task_id = str(task_id or "").strip()
+
+            if result_atts:
+                payload: dict[str, Any] = {
+                    "text": "",
+                    "attachments": [{"path": p} for p in result_atts],
+                    "message_type": "async_tool_attachment",
+                    "action_type": "async_tool_attachment",
+                }
+                if event_node_id:
+                    payload["node_id"] = event_node_id
+                if event_task_id:
+                    payload["task_id"] = event_task_id
+                tool = str(tool_name or "").strip()
+                if tool:
+                    payload["tool_name"] = tool
+                conv_key = session_info.conversation_key
+                if conv_key:
+                    payload["conversation_key"] = conv_key
+                evt = self.eventlog.append(
+                    session_id=session_id,
+                    component="supervisor",
+                    type_="outbound_message",
+                    payload=payload,
+                )
+                try:
+                    self._apply_outbound_message(
+                        seq=int(evt.get("seq", 0) or 0),
+                        session_id=session_id,
+                        payload=payload,
+                    )
+                except Exception as exc:
+                    log.warning("async tool attachment outbound apply failed: %s", exc)
+                return {"ok": True, "strategy": "outbound_attachment"}
 
             # [Fork/Merge 2026-05-12] 外部异步结果注入不再自动 preempt。
             # 原因：preempt 语义收窄为 adapter 显式请求；内部注入应像普通 inbound 一样
@@ -1057,14 +1101,12 @@ class TaskRouterMixin:
             channel = session_info.channel
             msg_id = f"async_tool_result:{session_id}"
 
-            payload: dict[str, Any] = {
+            payload = {
                 "channel": channel,
                 "conversation_key": conv_key,
                 "message_id": msg_id,
                 "text": text,
             }
-            if result_atts:
-                payload["attachments"] = [{"path": p} for p in result_atts]
 
             evt = self.eventlog.append(
                 session_id=session_id,

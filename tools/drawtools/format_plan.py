@@ -55,13 +55,35 @@ def character_prompt(ch: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def normalize_image_task(image: dict[str, Any], index: int, settings: dict[str, Any]) -> dict[str, Any]:
+def _coerce_seed(value: Any) -> int | None:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_image_task(image: dict[str, Any], index: int, settings: dict[str, Any], base_seed: int | None = None) -> dict[str, Any]:
     preset_ref = str(image.get("preset") or image.get("preset_id") or image.get("style_preset") or "").strip()
     preset = selected_preset(settings, preset_ref)
     width, height, size_label = size_to_dimensions(str(image.get("size_label") or "竖图"), settings)
     params = dict(preset.get("params") or {})
     params["width"] = width
     params["height"] = height
+    # seed 有两种来源，用 seed_from_image 区分，供下游决定是否递增：
+    #   1) image 级显式 seed：用户想固定这张图，用原值、不加偏移（可让多张 tag 不同但同 seed）。
+    #   2) plan 级基准 seed：整批共享一个基准，由下游按图序递增，保证整批可复现且每张不同。
+    # 缺省时保持预设的 -1（随机）。
+    seed_from_image = False
+    image_seed = _coerce_seed(image.get("seed"))
+    if image_seed is None:
+        image_seed = _coerce_seed(image.get("seed_value"))
+    if image_seed is not None:
+        params["seed"] = image_seed
+        seed_from_image = True
+    elif base_seed is not None:
+        params["seed"] = base_seed
 
     characters_raw = image.get("characters")
     characters = [c for c in characters_raw if isinstance(c, dict)] if isinstance(characters_raw, list) else []
@@ -79,6 +101,8 @@ def normalize_image_task(image: dict[str, Any], index: int, settings: dict[str, 
         "size_label": size_label,
         "width": width,
         "height": height,
+        "seed": params.get("seed"),
+        "seed_from_image": seed_from_image,
         "prompt": scene,
         "negative_prompt": negative,
         "character_prompts": char_prompts,
@@ -93,8 +117,14 @@ def build_tasks_from_plan(plan_text: str) -> list[dict[str, Any]]:
     settings = load_settings()
     plan = parse_plan(plan_text)
     images = plan["images"]
+    # plan 顶层基准 seed：兼容 seed / base_seed / seed_value 三种写法。
+    base_seed = _coerce_seed(plan.get("seed"))
+    if base_seed is None:
+        base_seed = _coerce_seed(plan.get("base_seed"))
+    if base_seed is None:
+        base_seed = _coerce_seed(plan.get("seed_value"))
     preset = selected_preset(settings)
     max_images = int(preset.get("max_images") or 0)
     if max_images > 0:
         images = images[:max_images]
-    return [normalize_image_task(img, i + 1, settings) for i, img in enumerate(images) if isinstance(img, dict)]
+    return [normalize_image_task(img, i + 1, settings, base_seed) for i, img in enumerate(images) if isinstance(img, dict)]

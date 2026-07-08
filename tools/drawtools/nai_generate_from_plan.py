@@ -109,6 +109,23 @@ if __name__ == "__main__":
             "params": task["params"],
             "preset_id": task.get("preset_id", ""),
         }
+        # seed 策略（与 format_plan 配合）：
+        #   - image 级显式 seed（seed_from_image=True）：用原值、不加偏移，
+        #     便于“多张 tag 不同但用完全相同的同一个 seed”。
+        #   - plan 级基准 seed：按图序递增（seed + (index-1)），整批可复现且每张不同。
+        #   - None/缺省或负数：不传，交给 nai_generate 随机生成。
+        seed_raw = task.get("seed")
+        if seed_raw is not None:
+            try:
+                seed_int = int(seed_raw)
+            except (TypeError, ValueError):
+                seed_int = -1
+            if seed_int >= 0:
+                if task.get("seed_from_image"):
+                    payload["seed"] = seed_int
+                else:
+                    offset = int(task.get("index") or 1) - 1
+                    payload["seed"] = seed_int + offset
         try:
             proc = subprocess.run(
                 [sys.executable, str(tool_path)],

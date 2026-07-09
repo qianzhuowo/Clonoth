@@ -9,6 +9,7 @@ core llm_call.py or ai_step.py.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,26 @@ PLUGIN_META = {
 }
 
 
+def _resolve_env_value(value: str | None) -> str:
+    """Expand ${VAR} / $ENV{VAR} references against process environment.
+
+    [fix 2026-07-09] Why: fallback_provider reads data/config.yaml directly via
+    yaml.safe_load and never went through ConfigStore, so ${VAR} placeholders in
+    fallback provider blocks were sent to the API verbatim. How: mirror
+    supervisor.config_store._resolve_env_value so fallback base_url/api_key/model
+    support the same env-reference syntax. Purpose: let users keep fallback
+    secrets in .env instead of committing them to config.yaml.
+    """
+    s = (value or "").strip()
+    if not s:
+        return ""
+    if s.startswith("${") and s.endswith("}") and len(s) > 3:
+        return os.getenv(s[2:-1].strip(), "").strip()
+    if s.startswith("$ENV{") and s.endswith("}") and len(s) > 6:
+        return os.getenv(s[5:-1].strip(), "").strip()
+    return s
+
+
 def _load_config(workspace_root: str | Path) -> dict[str, Any]:
     """Read full data/config.yaml."""
     cfg_path = Path(workspace_root) / "data" / "config.yaml"
@@ -99,11 +120,14 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
     if not isinstance(provider_block, dict):
         provider_block = {}
 
+    # [fix 2026-07-09] Resolve ${VAR}/$ENV{VAR} for both the fallback entry and
+    # the inherited provider block so secrets can live in .env. Explicit values
+    # on the fallback entry still take precedence over the provider block.
     return {
         "provider": provider_name,
-        "base_url": (fb_cfg.get("base_url") or "").strip() or (provider_block.get("base_url") or "").strip(),
-        "api_key": (fb_cfg.get("api_key") or "").strip() or (provider_block.get("api_key") or "").strip(),
-        "model": (fb_cfg.get("model") or "").strip() or (provider_block.get("model") or "").strip(),
+        "base_url": _resolve_env_value(fb_cfg.get("base_url")) or _resolve_env_value(provider_block.get("base_url")),
+        "api_key": _resolve_env_value(fb_cfg.get("api_key")) or _resolve_env_value(provider_block.get("api_key")),
+        "model": _resolve_env_value(fb_cfg.get("model")) or _resolve_env_value(provider_block.get("model")),
     }
 
 

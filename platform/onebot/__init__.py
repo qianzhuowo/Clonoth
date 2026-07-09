@@ -82,6 +82,7 @@ from .config import (
     USER_PROFILES_PATH,
     ONEBOT_STATE_FILE,
     REPLY_ATTACHMENT_CACHE_FILE,
+    ANON_MAP_FILE,
 )
 from .emoji_handler import (
     count_duplicate_face_names,
@@ -251,6 +252,16 @@ _anon_users: Dict[str, str] = {}
 _anon_groups: Dict[str, str] = {}
 _anon_user_reverse: Dict[str, str] = {}
 _anon_group_reverse: Dict[str, str] = {}
+# 显式维护“下一个编号”计数器。不再用 len(_anon_users) 推断，避免持久化恢复/
+# TTL 回收后长度与实际已用编号不一致导致别名冲突。加载时以文件为准恢复。
+_anon_user_next: int = 0
+_anon_group_next: int = 0
+_anon_map_dirty: bool = False
+# 匿名映射写盘节流：新登记不再每次都立即写盘，而是合并到至少间隔 5s 后写一次。
+# _anon_map_save_task 保存待触发的延迟 flush task；_anon_map_last_saved_at 记录上次落盘时间。
+_ANON_MAP_SAVE_MIN_INTERVAL = max(0.0, float(os.environ.get("ONEBOT_ANON_MAP_SAVE_MIN_INTERVAL", "5.0")))
+_anon_map_save_task: Optional["asyncio.Task[Any]"] = None
+_anon_map_last_saved_at: float = 0.0
 
 # 待管理员审批的 Clonoth 操作。key 为 approval_id，value 保存操作、详情和来源会话。
 _pending_approvals: Dict[str, Dict[str, Any]] = {}
@@ -632,16 +643,26 @@ async def _get_forward_messages(bot: Bot, forward_id: str) -> List[Dict[str, Any
     return None
 
 
-def _format_forward_sender(sender: Any) -> tuple[str, str]:
+# 合并转发子消息发送者无名片/昵称时的固定占位。
+FORWARD_SENDER_PLACEHOLDER = "转发用户"
+
+
+def _format_forward_sender(sender: Any) -> str:
+    """返回合并转发子消息发送者的显示名。
+
+    2026-07-09 修改原因：合并转发卡片里的发送者往往是与 Bot 无直接交互的路人
+    （一张卡片可能带几十个陆陌号）。不应把这些无关 QQ 号写入匿名映射表（更不应持久化）。
+    因此这里不再调 _anonymize_user_id（既不登记内存匿名表、也不落盘），直接用
+    profile 显示名 / 群名片 / 昵称；都没有时回退到固定占位，绝不暴露裸 QQ 号。
+    """
     if isinstance(sender, dict):
-        user_id = str(sender.get("user_id") or "")
+        user_id = str(sender.get("user_id") or "").strip()
         raw_name = str(sender.get("card") or sender.get("nickname") or "").strip()
     else:
         user_id = str(getattr(sender, "user_id", "") or "").strip()
         raw_name = str(getattr(sender, "card", "") or getattr(sender, "nickname", "") or "").strip()
-    # 取消泛数字匿名正则后，name 回退不能直接用裸 user_id，否则真实 QQ 号会泄露给模型。
-    display = _qq_profile_display_name(user_id) or raw_name or (_anonymize_user_id(user_id) if user_id else "未知用户")
-    return _sanitize_name(display), (_anonymize_user_id(user_id) if user_id else "UserUnknown")
+    display = _qq_profile_display_name(user_id) or raw_name
+    return _sanitize_name(display) if display else FORWARD_SENDER_PLACEHOLDER
 
 
 def _truncate_forward_text(text: str) -> str:
@@ -684,7 +705,7 @@ async def _format_forward_msg(
             lines.append("…（合并转发条数过多，已截断）")
             break
         remaining[0] -= 1
-        sender_name, sender_user = _format_forward_sender(item.get("sender"))
+        sender_name = _format_forward_sender(item.get("sender"))
         content = item.get("content") if item.get("content") is not None else item.get("message")
         text = await _message_to_text_with_forward(
             bot,
@@ -695,7 +716,8 @@ async def _format_forward_msg(
             remaining=remaining,
         )
         text = _compact_text(text or "[暂不支持的消息类型]", limit=max(_HISTORY_TEXT_LIMIT, 1200))
-        lines.append(f"{index}. [{_format_hhmm(item.get('time'))}] {sender_name}({sender_user}): {text}")
+        # 合并转发子消息只展示发送者显示名，不附带匿名 ID（避免缓存无关号）。
+        lines.append(f"{index}. [{_format_hhmm(item.get('time'))}] {sender_name}: {text}")
     lines.append("【合并转发结束】")
     visited.discard(forward_id)
     return _truncate_forward_text("\n".join(lines))
@@ -2438,27 +2460,178 @@ def _alias_from_index(prefix: str, index: int) -> str:
     return f"{prefix}{letters}"
 
 
+def _mark_anon_map_dirty() -> None:
+    """标记匿名映射需要回写；带最小写盘间隔（默认 5s）的节流合并落盘。
+
+    2026-07-09 修改原因：原实现每次新登记都 create_task 一次全量写盘，新用户
+    集中涌入时会短时间多次写盘。改为节流：距上次落盘不足 _ANON_MAP_SAVE_MIN_INTERVAL
+    时，只调度一个延迟 flush task（已存在则复用），把这段时间内的多次登记合并成一次写盘。
+    关闭时的显式 flush 仍会强制写入最新别名。
+    """
+    global _anon_map_dirty, _anon_map_save_task
+    _anon_map_dirty = True
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 没有运行中的事件循环（如同步测试上下文），保持 dirty，由下次显式保存处理。
+        return
+    # 已有等待中的 flush task 时直接复用，避免重复调度。
+    if _anon_map_save_task is not None and not _anon_map_save_task.done():
+        return
+    _anon_map_save_task = loop.create_task(_anon_map_save_throttled())
+
+
+async def _anon_map_save_throttled() -> None:
+    """trailing 节流：触发后固定等待一个写盘窗口再写，窗口内的多次 dirty 合并为一次。
+
+    为何固定等待而不是“距上次写盘”计算：后者在首次/间隔已满足时会立即写，
+    导致高频场景下每隔一个间隔就写一次；固定等待一个窗口能保证“窗口内只写一次”。
+    """
+    global _anon_map_save_task
+    try:
+        if _ANON_MAP_SAVE_MIN_INTERVAL > 0:
+            await asyncio.sleep(_ANON_MAP_SAVE_MIN_INTERVAL)
+        await _save_anon_map()
+    finally:
+        _anon_map_save_task = None
+
+
+def _load_anon_map() -> None:
+    """以文件为准恢复 _anon_users/_anon_groups、反向表及“下一个编号”计数器。
+
+    2026-07-09 新增：匿名别名映射持久化，保障跨重启同一人/群别名一致与可反解。
+    加载优先从持久化的 next 计数器恢复；若旧文件无该字段，则根据已有别名推断。
+    """
+    global _anon_user_next, _anon_group_next
+    path = Path(ANON_MAP_FILE)
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        logger.warning("failed to load OneBot anon map: %s", path, exc_info=True)
+        return
+    if not isinstance(data, dict):
+        return
+
+    max_user_idx = -1
+    users = data.get("users")
+    if isinstance(users, dict):
+        for real, item in users.items():
+            real = str(real or "").strip()
+            if not real or not isinstance(item, dict):
+                continue
+            alias = str(item.get("alias") or "").strip()
+            if not alias:
+                continue
+            _anon_users[real] = alias
+            _anon_user_reverse[alias] = real
+            max_user_idx = max(max_user_idx, _alias_to_index("User", alias))
+
+    max_group_idx = -1
+    groups = data.get("groups")
+    if isinstance(groups, dict):
+        for real, item in groups.items():
+            real = str(real or "").strip()
+            if not real or not isinstance(item, dict):
+                continue
+            alias = str(item.get("alias") or "").strip()
+            if not alias:
+                continue
+            _anon_groups[real] = alias
+            _anon_group_reverse[alias] = real
+            max_group_idx = max(max_group_idx, _alias_to_index("Group", alias))
+
+    # 下一个编号：优先用文件里显式保存的 next；否则用“最大已用 index + 1”兼容旧文件。
+    try:
+        _anon_user_next = max(int(data.get("user_next", 0) or 0), max_user_idx + 1)
+    except Exception:
+        _anon_user_next = max_user_idx + 1
+    try:
+        _anon_group_next = max(int(data.get("group_next", 0) or 0), max_group_idx + 1)
+    except Exception:
+        _anon_group_next = max_group_idx + 1
+    _anon_user_next = max(0, _anon_user_next)
+    _anon_group_next = max(0, _anon_group_next)
+    logger.info(
+        "loaded OneBot anon map from %s (users=%d groups=%d)",
+        path, len(_anon_users), len(_anon_groups),
+    )
+
+
+async def _save_anon_map() -> None:
+    """把匿名别名映射原子写入单独文件；复用 _route_state_lock + tmp→replace。"""
+    global _anon_map_dirty, _anon_map_last_saved_at
+    async with _route_state_lock:
+        if not _anon_map_dirty:
+            return
+        path = Path(ANON_MAP_FILE)
+        now = time.time()
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "version": 1,
+                "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "user_next": _anon_user_next,
+                "group_next": _anon_group_next,
+                "users": {
+                    real: {"alias": alias, "last_seen": now}
+                    for real, alias in _anon_users.items()
+                },
+                "groups": {
+                    real: {"alias": alias, "last_seen": now}
+                    for real, alias in _anon_groups.items()
+                },
+            }
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(path)
+            _anon_map_dirty = False
+            _anon_map_last_saved_at = time.time()
+        except Exception:
+            logger.warning("failed to save OneBot anon map: %s", path, exc_info=True)
+
+
+def _alias_to_index(prefix: str, alias: str) -> int:
+    """把 UserA/GroupAB 这类别名反解为 0-based 索引；非法别名返回 -1。"""
+    if not alias.startswith(prefix):
+        return -1
+    letters = alias[len(prefix):]
+    if not letters or not letters.isalpha() or not letters.isupper():
+        return -1
+    index = 0
+    for ch in letters:
+        index = index * 26 + (ord(ch) - ord("A") + 1)
+    return index - 1
+
+
 def _anonymize_user_id(user_id: Any) -> str:
+    global _anon_user_next
     real = str(user_id or "").strip()
     if not real:
         return "UserUnknown"
     alias = _anon_users.get(real)
     if alias is None:
-        alias = _alias_from_index("User", len(_anon_users))
+        alias = _alias_from_index("User", _anon_user_next)
+        _anon_user_next += 1
         _anon_users[real] = alias
         _anon_user_reverse[alias] = real
+        _mark_anon_map_dirty()
     return alias
 
 
 def _anonymize_group_id(group_id: Any) -> str:
+    global _anon_group_next
     real = str(group_id or "").strip()
     if not real:
         return "GroupUnknown"
     alias = _anon_groups.get(real)
     if alias is None:
-        alias = _alias_from_index("Group", len(_anon_groups))
+        alias = _alias_from_index("Group", _anon_group_next)
+        _anon_group_next += 1
         _anon_groups[real] = alias
         _anon_group_reverse[alias] = real
+        _mark_anon_map_dirty()
     return alias
 
 
@@ -4361,6 +4534,7 @@ async def _startup() -> None:
         logger.info("loaded %d QQ user profiles", len(_QQ_USER_PROFILES))
     _load_route_state()
     _load_reply_attachment_cache()
+    _load_anon_map()
     _client = ClonothClient(CLONOTH_BASE_URL)
     _session_state = SessionState()
     for sid, target in list(_persisted_session_targets.items()):
@@ -4409,7 +4583,7 @@ async def _startup() -> None:
 @driver.on_shutdown
 async def _shutdown() -> None:
     """NoneBot 关闭时停止事件路由并释放 HTTP 连接。"""
-    global _client, _event_router, _router_task, _qq_queue_tasks, _callbacks
+    global _client, _event_router, _router_task, _qq_queue_tasks, _callbacks, _anon_map_save_task
     if _event_router is not None:
         _event_router.stop()
     if _router_task is not None:
@@ -4430,6 +4604,15 @@ async def _shutdown() -> None:
     _event_router = None
     _callbacks = None
     await _stop_forward_bridge()
+    # 关闭前先取消可能在睡等间隔的节流 flush task，再同步 flush 一次，
+    # 避免延迟写盘 task 未到点就退出导致最新别名丢失。
+    if _anon_map_save_task is not None and not _anon_map_save_task.done():
+        _anon_map_save_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await _anon_map_save_task
+    _anon_map_save_task = None
+    with contextlib.suppress(Exception):
+        await _save_anon_map()
     logger.info("Clonoth Agent QQ adapter stopped")
 
 

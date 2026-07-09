@@ -169,6 +169,15 @@ REPLY_ATTACHMENT_CACHE_FILE = _env_first(
     default=os.path.join(CLONOTH_WORKSPACE, "data", "cache", "onebot_reply_attachments.json"),
 )
 
+# 匿名别名映射持久化文件：保存 真实 QQ 号/群号 <-> UserX/GroupX 别名 的双向映射。
+# 目的：跨重启保持别名一致，避免历史/记忆里同一人出现不同别名，并支持别名反解。
+# 注意：这是一份“去匿名化字典”（明文对照真实号 <-> 别名），属于敏感文件，
+# 必须与 data/config.yaml 同级别保护、不得提交到版本库。与路由状态分离存放。
+ANON_MAP_FILE = _env_first(
+    "ONEBOT_ANON_MAP_FILE",
+    default=os.path.join(CLONOTH_WORKSPACE, "data", "onebot_anon_map.json"),
+)
+
 # QQ 审批管理员白名单。只有这些 QQ 用户能批准/拒绝 Clonoth 审批请求。
 _raw_admin_users = _env_first("CLONOTH_ADMIN_QQ_USERS", "ONEBOT_ADMIN_USERS", default="[占位符],[占位符]")
 ADMIN_QQ_USERS: list[int] = _parse_qq_id_list(_raw_admin_users)

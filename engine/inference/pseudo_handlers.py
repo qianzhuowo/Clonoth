@@ -406,6 +406,25 @@ async def _handle_pseudo_preempt_task(ls: _LoopState, pseudo_call, args: dict) -
     return None
 
 
+def _target_is_persistent(ls: _LoopState, target: str) -> bool:
+    """读取 dispatch 目标节点的 persistent 声明，用于推导默认 context_mode。
+
+    [AutoC 2026-07-09] Why: 只有声明为长期节点（persistent=true）的 target
+    才应默认 accumulate；其余节点默认 fresh。How: 复用 engine.node.load_node
+    的同一搭载逻辑（config/nodes 与 system_nodes 搜索顺序），失败时保守返回
+    False。Purpose: 避免把普通工具型/一次性节点默认持久化。
+    """
+    tid = str(target or "").strip()
+    if not tid:
+        return False
+    try:
+        from ..node import load_node
+        _n = load_node(Path(ls.rctx.workspace_root), tid)
+        return bool(_n is not None and getattr(_n, "persistent", False))
+    except Exception:
+        return False
+
+
 async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> None:
     """处理 dispatch:{target_id} 动态伪工具。始终返回 None（非终止）。
 
@@ -417,11 +436,17 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     """
     target = str(args.get("target") or "").strip()
     instr = str(args.get("instruction") or "").strip()
+    # [AutoC 2026-07-09] Why: dispatch 的默认 context_mode 原先写死 accumulate，
+    # 导致所有未显式指定模式的子节点都长期复用 child session（历史污染 / 成本上升）。
+    # How: 显式传参优先；未传时按 target 节点的 persistent 声明推导——
+    # persistent=true → accumulate（长期人格 / 专属助手 / 立项的长期维护 agent），
+    # 否则 fresh（一次性搜索、一次性工程执行、审查/debug 等）。
+    # Purpose: 让 persistent 字段真正驱动默认行为，语义与 node.persistent 一致。
     _raw_ctx_mode = args.get("context_mode")
-    if _raw_ctx_mode is not None:
+    if _raw_ctx_mode is not None and str(_raw_ctx_mode).strip():
         ctx_mode = str(_raw_ctx_mode).strip()
     else:
-        ctx_mode = "accumulate"
+        ctx_mode = "accumulate" if _target_is_persistent(ls, target) else "fresh"
     ctx_key = str(args.get("context_key") or "").strip() or None
     attachment_paths = args.get("attachment_paths") or []
     attachments = _paths_to_attachments(attachment_paths, ls.rctx.workspace_root)

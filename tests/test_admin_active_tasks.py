@@ -166,6 +166,10 @@ def test_admin_active_tasks_returns_summaries_sorted_and_requires_auth(tmp_path:
             "caller_task_id",
             "input_summary",
             "cancel_requested",
+            # [AutoC 2026-07-09] active-task 摘要新增实时阶段展示字段，
+            # 由 event WS 推导写入 Task.current_phase/current_detail。
+            "current_phase",
+            "current_detail",
         }
         assert "large_prompt" not in str(item)
         assert "secret_input" not in str(item)

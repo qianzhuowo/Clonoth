@@ -113,12 +113,11 @@ def _dispatch_delegate_parameters() -> dict[str, Any]:
             "context_mode": {
                 "type": "string",
                 "enum": ["fresh", "fork", "accumulate"],
-                "default": "accumulate",
-                "description": "子节点上下文模式。fresh=每次从零无历史；fork=继承父节点对话历史；accumulate=首次从零后续恢复自己的上下文（默认 accumulate）。",
+                "description": "子节点上下文模式。fresh=每次从零无历史（一次性搜索/一次性工程执行/审查/debug 推荐）；fork=继承父节点对话历史（需要当前上下文但不污染长期子节点时用）；accumulate=首次从零、后续恢复自己的长期上下文（长期人格/专属助手/立项长期维护 agent 用）。不填时按目标节点是否为持久节点自动选择：持久节点默认 accumulate，其余默认 fresh。",
             },
             "context_key": {
                 "type": "string",
-                "description": "上下文继承标识（仅 accumulate 模式有效）。同一 context_key 的历次任务共享上下文链。不填则按目标节点 ID 查找。",
+                "description": "上下文继承标识（仅 accumulate 模式有效）。同一 context_key 的历次任务共享同一条上下文链，不同 context_key 之间文件隔离——用于长期研究员按主题/项目分开积累。不填则按目标节点 ID 查找。",
             },
             "attachment_paths": {
                 "type": "array",

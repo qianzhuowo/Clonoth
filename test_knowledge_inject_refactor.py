@@ -154,4 +154,9 @@ def test_loader_registers_knowledge_tools_from_plugin_meta(tmp_path: Path) -> No
             ctx=SimpleNamespace(workspace_root=tmp_path),
         )
     )
-    assert result == {"ok": True, "skills": []}
+    # [AutoC 2026-07-09] knowledge 工具统一返回 ok/data 结构（_tool_ok）：
+    # {"ok": True, "data": {"result": "0 skills", "skills": []}}。不再做全等断言，
+    # 只校验关键字段，以免因展示包装字段变化而误报。
+    assert result["ok"] is True
+    assert result["data"]["skills"] == []
+    assert result["data"]["result"] == "0 skills"

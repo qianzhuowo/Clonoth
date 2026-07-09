@@ -1359,7 +1359,22 @@ def create_app(
         session_generation = int(body.get("session_generation", 1))
         node_id = str(body.get("node_id") or "").strip()
         instruction = str(body.get("instruction") or "").strip()
-        context_mode = str(body.get("context_mode") or "accumulate").strip()
+        # [AutoC 2026-07-09] Why: default no longer hardwired to accumulate; explicit
+        # arg wins, otherwise inferred from target node persistent declaration
+        # (persistent -> accumulate, else fresh).
+        _raw_ctx_mode = str(body.get("context_mode") or "").strip()
+        if _raw_ctx_mode:
+            context_mode = _raw_ctx_mode
+        else:
+            _node_persistent = False
+            if node_id:
+                try:
+                    from engine.node import load_node
+                    _tn = load_node(Path(st.workspace_root), node_id)
+                    _node_persistent = bool(_tn is not None and getattr(_tn, "persistent", False))
+                except Exception:
+                    _node_persistent = False
+            context_mode = "accumulate" if _node_persistent else "fresh"
         context_key = str(body.get("context_key") or "").strip() or None
         source_inbound_seq = body.get("source_inbound_seq")
         caller_node_id = str(body.get("caller_node_id") or "").strip()

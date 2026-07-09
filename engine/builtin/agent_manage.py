@@ -193,6 +193,8 @@ PLUGIN_META["tools"] = [
             "从现有节点 yaml 模板创建新的持久化子节点。"
             "读取模板节点配置，替换 id/name/description 等字段后写入 config/nodes/ 目录，"
             "并可选地将新节点追加到调用者的 delegate_targets 中。"
+            "约定：每个长期方向（研究领域/项目/专属助手）应各自新建一个 persistent 节点，"
+            "并使用独立的 memory_book（记忆库物理隔离），不要用同一个节点靠 context_key 分叉多个方向。"
         ),
         "input_schema": {
             "type": "object",
@@ -215,11 +217,11 @@ PLUGIN_META["tools"] = [
                 },
                 "memory_book": {
                     "type": "string",
-                    "description": "记忆 namespace，不填则默认等于 name",
+                    "description": "记忆 namespace（记忆物理落在 data/memory/{memory_book}/，与其他节点隔离），不填则默认等于 name。每个长期方向应有独立的 memory_book。",
                 },
                 "persistent": {
                     "type": "boolean",
-                    "description": "是否持久化，默认 true",
+                    "description": "是否持久化，默认 true。persistent=true 的节点被 dispatch 时默认 context_mode=accumulate（长期累积上下文）；一次性/工具型节点应设为 false，dispatch 时默认 fresh。",
                 },
                 "provider": {
                     "type": "string",

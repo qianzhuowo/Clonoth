@@ -348,6 +348,35 @@ class TaskRouterMixin:
     #  dispatch
     # ------------------------------------------------------------------ #
 
+    def _node_is_persistent(self, node_id: str) -> bool:
+        """读取 dispatch 目标节点的 persistent 声明。
+
+        [AutoC 2026-07-09] Why: 当上游未显式传 context_mode 时，需要依据
+        节点的 persistent 声明推导默认（persistent→accumulate，否则 fresh）。
+        How: 复用 engine.node.load_node（config/nodes 与 system_nodes 搜索顺序），
+        失败时保守返回 False。Purpose: engine 侧与 supervisor 侧行为一致。
+        """
+        nid = str(node_id or "").strip()
+        if not nid:
+            return False
+        try:
+            from pathlib import Path
+            from engine.node import load_node
+            _n = load_node(Path(self.workspace_root), nid)
+            return bool(_n is not None and getattr(_n, "persistent", False))
+        except Exception:
+            return False
+
+    def _resolve_dispatch_context_mode(self, node_id: str, raw_mode: Any) -> str:
+        """解析 dispatch 的有效 context_mode。
+
+        [AutoC 2026-07-09] 显式传参优先；未传时按 target 节点 persistent 推导默认。
+        """
+        _m = str(raw_mode or "").strip()
+        if _m:
+            return _m
+        return "accumulate" if self._node_is_persistent(node_id) else "fresh"
+
     def _route_dispatch_locked(self, task: Task, action: dict[str, Any]) -> None:
         target = str(action.get("target_node") or "").strip()
         dispatch_input = action.get("dispatch_input") if isinstance(action.get("dispatch_input"), dict) else {}
@@ -416,7 +445,9 @@ class TaskRouterMixin:
                         batch_index=idx,
                     )
                 else:
-                    _batch_ctx_mode = str(item.get("context_mode") or "accumulate").strip()
+                    _batch_ctx_mode = self._resolve_dispatch_context_mode(
+                        item_target, item.get("context_mode")
+                    )
                     _batch_ctx_key = str(item.get("context_key") or "").strip() or None
                     _batch_input: dict[str, Any] = {
                         "instruction": str(item.get("instruction") or "").strip(),
@@ -460,7 +491,12 @@ class TaskRouterMixin:
 
         # ---- 单节点委派 ----
         if not created_child_ids and target:
-            _ctx_mode = str(dispatch_input.get("context_mode") or "accumulate").strip()
+            # [AutoC 2026-07-09] Why: compact dispatch 等系统任务已显式传 context_mode；
+            # 其余单节点委派未传时按 target persistent 推导（persistent→accumulate，
+            # 否则 fresh），避免普通节点默认持久化。
+            _ctx_mode = self._resolve_dispatch_context_mode(
+                target, dispatch_input.get("context_mode")
+            )
             _ctx_key = str(dispatch_input.get("context_key") or "").strip() or None
             _single_input: dict[str, Any] = {
                 "instruction": str(dispatch_input.get("instruction") or "").strip(),

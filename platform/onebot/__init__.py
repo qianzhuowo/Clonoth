@@ -1651,11 +1651,9 @@ async def _maybe_handle_model_command(
             cfg = await _client.get_openai_config()
         except Exception as exc:
             logger.warning("get openai config failed: %s", exc, exc_info=True)
-            return f"获取当前模型失败：{exc}"
+            return f"❌ 获取当前模型失败：{exc}"
         return (
-            "【当前主模型】\n"
-            f"model: {cfg.model or '(未设置)'}\n"
-            f"base_url: {cfg.base_url or '(默认)'}\n"
+            f"ℹ️ 当前 model → {cfg.model or '(未设置)'}\n"
             "切换：/切换模型 <模型名>"
         )
 
@@ -1673,17 +1671,14 @@ async def _maybe_handle_model_command(
             out = await _client.update_openai_config(model=model_name)
         except Exception as exc:
             logger.warning("switch global model failed: %s", exc, exc_info=True)
-            return f"切换主模型失败：{exc}"
+            return f"❌ 切换失败：{exc}"
         new_model = ""
         try:
             new_model = str((out or {}).get("openai", {}).get("model") or "").strip()
         except Exception:
             new_model = ""
         logger.info("QQ admin %s switched global model -> %s", getattr(event, "user_id", ""), new_model or model_name)
-        return (
-            f"已切换全局主模型：{new_model or model_name}\n"
-            "（已实时生效，无需重启；仅影响未单独指定 model 的节点）"
-        )
+        return f"✅ model → {new_model or model_name}"
 
     return None
 

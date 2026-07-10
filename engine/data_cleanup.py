@@ -69,6 +69,27 @@ CHILD_SESSION_MAX_AGE = 24 * 3600     # 24 h（与默认 TTL 一致）
 # 保留 48h 宽裕期后清理旧文件（比 child session TTL 长一倍，确保兼容期充分）。
 NODE_CONTEXTS_MAX_AGE = 48 * 3600     # 48 h
 
+# TaskRecord 转写目录 data/transcripts/。文件形如 {session_id}.jsonl 与 child_*.jsonl，
+# 是每个任务的执行转写，供事后分析/记忆提取使用。长期未更新即可回收。
+# 为什么：之前该目录从不清理，会无限累积（本例已 233 个）。
+TRANSCRIPTS_MAX_AGE = float(os.getenv("CLONOTH_TRANSCRIPTS_MAX_AGE_SECONDS", str(14 * 24 * 3600)))  # 14 d
+
+# engine/supervisor 进程日志 data/logs/*.log。重启/重连会产生大量空日志文件
+# （本例 1146 个日志中 1014 个为 0 字节）。按龄清理，保留 cleanup.log。
+LOG_MAX_AGE = float(os.getenv("CLONOTH_LOG_MAX_AGE_SECONDS", str(7 * 24 * 3600)))  # 7 d
+LOG_KEEP_NAMES = {"cleanup.log"}
+
+# LLM 错误快照 data/llm_error_snapshots/：调试用，保留 3 天。
+LLM_ERROR_SNAPSHOT_MAX_AGE = float(os.getenv("CLONOTH_LLM_ERROR_SNAPSHOT_MAX_AGE_SECONDS", str(3 * 24 * 3600)))
+
+# stocktool 行情缓存 data/stocktool/cache/：行情/解析缓存，过期可重拉，保留 7 天。
+STOCKTOOL_CACHE_MAX_AGE = float(os.getenv("CLONOTH_STOCKTOOL_CACHE_MAX_AGE_SECONDS", str(7 * 24 * 3600)))
+
+# OneBot 引用消息附件索引缓存 data/cache/onebot_reply_attachments.json：
+# 指向已落盘附件的路径索引；附件本体由 attachments 清理，这里按文件龄保守清（与 attachments 同龄期）。
+ONEBOT_CACHE_MAX_AGE = float(os.getenv("CLONOTH_ONEBOT_CACHE_MAX_AGE_SECONDS", str(24 * 3600)))
+
+
 
 def _log_init():
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -472,6 +493,56 @@ def purge_expired_child_sessions():
     logging.info("[child_sessions] deleted %d expired files", deleted)
 
 
+# ── transcripts cleanup ────────────────
+def purge_expired_transcripts():
+    """清理 data/transcripts/ 中长期未更新的 TaskRecord 转写文件。
+
+    engine.task_record 向 data/transcripts/{session_id}.jsonl 追写任务记录，之前
+    从不清理，会随会话无限累积。按文件 mtime 删除超过 TRANSCRIPTS_MAX_AGE 的条目。
+    """
+    if TRANSCRIPTS_MAX_AGE <= 0:
+        logging.info("[transcripts] cleanup disabled")
+        return
+    purge_dir(DATA_DIR / "transcripts", TRANSCRIPTS_MAX_AGE, "transcripts")
+
+
+# ── logs cleanup ─────────────────────
+def purge_old_logs():
+    """清理 data/logs/ 下过期的进程日志。
+
+    engine/supervisor 每次重启/重连都会新建日志文件，其中大量为 0 字节空文件，
+    长期不清会堆积成千上万个小文件。保留 cleanup.log（本脚本自身日志）。
+    """
+    if LOG_MAX_AGE <= 0:
+        logging.info("[logs] cleanup disabled")
+        return
+    log_dir = DATA_DIR / "logs"
+    if not log_dir.exists():
+        return
+    cutoff = time.time() - LOG_MAX_AGE
+    deleted = 0
+    for p in log_dir.iterdir():
+        try:
+            if not p.is_file() or p.name in LOG_KEEP_NAMES:
+                continue
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+                deleted += 1
+        except Exception:
+            pass
+    logging.info("[logs] deleted %d files", deleted)
+
+
+# ── stocktool cache cleanup ─────────────
+def purge_stocktool_cache():
+    """清理 data/stocktool/cache/ 下过期行情/解析缓存。过期缓存下次会重拉。"""
+    if STOCKTOOL_CACHE_MAX_AGE <= 0:
+        logging.info("[stocktool_cache] cleanup disabled")
+        return
+    purge_dir(DATA_DIR / "stocktool" / "cache", STOCKTOOL_CACHE_MAX_AGE,
+              "stocktool_cache", recursive=True)
+
+
 # ── main ──────────────────────────────────────
 def main():
     _log_init()
@@ -494,8 +565,18 @@ def main():
                          max_age=ARTIFACT_MAX_AGE, label="artifacts")),
         (purge_dir, dict(directory=DATA_DIR / "attachments",
                          max_age=ATTACH_MAX_AGE, label="attachments", recursive=True)),
+        # OneBot 引用附件索引缓存（与 attachments 同龄期，避免指向已删附件的旧索引堆积）。
+        (purge_dir, dict(directory=DATA_DIR / "cache",
+                         max_age=ONEBOT_CACHE_MAX_AGE, label="onebot_cache", recursive=True)),
         (purge_qq_internal_cache, {}),
         (purge_expired_memory_entries, {}),
+        # 新增：之前未覆盖的目录
+        (purge_expired_transcripts, {}),
+        (purge_old_logs, {}),
+        (purge_dir, dict(directory=DATA_DIR / "llm_error_snapshots",
+                         max_age=LLM_ERROR_SNAPSHOT_MAX_AGE, label="llm_error_snapshots",
+                         recursive=True)),
+        (purge_stocktool_cache, {}),
     ]
 
     for fn, kw in tasks:

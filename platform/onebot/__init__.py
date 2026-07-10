@@ -2336,6 +2336,150 @@ async def _maybe_handle_proactive_command(
 
 
 
+# ---------------------------------------------------------------------------
+#  管理员命令：/清除群记忆 —— 清空指定 QQ 群的长期 memory namespace
+# ---------------------------------------------------------------------------
+
+# 命令别名：群聊里直接清当前群；私聊里列可清理群名或按群名清指定群。
+_CLEAR_GROUP_MEMORY_RE = re.compile(
+    r"^[/／!！]?\s*(?:清除群记忆|清空群记忆|清理群记忆|清除群聊记忆|清空群聊记忆)\s*(.*)$"
+)
+
+
+def _parse_clear_group_memory_command(text: str) -> Optional[str]:
+    """识别 /清除群记忆 命令。返回目标群引用（可为空字符串表示当前群/需列表）。
+
+    返回 None 表示不是本命令。返回 "" 表示命令无参数；返回非空字符串表示
+    管理员显式指定了群名/群号。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    match = _CLEAR_GROUP_MEMORY_RE.match(raw)
+    if match is None:
+        return None
+    return match.group(1).strip()
+
+
+def _conversation_memory_namespace_for_group(group_id: int) -> str:
+    """计算 QQ 群对应的 memory namespace 目录名。
+
+    必须与 engine.builtin.knowledge_inject._conversation_memory_namespace 完全一致：
+    对"真实 conversation_key"（qq_group:<群号>）做纯 SHA256 后取前 24 位，前缀 conv_。
+    注意这里用真实 key 而非稳定哈希 key，因为 memory 落盘用的就是真实 key 的摘要。
+    """
+    real_key = f"qq_group:{int(group_id)}"
+    digest = hashlib.sha256(real_key.encode("utf-8")).hexdigest()[:24]
+    return f"conv_{digest}"
+
+
+def _clear_group_memory_namespace(group_id: int) -> tuple[bool, int]:
+    """删除指定群的 memory namespace 目录及其命中缓存条目。
+
+    返回 (是否存在过目录, 删除的 memory book 文件数)。删除后清除 knowledge
+    injector 的进程内缓存与磁盘 .hit_cache.json 中对应条目，避免残留。
+    """
+    namespace = _conversation_memory_namespace_for_group(group_id)
+    mem_root = Path(CLONOTH_WORKSPACE) / "data" / "memory"
+    ns_dir = mem_root / namespace
+    deleted_books = 0
+    existed = ns_dir.exists() and ns_dir.is_dir()
+    if existed:
+        try:
+            deleted_books = sum(1 for _ in ns_dir.glob("*.yaml"))
+        except Exception:
+            deleted_books = 0
+        import shutil as _shutil
+        try:
+            _shutil.rmtree(ns_dir)
+        except Exception:
+            logger.exception("remove memory namespace failed: %s", ns_dir)
+            existed = False
+    # 尽力使 engine 侧 memory catalog 缓存与磁盘命中缓存失效，避免被删条目仍被注入。
+    try:
+        from engine.builtin.knowledge_inject import _invalidate_cache as _ki_invalidate  # type: ignore
+        _ki_invalidate(Path(CLONOTH_WORKSPACE), memory_book=namespace)
+    except Exception:
+        logger.debug("invalidate knowledge cache failed for %s", namespace, exc_info=True)
+    _drop_hit_cache_entries()
+    return existed, deleted_books
+
+
+def _drop_hit_cache_entries() -> None:
+    """删除 data/memory/.hit_cache.json，让被清群的命中记录一并作废。
+
+    命中缓存以 entry id 为 key、不区分 namespace，被清群的 entry id 已随目录
+    删除；直接移除整个命中缓存文件最简单且安全（下次访问会重建）。
+    """
+    hit_cache = Path(CLONOTH_WORKSPACE) / "data" / "memory" / ".hit_cache.json"
+    try:
+        if hit_cache.exists():
+            hit_cache.unlink()
+    except Exception:
+        logger.debug("drop hit cache failed", exc_info=True)
+
+
+async def _clearable_group_targets(bot: Bot) -> list[ProactiveTarget]:
+    """列出管理员可清理记忆的群（复用主动群目标候选逻辑）。"""
+    return await _group_target_candidates(bot)
+
+
+async def _clear_group_memory_list_text(bot: Bot) -> str:
+    """生成私聊场景下"可清理群记忆"的群名列表提示。"""
+    groups = await _clearable_group_targets(bot)
+    names = [_sanitize_name(t.label, max_len=30) for t in groups if t.label]
+    body = "、".join(names[:80]) if names else "（无；需配置 CLONOTH_ALLOWED_GROUPS 或 get_group_list 可用）"
+    return (
+        "【可清理群记忆的群】\n"
+        + body
+        + "\n\n用法：/清除群记忆 <群名>\n"
+        "例如：/清除群记忆 " + (names[0] if names else "某群")
+        + "\n提示：群名可用 get_group_list 中的群名或配置别名；也可用 /清除群记忆 群号"
+    )
+
+
+async def _maybe_handle_clear_group_memory_command(
+    *,
+    bot: Bot,
+    event: Event,
+    user_text: str,
+) -> str | None:
+    """处理管理员 /清除群记忆 命令。
+
+    - 群聊中无参数：清空当前群记忆。
+    - 私聊中无参数：返回可清理群列表 + 用法。
+    - 任意场景带参数（群名/群号）：解析目标群并清空其记忆。
+    非管理员一律拒绝，且不暴露命令能力细节。
+    """
+    target_ref = _parse_clear_group_memory_command(user_text)
+    if target_ref is None:
+        return None
+    if not _is_admin_user(getattr(event, "user_id", "")):
+        return "该请求不可用。"
+
+    # 无参数：群聊直接清当前群；私聊给出可清理列表。
+    if not target_ref:
+        if isinstance(event, GroupMessageEvent):
+            group_id = int(event.group_id)
+            existed, count = _clear_group_memory_namespace(group_id)
+            if existed:
+                return f"已清空当前群的记忆（删除 {count} 个记忆本）。"
+            return "当前群没有可清理的记忆（记忆目录为空或从未生成）。"
+        return await _clear_group_memory_list_text(bot)
+
+    # 带参数：解析目标群（复用主动发送的目标解析，支持群名/别名/显式群号）。
+    target, error = await _resolve_proactive_target(bot, event, "group", target_ref)
+    if target is None:
+        # 附带可清理群列表，方便管理员纠正群名。
+        list_hint = await _clear_group_memory_list_text(bot)
+        return (error or "目标群解析失败。") + "\n\n" + list_hint
+    existed, count = _clear_group_memory_namespace(int(target.target_id))
+    label = _sanitize_name(target.label, max_len=40)
+    if existed:
+        return f"已清空群「{label}」的记忆（删除 {count} 个记忆本）。"
+    return f"群「{label}」没有可清理的记忆（记忆目录为空或从未生成）。"
+
+
 def _format_history_line(event: GroupMessageEvent, bot: Bot, override_text: str = "") -> str:
     """把群消息格式化为 tangqiu_main 提示词要求的历史行，并匿名化 QQ ID。"""
     text = _anonymize_text_for_ai(_compact_text(override_text or _message_to_text(event.get_message(), getattr(bot, "self_id", None))))
@@ -4698,6 +4842,13 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
 
     attachments, attachment_errors = await _collect_qq_attachments(event, stable_conversation_key)
     _remember_recent_images(stable_conversation_key, event, attachments)
+    clear_mem_reply = await _maybe_handle_clear_group_memory_command(
+        bot=bot,
+        event=event,
+        user_text=user_text,
+    )
+    if clear_mem_reply is not None:
+        await _agent_matcher.finish(clear_mem_reply)
     drawtools_reply = await _maybe_handle_drawtools_command(user_text)
     if drawtools_reply is not None:
         await _agent_matcher.finish(drawtools_reply)
@@ -4802,6 +4953,16 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
         if ok:
             await _private_matcher.finish(f"已{('同意' if decision == 'allow' else '拒绝')}审批：{approval_id}\n操作：{operation}")
         await _private_matcher.finish("审批提交被 Supervisor 拒绝，请检查日志。")
+
+    # 管理员私聊清除群记忆：无参数列出可清理群，带参数按群名/群号清除。
+    # 放在 _is_private_allowed 之前，使管理员即便私聊未整体放通也能使用该命令。
+    clear_mem_reply = await _maybe_handle_clear_group_memory_command(
+        bot=bot,
+        event=event,
+        user_text=user_text,
+    )
+    if clear_mem_reply is not None:
+        await _private_matcher.finish(clear_mem_reply)
 
     if not _is_private_allowed(event):
         await _private_matcher.finish("当前 QQ 私聊未被允许接入 Clonoth。")

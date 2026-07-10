@@ -75,15 +75,15 @@ NODE_CONTEXTS_MAX_AGE = 48 * 3600     # 48 h
 TRANSCRIPTS_MAX_AGE = float(os.getenv("CLONOTH_TRANSCRIPTS_MAX_AGE_SECONDS", str(14 * 24 * 3600)))  # 14 d
 
 # engine/supervisor 进程日志 data/logs/*.log。重启/重连会产生大量空日志文件
-# （本例 1146 个日志中 1014 个为 0 字节）。按龄清理，保留 cleanup.log。
-LOG_MAX_AGE = float(os.getenv("CLONOTH_LOG_MAX_AGE_SECONDS", str(7 * 24 * 3600)))  # 7 d
+# 按龄清理，保留 cleanup.log。
+LOG_MAX_AGE = float(os.getenv("CLONOTH_LOG_MAX_AGE_SECONDS", str(3 * 24 * 3600)))  # 3 d
 LOG_KEEP_NAMES = {"cleanup.log"}
 
 # LLM 错误快照 data/llm_error_snapshots/：调试用，保留 3 天。
 LLM_ERROR_SNAPSHOT_MAX_AGE = float(os.getenv("CLONOTH_LLM_ERROR_SNAPSHOT_MAX_AGE_SECONDS", str(3 * 24 * 3600)))
 
-# stocktool 行情缓存 data/stocktool/cache/：行情/解析缓存，过期可重拉，保留 7 天。
-STOCKTOOL_CACHE_MAX_AGE = float(os.getenv("CLONOTH_STOCKTOOL_CACHE_MAX_AGE_SECONDS", str(7 * 24 * 3600)))
+# stocktool 行情缓存 data/stocktool/cache/：行情/解析缓存，过期可重拉，保留 1 天。
+STOCKTOOL_CACHE_MAX_AGE = float(os.getenv("CLONOTH_STOCKTOOL_CACHE_MAX_AGE_SECONDS", str(1 * 24 * 3600)))
 
 # OneBot 引用消息附件索引缓存 data/cache/onebot_reply_attachments.json：
 # 指向已落盘附件的路径索引；附件本体由 attachments 清理，这里按文件龄保守清（与 attachments 同龄期）。

@@ -114,17 +114,10 @@ Examples:
 
 ## Code Sync Flow (Production)
 
-All changes MUST be made in the source repo (`clonoth_original/`) first:
+All changes MUST be made in the local repo (`Clonoth/`) first:
 
-1. Edit files in `/www/wwwroot/clonoth_original/`
-2. `py_compile` check
-3. `git add -A && git commit -m '[AutoC] ...'`
-4. Copy to production instances:
-   ```bash
-   cp clonoth_original/<path> Clonoth/<path>
-   cp clonoth_original/<path> ClonothZX/<path>
-   ```
-5. Restart affected services
+1. Edit files
+2. Restart affected services
 
 **Never edit production directories directly.**
 

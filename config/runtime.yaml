@@ -51,7 +51,13 @@ engine:
   # bus 在 _run_node_task 中初始化，bridge 将信号写入 data/signals.jsonl。
   signals:
     enabled: true                # false 时 emit 零开销跳过
-    bridge_patterns: null        # null = 全部桥接；或指定 glob 列表如 ["llm.*", "tool.*"]
+    bridge_patterns: null        # 可选允许列表；null = 所有信号均可进入 bridge
+    # 排除高频流式增量和包含完整工具结果的重复事件；关键完成信息仍由
+    # stream_text_final、tool.call.end 及 supervisor events.jsonl 保留。
+    bridge_exclude_patterns:
+      - stream_delta
+      - tool_call_delta
+      - tool_call_end
 
   model: ""
 

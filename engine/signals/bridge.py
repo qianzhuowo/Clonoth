@@ -1,6 +1,6 @@
 """Signal → JSONL file bridge.
 
-Writes every signal as a JSON line to data/signals.jsonl.
+Writes selected signals as JSON lines to data/signals.jsonl.
 Zero dependency on supervisor — works purely within the engine process.
 
 Usage:
@@ -10,6 +10,7 @@ Usage:
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import logging
 import threading
@@ -28,14 +29,20 @@ _write_lock = threading.Lock()
 
 
 def _bridge_handler(signal: Signal) -> None:
-    """Append signal as a JSON line to the signals log file."""
+    """Append a selected signal as a JSON line to the signals log file."""
     if _SIGNALS_LOG is None:
         return
-    # Filter by bridge_patterns if configured
-    if _bridge_patterns is not None:
-        import fnmatch
-        if not any(fnmatch.fnmatch(signal.name, p) for p in _bridge_patterns):
-            return
+    # Apply the optional allowlist first, then the denylist.  A denylist lets
+    # deployments suppress known high-volume signals while retaining new signal
+    # types by default.
+    if _bridge_patterns is not None and not any(
+        fnmatch.fnmatch(signal.name, pattern) for pattern in _bridge_patterns
+    ):
+        return
+    if _bridge_exclude_patterns and any(
+        fnmatch.fnmatch(signal.name, pattern) for pattern in _bridge_exclude_patterns
+    ):
+        return
     entry = {
         "ts": datetime.fromtimestamp(signal.ts, tz=timezone.utc).isoformat(),
         "name": signal.name,
@@ -56,12 +63,18 @@ def _bridge_handler(signal: Signal) -> None:
 
 # Lock for idempotent install check
 _install_lock = threading.Lock()
-# Glob patterns for filtering which signals to bridge (None = all)
-_bridge_patterns: Optional[list] = None
+# Glob patterns for filtering which signals to bridge (None = all).
+_bridge_patterns: Optional[list[str]] = None
+# Glob patterns excluded after the optional allowlist is applied.
+_bridge_exclude_patterns: Optional[list[str]] = None
 
 
-def install_event_bridge(bus: SignalBus, log_dir: Optional[Path] = None,
-                        patterns: Optional[list] = None) -> None:
+def install_event_bridge(
+    bus: SignalBus,
+    log_dir: Optional[Path] = None,
+    patterns: Optional[list[str]] = None,
+    exclude_patterns: Optional[list[str]] = None,
+) -> None:
     """Install the JSONL file bridge on a SignalBus.
 
     Idempotent: multiple calls only register the handler once.
@@ -69,10 +82,10 @@ def install_event_bridge(bus: SignalBus, log_dir: Optional[Path] = None,
     Args:
         bus: The SignalBus instance to bridge.
         log_dir: Directory for signals.jsonl. Defaults to data/ relative to workspace root.
-        patterns: Optional list of glob patterns to filter which signals are bridged.
-                  If None, all signals are bridged.
+        patterns: Optional allowlist of glob patterns. If None, all signals are eligible.
+        exclude_patterns: Optional denylist applied after ``patterns``.
     """
-    global _bridge_installed, _SIGNALS_LOG, _bridge_patterns
+    global _bridge_installed, _SIGNALS_LOG, _bridge_patterns, _bridge_exclude_patterns
     with _install_lock:
         if _bridge_installed:
             log.debug("Signal bridge already installed, skipping")
@@ -82,6 +95,12 @@ def install_event_bridge(bus: SignalBus, log_dir: Optional[Path] = None,
         log_dir.mkdir(parents=True, exist_ok=True)
         _SIGNALS_LOG = log_dir / "signals.jsonl"
         _bridge_patterns = patterns
+        _bridge_exclude_patterns = exclude_patterns
         _bridge_installed = True
         bus.subscribe("*", _bridge_handler)
-        log.info("Signal → JSONL bridge installed: %s (patterns=%s)", _SIGNALS_LOG, patterns)
+        log.info(
+            "Signal → JSONL bridge installed: %s (patterns=%s, exclude_patterns=%s)",
+            _SIGNALS_LOG,
+            patterns,
+            exclude_patterns,
+        )

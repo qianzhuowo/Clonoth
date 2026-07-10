@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
-"""data_cleanup.py — Periodic cleanup for Clonoth data directory.
+"""Periodic cleanup for the Clonoth data directory.
 
-Crontab every 6h. Pure Python, no LLM calls.
-
-1. events.jsonl rotation (>50MB → keep 3 backups)
-2. temp files: chat_dump/chunk/compact/messages, temp_summary (>24h)
-3. artifacts (>24h)
-4. attachments incl. gemini_image (>24h)
+Run by ``clonoth-data-cleanup.timer`` every hour by default. Pure Python, with no
+LLM calls. The jobs include event/signal log rotation, expiration of temporary
+artifacts and child-session state, conservative QQ cache cleanup, and stale
+non-constant memory entry cleanup.
 """
 
 import logging

@@ -1063,7 +1063,12 @@ async def _run_node_task(
     _sig_bus = get_bus()
     _sig_bus.enabled = bool(_signals_cfg.get("enabled", True))
     _bridge_patterns = _signals_cfg.get("bridge_patterns")
-    install_event_bridge(_sig_bus, patterns=_bridge_patterns)
+    _bridge_exclude_patterns = _signals_cfg.get("bridge_exclude_patterns")
+    install_event_bridge(
+        _sig_bus,
+        patterns=_bridge_patterns,
+        exclude_patterns=_bridge_exclude_patterns,
+    )
 
     action = await run_ai_node(
         rctx=rctx, provider=provider, registry=registry, node=node,

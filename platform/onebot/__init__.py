@@ -142,6 +142,16 @@ _CUSTOM_FACE_DELETE_RE = re.compile(r"^(?:删除表情|移除表情|取消收藏
 _DRAW_DIRECT_RE = re.compile(r"^(?:[/／!！]?\s*(?:生图|画图|绘图|nai生图|novelai生图)|/(?:draw|nai|novelai))\s*(.*)$", re.IGNORECASE)
 _DRAW_HELP_RE = re.compile(r"^(?:[/／!！]?\s*(?:生图帮助|画图帮助|绘图帮助|画师串帮助)|/(?:drawhelp|naihelp))\s*$", re.IGNORECASE)
 _DRAW_PRESET_LIST_RE = re.compile(r"^(?:[/／!！]?\s*(?:画师串列表|绘图预设列表|生图预设列表|画风列表)|/(?:drawpresets|presets))\s*$", re.IGNORECASE)
+# [AutoC] 管理员快捷切换全局主模型：/切换模型 <模型名>。
+# 兼容 /切模型、/setmodel、切换主模型 等别名；"模型帮助"/"当前模型" 用于查看。
+_MODEL_SWITCH_RE = re.compile(
+    r"^[/／!！]?\s*(?:切换模型|切换主模型|切模型|设置模型|/?(?:setmodel|switchmodel|model\s+set))\s+(.+?)\s*$",
+    re.IGNORECASE,
+)
+_MODEL_SHOW_RE = re.compile(
+    r"^[/／!！]?\s*(?:当前模型|查看模型|模型帮助|/?(?:model|showmodel|model\s+show))\s*$",
+    re.IGNORECASE,
+)
 _DRAW_PRESET_SWITCH_RE = re.compile(r"^(?:[/／!！]?\s*(?:切换画师串|切换绘图预设|切换生图预设|切换画风)|/(?:setdrawpreset|preset))\s+(.+?)\s*$", re.IGNORECASE)
 DRAW_NODE_ID = "draw.novelai_planner"
 # 2026-07-09: 旧的"5~12 位数字一律当作 QQ 号"兜底匿名正则已废弃（会误伤金额/验证码/
@@ -1607,6 +1617,74 @@ async def _maybe_handle_drawtools_command(user_text: str) -> str | None:
             logger.warning("switch draw preset failed: %s", exc, exc_info=True)
             return f"切换绘图预设失败：没找到“{preset_ref}”，可发送 /画师串列表 查看可用项。"
         return f"已切换默认画师串：{preset.get('name') or preset.get('id')}（id: {preset.get('id')}）"
+    return None
+
+
+async def _maybe_handle_model_command(
+    *,
+    event: Event,
+    user_text: str,
+) -> str | None:
+    """处理 QQ 管理员 /切换模型 <模型名> 命令，切换全局主模型。
+
+    返回回复文本；None 表示不是本命令。切换通过 Supervisor 的
+    POST /v1/config/openai 实时写入 data/config.yaml；Engine 每次处理任务
+    前都会重新拉取该配置（fetch_openai_secret），因此无需重启服务。
+    """
+    text = (user_text or "").strip()
+    if not text:
+        return None
+
+    if _client is None:
+        # 不是本命令时返回 None；确实是本命令但客户端未就绪时才提示。
+        if _MODEL_SWITCH_RE.match(text) or _MODEL_SHOW_RE.match(text):
+            return "Clonoth Agent 尚未初始化，请稍后重试。"
+        return None
+
+    is_admin = _is_admin_user(getattr(event, "user_id", ""))
+
+    # 查看当前模型 / 帮助（仅管理员，避免向普通用户暴露底层模型名）。
+    if _MODEL_SHOW_RE.match(text):
+        if not is_admin:
+            return "模型命令仅限 Clonoth 管理员使用。"
+        try:
+            cfg = await _client.get_openai_config()
+        except Exception as exc:
+            logger.warning("get openai config failed: %s", exc, exc_info=True)
+            return f"获取当前模型失败：{exc}"
+        return (
+            "【当前主模型】\n"
+            f"model: {cfg.model or '(未设置)'}\n"
+            f"base_url: {cfg.base_url or '(默认)'}\n"
+            "切换：/切换模型 <模型名>"
+        )
+
+    switch_match = _MODEL_SWITCH_RE.match(text)
+    if switch_match:
+        if not is_admin:
+            # 不向非管理员暴露切换能力。
+            return "模型命令仅限 Clonoth 管理员使用。"
+        model_name = switch_match.group(1).strip()
+        # 去掉可能的包裹引号/反引号。
+        model_name = model_name.strip("`\"'").strip()
+        if not model_name:
+            return "用法：/切换模型 <模型名>"
+        try:
+            out = await _client.update_openai_config(model=model_name)
+        except Exception as exc:
+            logger.warning("switch global model failed: %s", exc, exc_info=True)
+            return f"切换主模型失败：{exc}"
+        new_model = ""
+        try:
+            new_model = str((out or {}).get("openai", {}).get("model") or "").strip()
+        except Exception:
+            new_model = ""
+        logger.info("QQ admin %s switched global model -> %s", getattr(event, "user_id", ""), new_model or model_name)
+        return (
+            f"已切换全局主模型：{new_model or model_name}\n"
+            "（已实时生效，无需重启；仅影响未单独指定 model 的节点）"
+        )
+
     return None
 
 
@@ -4682,7 +4760,14 @@ async def _startup() -> None:
     _load_route_state()
     _load_reply_attachment_cache()
     _load_anon_map()
-    _client = ClonothClient(CLONOTH_BASE_URL)
+    # [AutoC] QQ 管理员 /切换模型 命令需要调用受 admin_token 保护的
+    # POST /v1/config/openai，因此这里把 Supervisor 写出的 data/.admin_token
+    # 传给 ClonothClient（每次请求实时读取，token 轮换也能跟上）。
+    _client = ClonothClient(
+        CLONOTH_BASE_URL,
+        admin_token=os.environ.get("CLONOTH_ADMIN_TOKEN", "").strip(),
+        admin_token_path=str(Path(CLONOTH_WORKSPACE) / "data" / ".admin_token"),
+    )
     _session_state = SessionState()
     for sid, target in list(_persisted_session_targets.items()):
         conv_key = str(target.get("conversation_key") or "")
@@ -4852,6 +4937,9 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     )
     if clear_mem_reply is not None:
         await _agent_matcher.finish(clear_mem_reply)
+    model_reply = await _maybe_handle_model_command(event=event, user_text=user_text)
+    if model_reply is not None:
+        await _agent_matcher.finish(model_reply)
     drawtools_reply = await _maybe_handle_drawtools_command(user_text)
     if drawtools_reply is not None:
         await _agent_matcher.finish(drawtools_reply)
@@ -4966,6 +5054,9 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     )
     if clear_mem_reply is not None:
         await _private_matcher.finish(clear_mem_reply)
+    model_reply = await _maybe_handle_model_command(event=event, user_text=user_text)
+    if model_reply is not None:
+        await _private_matcher.finish(model_reply)
 
     if not _is_private_allowed(event):
         await _private_matcher.finish("当前 QQ 私聊未被允许接入 Clonoth。")

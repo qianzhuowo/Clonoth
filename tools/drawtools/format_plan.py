@@ -39,17 +39,54 @@ def center_from_grid(value: Any) -> dict[str, float]:
     return {"x": 0.5, "y": 0.5}
 
 
+# 中日文/全角字符检测：character_tags.yaml 里角色名多为中文，
+# 一旦被当成 danbooru tag 塞进 prompt，NovelAI 会画错。这里用于兜底剔除。
+_CJK_RE = re.compile(r"[\u3000-\u303f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uff00-\uffef]")
+
+
+def _strip_cjk_tags(value: Any) -> str:
+    """逐个 tag 过滤掉含 CJK 字符（中文名/日文名）的项，避免把角色中文名当 tag。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.replace("，", ",")
+    kept = [seg.strip() for seg in text.split(",") if seg.strip() and not _CJK_RE.search(seg)]
+    return ", ".join(kept)
+
+
 def character_prompt(ch: dict[str, Any]) -> dict[str, Any]:
+    # 字段兼容：既支持计划里 AI 常用的 appear/costume，也支持角色库原始的
+    # appearance/outfits 字段名，避免 AI 直接透传角色库对象时字段对不上导致丢失。
+    appear = ch.get("appear")
+    if not appear:
+        appear = ch.get("appearance")
+
+    costume = ch.get("costume")
+    if not costume:
+        # outfits 是列表 [{name, tags}]，取其 tags 合并；也兼容直接给 outfit 字符串。
+        outfits = ch.get("outfits")
+        if isinstance(outfits, list):
+            costume = comma_join(*[
+                o.get("tags") if isinstance(o, dict) else o for o in outfits
+            ])
+        elif ch.get("outfit"):
+            costume = ch.get("outfit")
+
+    # danbooru：过滤掉中文名，避免 AI 误把中文名写进 danbooru 字段。
+    danbooru = _strip_cjk_tags(ch.get("danbooru"))
+
     parts = [
-        ch.get("danbooru"),
+        danbooru,
         ch.get("type"),
-        ch.get("appear"),
-        ch.get("costume"),
+        appear,
+        costume,
         ch.get("action"),
         ch.get("interact"),
     ]
+    # 逐段过滤 CJK，最终保险：整条 prompt 不允许残留中文名当 tag。
+    prompt = _strip_cjk_tags(comma_join(*parts))
     return {
-        "prompt": comma_join(*parts),
+        "prompt": prompt,
         "uc": comma_join(ch.get("uc")),
         "center": center_from_grid(ch.get("center")),
     }

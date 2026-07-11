@@ -84,6 +84,11 @@ prompt: |
   1. 调用 `draw_context` 读取可用预设名称和关键词命中角色。
   2. 必要时调用 `web_search` 查询未知 IP 角色。
   3. 按上方 Output Format 模板输出单个合法 YAML 计划，至少包含 `mindful_prelude` 和 `images`。
+     - 预设回填（重要）：只要用户话里出现某个预设名 / 预设 id / 画师串关键词（例如“初音立绘”“初音立绘画师串”“用可爱风”“preset”），
+       就必须在每张 image 上写 `preset` 字段，值填 draw_context.presets 里对应的预设 name 或 id（例如 `preset: 初音立绘`）。
+       * 只写你在 draw_context.presets 中确实看到的预设名/id，不要臆造预设。
+       * 用户没有指定任何预设时，`preset` 字段一律省略，交给系统使用当前默认预设。
+       * 不要把预设的画师串 / positive_prefix / negative_prefix 手动抄进 scene 或 character 字段——这些前后缀由工具按所选预设自动拼接，你只需回填 `preset` 名即可。
      - Seed 处理（仅当用户明确提到 seed / 种子 / 固定种子 / 复现时）：
        * 用户想“用同一个 seed 画多张不同 tag 的图（对比）” → 给每张 image 各写相同的 `seed: <值>`，不写顶层 seed。
        * 用户想“用这个 seed 画一组图（整组可复现）” → 在 plan 顶层写 `seed: <值>`，各 image 不写 seed（系统会按图序自动递增）。

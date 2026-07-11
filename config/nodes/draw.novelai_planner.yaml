@@ -19,6 +19,15 @@ tool_access:
     - nai_generate
     - web_search
 
+# [AutoC 2026-07-11] finish 硬校验：生图模式下，只有当本任务内至少成功执行过
+# 下列任一真实工具时，才允许模型调用 finish 声称已生成/已发送图片。
+# 目的：阻止绘图节点模型“伪造工具调用”（在自然语言里编造 tool result 说成功，
+# 却从未真正调用生图工具）导致的假成功、图片从未生成也从未发送。
+finish_requires_tool:
+  any:
+    - nai_generate_from_plan
+    - nai_generate
+
 skills:
   mode: none
 

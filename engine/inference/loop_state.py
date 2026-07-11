@@ -130,6 +130,15 @@ class _LoopState:
     # ---- 已授权的真工具名集合（由 _filter_tool_specs 输出决定）----
     allowed_real_tools: set = field(default_factory=set)
 
+    # ---- 本任务内真实工具执行记录 ----
+    # [AutoC 2026-07-11] Why: 某些绘图/媒体节点的模型会“伪造工具调用”——
+    # 在自然语言里编造 tool result 说生图成功，却从未真正调用 nai_generate_*，
+    # 导致 finish 谎报成功、图片从未生成也从未发送。How: 每次真实工具执行完成后，
+    # 记录成功执行过的真实工具名，供 finish 硬校验钩子核对。Purpose: 让节点无法在
+    # 没有真实成功工具调用的情况下 finish 报成功。
+    succeeded_real_tools: set = field(default_factory=set)
+    failed_real_tools: set = field(default_factory=set)
+
     # ---- Phase 3 (Session Conversation Store): 最近一次 shadow write 的 Message.id ----
     # 由 _shadow_write() 更新，_persist_ctx() 写入 snapshot 的 last_message_id 字段，
     # 为后续 snapshot 瘦身（不再存完整 messages 数组）做准备。

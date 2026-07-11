@@ -560,7 +560,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
         step=step,
         response=resp,
         tool_calls=list(resp.tool_calls or []),
-        extra={"pseudo_calls": pseudo_calls, "real_tool_calls": real_tool_calls},
+        extra={"pseudo_calls": pseudo_calls, "real_tool_calls": real_tool_calls, "loop_state": ls},
     )
     _before_result = await hook_registry.afire("before_tool_call", _before_ctx)
     if _before_result.action is not None:
@@ -1114,6 +1114,23 @@ async def _execute_real_tools(
         # 确保 assistant 的 tool_use 有对应 tool_result 配对，
         # 模型下次看到的是「我调了工具但被用户取消了」而非 tool_use 悬空无响应。
         _t_cancelled = isinstance(_t_result, dict) and _t_result.get("cancelled")
+
+        # [AutoC 2026-07-11] Why: finish 硬校验需要知道本任务内每个真实工具
+        # 是否真的成功执行过，用于阻止“伪造工具调用”的假成功 finish。How: 判定
+        # 工具结果是否为成功（无 error 且未 cancelled，dict 时优先看 ok 字段）。
+        # Purpose: 让 FinishGuardHandler 能核对真实工具执行记录。
+        _t_is_error = False
+        if _t_cancelled:
+            _t_is_error = True
+        elif isinstance(_t_result, dict):
+            if _t_result.get("error"):
+                _t_is_error = True
+            elif _t_result.get("ok") is False:
+                _t_is_error = True
+        if _t_is_error:
+            ls.failed_real_tools.add(_t_name)
+        else:
+            ls.succeeded_real_tools.add(_t_name)
 
         # [summary-args 2026-05-19] Why: handoff_progress keeps the legacy
         # "[node] tool: summary" format, so argument detail must come from the

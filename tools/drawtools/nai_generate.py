@@ -270,6 +270,13 @@ if __name__ == "__main__":
         except Exception:
             return ""
 
+    def is_concurrent_lock(code: str, body: str) -> bool:
+        # NovelAI 并发锁：HTTP 429 且响应体含 "Concurrent generation is locked"。
+        # 这类错误必须退避更久（服务端配额释放需要时间），不能用普通短重试间隔。
+        if code != "429":
+            return False
+        return "concurrent generation is locked" in (body or "").lower()
+
     def should_retry(code: str, stderr: str) -> bool:
         if code in {"429", "500", "502", "503", "504"}:
             return True
@@ -286,10 +293,26 @@ if __name__ == "__main__":
         retry_max_attempts = int(gen_cfg.get("retry_max_attempts", 5) or 0)
         request_delay_sec = float(gen_cfg.get("request_delay_sec", 0) or 0)
         lock_timeout_sec = float(gen_cfg.get("lock_timeout_sec", 3600) or 3600)
+        # NovelAI 服务端并发锁（HTTP 429 Concurrent generation is locked）的专用退避参数。
+        # 原因：本地队列锁只能保证同一进程串行，但无法避免 NovelAI 账号层面上一张图
+        # 服务端尚未释放并发名额的情况。做法：遇到并发锁时，在用户设定的秒数区间
+        # [lock_retry_wait_min_sec, lock_retry_wait_max_sec] 内随机取一个等待时间再重试，
+        # 与普通 retry_wait_sec 互斥、且并发锁判定优先。
+        lock_retry_max_attempts = int(gen_cfg.get("lock_retry_max_attempts", 8) or 0)
+        lock_retry_wait_min_sec = float(gen_cfg.get("lock_retry_wait_min_sec", 6) or 0)
+        lock_retry_wait_max_sec = float(gen_cfg.get("lock_retry_wait_max_sec", 8) or 0)
+        # 兜底：若用户把区间写反或缺省，纠正为合法区间。
+        if lock_retry_wait_max_sec < lock_retry_wait_min_sec:
+            lock_retry_wait_min_sec, lock_retry_wait_max_sec = lock_retry_wait_max_sec, lock_retry_wait_min_sec
 
         with acquire_queue_lock(lock_file, lock_timeout_sec):
             last_error = ""
-            for attempt in range(retry_max_attempts + 1):
+            # 并发锁重试与普通重试共用一个循环，但并发锁（429 concurrent lock）
+            # 不占用普通重试名额，而是单独计数、用更长的退避等待。
+            attempt = 0
+            lock_attempt = 0
+            max_total_loops = retry_max_attempts + lock_retry_max_attempts + 2
+            for _ in range(max_total_loops):
                 try:
                     tmp_zip.unlink(missing_ok=True)
                 except Exception:
@@ -311,9 +334,19 @@ if __name__ == "__main__":
                 http_code = (result.stdout or "").strip()
                 if http_code == "200":
                     break
-                last_error = f"NovelAI API returned HTTP {http_code}: {read_error_body() or result.stderr}"
+                body = read_error_body()
+                last_error = f"NovelAI API returned HTTP {http_code}: {body or result.stderr}"
+                # 并发锁：单独退避，在用户设定的区间内随机等待后重试。
+                if is_concurrent_lock(http_code, body):
+                    if lock_attempt >= lock_retry_max_attempts:
+                        fail(last_error)
+                    wait = random.uniform(lock_retry_wait_min_sec, lock_retry_wait_max_sec)
+                    lock_attempt += 1
+                    time.sleep(wait)
+                    continue
                 if attempt >= retry_max_attempts or not should_retry(http_code, result.stderr):
                     fail(last_error)
+                attempt += 1
                 time.sleep(retry_wait_sec)
             else:
                 fail(last_error or "NovelAI API request failed")

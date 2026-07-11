@@ -2641,10 +2641,29 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
     text = await _message_to_text_with_forward(bot, message, getattr(bot, "self_id", None))
     if not text:
         text = await _message_to_text_with_forward(bot, raw_message, getattr(bot, "self_id", None))
-    images = _iter_qq_image_urls(message) or _iter_qq_image_urls(raw_message)
-    quoted_attachments, _quoted_errors = await _image_sources_to_attachments(images, conversation_key)
-    for att in quoted_attachments:
-        text = text.replace("[图片]", f"[图片: {att['path']}]", 1)
+
+    # 判断引用的消息是否为 Bot 自己发出的。QQ Bot 的回复里可能带表情包图片，
+    # 用户引用这类回复时不应该把 Bot 自己的图片下载成附件再送去识图——那既浪费
+    # 算力，也会让模型误以为用户在要求识别一张图片。这里仅当被引用消息不是 Bot
+    # 自身发出时才采集图片附件，否则保留 [图片] 文本占位符。
+    reply_sender = reply.get("sender") if isinstance(reply.get("sender"), dict) else None
+    reply_sender_qq = ""
+    if reply_sender is not None:
+        reply_sender_qq = str(reply_sender.get("user_id") or reply.get("user_id") or "")
+    else:
+        reply_sender_qq = str(reply.get("user_id") or "")
+    bot_ids = _bot_self_id_candidates(event, bot)
+    reply_from_bot = _qq_matches_bot(reply_sender_qq, bot_ids)
+
+    if reply_from_bot:
+        # Bot 自己的回复：不下载图片附件，将所有图片占位符标注为表情包。
+        quoted_attachments: list[dict[str, Any]] = []
+        text = text.replace("[图片]", "[表情包]")
+    else:
+        images = _iter_qq_image_urls(message) or _iter_qq_image_urls(raw_message)
+        quoted_attachments, _quoted_errors = await _image_sources_to_attachments(images, conversation_key)
+        for att in quoted_attachments:
+            text = text.replace("[图片]", f"[图片: {att['path']}]", 1)
 
     text = _anonymize_text_for_ai(_compact_text(text))
     if not text:

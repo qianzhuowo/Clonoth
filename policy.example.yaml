@@ -87,7 +87,12 @@ write_file:
 
 # 命令执行策略。
 # default=approval_required：AI 审核之后，仍需人类审批。
-# deny_patterns：仅拦截明确不可逆的破坏命令，作为最后防线。
+# deny_patterns：硬拦截，命中即拒绝，即使管理员任务也不放行、不发审批。
+#   仅用于不可逆破坏 + 极危险的“下载后直接执行 / 反弹 shell”用法。
+# sensitive_patterns：敏感但允许“管理员亲自决定”。命中则保持 approval_required 且
+#   标记 sensitive，使管理员任务不再自动放行、必须弹审批亲自确认；
+#   非管理员的 execute_command 本就被整体拒绝，普通命令（如 curl 纯读取网页不落盘）
+#   仍可对管理员免审批直接执行。
 execute_command:
   default: approval_required
   deny_patterns:
@@ -100,6 +105,26 @@ execute_command:
     - "\\bdd\\s+if=/dev/zero\\b"
     - "\\bshutdown\\b"
     - "\\breboot\\b"
+    # 下载后直接管道到 shell/解释器执行（curl ... | sh、wget ... | bash 等）。
+    - "(?:curl|wget)\\b[^|]*\\|\\s*(?:sudo\\s+)?(?:sh|bash|zsh|python[0-9.]*|perl|ruby|node)\\b"
+    # 反弹 shell。
+    - "/dev/tcp/"
+    - "\\bbash\\s+-i\\b"
+  sensitive_patterns:
+    # 下载到本地文件（curl -o/-O/--output、wget、重定向到文件）。
+    - "\\bcurl\\b[^|]*(?:\\s-O\\b|\\s-o\\b|--output\\b|--remote-name\\b)"
+    - "\\bwget\\b"
+    - "(?:curl|wget)\\b[^|<>]*>\\s*\\S+"
+    # 包管理器安装（引入外部代码）。
+    - "\\bpip[0-9.]*\\s+install\\b"
+    - "\\bpipx\\s+install\\b"
+    - "\\bnpm\\s+(?:install|i|add)\\b"
+    - "\\b(?:pnpm|yarn)\\s+add\\b"
+    - "\\b(?:apt|apt-get|yum|dnf|pacman|apk|brew|zypper)\\s+(?:install|add|-S)\\b"
+    # 给文件加可执行权限。
+    - "\\bchmod\\b[^|]*\\+x\\b"
+    # 网络监听（可能开后门）。
+    - "\\b(?:nc|ncat|netcat|socat)\\b[^|]*(?:\\s-l\\b|--listen\\b)"
 
 restart:
   default: approval_required

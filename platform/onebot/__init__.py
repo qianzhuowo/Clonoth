@@ -19,7 +19,7 @@ import os
 import re
 import sys
 import time
-from collections import defaultdict, deque
+from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, DefaultDict, Deque, Dict, List, Optional
@@ -278,6 +278,33 @@ _anon_map_last_saved_at: float = 0.0
 # 待管理员审批的 Clonoth 操作。key 为 approval_id，value 保存操作、详情和来源会话。
 _pending_approvals: Dict[str, Dict[str, Any]] = {}
 
+# 发给管理员的审批消息 message_id -> approval_id 映射。
+# 用于支持管理员“引用审批消息回复 审批同意/拒绝”即可放行，无需再手输 approval_id。
+# 采用有界字典，超过上限时清理最旧条目，避免无限增长。
+_approval_message_ids: "OrderedDict[str, str]" = OrderedDict()
+_APPROVAL_MSG_MAP_MAX = 500
+
+
+def _remember_approval_message(message_id: Any, approval_id: str) -> None:
+    """记录审批消息 id 到 approval_id 的映射，供引用回复审批时反查。"""
+    if message_id is None or not str(message_id).strip() or not approval_id:
+        return
+    key = str(message_id).strip()
+    _approval_message_ids[key] = approval_id
+    _approval_message_ids.move_to_end(key)
+    while len(_approval_message_ids) > _APPROVAL_MSG_MAP_MAX:
+        _approval_message_ids.popitem(last=False)
+
+
+def _resolve_approval_id_by_reply(reply_message_id: Any) -> Optional[str]:
+    """根据被引用的审批消息 id 反查 approval_id，只返回仍在待审批列表中的。"""
+    if reply_message_id is None:
+        return None
+    approval_id = _approval_message_ids.get(str(reply_message_id).strip())
+    if approval_id and approval_id in _pending_approvals:
+        return approval_id
+    return None
+
 
 # QQ 用户身份/称呼 Profile。只影响模型可见的称呼和身份说明，不授予任何权限。
 # 权限仍只由 CLONOTH_ADMIN_QQ_USERS / _is_admin_user 判定。
@@ -357,8 +384,9 @@ def _approval_summary(approval_id: str, operation: str, details: Dict[str, Any])
         lines.append(f"参数: {str(args)[:1500]}")
     lines.extend([
         "",
-        f"同意：审批 同意 {approval_id}",
-        f"拒绝：审批 拒绝 {approval_id}",
+        "【快捷审批】直接引用(回复)本消息，发送“同意”或“拒绝”即可。",
+        f"或手动发送：审批 同意 {approval_id}",
+        f"　　　　　审批 拒绝 {approval_id}",
     ])
     return _truncate_qq_text("\n".join(lines))
 
@@ -383,6 +411,29 @@ def _parse_approval_command(text: str) -> Optional[tuple[str, str]]:
         return "allow", token
     if verb in verbs_deny:
         return "deny", token
+    return None
+
+
+def _parse_approval_reply_verb(text: str) -> Optional[str]:
+    """从引用回复的文本中解析审批意图，返回 'allow' / 'deny' / None。
+
+    用于“引用审批消息 + 回复同意/拒绝”的快捷审批：无需携带 approval_id，
+    只要文本中出现同意/拒绝类关键词即可。容忍“审批同意”这种连写。
+    """
+    normalized = re.sub(r"\s+", "", (text or "").strip()).lower()
+    if not normalized:
+        return None
+    # 去掉可能的“审批”/“approval”前缀，便于“审批同意”也能识别。
+    for prefix in ("审批", "approval"):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix):]
+    allow_words = ("同意", "批准", "通过", "允许", "allow", "approve", "approved", "yes", "ok")
+    deny_words = ("拒绝", "驳回", "不同意", "deny", "reject", "rejected", "no")
+    # 先判断拒绝，避免“不同意”因包含“同意”而误判为 allow。
+    if any(w in normalized for w in deny_words):
+        return "deny"
+    if any(w in normalized for w in allow_words):
+        return "allow"
     return None
 
 
@@ -4385,8 +4436,11 @@ class TangQiuCallbacks:
         delivered = 0
         for admin_id in ADMIN_QQ_USERS:
             try:
-                await bot.send_private_msg(user_id=int(admin_id), message=summary)
+                sent = await bot.send_private_msg(user_id=int(admin_id), message=summary)
                 delivered += 1
+                # 记录审批消息 id -> approval_id，使管理员可直接引用该消息回复“审批同意/拒绝”。
+                sent_mid = sent.get("message_id") if isinstance(sent, dict) else None
+                _remember_approval_message(sent_mid, approval_id)
             except Exception:
                 logger.exception("send approval request to QQ admin failed: admin=%s id=%s", admin_id, approval_id)
 
@@ -5329,6 +5383,29 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
 _private_matcher = on_message(rule=Rule(_private_message_rule), priority=10, block=True)
 
 
+async def _finish_approval_decision(user_id: int, approval_id: str, decision: str) -> None:
+    """提交审批决策并结束当前私聊处理（末尾总会抛出 FinishedException）。
+
+    同时服务于“引用回复审批”和“手输审批命令”两个入口，避免重复代码。
+    """
+    try:
+        ok = await _client.approve(
+            approval_id,
+            decision=decision,
+            comment=f"QQ admin {user_id} {decision}ed via private message.",
+        )
+    except Exception as exc:
+        logger.exception("submit QQ approval decision failed")
+        await _private_matcher.finish(f"提交审批失败：{exc}")
+    info = _pending_approvals.pop(approval_id, {}) if ok else _pending_approvals.get(approval_id, {})
+    operation = str(info.get("operation") or "unknown")
+    if ok:
+        await _private_matcher.finish(
+            f"已{('同意' if decision == 'allow' else '拒绝')}审批：{approval_id}\n操作：{operation}"
+        )
+    await _private_matcher.finish("审批提交被 Supervisor 拒绝，请检查日志。")
+
+
 @_private_matcher.handle()
 async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     """把当前 QQ 私聊请求提交给 ClonothZX。"""
@@ -5342,6 +5419,16 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     user_id = int(event.user_id)
     user_text = (await _message_to_text_with_forward(bot, event.get_message(), getattr(bot, "self_id", None))).strip() or "你好"
 
+    # 快捷审批：管理员引用(回复)审批消息并发“同意/拒绝”即可，无需携带 approval_id。
+    reply_mid = _extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None))
+    reply_approval_id = _resolve_approval_id_by_reply(reply_mid) if reply_mid is not None else None
+    if reply_approval_id is not None:
+        reply_verb = _parse_approval_reply_verb(user_text)
+        if reply_verb is not None:
+            if not _is_admin_user(user_id):
+                await _private_matcher.finish("你不是 Clonoth 审批管理员，不能处理审批请求。")
+            await _finish_approval_decision(user_id, reply_approval_id, reply_verb)
+
     approval_command = _parse_approval_command(user_text)
     if approval_command is not None:
         if not _is_admin_user(user_id):
@@ -5350,20 +5437,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
         approval_id, error = _resolve_pending_approval_id(approval_token)
         if not approval_id:
             await _private_matcher.finish(error)
-        try:
-            ok = await _client.approve(
-                approval_id,
-                decision=decision,
-                comment=f"QQ admin {user_id} {decision}ed via private message.",
-            )
-        except Exception as exc:
-            logger.exception("submit QQ approval decision failed")
-            await _private_matcher.finish(f"提交审批失败：{exc}")
-        info = _pending_approvals.pop(approval_id, {}) if ok else _pending_approvals.get(approval_id, {})
-        operation = str(info.get("operation") or "unknown")
-        if ok:
-            await _private_matcher.finish(f"已{('同意' if decision == 'allow' else '拒绝')}审批：{approval_id}\n操作：{operation}")
-        await _private_matcher.finish("审批提交被 Supervisor 拒绝，请检查日志。")
+        await _finish_approval_decision(user_id, approval_id, decision)
 
     # 管理员私聊清除群记忆：无参数列出可清理群，带参数按群名/群号清除。
     # 放在 _is_private_allowed 之前，使管理员即便私聊未整体放通也能使用该命令。

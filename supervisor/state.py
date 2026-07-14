@@ -1072,7 +1072,24 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 "engine/system_nodes/",
                 "data/",
             )
-            if op in {"execute_command", "restart"}:
+            if op == "execute_command":
+                # 例外：允许非管理员群友用 curl 纯 GET 读取公网网页。
+                # 方法：由 policy.is_safe_public_curl 严格判定（不落盘、无注入、
+                # 非写方法、禁 localhost/内网）。群友无审批入口，故安全情况下直接 auto放行；
+                # 其余命令（下载、装包、危险命令等）仍然拒绝。
+                command = str(parameters.get("command") or "")
+                if self.policy.is_safe_public_curl(command):
+                    return OpRequestOut(
+                        safety_level=SafetyLevel.auto,
+                        reason="auto-allowed: qq non-admin safe public curl read",
+                        approval_id=None,
+                    )
+                return OpRequestOut(
+                    safety_level=SafetyLevel.deny,
+                    reason="qq non-admin users cannot execute sensitive operations",
+                    approval_id=None,
+                )
+            if op == "restart":
                 return OpRequestOut(
                     safety_level=SafetyLevel.deny,
                     reason="qq non-admin users cannot execute sensitive operations",
@@ -1118,6 +1135,17 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                         reason="auto-approved: scheduler task",
                         approval_id=None,
                     )
+
+        #  Why: QQ 管理员亲自触发的任务，对普通命令/文件操作不再逐条审批，
+        # 避免管理员反复确认。How: is_admin 且本次决策不是敏感规则(sensitive=False)
+        # 时，将 approval_required 直接转为 auto。Purpose: 改源码、重启、动
+        # config/nodes、data、工作区外部路径等敏感操作仍需人工确认，deny 硬拦截不变。
+        if is_qq and is_admin and not getattr(decision, "sensitive", False):
+            return OpRequestOut(
+                safety_level=SafetyLevel.auto,
+                reason=f"auto-approved: qq admin task ({decision.reason})",
+                approval_id=None,
+            )
 
         # [AutoC 2026-05-31] Why: request_guard can now identify the active tool
         # call. How: forward that identity to create_approval. Purpose: the emitted

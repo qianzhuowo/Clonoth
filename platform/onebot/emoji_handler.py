@@ -45,12 +45,21 @@ def set_at_alias_resolver(resolver: Any) -> None:
 _AT_TOKEN_SPLIT_RE = re.compile(r"[,\uFF0C\u3001;\uFF1B]+|\s{2,}")
 
 
+# 可能表示“@全体成员”的关键字（小写比较）。注意：这些词也可能恰好是某个
+# 群友的昵称/别名（如有人就叫 "all"），因此不能直接当全体成员，
+# 而是先走用户反查，反查不到时才视为 @全体成员。
+_AT_ALL_KEYWORDS = {"all", "at_all", "atall", "全体成员", "@全体成员"}
+
+
 def _resolve_at_token(token: str) -> str:
     """把 [at:xxx] 里的单个 token 解析为真实 QQ 号字符串。
 
+    解析优先级（2026-07-14 调整）：
     - 纯数字：直接返回（视为真实 QQ 号）。
-    - 特殊值 all/at_all/全体成员：返回 "all"，交由上层生成 @全体成员。
-    - 其余（别名/显示名/群昵称）：调用注入的 resolver 反查；失败返回空串。
+    - 其余（含 all/全体成员 等关键字）：**先**调用 resolver 按别名/显示名/群昵称
+      反查真实用户；命中就 @ 那个人（避免昵称叫 all 的群友被误伤）。
+    - 反查不到且 token 是 @全体关键字：返回 "all"，交由上层生成 @全体成员。
+    - 其余反查失败：返回空串。
     """
     raw = str(token or "").strip()
     if not raw:
@@ -62,8 +71,7 @@ def _resolve_at_token(token: str) -> str:
         return ""
     if raw.isdigit():
         return raw
-    if raw.lower() in {"all", "at_all", "全体成员", "@全体成员"}:
-        return "all"
+    # 先按用户反查（包括昵称恰好叫 all 的情况）。
     if _at_alias_resolver is not None:
         try:
             resolved = _at_alias_resolver(raw)
@@ -73,6 +81,9 @@ def _resolve_at_token(token: str) -> str:
             resolved = str(resolved).strip()
             if resolved:
                 return resolved
+    # 用户反查不到，且确实是 @全体关键字时，才视为 @全体成员。
+    if raw.lower() in _AT_ALL_KEYWORDS:
+        return "all"
     return ""
 
 

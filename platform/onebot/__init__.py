@@ -28,6 +28,7 @@ import httpx
 import yaml
 from nonebot import get_bot, get_driver, on_message, on_notice
 from nonebot.adapters.onebot.v11 import Bot, Event, GroupMessageEvent, GroupUploadNoticeEvent, Message, MessageSegment, PrivateMessageEvent
+from nonebot.adapters.onebot.v11.exception import ActionFailed
 from nonebot.rule import Rule, to_me
 
 from .config import (
@@ -3730,6 +3731,137 @@ def _should_skip_duplicate_send(target: Dict[str, Any], message: Any, *, ttl: fl
     return False
 
 
+# 群成员缓存：group_id -> (过期时间, {user_id 集合}, {名片/昵称小写 -> user_id})。
+# 用于（1）发送前校验 at 目标是否本群成员，避免 NapCat 对无法解析的 uid
+# 抛 Get Uid Error 使整条消息失败；（2）按当前群名片/昵称实时反查真实 QQ 号，
+# 让 [at:昵称] 能命中只存在于本群、未录入 profile/匿名表的成员（包括昵称叫 all 的人）。
+_group_member_cache: Dict[int, tuple[float, set[str], Dict[str, str]]] = {}
+_GROUP_MEMBER_CACHE_TTL = float(os.environ.get("ONEBOT_GROUP_MEMBER_CACHE_TTL", "300") or "300")
+
+
+async def _load_group_members(bot: Bot, group_id: int) -> tuple[set[str], Dict[str, str]] | None:
+    """拉取并缓存群成员：返回 ({user_id 集合}, {名片/昵称小写 -> user_id})。
+
+    取不到时返回 None（表示无法校验/反查，由调用方决定不做拦截）。
+    """
+    try:
+        gid = int(group_id)
+    except Exception:
+        return None
+    now = time.time()
+    cached = _group_member_cache.get(gid)
+    if cached and cached[0] > now:
+        return cached[1], cached[2]
+    try:
+        data = await bot.call_api("get_group_member_list", group_id=gid)
+    except Exception:
+        logger.debug("get_group_member_list failed for group=%s", gid, exc_info=True)
+        return None
+    members: set[str] = set()
+    name_map: Dict[str, str] = {}
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict) or item.get("user_id") is None:
+                continue
+            uid = str(item.get("user_id"))
+            members.add(uid)
+            # 名片(card)优先于昵称(nickname)；同名时不覆盖已有映射（保留先遇到的）。
+            for key in (item.get("card"), item.get("nickname")):
+                name = str(key or "").strip()
+                if name:
+                    name_map.setdefault(name.casefold(), uid)
+    if not members:
+        return None
+    _group_member_cache[gid] = (now + _GROUP_MEMBER_CACHE_TTL, members, name_map)
+    return members, name_map
+
+
+async def _group_member_ids(bot: Bot, group_id: int) -> set[str] | None:
+    """获取群成员 QQ 号集合（带 TTL 缓存）。取不到时返回 None。"""
+    loaded = await _load_group_members(bot, group_id)
+    return loaded[0] if loaded else None
+
+
+def _resolve_at_alias_in_group(group_id: Any, token: str) -> str:
+    """在已缓存的群成员名片/昵称里反查 token 对应的真实 QQ 号（小写匹配）。
+
+    仅使用缓存（不发网络请求）；缓存未就绪或未命中时返回空串。
+    """
+    raw = str(token or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("@"):
+        raw = raw[1:].strip()
+    if not raw:
+        return ""
+    try:
+        gid = int(group_id)
+    except Exception:
+        return ""
+    cached = _group_member_cache.get(gid)
+    if not cached:
+        return ""
+    return cached[2].get(raw.casefold(), "")
+
+
+async def _sanitize_group_at_segments(bot: Bot, group_id: Any, message: Any) -> Any:
+    """把群消息里"非本群成员/无法解析"的 at 段降级为文本，避免整条消息发送失败。
+
+    2026-07-14 修复：一条消息 @ 多人时，只要其中一个 at 的 uid 被 NapCat 判为
+    Get Uid Error，send_group_msg 就会整条失败。这里在发送前用群成员列表校验，
+    命中不了的 at 用 @昵称/@别名 文本代替，@全体成员(all) 放行。
+    """
+    if not isinstance(message, Message):
+        return message
+    loaded = await _load_group_members(bot, group_id)
+    if loaded is None:
+        # 拿不到成员列表时不拦截，保持原样（避免误伤把所有 at 变文本）。
+        return message
+    members, name_map = loaded
+    new_segments: List[MessageSegment] = []
+    for seg in message:
+        if getattr(seg, "type", "") == "at":
+            qq = str((getattr(seg, "data", {}) or {}).get("qq", "")).strip()
+            # 特例：[at:all] 但群里真有成员名片/昵称叫 "all"，优先当成 @ 那个人，
+            # 避免把他误伤为 @全体成员。
+            if qq.lower() == "all":
+                mapped = name_map.get("all")
+                if mapped:
+                    logger.info("resolve [at:all] to group member %s in group=%s", mapped, group_id)
+                    new_segments.append(MessageSegment.at(mapped))
+                    continue
+                # 确实是 @全体成员，放行。
+                new_segments.append(seg)
+                continue
+            if qq and qq not in members:
+                # 先尝试用群名片/昵称反查（适用于昵称未录入 profile/匿名表的本群成员）。
+                name = _qq_profile_display_name(qq) or _anonymize_user_id(qq)
+                logger.warning("downgrade at to text: qq=%s not in group=%s", qq, group_id)
+                new_segments.append(MessageSegment.text(f"@{name}"))
+                continue
+        new_segments.append(seg)
+    return Message(new_segments)
+
+
+def _strip_at_to_text(message: Any) -> Any:
+    """把消息里所有 at 段降级为 @文本，用于发送失败后的兜底重发。"""
+    if not isinstance(message, Message):
+        return message
+    new_segments: List[MessageSegment] = []
+    for seg in message:
+        if getattr(seg, "type", "") == "at":
+            data = getattr(seg, "data", {}) or {}
+            qq = str(data.get("qq", "")).strip()
+            if qq.lower() == "all":
+                new_segments.append(MessageSegment.text("@全体成员"))
+            elif qq:
+                name = _qq_profile_display_name(qq) or _anonymize_user_id(qq)
+                new_segments.append(MessageSegment.text(f"@{name}"))
+            continue
+        new_segments.append(seg)
+    return Message(new_segments)
+
+
 async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any, *, dedupe: bool = True) -> None:
     """按 QQ 会话类型选择 OneBot 发送接口。"""
     # 2026-05-01 修改原因：私聊回复必须调用 send_private_msg，群聊回复继续调用
@@ -3746,7 +3878,18 @@ async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any, *, de
         group_id = target.get("group_id")
         if group_id is None:
             raise ValueError("group target missing group_id")
-        await bot.send_group_msg(group_id=int(group_id), message=message)
+        # 发送前先把非本群/无法解析的 at 降级为文本，避免 Get Uid Error 整条失败。
+        safe_message = await _sanitize_group_at_segments(bot, group_id, message)
+        try:
+            await bot.send_group_msg(group_id=int(group_id), message=safe_message)
+        except ActionFailed as exc:
+            # 兜底：若仍因 at/uid 问题失败（如成员列表不准确），把所有 at 降级为文本重发一次。
+            fallback = _strip_at_to_text(safe_message)
+            if str(fallback) != str(safe_message):
+                logger.warning("send_group_msg failed (%s); retry with at-as-text", exc)
+                await bot.send_group_msg(group_id=int(group_id), message=fallback)
+            else:
+                raise
         return
     raise ValueError(f"unknown QQ target type: {target!r}")
 

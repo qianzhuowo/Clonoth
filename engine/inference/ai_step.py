@@ -5,6 +5,7 @@ import asyncio
 import logging
 import time
 import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
@@ -56,7 +57,7 @@ from ..compact import (
     record_compact_success,
     should_compact,
 )
-from clonoth_runtime import get_int, get_float, load_runtime_config
+from clonoth_runtime import get_int, get_float, get_bool, load_runtime_config
 from toolbox.context import ToolContext
 # build_llm_messages: 反序列化方向的格式转换，在 llm_call.py 中实际调用。
 # 此处导入供外部通过 ai_step 模块访问（如测试、调试）。
@@ -764,11 +765,184 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
 
 
 # ---------------------------------------------------------------------------
-#  异步工具后台执行器
+#  异步工具后台执行器 / 自适应转异步辅助
 #  [2026-04-23] 从 commit 7d10197 恢复，在 864a333 大扫除中被误删。
 #  当工具 spec 标记 async_mode=True 时，工具在后台 asyncio.Task 中执行，
 #  完成后通过 preempt API 将结果注入回当前任务的对话流。
+#  [2026-07-14] 追加 execute_command「长任务自动转异步」能力：
+#  同步执行超过阈值时，把仍在运行的 asyncio.Task 转到后台，通过同一套
+#  async_tool_result 回传协议交付结果，模型立即拿到「已转异步」占位结果。
 # ---------------------------------------------------------------------------
+
+
+def _snapshot_tool_context(tool_ctx: ToolContext) -> ToolContext:
+    """为后台工作复制一份足够稳定的 ToolContext 快照。"""
+    # [2026-07-14] Why: _execute_real_tools 复用同一个 ToolContext，
+    # 并在每轮循环里改写 tool_call_id。How: 在调度后台任务前复制 dataclass 字段以及
+    # 节点级动态属性。Purpose: 后台异步的 execute_command 回调仍保留原始工具调用的
+    # 审批与产物身份，不会被后续同批次工具覆盖。
+    snapshot = replace(tool_ctx)
+    for attr in ("_node_id", "_node_extra"):
+        if hasattr(tool_ctx, attr):
+            setattr(snapshot, attr, getattr(tool_ctx, attr))
+    return snapshot
+
+
+def _execute_command_async_upgrade_threshold(
+    tool_name: str,
+    tool_args: dict[str, Any],
+    runtime_cfg: dict[str, Any] | None,
+) -> float | None:
+    """返回 execute_command 的自适应转异步阈值秒数；不适用时返回 None。"""
+    # [2026-07-14] Why: execute_command 自身的 timeout_sec 仍是硬性
+    # 终止上限，但引擎可以更早停止等待。How: 仅对 execute_command 生效，取
+    # min(threshold, timeout*0.8)，并跳过 timeout 太接近阈值的调用。Purpose: 慢命令
+    # 在后台继续运行而无需改变工具调用语法。
+    if str(tool_name or "") != "execute_command":
+        return None
+    cfg = runtime_cfg if isinstance(runtime_cfg, dict) else {}
+    if not get_bool(cfg, "meta.execute_command.async_upgrade.enabled", True):
+        return None
+    threshold_sec = get_float(
+        cfg,
+        "meta.execute_command.async_upgrade.threshold_sec",
+        60.0,
+        min_value=0.01,
+        max_value=3600.0,
+    )
+    default_timeout_sec = get_float(
+        cfg,
+        "meta.execute_command.default_timeout_sec",
+        90.0,
+        min_value=1.0,
+        max_value=3600.0,
+    )
+    timeout_raw = (tool_args or {}).get("timeout_sec")
+    try:
+        timeout_sec = float(timeout_raw) if timeout_raw is not None else float(default_timeout_sec)
+    except Exception:
+        timeout_sec = float(default_timeout_sec)
+    if timeout_sec <= threshold_sec + 1.0:
+        return None
+    effective = min(float(threshold_sec), float(timeout_sec) * 0.8)
+    return effective if effective > 0 else None
+
+
+async def _execute_registry_tool_with_span(
+    registry: ToolRegistry,
+    tool_name: str,
+    tool_args: dict[str, Any],
+    tool_ctx: ToolContext,
+    *,
+    async_call: bool = False,
+) -> Any:
+    """在既有 SignalBus span 内执行单个 registry 工具调用。"""
+    # [2026-07-14] Why: 同步、声明式异步、自适应异步三条路径必须保持
+    # 相同的 tool.call signal 语义。How: 把 registry.execute 统一收敛到一个 span 辅助
+    # 函数。Purpose: 重构异步交付时不会丢失 signal 元数据或重复执行逻辑。
+    _args_summary = _short(json.dumps(tool_args, ensure_ascii=False, default=str), 200)
+    payload: dict[str, Any] = {"tool": tool_name, "args_summary": _args_summary}
+    if async_call:
+        payload["async"] = True
+    with get_bus().span('tool.call', payload=payload):
+        return await registry.execute(name=tool_name, arguments=tool_args, ctx=tool_ctx)
+
+
+async def _deliver_started_async_task(
+    exec_task: "asyncio.Task[Any]",
+    **delivery_kwargs: Any,
+) -> None:
+    """等待一个已启动的工具任务完成，并交付其最终异步结果。"""
+    # [2026-07-14] Why: 自适应 execute_command 先以普通 registry
+    # 执行启动，超过阈值才证明它很慢。How: 等待那个已存在的 task，而不是重新执行命令，
+    # 然后委派给 _run_async_deliver 复用回传逻辑。Purpose: 子进程保持单实例，
+    # execute_command 自身的超时仍拥有最终 kill 行为。
+    try:
+        result = await exec_task
+    except Exception as e:
+        await _run_async_deliver(error=e, **delivery_kwargs)
+    else:
+        await _run_async_deliver(result=result, **delivery_kwargs)
+
+
+async def _run_async_deliver(
+    *,
+    registry: ToolRegistry,
+    http: "httpx.AsyncClient",
+    supervisor_url: str,
+    task_id: str,
+    session_id: str,
+    tool_name: str,
+    tool_args: dict,
+    async_tool_id: str,
+    started_at: float,
+    result: Any = None,
+    error: Exception | None = None,
+) -> None:
+    """格式化、跟踪并通过 supervisor 交付一个异步工具结果。"""
+    # [2026-07-14] Why: 声明式异步工具与自适应 execute_command 共享
+    # 同一套回调协议。How: 把结果整形、tracker 更新、附件提取、async_tool_result POST
+    # 收敛到一个交付函数。Purpose: 自适应转异步可以等待一个已启动进程而无需复制
+    # 现有回调实现。
+    try:
+        if error is not None:
+            raise error
+        _elapsed = time.monotonic() - started_at
+        _summary = summarize_result(tool_name, result, args=tool_args)
+        _tool_spec = registry.get_spec(tool_name)
+        _fmt, raw = result_to_raw(tool_name, result, tool_spec=_tool_spec)
+
+        _async_tool_tasks[async_tool_id] = {
+            "tool_name": tool_name,
+            "status": "done",
+            "task_id": task_id,
+            "started_at": started_at,
+            "finished_at": time.monotonic(),
+            "elapsed": round(_elapsed, 1),
+        }
+
+        preempt_text = (
+            f'\u2705 Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
+            f'\nSummary: {_summary}\nResult:\n{raw}'
+        )
+
+        attachments: list[str] = []
+        if isinstance(result, dict):
+            data = result.get("data") if isinstance(result.get("data"), dict) else {}
+            source_attachments = data.get("attachments") if isinstance(data.get("attachments"), list) else result.get("attachments")
+            if isinstance(source_attachments, list):
+                for a in source_attachments:
+                    if isinstance(a, dict) and a.get("path"):
+                        attachments.append(str(a["path"]))
+                    elif isinstance(a, str):
+                        attachments.append(a)
+
+        payload: dict = {"message": preempt_text, "tool_name": tool_name, "task_id": task_id}
+        if attachments:
+            payload["attachment_paths"] = attachments
+
+        await http.post(
+            f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
+            json=payload,
+        )
+    except Exception as e:
+        _async_tool_tasks[async_tool_id] = {
+            "tool_name": tool_name,
+            "status": "failed",
+            "task_id": task_id,
+            "started_at": started_at,
+            "finished_at": time.monotonic(),
+            "elapsed": round(time.monotonic() - started_at, 1),
+            "error": str(e),
+        }
+        try:
+            await http.post(
+                f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
+                json={"message": f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}'},
+            )
+        except Exception:
+            pass
+
 
 async def _run_async_tool(
     registry: ToolRegistry,
@@ -1107,9 +1281,84 @@ async def _execute_real_tools(
         # Phase 2 Signal: tool.call span 包裹每个工具的执行过程。
         # 自动发射 tool.call.start（含工具名和参数摘要）和 tool.call.end（含 elapsed_ms 和 error）。
         # span 是同步 contextmanager，在 async 函数中直接 with 即可。
-        _args_summary = _short(json.dumps(_t_args, ensure_ascii=False, default=str), 200)
-        with get_bus().span('tool.call', payload={'tool': _t_name, 'args_summary': _args_summary}):
-            _t_result = await ls.registry.execute(name=_t_name, arguments=_t_args, ctx=_tool_ctx)
+        # [2026-07-14] execute_command 长任务自动转异步：
+        # 先照常发起 registry 执行，只等到自适应阈值；到点还没完成，则把
+        # 仍在运行的 task 转到后台，通过 async_tool_result 回传，给模型返回
+        # 「已转异步」占位结果。execute_command 自己的 timeout_sec 仍是硬 kill 上限。
+        _adaptive_threshold = _execute_command_async_upgrade_threshold(_t_name, _t_args, ls.runtime_cfg)
+        if _adaptive_threshold is not None:
+            _exec_tool_ctx = _snapshot_tool_context(_tool_ctx)
+            _exec_task = asyncio.create_task(
+                _execute_registry_tool_with_span(ls.registry, _t_name, _t_args, _exec_tool_ctx),
+                name=f"execute_command_adaptive_{str(_rtc.get('id') or '')[:24] or 'call'}",
+            )
+            _done, _pending = await asyncio.wait({_exec_task}, timeout=float(_adaptive_threshold))
+            if _exec_task not in _done:
+                _cleanup_async_tracker()
+                _async_id = uuid.uuid4().hex[:8]
+                _async_tool_tasks[_async_id] = {
+                    "tool_name": _t_name,
+                    "status": "running",
+                    "started_at": _tool_t0,
+                    "task_id": ls.rctx.task_id,
+                    "upgraded_from": "sync_timeout",
+                }
+                asyncio.create_task(
+                    _deliver_started_async_task(
+                        _exec_task,
+                        registry=ls.registry,
+                        http=ls.rctx.http,
+                        supervisor_url=ls.rctx.supervisor_url,
+                        task_id=ls.rctx.task_id,
+                        session_id=ls.rctx.parent_session_id or ls.rctx.session_id,
+                        tool_name=_t_name,
+                        tool_args=_t_args,
+                        async_tool_id=_async_id,
+                        started_at=_tool_t0,
+                    ),
+                    name=f"async_upgrade_{_t_name}_{_async_id}",
+                )
+                _async_summary = f"执行超过 {_adaptive_threshold:.1f}s，已自动转为异步 (id: {_async_id})，结果将通过 preempt 自动回传"
+                _t_result = None
+                _t_fmt = "text"
+                _t_raw_inline = (
+                    f'\u23f3 Tool "{_t_name}" exceeded {_adaptive_threshold:.1f}s and was '
+                    f'auto-upgraded to async (id: {_async_id}). Result will be delivered via preempt when ready.'
+                )
+                _t_elapsed_ms = round((time.monotonic() - _tool_t0) * 1000, 1)
+                _tool_entries.append({
+                    "id": _rtc.get("id", ""),
+                    "name": _t_name,
+                    "args": _t_args,
+                    "format": _t_fmt,
+                    "raw_inline": _t_raw_inline,
+                    "truncated": False,
+                    "ref": "",
+                    "summary": _async_summary,
+                })
+                await ls.rctx.emit_event("tool_call_end", {
+                    "node_id": ls.node.id,
+                    "task_id": ls.rctx.task_id,
+                    "tool_call_id": _rtc.get("id", ""),
+                    "tool_name": _t_name,
+                    "status": "async_started",
+                    "summary": _async_summary,
+                    "result": _t_result,
+                    "raw_inline": _t_raw_inline,
+                    "format": _t_fmt,
+                    "elapsed_ms": _t_elapsed_ms,
+                })
+                await ls.rctx.emit_event("handoff_progress", {
+                    "message": f"[{ls.node.id}] {_t_name}: 已自动转为异步执行",
+                    "node_id": ls.node.id,
+                    "task_id": ls.rctx.task_id,
+                })
+                continue
+            _t_result = _exec_task.result()
+        else:
+            _args_summary = _short(json.dumps(_t_args, ensure_ascii=False, default=str), 200)
+            with get_bus().span('tool.call', payload={'tool': _t_name, 'args_summary': _args_summary}):
+                _t_result = await ls.registry.execute(name=_t_name, arguments=_t_args, ctx=_tool_ctx)
         # [硬取消-场景1] 工具返回 cancelled 时，仍将结果存入 _tool_entries 再 break。
         # 确保 assistant 的 tool_use 有对应 tool_result 配对，
         # 模型下次看到的是「我调了工具但被用户取消了」而非 tool_use 悬空无响应。

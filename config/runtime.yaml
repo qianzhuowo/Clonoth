@@ -84,6 +84,13 @@ meta:
   execute_command:
     default_timeout_sec: 90.0
     max_output_chars: 12000
+    # [2026-07-14] shell 命令超过模型等待预算时应在
+    # execute_command 自身的 timeout_sec 下继续运行，而不阻塞推理循环。
+    # ai_step 最多等待 threshold_sec（封顶为 timeout_sec 的 80%），随后仅
+    # 把 execute_command 转为异步交付，结果通过 async_tool_result / preempt 回传。
+    async_upgrade:
+      enabled: true
+      threshold_sec: 60
 
   git:
     diff_max_chars: 600000

@@ -53,6 +53,13 @@ DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
         "execute_command": {
             "default_timeout_sec": 90.0,
             "max_output_chars": 12000,
+            # [2026-07-14] 长任务自动转异步：同步等待超过
+            # threshold_sec（且小于 timeout_sec）时，把 execute_command 转为后台
+            # 异步交付，不阻塞推理循环；timeout_sec 仍是硬 kill 上限。
+            "async_upgrade": {
+                "enabled": True,
+                "threshold_sec": 60.0,
+            },
         },
         "git": {"diff_max_chars": 600000},
         "search": {"max_file_size_bytes": 3000000, "max_matches": 100},

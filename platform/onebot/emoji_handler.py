@@ -40,14 +40,24 @@ def set_at_alias_resolver(resolver: Any) -> None:
     _at_alias_resolver = resolver
 
 
+# 一个 [at:...] 标记内多个目标的分隔符：英文逗号、中文逗号、顿号、分号、或连续空白。
+# 例如 [at:UserA,UserB、木] 会拆成 ["UserA", "UserB", "张三"]。
+_AT_TOKEN_SPLIT_RE = re.compile(r"[,\uFF0C\u3001;\uFF1B]+|\s{2,}")
+
+
 def _resolve_at_token(token: str) -> str:
-    """把 [at:xxx] 里的 token 解析为真实 QQ 号字符串。
+    """把 [at:xxx] 里的单个 token 解析为真实 QQ 号字符串。
 
     - 纯数字：直接返回（视为真实 QQ 号）。
     - 特殊值 all/at_all/全体成员：返回 "all"，交由上层生成 @全体成员。
     - 其余（别名/显示名/群昵称）：调用注入的 resolver 反查；失败返回空串。
     """
     raw = str(token or "").strip()
+    if not raw:
+        return ""
+    # 兼容模型可能写成 [at:@UserA] 的情况。
+    if raw.startswith("@"):
+        raw = raw[1:].strip()
     if not raw:
         return ""
     if raw.isdigit():
@@ -64,6 +74,24 @@ def _resolve_at_token(token: str) -> str:
             if resolved:
                 return resolved
     return ""
+
+
+def _resolve_at_tokens(raw_token: str) -> List[Dict[str, str]]:
+    """把一个 [at:...] 标记内容拆成多个目标并逐个解析。
+
+    2026-07-14 新增：支持“一条消息 @ 多个用户”。一个标记里可写多个
+    名字（逗号/顿号/分号分隔），每个名字独立反查真实 QQ 号。
+
+    返回每个子 token 的结果列表，元素为 {"raw": 原始子串, "qq": 解析后 QQ 号或空串}。
+    若整个标记不含分隔符，则列表只有一项（完全兼容单个 @）。
+    """
+    raw = str(raw_token or "").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in _AT_TOKEN_SPLIT_RE.split(raw) if p.strip()]
+    if not parts:
+        parts = [raw]
+    return [{"raw": part, "qq": _resolve_at_token(part)} for part in parts]
 
 # Discord 自定义表情在 QQ 无法渲染。这里直接剥离，避免群内出现平台私有格式。
 _DC_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
@@ -632,20 +660,28 @@ async def process_emojis(
             segments.append({"type": "text", "content": before})
 
         if match_type == "at":
-            # group(1) 匹配 [at:xxx]（xxx 可能是 QQ 号或别名/显示名），
-            # group(2) 匹配旧格式 [CQ:at,qq=xxx]（仅数字）。
+            # group(1) 匹配 [at:xxx]（xxx 可能是 QQ 号/别名/显示名，也可以是多个
+            # 名字用逗号/顿号/分号分隔）；group(2) 匹配旧格式 [CQ:at,qq=xxx]（仅数字）。
             raw_token = match.group(1)
             if raw_token is not None:
-                qq_id = _resolve_at_token(raw_token)
+                # 支持一个标记 @ 多人：逐个拆分、解析、生成多个 at 段。
+                resolved_list = _resolve_at_tokens(raw_token)
+                for idx, item in enumerate(resolved_list):
+                    qq_id = item.get("qq") or ""
+                    if qq_id:
+                        segments.append({"type": "at", "qq": qq_id})
+                    else:
+                        # 单个名字无法解析时保留可读文本，避免静默丢失。
+                        fallback = str(item.get("raw") or "").strip()
+                        if fallback:
+                            segments.append({"type": "text", "content": f"@{fallback}"})
+                    # 多个 @ 之间补一个空格，避免在部分客户端粘连成一块。
+                    if idx < len(resolved_list) - 1:
+                        segments.append({"type": "text", "content": " "})
             else:
                 qq_id = str(match.group(2) or "").strip()
-            if qq_id:
-                segments.append({"type": "at", "qq": qq_id})
-            else:
-                # 无法解析为真实 QQ 号时，保留可读文本避免静默丢失（去掉方括号）。
-                fallback = str(raw_token or "").strip()
-                if fallback:
-                    segments.append({"type": "text", "content": f"@{fallback}"})
+                if qq_id:
+                    segments.append({"type": "at", "qq": qq_id})
             last_end = end
             continue
 

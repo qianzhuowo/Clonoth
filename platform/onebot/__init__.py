@@ -97,6 +97,7 @@ from .emoji_handler import (
     load_custom_face_names,
     process_emojis,
     resolve_custom_face,
+    set_at_alias_resolver,
     strip_output_markers,
     write_custom_face_metadata,
     write_custom_face_names,
@@ -2874,6 +2875,44 @@ def _anonymize_group_id(group_id: Any) -> str:
     return alias
 
 
+def _resolve_at_alias_to_real(token: str) -> str:
+    """把模型写的 [at:xxx] 里的 xxx 反查为真实 QQ 号。
+
+    2026-07-14 新增：模型看到的是匿名别名（UserA/UserAF）或群昵称/显示名，
+    会输出 [at:UserAF] 而非真实 QQ 号。emoji_handler 在遇到非数字 token 时
+    回调本函数：
+      1. 先按匿名反向表 _anon_user_reverse 精确匹配别名 -> 真实 QQ 号；
+      2. 再按已知用户 profile 的显示名/群名片/别名尝试匹配。
+    解析不到时返回空串，由 emoji_handler 回退为可读文本。
+    """
+    raw = str(token or "").strip()
+    if not raw:
+        return ""
+    # 去掉可能带上的 @ 前缀。
+    if raw.startswith("@"):
+        raw = raw[1:].strip()
+    if not raw:
+        return ""
+    if raw.isdigit():
+        return raw
+    # 1) 匿名别名精确反查（UserA/UserAF 等）。
+    real = _anon_user_reverse.get(raw)
+    if real:
+        return str(real)
+    # 2) 按已知用户 profile 的显示名/别名匹配（忽略大小写与首尾空白）。
+    norm = raw.casefold()
+    try:
+        for uid in list(_QQ_USER_PROFILES.keys()):
+            names = [_qq_profile_display_name(uid) or ""]
+            names.extend(_profile_aliases_for_user(uid))
+            for name in names:
+                if name and str(name).strip().casefold() == norm:
+                    return str(uid)
+    except Exception:
+        logger.debug("resolve at alias by profile failed for %r", raw, exc_info=True)
+    return ""
+
+
 def _anonymize_text_for_ai(text: str) -> str:
     """把文本中"系统已知的真实 QQ 号/群号"替换为稳定匿名别名后交给模型。
 
@@ -4281,8 +4320,8 @@ _forward_bridge_site: Any = None
 _forward_bridge_started: bool = False
 
 
-def _forward_bridge_session_target(session_id: str) -> Dict[str, Any] | None:
-    """根据 Engine 传来的 session_id 找回该会话对应的真实 QQ 目标。"""
+def _forward_bridge_lookup_target(session_id: str) -> Dict[str, Any] | None:
+    """在内存/持久化两张表中按单个 session_id 查找目标。"""
     sid = str(session_id or "").strip()
     if not sid:
         return None
@@ -4293,8 +4332,39 @@ def _forward_bridge_session_target(session_id: str) -> Dict[str, Any] | None:
     return None
 
 
-def _forward_bridge_origin_group_id(session_id: str) -> int | None:
-    target = _forward_bridge_session_target(session_id)
+def _forward_bridge_session_target(
+    session_id: str,
+    *,
+    parent_session_id: str = "",
+    runtime_session_id: str = "",
+) -> Dict[str, Any] | None:
+    """根据 Engine 传来的 session_id 找回该会话对应的真实 QQ 目标。
+
+    2026-07-14 修复原因：入口任务实际运行在 entry branch session（branch_xxx），
+    ctx.session_id 为 branch，而 _session_targets / _persisted_session_targets 只按
+    用户可见的 parent session 登记。若直接拿 branch 去查会 miss，导致
+    op=remind + target_type=current 在群聊中误报“当前会话不是群聊”。
+    做法：依次尝试 parent_session_id -> 传入 session_id -> runtime_session_id，
+    任一命中即返回，对旧调用（仅传 session_id）完全兼容。
+    """
+    for candidate in (parent_session_id, session_id, runtime_session_id):
+        target = _forward_bridge_lookup_target(candidate)
+        if target:
+            return target
+    return None
+
+
+def _forward_bridge_origin_group_id(
+    session_id: str,
+    *,
+    parent_session_id: str = "",
+    runtime_session_id: str = "",
+) -> int | None:
+    target = _forward_bridge_session_target(
+        session_id,
+        parent_session_id=parent_session_id,
+        runtime_session_id=runtime_session_id,
+    )
     if not target:
         return None
     if str(target.get("type") or "") == "group" and target.get("group_id") is not None:
@@ -4305,9 +4375,18 @@ def _forward_bridge_origin_group_id(session_id: str) -> int | None:
     return None
 
 
-def _forward_bridge_origin_user_id(session_id: str) -> int | None:
+def _forward_bridge_origin_user_id(
+    session_id: str,
+    *,
+    parent_session_id: str = "",
+    runtime_session_id: str = "",
+) -> int | None:
     """当前会话触发者 QQ 号，用于把内容“私发给我”。"""
-    target = _forward_bridge_session_target(session_id)
+    target = _forward_bridge_session_target(
+        session_id,
+        parent_session_id=parent_session_id,
+        runtime_session_id=runtime_session_id,
+    )
     if not target:
         return None
     if target.get("user_id") is not None:
@@ -4318,12 +4397,23 @@ def _forward_bridge_origin_user_id(session_id: str) -> int | None:
     return None
 
 
-def _forward_bridge_list_messages(session_id: str, query: str = "", limit: int = 30) -> list[dict[str, Any]]:
+def _forward_bridge_list_messages(
+    session_id: str,
+    query: str = "",
+    limit: int = 30,
+    *,
+    parent_session_id: str = "",
+    runtime_session_id: str = "",
+) -> list[dict[str, Any]]:
     """列出当前会话（群）最近消息，供 AI 按下标/关键词多选转发。
 
     返回的 index 从 1 开始；只包含匿名后可展示给模型的字段。
     """
-    group_id = _forward_bridge_origin_group_id(session_id)
+    group_id = _forward_bridge_origin_group_id(
+        session_id,
+        parent_session_id=parent_session_id,
+        runtime_session_id=runtime_session_id,
+    )
     if group_id is None:
         return []
     records = list(_group_content_records.get(int(group_id), ()))
@@ -4349,17 +4439,37 @@ def _forward_bridge_list_messages(session_id: str, query: str = "", limit: int =
     return items[-limit:]
 
 
-def _forward_bridge_origin_bucket_key(session_id: str) -> str:
+def _forward_bridge_origin_bucket_key(
+    session_id: str,
+    *,
+    parent_session_id: str = "",
+    runtime_session_id: str = "",
+) -> str:
     """把来源会话映射为“最近发送/生成附件”索引的桶 key。"""
-    target = _forward_bridge_session_target(session_id)
+    target = _forward_bridge_session_target(
+        session_id,
+        parent_session_id=parent_session_id,
+        runtime_session_id=runtime_session_id,
+    )
     if not target:
         return ""
     return _sent_attachment_bucket_key(target)
 
 
-def _forward_bridge_list_recent(session_id: str, *, only_images: bool = True, limit: int = 20) -> list[dict[str, Any]]:
+def _forward_bridge_list_recent(
+    session_id: str,
+    *,
+    only_images: bool = True,
+    limit: int = 20,
+    parent_session_id: str = "",
+    runtime_session_id: str = "",
+) -> list[dict[str, Any]]:
     """列出本会话最近由 Bot 发出/生成的附件（如生图产出的图片），带 index 下标。"""
-    bucket = _forward_bridge_origin_bucket_key(session_id)
+    bucket = _forward_bridge_origin_bucket_key(
+        session_id,
+        parent_session_id=parent_session_id,
+        runtime_session_id=runtime_session_id,
+    )
     records = _recent_sent_attachment_records(bucket, only_images=only_images)
     limit = max(1, min(int(limit or 20), FORWARD_BRIDGE_MAX_MESSAGES))
     records = records[-limit:]
@@ -4378,12 +4488,18 @@ def _forward_bridge_pick_recent_attachments(
     *,
     indices: list[int] | None,
     only_images: bool = False,
+    parent_session_id: str = "",
+    runtime_session_id: str = "",
 ) -> list[dict[str, Any]]:
     """按下标从最近发送/生成附件里挑选；无下标时默认取最新一个。
 
     返回可直接发送的附件 dict（带绝对 path + name + type）。
     """
-    bucket = _forward_bridge_origin_bucket_key(session_id)
+    bucket = _forward_bridge_origin_bucket_key(
+        session_id,
+        parent_session_id=parent_session_id,
+        runtime_session_id=runtime_session_id,
+    )
     records = _recent_sent_attachment_records(bucket, only_images=only_images)
     if not records:
         return []
@@ -4416,8 +4532,14 @@ def _forward_bridge_pick_records(
     *,
     indices: list[int] | None,
     query: str,
+    parent_session_id: str = "",
+    runtime_session_id: str = "",
 ) -> list[GroupContentRecord]:
-    group_id = _forward_bridge_origin_group_id(session_id)
+    group_id = _forward_bridge_origin_group_id(
+        session_id,
+        parent_session_id=parent_session_id,
+        runtime_session_id=runtime_session_id,
+    )
     if group_id is None:
         return []
     records = list(_group_content_records.get(int(group_id), ()))
@@ -4447,17 +4569,28 @@ async def _forward_bridge_resolve_target(
     session_id: str,
     target_type: str,
     target_ref: str,
+    *,
+    parent_session_id: str = "",
+    runtime_session_id: str = "",
 ) -> tuple[ProactiveTarget | None, str]:
     """把工具给出的目标（含 self/current 语义）解析为真实 ProactiveTarget。"""
     target_type = str(target_type or "").strip().lower()
     ref = str(target_ref or "").strip()
     if target_type == "self" or ref in {"我", "自己", "me", "self"}:
-        uid = _forward_bridge_origin_user_id(session_id)
+        uid = _forward_bridge_origin_user_id(
+            session_id,
+            parent_session_id=parent_session_id,
+            runtime_session_id=runtime_session_id,
+        )
         if uid is None:
             return None, "无法确定当前用户，无法私发给你。"
         return ProactiveTarget("private", uid, _qq_profile_display_name(uid) or _anonymize_user_id(uid)), ""
     if target_type == "current" or ref in {"当前群", "本群", "这个群", "此群"}:
-        gid = _forward_bridge_origin_group_id(session_id)
+        gid = _forward_bridge_origin_group_id(
+            session_id,
+            parent_session_id=parent_session_id,
+            runtime_session_id=runtime_session_id,
+        )
         if gid is None:
             return None, "当前会话不是群聊，无法发送到本群。"
         if ALLOWED_GROUPS and gid not in ALLOWED_GROUPS:
@@ -4546,6 +4679,10 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
     except Exception:
         return {"ok": False, "error": "QQ Bot 尚未连接，无法执行转发。"}
     session_id = str(payload.get("session_id") or "").strip()
+    # [2026-07-14] 入口任务运行在 branch session 上，因此工具会额外透传 parent/runtime
+    # session id；这里全部收集下来供 target 解析做多级回退。
+    parent_session_id = str(payload.get("parent_session_id") or "").strip()
+    runtime_session_id = str(payload.get("runtime_session_id") or "").strip()
     action = str(payload.get("action") or "forward").strip().lower()
     target_type = str(payload.get("target_type") or "").strip().lower()
     target_ref = str(payload.get("target_ref") or "").strip()
@@ -4574,7 +4711,14 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
     if recent_indices:
         use_recent = True
 
-    target, error = await _forward_bridge_resolve_target(bot, session_id, target_type, target_ref)
+    target, error = await _forward_bridge_resolve_target(
+        bot,
+        session_id,
+        target_type,
+        target_ref,
+        parent_session_id=parent_session_id,
+        runtime_session_id=runtime_session_id,
+    )
     if target is None:
         return {"ok": False, "error": error or "目标解析失败。"}
     send_target = _target_to_send_dict(target)
@@ -4601,6 +4745,8 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
                 session_id,
                 indices=recent_indices,
                 only_images=False,
+                parent_session_id=parent_session_id,
+                runtime_session_id=runtime_session_id,
             )
             attachments = _forward_bridge_resolve_files(
                 [att.get("path") for att in recent_atts],
@@ -4624,6 +4770,8 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
             session_id,
             indices=recent_indices,
             only_images=False,
+            parent_session_id=parent_session_id,
+            runtime_session_id=runtime_session_id,
         )
         recent_atts = _forward_bridge_resolve_files(
             [att.get("path") for att in recent_atts],
@@ -4634,7 +4782,13 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
         await _send_text_and_attachments(bot, send_target, extra_text, recent_atts)
         return {"ok": True, "result": f"已向{label}发送 {len(recent_atts)} 张最近生成/发送的图片。"}
 
-    records = _forward_bridge_pick_records(session_id, indices=indices, query=query)
+    records = _forward_bridge_pick_records(
+        session_id,
+        indices=indices,
+        query=query,
+        parent_session_id=parent_session_id,
+        runtime_session_id=runtime_session_id,
+    )
 
     if action == "send":
         # 直接把挑选到的消息拼成一段文本 + 附件发送（非合并转发卡片）。
@@ -4694,11 +4848,15 @@ async def _forward_bridge_http_handler(request: "Any") -> "Any":
         return web.json_response({"ok": False, "error": "invalid payload"}, status=400)
     op = str(payload.get("op") or "").strip().lower()
     try:
+        _parent_sid = str(payload.get("parent_session_id") or "")
+        _runtime_sid = str(payload.get("runtime_session_id") or "")
         if op == "list":
             messages = _forward_bridge_list_messages(
                 str(payload.get("session_id") or ""),
                 query=str(payload.get("query") or ""),
                 limit=int(payload.get("limit") or FORWARD_BRIDGE_MAX_MESSAGES),
+                parent_session_id=_parent_sid,
+                runtime_session_id=_runtime_sid,
             )
             return web.json_response({"ok": True, "messages": messages})
         if op == "recent":
@@ -4706,6 +4864,8 @@ async def _forward_bridge_http_handler(request: "Any") -> "Any":
                 str(payload.get("session_id") or ""),
                 only_images=bool(payload.get("only_images", True)),
                 limit=int(payload.get("limit") or 20),
+                parent_session_id=_parent_sid,
+                runtime_session_id=_runtime_sid,
             )
             return web.json_response({"ok": True, "recent": recent})
         if op in {"forward", "send", "remind", "file", ""}:
@@ -4774,6 +4934,9 @@ async def _startup() -> None:
     _load_route_state()
     _load_reply_attachment_cache()
     _load_anon_map()
+    # [2026-07-14] 注入 at 别名反查，让 emoji_handler 在处理 [at:UserAF]/[at:显示名]
+    # 时能把匿名别名/群昵称回解为真实 QQ 号，避免直接把代号当纯文本 @ 出去。
+    set_at_alias_resolver(_resolve_at_alias_to_real)
     # [AutoC] QQ 管理员 /切换模型 命令需要调用受 admin_token 保护的
     # POST /v1/config/openai，因此这里把 Supervisor 写出的 data/.admin_token
     # 传给 ClonothClient（每次请求实时读取，token 轮换也能跟上）。

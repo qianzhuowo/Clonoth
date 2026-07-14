@@ -21,7 +21,49 @@ _QQ_EMOJI_RE = re.compile(r"\[(?:QQ_EMOJI|表情|emoji|收藏表情)\s*[:：]\s*
 # Clonoth 模型输出 [at:QQ号] 格式的 at 标记。QQ 端需要将其
 # 转换为 OneBot MessageSegment.at()，否则只会被当作纯文本发送。
 # 同时兼容旧的 [CQ:at,qq=xxx] 格式。
-_AT_RE = re.compile(r"\[at:(\d+)\]|\[CQ:at,qq=(\d+)\]")
+#
+# 2026-07-14 扩展：模型看到的是匿名别名（UserA/UserAF 等），很容易输出
+# [at:UserAF] 而不是真实 QQ 号。旧正则只匹配纯数字，导致这类 @ 标记
+# 被当成纯文本原样发出（群里看到 "@UserAF"）。这里允许方括号内为
+# 数字或非数字别名/显示名，非数字部分在 process_emojis 里通过
+# _at_alias_resolver 反查为真实 QQ 号（后续由 NapCat 渲染为群昵称）。
+_AT_RE = re.compile(r"\[at:([^\]]+)\]|\[CQ:at,qq=(\d+)\]")
+
+# at 别名反查回调：由 __init__.py 在导入后注入，输入别名/显示名，返回真实 QQ 号
+# 字符串；无法解析时返回 None。默认 None 表示未注入（只识别纯数字 QQ 号）。
+_at_alias_resolver: Any = None
+
+
+def set_at_alias_resolver(resolver: Any) -> None:
+    """注入 at 别名 -> 真实 QQ 号 的解析回调。"""
+    global _at_alias_resolver
+    _at_alias_resolver = resolver
+
+
+def _resolve_at_token(token: str) -> str:
+    """把 [at:xxx] 里的 token 解析为真实 QQ 号字符串。
+
+    - 纯数字：直接返回（视为真实 QQ 号）。
+    - 特殊值 all/at_all/全体成员：返回 "all"，交由上层生成 @全体成员。
+    - 其余（别名/显示名/群昵称）：调用注入的 resolver 反查；失败返回空串。
+    """
+    raw = str(token or "").strip()
+    if not raw:
+        return ""
+    if raw.isdigit():
+        return raw
+    if raw.lower() in {"all", "at_all", "全体成员", "@全体成员"}:
+        return "all"
+    if _at_alias_resolver is not None:
+        try:
+            resolved = _at_alias_resolver(raw)
+        except Exception:
+            resolved = None
+        if resolved:
+            resolved = str(resolved).strip()
+            if resolved:
+                return resolved
+    return ""
 
 # Discord 自定义表情在 QQ 无法渲染。这里直接剥离，避免群内出现平台私有格式。
 _DC_EMOJI_RE = re.compile(r"<a?:\w+:\d+>")
@@ -590,9 +632,20 @@ async def process_emojis(
             segments.append({"type": "text", "content": before})
 
         if match_type == "at":
-            # group(1) 匹配 [at:xxx]，group(2) 匹配 [CQ:at,qq=xxx]
-            qq_id = match.group(1) or match.group(2)
-            segments.append({"type": "at", "qq": qq_id})
+            # group(1) 匹配 [at:xxx]（xxx 可能是 QQ 号或别名/显示名），
+            # group(2) 匹配旧格式 [CQ:at,qq=xxx]（仅数字）。
+            raw_token = match.group(1)
+            if raw_token is not None:
+                qq_id = _resolve_at_token(raw_token)
+            else:
+                qq_id = str(match.group(2) or "").strip()
+            if qq_id:
+                segments.append({"type": "at", "qq": qq_id})
+            else:
+                # 无法解析为真实 QQ 号时，保留可读文本避免静默丢失（去掉方括号）。
+                fallback = str(raw_token or "").strip()
+                if fallback:
+                    segments.append({"type": "text", "content": f"@{fallback}"})
             last_end = end
             continue
 

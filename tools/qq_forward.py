@@ -173,7 +173,13 @@ if __name__ == "__main__":
     port = _env_first("ONEBOT_FORWARD_BRIDGE_PORT", default="8769")
     token = _env_first("ONEBOT_FORWARD_BRIDGE_TOKEN", default="")
     # session_id 由 Engine 注入，Bridge 用它把请求映射回真实 QQ 群/用户，工具本身看不到真实号码。
-    session_id = _env_first("CLONOTH_SESSION_ID", "CLONOTH_PARENT_SESSION_ID", default="")
+    # 说明：入口任务实际运行在 branch session（CLONOTH_SESSION_ID=branch_xxx），而 QQ Bot
+    # 侧的 _session_targets 仅按用户可见的 parent session 登记。因此这里优先使用
+    # CLONOTH_PARENT_SESSION_ID，让 Bridge 能稳定映射回来源群/用户；缺省时再回退到
+    # CLONOTH_SESSION_ID，并把两者都透传给 Bridge 供其做二次回退。
+    parent_session_id = _env_first("CLONOTH_PARENT_SESSION_ID", default="")
+    runtime_session_id = _env_first("CLONOTH_SESSION_ID", default="")
+    session_id = parent_session_id or runtime_session_id
     if not session_id:
         fail(
             "缺少会话上下文（CLONOTH_SESSION_ID）。",
@@ -183,6 +189,8 @@ if __name__ == "__main__":
     payload = {
         "op": op,
         "session_id": session_id,
+        "parent_session_id": parent_session_id,
+        "runtime_session_id": runtime_session_id,
     }
     if op == "list":
         payload["query"] = str(args.get("query") or "").strip()

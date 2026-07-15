@@ -908,6 +908,10 @@ class TaskRouterMixin:
             "child_task_id": task.task_id,
             "child_session_id": child_session_id,
         }
+        # [2026-07-15] 同 _inject_dispatch_result_via_origin_locked：回调明确回
+        # 发起节点，避免回退到 session 上一次绑定的入口节点而错路。
+        if caller_node:
+            payload["entry_node_id"] = caller_node
         if attachments_outbound_sent:
             payload["attachments_outbound_sent"] = True
         elif result_atts:
@@ -1010,6 +1014,14 @@ class TaskRouterMixin:
             "child_task_id": task.task_id,
             "child_session_id": child_session_id,
         }
+        # [2026-07-15] Why: 异步 dispatch 结果回调以新 inbound 注入时，若不指定
+        # entry_node_id，_create_entry_task_for_inbound_locked 会回退到 session 最后绑定
+        # 的入口节点（如上一次被 dispatch 目标写入的 qq.web_search），导致回调被错误
+        # 路由到不具备推送能力的节点，异步结果无法发出。How: 回调明确指定
+        # entry_node_id 为发起 dispatch 的 caller 节点（orchestrator）。Purpose: 异步
+        # 结果回到原编排节点，由它决定如何向用户推送。
+        if caller_node:
+            payload["entry_node_id"] = caller_node
         if attachments_outbound_sent:
             payload["attachments_outbound_sent"] = True
         elif result_atts:

@@ -461,6 +461,17 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
     parent_channel = ls.rctx.task_context.get("channel", "internal")
     target_node_id = target
 
+    # Why: 子节点(如 cmd_reviewer 执行 curl 读网页)在 dispatch 后
+    # 丢失了发起者身份，platform_auth.is_admin 变成 False，导致管理员发起的读网页 curl
+    # 仍被要求审批。How: 从父 task_context 透传 platform_auth 与 route_hints 到 dispatch
+    # inbound。Purpose: 子节点的策略判定沿用发起者身份，管理员任务的普通命令自动放行。
+    parent_platform_auth = ls.rctx.task_context.get("platform_auth")
+    if not isinstance(parent_platform_auth, dict):
+        parent_platform_auth = {}
+    parent_route_hints = ls.rctx.task_context.get("route_hints")
+    if not isinstance(parent_route_hints, dict):
+        parent_route_hints = {}
+
     # 生成 conversation_key
     if ctx_mode in ("fresh", "fork"):
         import uuid as _uuid
@@ -479,6 +490,8 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         "entry_node_id": target_node_id,
         "use_context": True,
         "attachments": attachments or [],
+        "platform_auth": dict(parent_platform_auth),
+        "route_hints": dict(parent_route_hints),
         "dispatch_origin": {
             "parent_session_id": parent_session_id,
             "caller_node_id": ls.node.id,

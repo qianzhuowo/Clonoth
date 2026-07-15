@@ -285,11 +285,33 @@ _approval_message_ids: "OrderedDict[str, str]" = OrderedDict()
 _APPROVAL_MSG_MAP_MAX = 500
 
 
+def _normalize_msg_id(message_id: Any) -> str:
+    """将消息 id 归一化为稳定字符串 key。
+
+    Why: NapCat/OneBot 上报的 reply id 与 send_private_msg 返回的
+    message_id 可能分别以 int / 带小数点浮点字符串 / 带空白的形式出现，直接
+    str() 对比会因“-123 vs -123.0”等差异而反查失败。How: 先 strip，再尝试按
+    整数归一化（容忍 '-123.0' 这类）。Purpose: 写入与反查使用同一归一化规则，
+    避免引用快捷审批因 id 格式差异而失败。
+    """
+    if message_id is None:
+        return ""
+    key = str(message_id).strip()
+    if not key:
+        return ""
+    try:
+        return str(int(float(key))) if any(c in key for c in ".") else str(int(key))
+    except (ValueError, TypeError):
+        return key
+
+
 def _remember_approval_message(message_id: Any, approval_id: str) -> None:
     """记录审批消息 id 到 approval_id 的映射，供引用回复审批时反查。"""
-    if message_id is None or not str(message_id).strip() or not approval_id:
+    if not approval_id:
         return
-    key = str(message_id).strip()
+    key = _normalize_msg_id(message_id)
+    if not key:
+        return
     _approval_message_ids[key] = approval_id
     _approval_message_ids.move_to_end(key)
     while len(_approval_message_ids) > _APPROVAL_MSG_MAP_MAX:
@@ -298,11 +320,64 @@ def _remember_approval_message(message_id: Any, approval_id: str) -> None:
 
 def _resolve_approval_id_by_reply(reply_message_id: Any) -> Optional[str]:
     """根据被引用的审批消息 id 反查 approval_id，只返回仍在待审批列表中的。"""
-    if reply_message_id is None:
+    key = _normalize_msg_id(reply_message_id)
+    if not key:
         return None
-    approval_id = _approval_message_ids.get(str(reply_message_id).strip())
+    approval_id = _approval_message_ids.get(key)
     if approval_id and approval_id in _pending_approvals:
         return approval_id
+    return None
+
+
+def _extract_approval_id_from_text(text: str) -> Optional[str]:
+    """从任意文本（如被引用的审批摘要）中提取仍在待审批列表的 approval_id。"""
+    if not text:
+        return None
+    for aid in _pending_approvals:
+        if aid and aid in text:
+            return aid
+    # 容忍“ID: <uuid>”前缀写法，取出 uuid 后再比对 pending。
+    m = re.search(r"([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", text)
+    if m:
+        token = m.group(1)
+        if token in _pending_approvals:
+            return token
+    return None
+
+
+async def _resolve_approval_id_by_reply_fallback(bot: Bot, event: Event, reply_message_id: Any) -> Optional[str]:
+    """引用快捷审批的兜底反查。
+
+    [2026-07-15] Why: 部分 NapCat 版本私聊 reply 段未带可用 id，直接映射反查
+    失败。How: 依次尝试（1）用 get_msg 拉被引用消息，从其文本中提取 approval_id；
+    （2）若仍失败且当前恰好只有一个待审批，直接回退到该唯一 id。Purpose: 在 reply
+    id 不可用时仍能让管理员“引用+同意/拒绝”生效。
+    """
+    # 1) get_msg 拉被引用消息文本
+    if reply_message_id is not None:
+        try:
+            reply_obj = await _get_reply_message(bot, reply_message_id)
+        except Exception:
+            reply_obj = None
+        if isinstance(reply_obj, dict):
+            parts: List[str] = []
+            for key in ("raw_message", "message"):
+                val = reply_obj.get(key)
+                if isinstance(val, str):
+                    parts.append(val)
+                elif isinstance(val, list):
+                    for seg in val:
+                        data = seg.get("data") if isinstance(seg, dict) else None
+                        if isinstance(data, dict):
+                            txt = data.get("text")
+                            if isinstance(txt, str):
+                                parts.append(txt)
+            aid = _extract_approval_id_from_text("\n".join(parts))
+            if aid:
+                return aid
+    # 2) 唯一待审批回退
+    if len(_pending_approvals) == 1:
+        return next(iter(_pending_approvals))
     return None
 
 
@@ -5422,8 +5497,15 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     # 快捷审批：管理员引用(回复)审批消息并发“同意/拒绝”即可，无需携带 approval_id。
     reply_mid = _extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None))
     reply_approval_id = _resolve_approval_id_by_reply(reply_mid) if reply_mid is not None else None
+    # [2026-07-15] Why: 部分 NapCat 版本在私聊 reply 段里不带可用 id（上报为 0
+    # 或缺失），导致反查失败、快捷审批没命中而被当成普通聊天回复。How: 若直接
+    # 反查不到、但本条确实是引用回复且文本是同意/拒绝意图，则尝试用 get_msg 拉取
+    # 被引用消息内容，匹配其中的审批摘要/approval_id；仍失败且当前只有唯一待审批时
+    # 回退到该唯一 id。Purpose: 提高引用快捷审批的健壮性，避免因 reply id 缺失失效。
+    reply_verb = _parse_approval_reply_verb(user_text)
+    if reply_approval_id is None and reply_verb is not None and _is_admin_user(user_id):
+        reply_approval_id = await _resolve_approval_id_by_reply_fallback(bot, event, reply_mid)
     if reply_approval_id is not None:
-        reply_verb = _parse_approval_reply_verb(user_text)
         if reply_verb is not None:
             if not _is_admin_user(user_id):
                 await _private_matcher.finish("你不是 Clonoth 审批管理员，不能处理审批请求。")

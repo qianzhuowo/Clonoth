@@ -217,6 +217,86 @@ def normalize_openai_secret(data: dict[str, Any]) -> tuple[str, str, str]:
     return api_key, base_url, model
 
 
+# ---------------------------------------------------------------------------
+#  系统模型渠道解析（compact / summary / image）
+# ---------------------------------------------------------------------------
+# [2026-07-16] Why: 压缩/轮摘要/读图这三个系统用途，用户希望：
+#   1) 不填时跟随主渠道 url/key（只换模型名，甚至模型名也可留空跟随主模型）；
+#   2) 也能单独指定 url/key/model；
+#   3) 环境变量和 config.yaml 两种方式都支持。
+# How: 统一读 data/config.yaml 的 system_models.<slot> 块，每个字段解析 ${VAR}；
+#   字段留空时按 slot 专属环境变量兜底，再留空则跟随主渠道对应值。
+# Purpose: 三个系统用途共用同一套解析规则，配置集中在 config.yaml + .env。
+#
+# config.yaml 布局：
+#   system_models:
+#     compact:  { model: "...", base_url: "${...}", api_key: "${...}" }
+#     summary:  { model: "..." }                 # 只换模型，url/key 跟随主渠道
+#     image:    { model: "gemini-3.5-flash" }
+#
+# slot -> 环境变量映射：
+#   compact -> CLONOTH_COMPACT_MODEL / CLONOTH_COMPACT_BASE_URL / CLONOTH_COMPACT_API_KEY
+#   summary -> CLONOTH_SUMMARY_MODEL / CLONOTH_SUMMARY_BASE_URL / CLONOTH_SUMMARY_API_KEY
+#   image   -> CLONOTH_IMAGE_MODEL   / CLONOTH_IMAGE_BASE_URL   / CLONOTH_IMAGE_API_KEY
+
+_SYSTEM_MODEL_ENV_PREFIX = {
+    "compact": "CLONOTH_COMPACT",
+    "summary": "CLONOTH_SUMMARY",
+    "image": "CLONOTH_IMAGE",
+}
+
+
+def _load_config_yaml(workspace_root: Path) -> dict[str, Any]:
+    p = workspace_root / "data" / "config.yaml"
+    data = load_yaml_dict(p)
+    return data if isinstance(data, dict) else {}
+
+
+def resolve_system_model(
+    workspace_root: Path,
+    slot: str,
+    *,
+    default_model: str = "",
+    default_base_url: str = "",
+    default_api_key: str = "",
+) -> tuple[str, str, str]:
+    """Resolve (model, base_url, api_key) for a system slot.
+
+    Priority per field: config.yaml system_models.<slot> > slot env var > main
+    channel default passed by caller. Empty string means "follow main channel".
+    Returns resolved (model, base_url, api_key); any of them may be empty, in
+    which case the caller should fall back to the main channel value.
+    """
+    slot = (slot or "").strip().lower()
+    prefix = _SYSTEM_MODEL_ENV_PREFIX.get(slot, "")
+
+    block: dict[str, Any] = {}
+    cfg = _load_config_yaml(workspace_root)
+    sm = cfg.get("system_models")
+    if isinstance(sm, dict):
+        raw_block = sm.get(slot)
+        if isinstance(raw_block, dict):
+            block = raw_block
+
+    def _pick(field: str, env_suffix: str, fallback: str) -> str:
+        # 1) config.yaml 字段（支持 ${VAR}）
+        v = resolve_env_ref(str(block.get(field) or "").strip())
+        if v:
+            return v
+        # 2) slot 专属环境变量
+        if prefix:
+            v = os.getenv(f"{prefix}_{env_suffix}", "").strip()
+            if v:
+                return v
+        # 3) 主渠道兜底
+        return fallback
+
+    model = _pick("model", "MODEL", default_model)
+    base_url = _pick("base_url", "BASE_URL", default_base_url)
+    api_key = _pick("api_key", "API_KEY", default_api_key)
+    return model, base_url, api_key
+
+
 def load_policy_config(workspace_root: Path) -> dict[str, Any]:
     p = workspace_root / "data" / "policy.yaml"
     data = load_yaml_dict(p)

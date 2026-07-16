@@ -17,7 +17,8 @@ SPEC = {
         "[ONLY for text-only models like DeepSeek. Do NOT use if you can see images natively.] "
         "Analyze image(s) and return a comprehensive text description including all visible text (OCR), "
         "layout, colors, objects, people, style, and context. "
-        "Provide local image paths to analyze. Uses gemini-3-flash-preview internally."
+        "Provide local image paths to analyze. Uses a Gemini vision model internally "
+        "(configurable via CLONOTH_IMAGE_MODEL)."
     ),
     "input_schema": {
         "type": "object",
@@ -94,26 +95,68 @@ if __name__ == "__main__":
                 kv[k.strip()] = v.strip().strip("'\"")
         return kv
 
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-    base_url = os.environ.get("OPENAI_BASE_URL", "").strip().rstrip("/")
+    # [2026-07-16] 读图渠道支持单独配置 model/base_url/api_key，与
+    # compact/summary 一致：优先读 data/config.yaml 的 system_models.image，
+    # 其次 slot 专属环境变量 CLONOTH_IMAGE_*，留空则跟随主渠道。
+    # read_image 是独立子进程工具，无法导入 clonoth_runtime，故本地实现
+    # 一份轻量解析（与 clonoth_runtime.resolve_system_model 策略一致）。
+    dotenv = _load_dotenv()
 
-    if not api_key or not base_url:
-        dotenv = _load_dotenv()
-        if not api_key:
-            api_key = dotenv.get("GEMINI_API_KEY", "") or dotenv.get("OPENAI_API_KEY", "")
-        if not base_url:
-            base_url = dotenv.get("OPENAI_BASE_URL", "").rstrip("/")
+    def _env(key: str) -> str:
+        return (os.environ.get(key, "") or dotenv.get(key, "")).strip()
+
+    def _load_config_image_block():
+        try:
+            import yaml  # type: ignore
+        except Exception:
+            return {}
+        cfg_path = Path.cwd() / "data" / "config.yaml"
+        if not cfg_path.exists():
+            return {}
+        try:
+            data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+        except Exception:
+            return {}
+        sm = data.get("system_models") if isinstance(data, dict) else None
+        blk = sm.get("image") if isinstance(sm, dict) else None
+        return blk if isinstance(blk, dict) else {}
+
+    def _resolve_ref(v: str) -> str:
+        s = (v or "").strip()
+        if s.startswith("${") and s.endswith("}") and len(s) > 3:
+            return _env(s[2:-1].strip())
+        if s.startswith("$ENV{") and s.endswith("}") and len(s) > 6:
+            return _env(s[5:-1].strip())
+        return s
+
+    _img_cfg = _load_config_image_block()
+
+    def _pick(cfg_field: str, env_suffix: str, *fallbacks: str) -> str:
+        v = _resolve_ref(str(_img_cfg.get(cfg_field) or ""))
+        if v:
+            return v
+        v = _env(f"CLONOTH_IMAGE_{env_suffix}")
+        if v:
+            return v
+        for fb in fallbacks:
+            if fb and fb.strip():
+                return fb.strip()
+        return ""
+
+    # api_key: image 专属 > GEMINI_API_KEY > OPENAI_API_KEY
+    api_key = _pick("api_key", "API_KEY", _env("GEMINI_API_KEY"), _env("OPENAI_API_KEY"))
+    # base_url: image 专属 > OPENAI_BASE_URL（主渠道）
+    base_url = _pick("base_url", "BASE_URL", _env("OPENAI_BASE_URL")).rstrip("/")
 
     if not api_key:
-        fail("No API key found in env or .env file")
+        fail("No API key found in config.yaml / env / .env file")
     if not base_url:
         base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
     if not base_url.endswith("/v1"):
         base_url = base_url.rstrip("/") + "/v1" if "/v1" not in base_url else base_url
 
-    model = "gemini-3-flash-preview"
+    # model: image 专属 > CLONOTH_IMAGE_MODEL > 默认 gemini-3.5-flash
+    model = _pick("model", "MODEL", "gemini-3.5-flash")
     url = f"{base_url}/chat/completions"
 
     # ---- Build content parts ----

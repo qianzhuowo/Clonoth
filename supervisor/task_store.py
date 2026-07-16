@@ -79,10 +79,16 @@ class TaskStoreMixin:
             session_id=task.session_id,
             component=component,
             type_=event_type,
-            payload=self._event_payload_for_task(task),
+            payload=self._event_payload_for_task(task, event_type=event_type),
         )
 
-    def _event_payload_for_task(self, task: Task) -> dict[str, Any]:
+    # [2026-07-16] 只在 task_created 快照保留完整 input；后续生命周期
+    # 事件（started/completed/suspended/resumed 等）的 input 与 created 一致。
+    _INPUT_FULL_EVENT_TYPES = frozenset({"task_created"})
+
+    def _event_payload_for_task(
+        self, task: Task, *, event_type: str = "",
+    ) -> dict[str, Any]:
         """Build a task snapshot payload safe for long-term event storage."""
         payload = task.model_dump(mode="json")
         result = payload.get("result")
@@ -98,10 +104,41 @@ class TaskStoreMixin:
             slim_result.pop("dispatch_input", None)
             slim_result["dispatch_input_omitted"] = True
             payload["result"] = slim_result
+        # [2026-07-16] Why: task_started/task_completed/task_suspended/
+        # task_resumed 等事件重复写入与 task_created 相同的 input（实测每条
+        # ~1KB）How: 除 task_created 外，把 input 替换为只
+        # 保留路由/回放必需轻量字段的瘦身版本并标记 _input_slimmed。
+        # Purpose: 回放仍可从 task_created 拿完整 input，后续事件体积大幅缩减，
+        # 不影响活 Task 对象与路由。
+        if event_type and event_type not in self._INPUT_FULL_EVENT_TYPES:
+            raw_input = payload.get("input")
+            if isinstance(raw_input, dict) and raw_input:
+                slim_input: dict[str, Any] = {"_input_slimmed": True}
+                for _k in (
+                    "task_context", "_dispatch_origin", "dispatch_context_mode",
+                    "parent_session_id", "child_session_id",
+                    "_compact_dispatch_pending",
+                ):
+                    if _k in raw_input:
+                        slim_input[_k] = raw_input[_k]
+                payload["input"] = slim_input
         return payload
 
     def _apply_task_snapshot(self, payload: dict[str, Any]) -> None:
+        # [2026-07-16] Why: 非 task_created 事件的 input 已被瘦身
+        # （只留 _input_slimmed + 少量路由字段）。回放时若直接用瘦身快照覆盖，
+        # 会丢失已从 task_created 恢复的完整 instruction 等。How: 检测到
+        # _input_slimmed 且已有同 task_id 的完整 input 时，保留旧 input。
+        # Purpose: 事件回放后 Task.input 仍为完整值，路由/诊断不受影响。
         try:
+            _new_input = payload.get("input")
+            if isinstance(_new_input, dict) and _new_input.get("_input_slimmed"):
+                _tid = payload.get("task_id")
+                _prev = self.tasks.get(_tid) if _tid else None
+                _prev_input = getattr(_prev, "input", None) if _prev else None
+                if isinstance(_prev_input, dict) and _prev_input:
+                    payload = dict(payload)
+                    payload["input"] = _prev_input
             t = Task.model_validate(payload)
         except Exception:
             return

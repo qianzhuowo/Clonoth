@@ -23,8 +23,12 @@ SIGNALS_FILE = DATA_DIR / "signals.jsonl"
 LOG_FILE = DATA_DIR / "logs" / "cleanup.log"
 
 # ── Thresholds ─────────────────────────────────
-EVENTS_MAX_BYTES = 50 * 1024 * 1024   # 50 MB
-EVENTS_BACKUPS = 3
+# [2026-07-16] 轮转阈值/保留份数可通过环境变量调整，便于在
+# 事件高频写入的部署里收紧阈值（例如降到 20MB）。EventLog 写入侧
+# 的在线护栏（见 supervisor/eventlog.py）会读取同名环境变量，避免
+# 单小时突发写入把活动日志擑到数 GB 才被定时 timer 轮转。
+EVENTS_MAX_BYTES = int(os.getenv("CLONOTH_EVENTS_MAX_BYTES", str(50 * 1024 * 1024)))   # 50 MB
+EVENTS_BACKUPS = int(os.getenv("CLONOTH_EVENTS_BACKUPS", "3"))
 
 TEMP_MAX_AGE = 24 * 3600              # 24 h
 ARTIFACT_MAX_AGE = 24 * 3600          # 24 h

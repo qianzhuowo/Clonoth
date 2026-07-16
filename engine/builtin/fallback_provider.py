@@ -131,6 +131,37 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
     }
 
 
+def _select_fallbacks_for_node(full_cfg: dict[str, Any], node_id: str) -> list[Any]:
+    """Return the fallback chain that applies to *node_id*.
+
+    [2026-07-16] Why: system nodes (system.compactor / system.turn_summarizer /
+    read_image 等) may want a cheaper/different backup chain than the main
+    conversation. How: look up config.yaml's optional ``node_fallbacks`` mapping
+    (keyed by node id) first; if the node has an explicit entry use it, otherwise
+    fall back to the top-level ``fallbacks`` list. Purpose: keep existing configs
+    working (no node_fallbacks -> global fallbacks) while allowing per-node chains.
+
+    config.yaml layout::
+
+        fallbacks:              # 全局默认备选链（主对话等）
+          - provider: openai
+
+        node_fallbacks:         # 可选：按节点 id 的专属备选链
+          system.compactor:
+            - provider: openai
+              model: deepseek-v4-pro
+          system.turn_summarizer:
+            - provider: openai
+              model: deepseek-v4-pro
+    """
+    node_map = full_cfg.get("node_fallbacks")
+    if node_id and isinstance(node_map, dict):
+        entry = node_map.get(node_id)
+        if isinstance(entry, list) and entry:
+            return entry
+    return full_cfg.get("fallbacks", []) or []
+
+
 def _is_retryable(status_code: int | None, error: str | None = None) -> bool:
     """Check if the error is worth retrying on a different provider.
 
@@ -224,7 +255,14 @@ class FallbackProviderHandler:
             return None
 
         full_cfg = _load_config(workspace_root)
-        fallbacks_raw = full_cfg.get("fallbacks", [])
+        # [2026-07-16] Why: 系统节点（压缩/轮摘要/读图等）希望能配置与
+        # 对话主链不同的备选渠道/模型（例如主链用大模型，压缩用便宜模型）。
+        # How: 先按当前节点 id 在 config.yaml 的 node_fallbacks 映射里查专属备选链，
+        # 命中则用它；未命中回退到全局 fallbacks。Purpose: 不改变旧配置行为
+        # 的前提下，让系统节点能单独指定备选渠道。
+        _node = getattr(ctx, "node", None)
+        _node_id = str(getattr(_node, "id", "") or "").strip()
+        fallbacks_raw = _select_fallbacks_for_node(full_cfg, _node_id)
         if not isinstance(fallbacks_raw, list) or not fallbacks_raw:
             return None
 

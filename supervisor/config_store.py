@@ -189,7 +189,9 @@ class ConfigStore:
     #  Multi-provider CRUD (operates on raw YAML dict)
     # ================================================================
 
-    _META_KEYS = frozenset({"version", "provider", "fallbacks"})
+    # [2026-07-16] node_fallbacks / system_models 是可选配置块，不是 provider
+    # 块，列为 meta key 避免被当成 provider 展示/删除。
+    _META_KEYS = frozenset({"version", "provider", "fallbacks", "node_fallbacks", "system_models"})
 
     def _load_raw(self) -> dict[str, Any]:
         """Load raw YAML dict from disk."""

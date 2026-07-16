@@ -1379,7 +1379,43 @@ class TaskRouterMixin:
                         )
                         return
 
-        # 失败路径：静默恢复父 task
+        # ---- 失败路径 ----
+        # [2026-07-16] Why: compactor 子 task 以 action=fail 结束时（例如
+        # 压缩模型 404 / 不可用），act != "finish"，会直接落到这里静默恢复父 task，
+        # 但从未调用 record_compact_failure，导致熔断器计数永远为 0、is_compact_circuit_open
+        # 恒为 False，父 task 恢复后上下文未变小又立即再次 dispatch 压缩，形成死循环
+        # How: 在失败路径同样对 compact target session 记一次失败；累计到
+        # _MAX_CONSECUTIVE_FAILURES 后 _check_and_compact 会跳过压缩。并复用
+        # 与「finish 但 summary 为空」分支相同的应急截断，尽力打破死循环。
+        # Purpose: 压缩模型偶发/持续失败时不再无限重试拖垮群聊主任务。
+        if target_sid_for_conv:
+            from engine.compact import record_compact_failure
+            record_compact_failure(target_sid_for_conv)
+            _keep = int(caller.input.get("_compact_keep_recent", 6))
+            _threshold = int(caller.input.get("_compact_threshold_tokens", 0) or 256000)
+            _emergency_summary = (
+                "[上下文压缩摘要生成失败，旧消息已被裁剪以恢复服务]"
+            )
+            try:
+                cr = self._apply_compact_via_conv_store_locked(
+                    target_sid_for_conv, _emergency_summary,
+                    keep_recent=_keep,
+                    threshold_tokens=_threshold,
+                )
+                if cr["after"] < cr["before"]:
+                    log.warning(
+                        "compact: emergency truncation applied (compactor action=%s), "
+                        "before=%d after=%d", act or "?", cr["before"], cr["after"],
+                    )
+                    self._resume_compact_parent_locked(
+                        caller, parent_ctx_ref,
+                        compact_result=cr, success=True,
+                    )
+                    return
+            except Exception as _et:
+                log.warning("compact: emergency truncation failed on fail-path: %s", _et)
+
+        # 静默恢复父 task
         self._resume_compact_parent_locked(
             caller, parent_ctx_ref, success=False,
         )

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -14,6 +15,16 @@ SYSTEM_SESSION_ID = "__system__"
 _MAX_MEMORY_EVENTS = 5000
 _MAX_MEMORY_EVENT_BYTES = 64 * 1024 * 1024
 _TAIL_READ_BLOCK_BYTES = 1024 * 1024
+
+# [2026-07-16] Why: events.jsonl 只在每小时的 data_cleanup timer 里轮转，
+# 一旦高频写入（如压缩死循环），单小时内可膨胀到数 GB。How: append() 写盘后按
+# 计数抽检文件大小，超过在线硬上限则立即就地轮转（.N->.N+1，活动文件->.1），
+# 与 data_cleanup.rotate_events 策略一致。Purpose: 给日志膨胀一个不依赖定时任务
+# 的硬上限。<=0 表示禁用在线护栏（仅靠定时轮转）。
+_ONLINE_ROTATE_MAX_BYTES = int(os.getenv("CLONOTH_EVENTS_MAX_BYTES", str(50 * 1024 * 1024)))
+_ONLINE_ROTATE_BACKUPS = int(os.getenv("CLONOTH_EVENTS_BACKUPS", "3"))
+_ONLINE_ROTATE_CHECK_EVERY = 200  # 每写 N 条检查一次文件大小
+
 
 
 def _now() -> datetime:
@@ -39,6 +50,8 @@ class EventLog:
         self._lock = threading.Lock()
         self._events: list[dict[str, Any]] = []
         self._seq: int = 0
+        # [2026-07-16] 在线轮转护栏：距上次检查写入的条数计数器。
+        self._append_since_size_check: int = 0
         # [WS events 2026-05-17] Why: WebSocket clients need live updates while
         # EventLog remains the durable source of truth. How: keep per-session
         # asyncio.Queue subscribers beside the append-only memory buffer. Purpose:
@@ -129,6 +142,41 @@ class EventLog:
         raw_lines = raw_lines[-_MAX_MEMORY_EVENTS:]
         return [line.decode("utf-8", errors="replace") for line in raw_lines]
 
+    def _maybe_rotate_locked(self) -> None:
+        """Rotate the active events file if it exceeds the online size cap.
+
+        [2026-07-16] Must be called while holding self._lock. Why: only the
+        append() writer touches the active file, so rotating under the same lock
+        keeps writes and the rename atomic w.r.t. this process. How: mirror
+        engine/data_cleanup.rotate_events (.N -> .N+1, active -> .1, drop oldest).
+        Purpose: give runaway event growth a hard ceiling between hourly cleanup
+        timer runs. A concurrent data_cleanup rename is tolerated because a
+        missing active file simply resets the seq-based memory buffer; new writes
+        recreate the file.
+        """
+        if _ONLINE_ROTATE_MAX_BYTES <= 0:
+            return
+        try:
+            sz = self._path.stat().st_size
+        except OSError:
+            return
+        if sz < _ONLINE_ROTATE_MAX_BYTES:
+            return
+        data_dir = self._path.parent
+        stem = self._path.name  # e.g. events.jsonl
+        try:
+            for i in range(_ONLINE_ROTATE_BACKUPS, 0, -1):
+                p = data_dir / f"{stem}.{i}"
+                if i == _ONLINE_ROTATE_BACKUPS and p.exists():
+                    p.unlink()
+                elif p.exists():
+                    p.rename(data_dir / f"{stem}.{i + 1}")
+            if self._path.exists():
+                self._path.rename(data_dir / f"{stem}.1")
+        except OSError:
+            # 轮转失败不应中断写入；下次抽检或定时 timer 会再试。
+            return
+
     def append(
         self,
         *,
@@ -160,6 +208,12 @@ class EventLog:
                 line = json.dumps(evt, ensure_ascii=False)
                 with self._path.open("a", encoding="utf-8") as f:
                     f.write(line + "\n")
+                # [2026-07-16] 在线轮转护栏：在写盘后、仍持有 self._lock
+                # 时抽检文件大小，避免与定时轮转/其他写入竞争。
+                self._append_since_size_check += 1
+                if self._append_since_size_check >= _ONLINE_ROTATE_CHECK_EVERY:
+                    self._append_since_size_check = 0
+                    self._maybe_rotate_locked()
 
             self._events.append(evt)
             # Trim with hysteresis to prevent unbounded memory growth

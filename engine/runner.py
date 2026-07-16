@@ -20,6 +20,7 @@ from clonoth_runtime import (
     get_str,
     load_runtime_config,
     normalize_openai_secret,
+    resolve_system_model,
 )
 from providers import registry as provider_registry
 from toolbox.context import ToolContext
@@ -921,6 +922,27 @@ async def _run_node_task(
 
     session_provider_override = await _fetch_session_provider_override(http, sup_url, parent_session_id or session_id)
     rp = resolve_provider(ws_root, node, default_model, session_override=session_provider_override)
+    # [2026-07-16] 系统节点（压缩/轮摘要）支持单独配置 model/base_url/api_key，
+    # 来源 config.yaml 的 system_models.<slot> 或同名环境变量；留空则跟随主渠道。
+    # 为什么在这里：节点 yaml 仍然支持 $ENV{CLONOTH_*_MODEL}，但 url/key 无法在
+    # 节点 yaml 方便地“跟随主渠道”，故在 runner 统一叠加。
+    _sys_slot = {
+        "system.compactor": "compact",
+        "system.turn_summarizer": "summary",
+    }.get(node.id, "")
+    if _sys_slot:
+        _sm_model, _sm_base_url, _sm_api_key = resolve_system_model(
+            ws_root, _sys_slot,
+            default_model=rp.model or default_model,
+            default_base_url="",   # 留空→下方 _create_provider_from_registry 用主渠道 base_url
+            default_api_key="",    # 留空→同上用主渠道 api_key
+        )
+        if _sm_model:
+            rp.model = _sm_model
+        if _sm_base_url:
+            rp.base_url = _sm_base_url
+        if _sm_api_key:
+            rp.api_key = _sm_api_key
     provider_cfg = (runtime_cfg.get("providers") or {}).get(rp.provider_type or "openai")
     global_provider_options = provider_cfg.get("options") if isinstance(provider_cfg, dict) else {}
     if not isinstance(global_provider_options, dict):

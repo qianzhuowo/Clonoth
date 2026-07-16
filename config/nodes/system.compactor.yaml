@@ -2,7 +2,7 @@ id: system.compactor
 type: ai
 name: "上下文压缩节点"
 description: "压缩对话上下文，生成结构化摘要。系统内部节点，对用户不可见。"
-model: gemini-3-flash-preview
+model: $ENV{CLONOTH_COMPACT_MODEL}
 tool_access:
   mode: none
 skills:

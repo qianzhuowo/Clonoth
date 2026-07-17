@@ -2907,6 +2907,7 @@ def _load_anon_map() -> None:
         return
 
     max_user_idx = -1
+    skipped_dirty = 0
     users = data.get("users")
     if isinstance(users, dict):
         for real, item in users.items():
@@ -2916,9 +2917,17 @@ def _load_anon_map() -> None:
             alias = str(item.get("alias") or "").strip()
             if not alias:
                 continue
+            # 跳过历史脏数据：明显非法的短数字 QQ 号（如 "1"）不再载入，
+            # 并标脏触发下次写盘自清理（避免 @UserAP 这类脏别名回流群里）。
+            if real.isdigit() and not _is_plausible_qq_id(real):
+                skipped_dirty += 1
+                continue
             _anon_users[real] = alias
             _anon_user_reverse[alias] = real
             max_user_idx = max(max_user_idx, _alias_to_index("User", alias))
+    if skipped_dirty:
+        _mark_anon_map_dirty()
+        logger.warning("dropped %d invalid short-qq entries from anon map", skipped_dirty)
 
     max_group_idx = -1
     groups = data.get("groups")
@@ -2997,10 +3006,24 @@ def _alias_to_index(prefix: str, alias: str) -> int:
     return index - 1
 
 
+# QQ 号至少 5 位（最小靳号也远大于此）；低于此位数的“数字”基本不可能是真实 QQ 号，
+# 多半是模型凭空捧造的 at目标（如 qq=1）或把纯数字群名片误当成的 QQ 号。
+_MIN_REAL_QQ_LEN = 5
+
+
+def _is_plausible_qq_id(value: str) -> bool:
+    """粗略判断一个字符串是否看上去像真实 QQ 号（纯数字且不至于过短）。"""
+    real = str(value or "").strip()
+    return real.isdigit() and len(real) >= _MIN_REAL_QQ_LEN
+
+
 def _anonymize_user_id(user_id: Any) -> str:
     global _anon_user_next
     real = str(user_id or "").strip()
     if not real:
+        return "UserUnknown"
+    # 不把明显非法的短数字（如 qq=1）登记进永存匿名表，避免脏号占用稳定别名并回流到群里。
+    if real.isdigit() and not _is_plausible_qq_id(real):
         return "UserUnknown"
     alias = _anon_users.get(real)
     if alias is None:
@@ -4015,16 +4038,26 @@ async def _sanitize_group_at_segments(bot: Bot, group_id: Any, message: Any) -> 
                 # 确实是 @全体成员，放行。
                 new_segments.append(seg)
                 continue
-            if qq and qq not in members:
-                # 降级为文本时也优先用本群群名片/昵称，其次 profile 显示名，最后匿名。
-                name = (
-                    _group_member_display_name(group_id, qq)
-                    or _qq_profile_display_name(qq)
-                    or _anonymize_user_id(qq)
-                )
-                logger.warning("downgrade at to text: qq=%s not in group=%s", qq, group_id)
-                new_segments.append(MessageSegment.text(f"@{name}"))
+            if not qq:
+                new_segments.append(seg)
                 continue
+            # 以 members（本群真实 QQ 号集合）为权威，按理想顺序判定：
+            #   1) qq 是数字且 ∈ members  -> 就是这个真实 QQ 号，放行。
+            #   2) 否则先按 name_map（群名片/昵称，card 优先）反查：命中则改用真实 QQ 号。
+            #     这能修复“群名片恰好是纯数字（如名片叫 1）”被误当成 QQ 号的问题。
+            #   3) 都不中 -> 丢弃这个非法 at（不再降级成 @匿名代号发到群里）。
+            if qq in members:
+                new_segments.append(seg)
+                continue
+            mapped = _resolve_at_alias_in_group(group_id, qq)
+            if mapped and mapped in members:
+                logger.info("resolve at token %r to group member %s in group=%s", qq, mapped, group_id)
+                new_segments.append(MessageSegment.at(mapped))
+                continue
+            # 既不是本群成员 QQ 号，也没有群友名片/昵称叫这个名字：判为无效 at，直接丢弃。
+            # Why: 这种情况多半是模型凭空捧造的 at（如 qq=1），降级成 @UserXX 反而产生脗肿文本。
+            logger.warning("drop invalid at: token=%r not a member/card in group=%s", qq, group_id)
+            continue
         new_segments.append(seg)
     return Message(new_segments)
 
@@ -4032,7 +4065,8 @@ async def _sanitize_group_at_segments(bot: Bot, group_id: Any, message: Any) -> 
 def _strip_at_to_text(message: Any, group_id: Any = None) -> Any:
     """把消息里所有 at 段降级为 @文本，用于发送失败后的兜底重发。
 
-    传入 group_id 时，@文本优先取本群群名片/昵称，其次 profile 显示名，最后匿名。
+    传入 group_id 时，@文本优先取本群群名片/昵称，其次 profile 显示名。
+    拿不到可读名字时直接丢弃这个 at（不再用 _anonymize_user_id 把匿名代号发到群里）。
     """
     if not isinstance(message, Message):
         return message
@@ -4044,12 +4078,10 @@ def _strip_at_to_text(message: Any, group_id: Any = None) -> Any:
             if qq.lower() == "all":
                 new_segments.append(MessageSegment.text("@全体成员"))
             elif qq:
-                name = (
-                    _group_member_display_name(group_id, qq)
-                    or _qq_profile_display_name(qq)
-                    or _anonymize_user_id(qq)
-                )
-                new_segments.append(MessageSegment.text(f"@{name}"))
+                name = _group_member_display_name(group_id, qq) or _qq_profile_display_name(qq)
+                if name:
+                    new_segments.append(MessageSegment.text(f"@{name}"))
+                # 无可读名字：丢弃该 at，避免 @匿名代号泄露到群里。
             continue
         new_segments.append(seg)
     return Message(new_segments)

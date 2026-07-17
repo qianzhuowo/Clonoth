@@ -777,8 +777,20 @@ class TaskRouterMixin:
         # 原先 `if text or atts:` 导致空文本 finish 不发事件，
         # Bot 侧 trigger 和 status_msg（含 stream_delta 累积的原始标记预览）永远无法清理。
         # 去掉守卫后，Bot 侧 send_reply 会跳过 Discord 发送但正常执行清理收尾。
+        # [fix 2026-07-17] 路由竞态防护：任务完成到这里时，目标 session 可能已被
+        # 合并/清理（例如 branch 已 merge 回主 session、或 fresh/fork dispatch session
+        # 已删除），此时 append_outbound_message 会抛 KeyError('session not found')并
+        # 中断整个 task_complete 路由。做法：投递前先判断 session 是否存在，不存在
+        # 则记日志并跳过，避免一条已无处可送的回复拖垮后续完成处理。
+        _route_sid = self._route_session_id_for_task_locked(task)
+        if _route_sid not in self.sessions:
+            log.warning(
+                "skip outbound for task %s: route session %s no longer exists "
+                "(likely merged/cleaned up)", task.task_id, _route_sid,
+            )
+            return
         self.append_outbound_message(
-            session_id=self._route_session_id_for_task_locked(task), text=text,
+            session_id=_route_sid, text=text,
             attachments=atts, source_inbound_seq=task.source_inbound_seq,
             node_id=task.node_id,
             action_type=action_type,

@@ -356,9 +356,10 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
 
         # ---- 重试判定 ----
         _retry_reason = ""
+        _is_empty_ok = resp.ok and not resp.tool_calls and not (resp.text or "").strip()
         if not resp.ok and _is_retryable_error(resp):
             _retry_reason = resp.error or "unknown"
-        elif resp.ok and not resp.tool_calls and not (resp.text or "").strip():
+        elif _is_empty_ok:
             _retry_reason = "empty_response"
 
         if _retry_reason and _retry_attempt < ls.retry_max:
@@ -405,6 +406,27 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                             ls.preempt_after_step = True
             resp = None
             continue  # 重试
+
+        # ---------------------------------------------------------------
+        # [fix 2026-07-17] 空响应重试耗尽后，转成可 fallback 的失败响应。
+        # 原因：empty_response 时 provider 返回 ok=True（只是没有 text/tool_calls），
+        # 重试上限用尽后若仍保持 ok=True，会绕过 after_llm_call 的 fallback_provider
+        # hook（该 hook 仅在 ok=False 时介入），导致系统节点（如 system.compactor）
+        # 在同一个空响应模型上原地空转，直到 max_steps 才失败——正是压缩节点卡死的根因。
+        # 做法：把持续空响应改写为 ok=False（保留 status_code），交给下游 fallback。
+        # 目的：让空响应也能走备选渠道，而不是无意义地拖垮整条会话。
+        # ---------------------------------------------------------------
+        if _is_empty_ok and _retry_attempt >= ls.retry_max:
+            from providers.base import ProviderResponse as _PR
+            resp = _PR(
+                ok=False,
+                text=resp.text,
+                tool_calls=list(resp.tool_calls or []),
+                reasoning=resp.reasoning,
+                error=f"empty_response (retried {_retry_attempt} times)",
+                status_code=resp.status_code,
+                usage=resp.usage,
+            )
 
         # ---------------------------------------------------------------
         # P5a Reactive Compact: 检测 "request too long" 类错误时，剥离旧

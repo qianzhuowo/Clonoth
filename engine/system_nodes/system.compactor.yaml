@@ -10,6 +10,12 @@ description: "压缩对话上下文，生成结构化摘要。系统内部节点
 # 下方的 $ENV{} 仅作兵库兼容默认值；runner 会用上述规则覆盖 model。
 # 主渠道调用失败时，还会走 config.yaml 的 fallbacks / node_fallbacks 备选渠道。
 model: $ENV{CLONOTH_COMPACT_MODEL}
+# [fix 2026-07-17] 收紧压缩节点的失败上限：压缩是单轮一次性任务，不需要 32 步大循环。
+# 模型持续空响应/非法 JSON 时，快速失败放行调用方，避免拖垮整条会话。
+# max_steps: 每个任务最多推理步数（节点级覆盖全局 engine.max_steps=32）。
+# retry_max: 单步 LLM 调用的最大重试次数（节点级覆盖全局 engine.retry.max_retries=3）。
+max_steps: 4
+retry_max: 1
 tool_access:
   mode: none
 skills:

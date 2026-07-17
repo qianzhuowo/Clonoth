@@ -466,6 +466,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     # 返回 None 的（reply / compact_context / preempt_task）继续执行下一个。
     pseudo_calls: list = []
     real_tool_calls: list[dict[str, Any]] = []
+    _unauthorized_names: list[str] = []
     for tc in resp.tool_calls:
         # [2026-05-04] Dynamic per-target dispatch tools are pseudo tools too.
         # Why: names like dispatch:ereuna_coder are generated from delegate_targets
@@ -479,6 +480,7 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
             if tc.name not in ls.allowed_real_tools:
                 logger.warning("node %s attempted unauthorized tool call: %s (allowed: %s)",
                                ls.node.id, tc.name, ls.allowed_real_tools)
+                _unauthorized_names.append(tc.name)
                 _err_msg = ls.formatter.format_tool_result(
                     tc,
                     f"Error: Tool '{tc.name}' is not in this node's allowed tool list. "
@@ -620,6 +622,49 @@ async def _handle_tool_calls(ls: _LoopState, resp, step: int) -> TaskAction | No
     #         ls.messages.append(_err)
     #         _shadow_write(ls, _err, message_type="tool_result")
     #     return None  # 不执行任何工具，回到主循环让 AI 重试
+
+    # ---------------------------------------------------------------
+    # [fix 2026-07-17] turn_summarizer/compactor 等 tool_access:none 的系统节点
+    # 空转保护：部分模型（尤其摘要/压缩场景）会反复调一个不存在的
+    # 伪工具（如 default_api:_done）而不是直接 finish，未授权拦截后只写一条
+    # 错误 tool_result，回到主循环又接着空转，直到 max_steps 才失败（engine 日志
+    # 里大量“attempted unauthorized tool call: _done”就是这个现象）。
+    # 做法：当本轮既没有合法伪工具也没有合法真工具，但出现了未授权工具调用，
+    # 且该节点不允许任何真工具（allowed_real_tools 为空，典型的系统输出型节点）时，
+    # 把模型本轮输出的自由文本当作隐式 finish 直接交付，而不再回到循环空转。
+    # 目的：让摘要/压缩结果能落地（或快速失败），避免无意义重试。
+    # ---------------------------------------------------------------
+    _has_finish = any(_pc.name in ("finish", "ask") for _pc in pseudo_calls)
+    if (
+        _unauthorized_names
+        and not real_tool_calls
+        and not _has_finish
+        and not ls.allowed_real_tools
+    ):
+        _plain = (resp.text or "").strip()
+        if _plain:
+            logger.warning(
+                "node %s only issued unauthorized tool call(s) %s with no allowed tools; "
+                "treating plaintext output as implicit finish to avoid empty spinning",
+                ls.node.id, _unauthorized_names,
+            )
+            return await _fire_task_end_hook_if_finish(
+                ls,
+                _build_unauthorized_implicit_finish(ls, resp, _plain, step),
+                step + 1,
+            )
+        # 没有任何可交付文本，直接快速失败，不在同一个坏模型上继续空转。
+        logger.warning(
+            "node %s issued only unauthorized tool call(s) %s with no plaintext; failing fast",
+            ls.node.id, _unauthorized_names,
+        )
+        _uctx_ref = _persist_ctx(ls, step + 1)
+        return TaskAction(
+            action=ACTION_FAIL, node_id=ls.node.id,
+            error=f"节点只调用了未授权工具 {_unauthorized_names} 且无文本输出。",
+            context_ref=_uctx_ref,
+            summary="unauthorized_tool_only",
+        )
 
     # 处理伪工具（finish/ask 延后到真实工具之后，确保同轮真实工具不被跳过）
     # [AutoC 2026-05-31] Why: ask terminates the task just like finish in Phase 0,
@@ -1519,6 +1564,45 @@ async def _execute_real_tools(
 #  纯文本响应处理
 # ---------------------------------------------------------------------------
 
+def _build_unauthorized_implicit_finish(ls: _LoopState, resp, text: str, step: int) -> TaskAction:
+    """[fix 2026-07-17] 将只调了未授权工具但带有自由文本的输出包装为隐式 finish。
+
+    为什么：system.turn_summarizer / system.compactor 等 tool_access:none 的系统节点，
+    部分模型会反复调一个不存在的伪工具（如 default_api:_done）而不直接 finish，
+    导致在循环里空转到 max_steps。怎么改：把模型本轮输出的文本当作成果直接
+    交付（与 hybrid 隐式 finish 一致）。目的：摘要/压缩结果能落地，不再空转。
+    """
+    _assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
+    _provider_name = getattr(ls.provider, "name", "") or "unknown"
+    _meta = MessageMeta(
+        provider=_provider_name,
+        tool_mode=getattr(ls.node, "tool_mode", "fake-native"),
+        message_type="assistant",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        metadata={},
+        tool_call_ids=[],
+        reasoning="",
+        has_reasoning=False,
+        usage=dict(ls.last_usage) if ls.last_usage else {},
+    )
+    set_message_meta(_assistant_msg, _meta)
+    ls.messages.append(_assistant_msg)
+    _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
+
+    ctx_ref = _persist_ctx(ls, step + 1)
+    return TaskAction(
+        action=ACTION_FINISH, node_id=ls.node.id,
+        result={
+            "text": text,
+            "attachments": list(ls.tool_produced_attachments),
+            "implicit_finish": True,
+            "unauthorized_tool_recovery": True,
+        },
+        context_ref=ctx_ref,
+        summary=_short(text, 240),
+    )
+
+
 def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | None:
     """处理纯文本响应（无 tool_calls）。"""
     text = (resp.text or "").strip()
@@ -1596,6 +1680,25 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
 #  AI 节点主执行函数
 # ---------------------------------------------------------------------------
 
+def _resolve_node_int(node: Any, key: str, default: int, minimum: int, maximum: int) -> int:
+    """[fix 2026-07-17] 从节点 yaml 的 extra 中读取整型覆盖值，并 clamp 到 [minimum, maximum]。
+
+    为什么：系统节点（压缩/摘要/读图）希望把 max_steps / retry_max 等循环上限
+    配得比对话主链更保守，避免在坏模型上无限重试。怎么改：node.extra 收了 yaml
+    中 core 不认识的字段，直接取。目的：不新增 Node dataclass 字段即可支持节点级覆盖。
+    """
+    _extra = getattr(node, "extra", None) or {}
+    _raw = _extra.get(key)
+    if _raw is None:
+        return default
+    try:
+        _val = int(_raw)
+    except (TypeError, ValueError):
+        logger.warning("node %s has invalid %s override: %r", getattr(node, "id", "?"), key, _raw)
+        return default
+    return max(minimum, min(maximum, _val))
+
+
 async def _fire_task_end_hook_if_finish(ls: _LoopState, action: TaskAction, step_count: int) -> TaskAction:
     """Fire on_task_end for successful finish/ask actions and keep the action updated.
 
@@ -1667,6 +1770,20 @@ async def run_ai_node(
 
     runtime_cfg = load_runtime_config(rctx.workspace_root)
     max_steps = get_int(runtime_cfg, "engine.max_steps", 32, min_value=1, max_value=200)
+    # [fix 2026-07-17] 支持节点级 max_steps 覆盖：系统节点（压缩/摘要/读图等）是
+    # 单轮一次性任务，不需要 32 步的大循环。压缩模型持续空响应/非法 JSON 时，若沿用
+    # 全局 max_steps=32，会在同一坏模型上原地空转十几分钟拖垮整条会话（system.compactor
+    # 卡死根因）。做法：优先读取节点 yaml 的 max_steps（收进 node.extra），命中即覆盖；
+    # 目的：让压缩/摘要节点快速失败放行，而不是无谓地反复重试。
+    _node_extra = getattr(node, "extra", None) or {}
+    _node_max_steps = _node_extra.get("max_steps")
+    if _node_max_steps is not None:
+        try:
+            _nms = int(_node_max_steps)
+            if 1 <= _nms <= 200:
+                max_steps = _nms
+        except (TypeError, ValueError):
+            logger.warning("node %s has invalid max_steps override: %r", node.id, _node_max_steps)
 
     # ---- 收集附件 ----
     collected_attachments: list[dict[str, Any]] = []
@@ -1847,7 +1964,11 @@ async def run_ai_node(
         compact_keep_recent=get_int(runtime_cfg, "engine.compact.keep_recent", 6, min_value=2, max_value=50),
         compacted=False,
         last_prompt_tokens=None,
-        retry_max=get_int(runtime_cfg, "engine.retry.max_retries", 3, min_value=0, max_value=10),
+        # [fix 2026-07-17] retry_max 同样支持节点级覆盖，让系统节点可以把 LLM 重试
+        # （含 empty_response）次数压低，更快进入 fallback / 失败。
+        retry_max=_resolve_node_int(node, "retry_max",
+                                    get_int(runtime_cfg, "engine.retry.max_retries", 3, min_value=0, max_value=10),
+                                    0, 10),
         retry_initial_delay=get_float(runtime_cfg, "engine.retry.initial_delay_sec", 1.0, min_value=0.1, max_value=60.0),
         retry_max_delay=get_float(runtime_cfg, "engine.retry.max_delay_sec", 30.0, min_value=1.0, max_value=300.0),
         retry_backoff=get_float(runtime_cfg, "engine.retry.backoff_multiplier", 2.0, min_value=1.0, max_value=10.0),

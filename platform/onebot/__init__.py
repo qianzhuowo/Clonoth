@@ -230,6 +230,15 @@ _group_content_records: DefaultDict[int, Deque[GroupContentRecord]] = defaultdic
 _recent_sent_attachments: DefaultDict[str, Deque[Dict[str, Any]]] = defaultdict(lambda: deque(maxlen=max(RECENT_IMAGE_MAX_ITEMS, 20)))
 _last_attachment_cleanup_at = 0.0
 
+# [2026-07-17] Bot 已发出附件消息的 message_id -> 本地附件路径列表 映射。
+# Why: Bot 发出的图片（如绘图产物）在上下文里被替换成占位符/表情包，用户引用
+# 这条消息要求“基于这张图继续改”时，AI 看不到原图。How: 发图时接住 send_*_msg
+# 返回的 message_id，登记它对应的本地附件路径；用户引用命中时把该图当附件送给 AI。
+# Purpose: 让“引用 Bot 生成的图 + 追加要求”能真正带上原图，而普通表情包（无此
+# 映射）仍保持屏蔽，不会重新触发识图。
+_MESSAGE_ATTACHMENT_MAX_ITEMS = int(os.environ.get("ONEBOT_MSG_ATTACHMENT_CACHE_ITEMS", "512") or "512")
+_sent_message_attachments: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
+
 
 @dataclass
 class QueuedInbound:
@@ -2784,9 +2793,25 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
     reply_from_bot = _qq_matches_bot(reply_sender_qq, bot_ids)
 
     if reply_from_bot:
-        # Bot 自己的回复：不下载图片附件，将所有图片占位符标注为表情包。
-        quoted_attachments: list[dict[str, Any]] = []
-        text = text.replace("[图片]", "[表情包]")
+        # Bot 自己的回复：默认不下载图片附件，避免把表情包送去识图。
+        # 但若这条消息是 Bot 发出的真实附件（如绘图产物，已在发送时登记
+        # message_id -> 本地路径），则把原图作为附件送给 AI，支持“引用该图继续改”。
+        quoted_attachments = []
+        bot_msg_atts = _message_attachment_records(reply_message_id, only_images=True)
+        if bot_msg_atts:
+            for att in bot_msg_atts:
+                rel_path = _to_workspace_rel_path(att["path"])
+                quoted_attachments.append({
+                    "type": "image",
+                    "path": rel_path,
+                    "name": att.get("name", "") or Path(att["path"]).name,
+                    "source": "onebot_bot_reply",
+                })
+                text = text.replace("[图片]", f"[图片: {rel_path}]", 1)
+            # 剩余未匹配的图片占位符（如同消息里的表情包）仍标为表情包。
+            text = text.replace("[图片]", "[表情包]")
+        else:
+            text = text.replace("[图片]", "[表情包]")
     else:
         images = _iter_qq_image_urls(message) or _iter_qq_image_urls(raw_message)
         quoted_attachments, _quoted_errors = await _image_sources_to_attachments(images, conversation_key)
@@ -3857,17 +3882,23 @@ def _should_skip_duplicate_send(target: Dict[str, Any], message: Any, *, ttl: fl
     return False
 
 
-# 群成员缓存：group_id -> (过期时间, {user_id 集合}, {名片/昵称小写 -> user_id})。
+# 群成员缓存：group_id -> (过期时间, {user_id 集合}, {名片/昵称小写 -> user_id},
+#                         {user_id -> (card, nickname)})。
 # 用于（1）发送前校验 at 目标是否本群成员，避免 NapCat 对无法解析的 uid
 # 抛 Get Uid Error 使整条消息失败；（2）按当前群名片/昵称实时反查真实 QQ 号，
-# 让 [at:昵称] 能命中只存在于本群、未录入 profile/匿名表的成员（包括昵称叫 all 的人）。
-_group_member_cache: Dict[int, tuple[float, set[str], Dict[str, str]]] = {}
+# 让 [at:昵称] 能命中只存在于本群、未录入 profile/匿名表的成员（包括昵称叫 all 的人）；
+# （3）2026-07-17 新增 uid -> (card, nickname) 正向映射，让 @ 群友时的显示名
+# 优先取“本群群名片(card)”，其次“QQ 昵称(nickname)”，避免直接用 QQ 昵称。
+_group_member_cache: Dict[int, tuple[float, set[str], Dict[str, str], Dict[str, tuple[str, str]]]] = {}
 _GROUP_MEMBER_CACHE_TTL = float(os.environ.get("ONEBOT_GROUP_MEMBER_CACHE_TTL", "300") or "300")
 
 
-async def _load_group_members(bot: Bot, group_id: int) -> tuple[set[str], Dict[str, str]] | None:
-    """拉取并缓存群成员：返回 ({user_id 集合}, {名片/昵称小写 -> user_id})。
+async def _load_group_members(
+    bot: Bot, group_id: int
+) -> tuple[set[str], Dict[str, str], Dict[str, tuple[str, str]]] | None:
+    """拉取并缓存群成员。
 
+    返回 ({user_id 集合}, {名片/昵称小写 -> user_id}, {user_id -> (card, nickname)})。
     取不到时返回 None（表示无法校验/反查，由调用方决定不做拦截）。
     """
     try:
@@ -3877,7 +3908,7 @@ async def _load_group_members(bot: Bot, group_id: int) -> tuple[set[str], Dict[s
     now = time.time()
     cached = _group_member_cache.get(gid)
     if cached and cached[0] > now:
-        return cached[1], cached[2]
+        return cached[1], cached[2], cached[3]
     try:
         data = await bot.call_api("get_group_member_list", group_id=gid)
     except Exception:
@@ -3885,27 +3916,52 @@ async def _load_group_members(bot: Bot, group_id: int) -> tuple[set[str], Dict[s
         return None
     members: set[str] = set()
     name_map: Dict[str, str] = {}
+    card_map: Dict[str, tuple[str, str]] = {}
     if isinstance(data, list):
         for item in data:
             if not isinstance(item, dict) or item.get("user_id") is None:
                 continue
             uid = str(item.get("user_id"))
             members.add(uid)
+            card = str(item.get("card") or "").strip()
+            nickname = str(item.get("nickname") or "").strip()
+            card_map[uid] = (card, nickname)
             # 名片(card)优先于昵称(nickname)；同名时不覆盖已有映射（保留先遇到的）。
-            for key in (item.get("card"), item.get("nickname")):
+            for key in (card, nickname):
                 name = str(key or "").strip()
                 if name:
                     name_map.setdefault(name.casefold(), uid)
     if not members:
         return None
-    _group_member_cache[gid] = (now + _GROUP_MEMBER_CACHE_TTL, members, name_map)
-    return members, name_map
+    _group_member_cache[gid] = (now + _GROUP_MEMBER_CACHE_TTL, members, name_map, card_map)
+    return members, name_map, card_map
 
 
 async def _group_member_ids(bot: Bot, group_id: int) -> set[str] | None:
     """获取群成员 QQ 号集合（带 TTL 缓存）。取不到时返回 None。"""
     loaded = await _load_group_members(bot, group_id)
     return loaded[0] if loaded else None
+
+
+def _group_member_display_name(group_id: Any, user_id: Any) -> str:
+    """返回 @ 某群友时应展示的名字：本群群名片(card) > 本群 QQ 昵称(nickname)。
+
+    仅使用已缓存的群成员数据（不发网络请求）；缓存未就绪或未命中时返回空串，
+    由调用方回退到 profile 显示名 / 匿名别名。
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        return ""
+    try:
+        gid = int(group_id)
+    except Exception:
+        return ""
+    cached = _group_member_cache.get(gid)
+    if not cached:
+        return ""
+    card, nickname = cached[3].get(uid, ("", ""))
+    name = card or nickname
+    return _sanitize_name(name) if name else ""
 
 
 def _resolve_at_alias_in_group(group_id: Any, token: str) -> str:
@@ -3943,7 +3999,7 @@ async def _sanitize_group_at_segments(bot: Bot, group_id: Any, message: Any) -> 
     if loaded is None:
         # 拿不到成员列表时不拦截，保持原样（避免误伤把所有 at 变文本）。
         return message
-    members, name_map = loaded
+    members, name_map, _card_map = loaded
     new_segments: List[MessageSegment] = []
     for seg in message:
         if getattr(seg, "type", "") == "at":
@@ -3960,8 +4016,12 @@ async def _sanitize_group_at_segments(bot: Bot, group_id: Any, message: Any) -> 
                 new_segments.append(seg)
                 continue
             if qq and qq not in members:
-                # 先尝试用群名片/昵称反查（适用于昵称未录入 profile/匿名表的本群成员）。
-                name = _qq_profile_display_name(qq) or _anonymize_user_id(qq)
+                # 降级为文本时也优先用本群群名片/昵称，其次 profile 显示名，最后匿名。
+                name = (
+                    _group_member_display_name(group_id, qq)
+                    or _qq_profile_display_name(qq)
+                    or _anonymize_user_id(qq)
+                )
                 logger.warning("downgrade at to text: qq=%s not in group=%s", qq, group_id)
                 new_segments.append(MessageSegment.text(f"@{name}"))
                 continue
@@ -3969,8 +4029,11 @@ async def _sanitize_group_at_segments(bot: Bot, group_id: Any, message: Any) -> 
     return Message(new_segments)
 
 
-def _strip_at_to_text(message: Any) -> Any:
-    """把消息里所有 at 段降级为 @文本，用于发送失败后的兜底重发。"""
+def _strip_at_to_text(message: Any, group_id: Any = None) -> Any:
+    """把消息里所有 at 段降级为 @文本，用于发送失败后的兜底重发。
+
+    传入 group_id 时，@文本优先取本群群名片/昵称，其次 profile 显示名，最后匿名。
+    """
     if not isinstance(message, Message):
         return message
     new_segments: List[MessageSegment] = []
@@ -3981,25 +4044,41 @@ def _strip_at_to_text(message: Any) -> Any:
             if qq.lower() == "all":
                 new_segments.append(MessageSegment.text("@全体成员"))
             elif qq:
-                name = _qq_profile_display_name(qq) or _anonymize_user_id(qq)
+                name = (
+                    _group_member_display_name(group_id, qq)
+                    or _qq_profile_display_name(qq)
+                    or _anonymize_user_id(qq)
+                )
                 new_segments.append(MessageSegment.text(f"@{name}"))
             continue
         new_segments.append(seg)
     return Message(new_segments)
 
 
-async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any, *, dedupe: bool = True) -> None:
-    """按 QQ 会话类型选择 OneBot 发送接口。"""
+def _extract_sent_message_id(result: Any) -> str:
+    """从 send_*_msg 返回值里提取 message_id（兼容 dict / 标量 两种形式）。"""
+    if isinstance(result, dict):
+        mid = result.get("message_id")
+        if mid is None:
+            mid = result.get("data", {}).get("message_id") if isinstance(result.get("data"), dict) else None
+        return str(mid).strip() if mid is not None else ""
+    if isinstance(result, (int, str)):
+        return str(result).strip()
+    return ""
+
+
+async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any, *, dedupe: bool = True) -> str:
+    """按 QQ 会话类型选择 OneBot 发送接口，返回新消息的 message_id（取不到时为空串）。"""
     # 2026-05-01 修改原因：私聊回复必须调用 send_private_msg，群聊回复继续调用
     # send_group_msg。通过 target 分发，回调发送文本和附件时不再硬编码群聊接口。
     if dedupe and _should_skip_duplicate_send(target, message):
-        return
+        return ""
     if target.get("type") == "private":
         user_id = target.get("user_id")
         if user_id is None:
             raise ValueError("private target missing user_id")
-        await bot.send_private_msg(user_id=int(user_id), message=message)
-        return
+        result = await bot.send_private_msg(user_id=int(user_id), message=message)
+        return _extract_sent_message_id(result)
     if target.get("type") == "group":
         group_id = target.get("group_id")
         if group_id is None:
@@ -4007,16 +4086,16 @@ async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any, *, de
         # 发送前先把非本群/无法解析的 at 降级为文本，避免 Get Uid Error 整条失败。
         safe_message = await _sanitize_group_at_segments(bot, group_id, message)
         try:
-            await bot.send_group_msg(group_id=int(group_id), message=safe_message)
+            result = await bot.send_group_msg(group_id=int(group_id), message=safe_message)
+            return _extract_sent_message_id(result)
         except ActionFailed as exc:
             # 兜底：若仍因 at/uid 问题失败（如成员列表不准确），把所有 at 降级为文本重发一次。
-            fallback = _strip_at_to_text(safe_message)
+            fallback = _strip_at_to_text(safe_message, group_id)
             if str(fallback) != str(safe_message):
                 logger.warning("send_group_msg failed (%s); retry with at-as-text", exc)
-                await bot.send_group_msg(group_id=int(group_id), message=fallback)
-            else:
-                raise
-        return
+                result = await bot.send_group_msg(group_id=int(group_id), message=fallback)
+                return _extract_sent_message_id(result)
+            raise
     raise ValueError(f"unknown QQ target type: {target!r}")
 
 
@@ -4053,6 +4132,23 @@ async def _send_split_text(bot: Bot, target: Dict[str, Any], text: str) -> bool:
     return sent_any
 
 
+def _to_workspace_rel_path(raw_path: Any) -> str:
+    """把绝对/任意路径尽量转为工作区相对 posix 路径，与其他附件字段保持一致。
+
+    无法相对化（不在工作区内）时，直接返回原始绝对路径字符串。
+    """
+    raw = str(raw_path or "").strip()
+    if not raw:
+        return ""
+    try:
+        p = Path(raw)
+        if p.is_absolute():
+            return p.relative_to(Path(CLONOTH_WORKSPACE)).as_posix()
+        return p.as_posix()
+    except Exception:
+        return raw
+
+
 def _resolve_attachment_path(attachment: Any) -> Optional[Path]:
     """把 Clonoth 附件解析为本地路径，兼容 dict 与字符串路径。"""
     # OneBot 适配层同时接受 dict 和 str，并统一解析 file://、绝对路径和工作区相对路径
@@ -4081,33 +4177,35 @@ def _attachment_filename(attachment: Any) -> str:
     return ""
 
 
-async def _send_attachment_path(bot: Bot, target: Dict[str, Any], path: Path, filename: str = "") -> None:
-    """图片附件发送为图片消息；非图片附件通过 NapCat 文件上传 API 发送。"""
+async def _send_attachment_path(bot: Bot, target: Dict[str, Any], path: Path, filename: str = "") -> str:
+    """图片附件发送为图片消息；非图片附件通过 NapCat 文件上传 API 发送。
+
+    返回图片消息的 message_id（非图片/取不到时为空串），供调用方登记
+    message_id -> 本地图片路径，支持“引用 Bot 图片继续改”时把原图送给 AI。
+    """
     display_name = filename or path.name
     if path.exists() and path.suffix.lower() in _IMAGE_SUFFIXES:
         file_path = str(path.resolve())
         try:
-            await _send_qq_message(bot, target, MessageSegment.image(file=file_path))
-            return
+            return await _send_qq_message(bot, target, MessageSegment.image(file=file_path))
         except Exception as exc:
             # 部分 OneBot 实现对本地路径格式较挑剔；失败后改用 file:// URI 重试。
             # 注意首发失败时去重缓存已经记录过该图片，重试必须绕过去重，否则会被
             # 当成重复消息直接跳过，导致「生成完成但图片没发出去」。
             logger.warning("图片发送失败，改用 file:// 重试 (%s): %s", display_name, exc, exc_info=True)
-            await _send_qq_message(
+            return await _send_qq_message(
                 bot,
                 target,
                 MessageSegment.image(file=f"file://{file_path}"),
                 dedupe=False,
             )
-            return
     # [2026-05-08] 非图片附件通过 NapCat upload_group_file / upload_private_file 发送
     # [2026-07-08] 改用 base64:// 传输文件内容，避免把宿主机绝对路径交给 NapCat：
     # NapCat 运行在 Docker 容器内，只挂载了部分目录，直接传本地路径会因容器内
     # 找不到文件而报 retcode=1200「识别URL失败」。base64 内联可彻底绕开路径/挂载问题。
     if not path.exists():
         await _send_qq_message(bot, target, f"Clonoth 生成了文件：{display_name}（文件不存在）")
-        return
+        return ""
     try:
         try:
             raw_bytes = path.read_bytes()
@@ -4120,21 +4218,26 @@ async def _send_attachment_path(bot: Bot, target: Dict[str, Any], path: Path, fi
             group_id = target.get("group_id")
             if group_id is not None:
                 await bot.call_api("upload_group_file", group_id=group_id, file=file_str, name=display_name)
-                return
+                return ""
         elif target.get("type") == "private":
             user_id = target.get("user_id")
             if user_id is not None:
                 await bot.call_api("upload_private_file", user_id=user_id, file=file_str, name=display_name)
-                return
+                return ""
         # fallback: 未知 target type
         await _send_qq_message(bot, target, f"Clonoth 生成了文件：{display_name}")
     except Exception as e:
         logger.warning("文件上传失败 (%s): %s", display_name, e)
         await _send_qq_message(bot, target, f"Clonoth 生成了文件：{display_name}（上传失败）")
+    return ""
 
 
 async def _send_attachments(bot: Bot, target: Dict[str, Any], attachments: List[Any]) -> None:
-    """发送 Clonoth 返回的附件列表。"""
+    """发送 Clonoth 返回的附件列表。
+
+    每发出一个附件，就把返回的 message_id -> 本地附件路径 登记下来，
+    让用户引用这条（如绘图产物）时能把原图作为附件送回给 AI。
+    """
     for attachment in attachments:
         path = _resolve_attachment_path(attachment)
         filename = _attachment_filename(attachment)
@@ -4144,7 +4247,9 @@ async def _send_attachments(bot: Bot, target: Dict[str, Any], attachments: List[
             else:
                 logger.warning("skip unsupported QQ attachment payload: %r", attachment)
             continue
-        await _send_attachment_path(bot, target, path, filename=filename)
+        message_id = await _send_attachment_path(bot, target, path, filename=filename)
+        if message_id:
+            _remember_message_attachments(message_id, [attachment])
 
 
 def _sent_attachment_bucket_key(target: Dict[str, Any]) -> str:
@@ -4189,6 +4294,56 @@ def _record_sent_attachments(target: Dict[str, Any], attachments: List[Any]) -> 
             "type": "image" if is_image else "file",
             "timestamp": now,
         })
+
+
+def _remember_message_attachments(message_id: Any, attachments: List[Any]) -> None:
+    """登记 Bot 已发出消息的 message_id -> 本地附件路径列表。
+
+    仅记录能解析出本地路径的附件（图片/文件），供用户引用这条消息时回取原图。
+    """
+    mid = str(message_id or "").strip()
+    if not mid or not attachments:
+        return
+    records: List[Dict[str, Any]] = []
+    for attachment in attachments:
+        path = _resolve_attachment_path(attachment)
+        if path is None:
+            continue
+        try:
+            resolved = str(path.resolve())
+        except Exception:
+            resolved = str(path)
+        name = _attachment_filename(attachment) or path.name
+        is_image = path.suffix.lower() in _IMAGE_SUFFIXES
+        records.append({
+            "path": resolved,
+            "name": name,
+            "type": "image" if is_image else "file",
+        })
+    if not records:
+        return
+    _sent_message_attachments[mid] = records
+    _sent_message_attachments.move_to_end(mid)
+    while len(_sent_message_attachments) > _MESSAGE_ATTACHMENT_MAX_ITEMS:
+        _sent_message_attachments.popitem(last=False)
+
+
+def _message_attachment_records(message_id: Any, *, only_images: bool = False) -> list[dict[str, Any]]:
+    """返回某条 Bot 已发消息登记的本地附件记录（过滤不存在的文件）。"""
+    mid = str(message_id or "").strip()
+    if not mid:
+        return []
+    records: list[dict[str, Any]] = []
+    for item in _sent_message_attachments.get(mid, ()):  # type: ignore[arg-type]
+        if not isinstance(item, dict):
+            continue
+        if only_images and str(item.get("type") or "") != "image":
+            continue
+        raw = str(item.get("path") or "").strip()
+        if not raw or not Path(raw).exists():
+            continue
+        records.append(dict(item))
+    return records
 
 
 def _recent_sent_attachment_records(bucket_key: str, *, only_images: bool = False) -> list[dict[str, Any]]:

@@ -48,20 +48,26 @@ openai:
   model: "${OPENAI_MODEL}"
 
 # ---------------------------------------------------------------------------
-# 系统模型渠道（压缩 / 轮摘要 / 读图）
+# 系统模型渠道（压缩 / 轮摘要 / 读图 / 生图）
 # ---------------------------------------------------------------------------
-# 压缩节点 system.compactor、轮摘要节点 system.turn_summarizer、以及 read_image
-# 工具，都不再硬编码模型。三个用途（slot）各自可单独配置 model/base_url/
-# api_key，也可仅换模型名而 url/key 跟随主渠道。
+# 压缩节点 system.compactor、轮摘要节点 system.turn_summarizer、read_image 工具，
+# 以及生图工具 gpt_image_2 / gemini_image，都不再硬编码模型。每个用途（slot）
+# 各自可单独配置 model/base_url/api_key，也可仅换模型名而 url/key 跟随主渠道。
 #
 # 逐字段解析优先级见文件顶部【配置生效优先级】：
 #   config.yaml.system_models > CLONOTH_<SLOT>_* 环境变量 > 主渠道
 # slot 专属环境变量名：
-#   compact -> CLONOTH_COMPACT_MODEL / CLONOTH_COMPACT_BASE_URL / CLONOTH_COMPACT_API_KEY
-#   summary -> CLONOTH_SUMMARY_MODEL / CLONOTH_SUMMARY_BASE_URL / CLONOTH_SUMMARY_API_KEY
-#   image   -> CLONOTH_IMAGE_MODEL   / CLONOTH_IMAGE_BASE_URL   / CLONOTH_IMAGE_API_KEY
+#   compact      -> CLONOTH_COMPACT_MODEL / CLONOTH_COMPACT_BASE_URL / CLONOTH_COMPACT_API_KEY
+#   summary      -> CLONOTH_SUMMARY_MODEL / CLONOTH_SUMMARY_BASE_URL / CLONOTH_SUMMARY_API_KEY
+#   image        -> CLONOTH_IMAGE_MODEL   / CLONOTH_IMAGE_BASE_URL   / CLONOTH_IMAGE_API_KEY   （read_image 读图）
+#   image_gpt    -> CLONOTH_IMAGE_GPT_MODEL / CLONOTH_IMAGE_GPT_BASE_URL / CLONOTH_IMAGE_GPT_API_KEY   （gpt_image_2 生图）
+#   image_gemini -> CLONOTH_IMAGE_GEMINI_MODEL / CLONOTH_IMAGE_GEMINI_BASE_URL / CLONOTH_IMAGE_GEMINI_API_KEY   （gemini_image 生图）
 # 留空→跟随主渠道（上方 openai 块）；
-# image 特例：api_key 回退额外含 GEMINI_API_KEY，model 默认 gemini-3.5-flash。
+# 各 slot 的回退与默认：
+#   image        : api_key 回退额外含 GEMINI_API_KEY，model 默认 gemini-3.5-flash。
+#   image_gpt    : api_key/base_url 回退 OPENAI_API_KEY/OPENAI_BASE_URL，model 默认 gpt-image-2。
+#   image_gemini : api_key 回退 GEMINI_API_KEY>OPENAI_API_KEY，base_url 回退
+#                  GEMINI_BASE_URL>OPENAI_BASE_URL，model 默认 gemini-3-pro-image-preview。
 #
 # 压缩/轮摘要节点也受 fallbacks / node_fallbacks 保护：主渠道失败时自动切备选。
 #
@@ -76,9 +82,18 @@ openai:
 #     model: "gemini-3.5-flash"
 #     base_url: "${GEMINI_BASE_URL}"
 #     api_key: "${GEMINI_API_KEY}"
+#   image_gpt:                            # gpt_image_2 生图渠道
+#     model: "gpt-image-2"
+#     base_url: "${GPT_IMAGE_BASE_URL}"   # 例如生图专用反代 https://relay.example.com/v1
+#     api_key: "${GPT_IMAGE_API_KEY}"
+#   image_gemini:                         # gemini_image 生图渠道
+#     model: "gemini-3-pro-image-preview"
+#     base_url: "${GEMINI_BASE_URL}"
+#     api_key: "${GEMINI_API_KEY}"
 #
 # 也可不写 system_models，只在 .env 设置对应变量，例如：
 #   CLONOTH_COMPACT_MODEL=gemini-3.5-flash
+#   CLONOTH_IMAGE_GPT_BASE_URL=https://relay.example.com/v1
 
 # ---------------------------------------------------------------------------
 # 备选渠道（fallback providers）

@@ -71,6 +71,9 @@ from .config import (
     FILE_MAX_BYTES,
     MAX_FILES_PER_TURN,
     MAX_IMAGES_PER_TURN,
+    ENABLE_IMAGE_FORWARD_MERGE,
+    IMAGE_FORWARD_MERGE_THRESHOLD,
+    IMAGE_FORWARD_MERGE_NICKNAME,
     QQ_MESSAGE_LIMIT,
     QQ_QUEUE_INTERVAL,
     QQ_QUEUE_REPLY_TIMEOUT,
@@ -4209,6 +4212,36 @@ def _attachment_filename(attachment: Any) -> str:
     return ""
 
 
+def _is_napcat_sendmsg_timeout(exc: Exception) -> bool:
+    """判断异常是否为 NapCat sendMsg 超时（消息大概率已发出，不应重试）。
+
+    Why: NapCat 在图片/大消息上常回 retcode=1200、message 包含
+    "Timeout: NTEvent ... sendMsg"，但实际消息已提交给 NTQQ 并发出。
+    How: 同时看 retcode==1200 与 message/wording 中是否包含 timeout+sendMsg
+    关键字，命中则视为“超时但可能已送达”。Purpose: 避免 file:// 重试
+    造成同一张图重复发送。
+    """
+    retcode = getattr(exc, "retcode", None)
+    text = f"{getattr(exc, 'message', '') or ''} {getattr(exc, 'wording', '') or ''} {exc}".lower()
+    has_timeout_sendmsg = ("timeout" in text and "sendmsg" in text)
+    return retcode == 1200 or has_timeout_sendmsg
+
+
+def _is_api_call_timeout(exc: Exception) -> bool:
+    """判断异常是否为 NoneBot 侧“WebSocket call api ... timeout”。
+
+    Why: 合并转发（send_group_forward_msg）等大耗时操作，NapCat 处理时间
+    可能超过 NoneBot 默认 API 响应超时，报 NetWorkError('... call api ... timeout')；
+    但日志证实 NapCat 实际已把消息发出。How: 匹配异常文本中
+    "call api"+"timeout" 或 "networkerror"+"timeout" 关键字。Purpose: 避免把
+    “已发出但未及时回 ack”误判为失败而重复发送。
+    """
+    text = f"{exc}".lower()
+    if "timeout" not in text:
+        return False
+    return "call api" in text or "networkerror" in text or "network error" in text
+
+
 async def _send_attachment_path(bot: Bot, target: Dict[str, Any], path: Path, filename: str = "") -> str:
     """图片附件发送为图片消息；非图片附件通过 NapCat 文件上传 API 发送。
 
@@ -4220,10 +4253,20 @@ async def _send_attachment_path(bot: Bot, target: Dict[str, Any], path: Path, fi
         file_path = str(path.resolve())
         try:
             return await _send_qq_message(bot, target, MessageSegment.image(file=file_path))
-        except Exception as exc:
-            # 部分 OneBot 实现对本地路径格式较挑剔；失败后改用 file:// URI 重试。
-            # 注意首发失败时去重缓存已经记录过该图片，重试必须绕过去重，否则会被
-            # 当成重复消息直接跳过，导致「生成完成但图片没发出去」。
+        except Exception as exc:  # noqa: BLE001
+            # [2026-07-17] 区分两类失败，避免「同一张图发两次」：
+            #   1) NapCat sendMsg 超时（retcode=1200 / message 含 Timeout+sendMsg）：
+            #      这类是 NapCat 已把消息交给 NTQQ、只是没在超时窗口内回 ack，
+            #      图片*大概率已经发出*。此时若再 file:// 重试（且 dedupe=False）就会
+            #      造成重复发送。因此对 sendMsg 超时不重试，直接吞掉异常返回空 mid。
+            #   2) 其它失败（如本地路径格式不被接受）：才用 file:// URI 重试。
+            #      重试必须绕过去重，否则会被当成重复消息跳过，导致图片没发出去。
+            if _is_napcat_sendmsg_timeout(exc):
+                logger.warning(
+                    "图片发送疑似超时但可能已送达，不重试以避免重复发送 (%s): %s",
+                    display_name, exc,
+                )
+                return ""
             logger.warning("图片发送失败，改用 file:// 重试 (%s): %s", display_name, exc, exc_info=True)
             return await _send_qq_message(
                 bot,
@@ -4264,13 +4307,129 @@ async def _send_attachment_path(bot: Bot, target: Dict[str, Any], path: Path, fi
     return ""
 
 
+def _target_forward_kind(target: Dict[str, Any]) -> tuple[str, int] | None:
+    """从发送 target 解析出合并转发所需的 (类型, id)。无法解析时返回 None。"""
+    ttype = str(target.get("type") or "")
+    if ttype == "group" and target.get("group_id") is not None:
+        try:
+            return "group", int(target["group_id"])
+        except (TypeError, ValueError):
+            return None
+    if ttype == "private" and target.get("user_id") is not None:
+        try:
+            return "private", int(target["user_id"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+async def _try_send_images_as_forward(
+    bot: Bot, target: Dict[str, Any], image_attachments: List[Any],
+) -> bool:
+    """尝试把多张图片用合并转发（forward node）一次性发送。
+
+    Why: NapCat/NTQQ 逐张 send_group_msg 发大图时，每张都要 base64 上传并
+    等 NTQQ ack，单张常超 baseTimeout(10s) 而报 retcode=1200，多图连发还会
+    把 WS 心跳拖断（已在日志中观察到 keepalive ping timeout）。
+    How: send_group_forward_msg / send_private_forward_msg 只需一次 API 调用，
+    把每张图包成一个 node 一次提交。Purpose: 大幅减少往返与逐张超时，
+    且失败时返回 False 回退到逐张直发。
+
+    返回 True 表示已通过合并转发发出；False 表示需回退到逐张直发。
+    """
+    kind = _target_forward_kind(target)
+    if kind is None:
+        return False
+    forward_type, forward_id = kind
+    self_id = getattr(bot, "self_id", "") or "10000"
+    nodes: list[dict[str, Any]] = []
+    for attachment in image_attachments:
+        path = _resolve_attachment_path(attachment)
+        if path is None or not path.exists():
+            continue
+        node = {
+            "type": "node",
+            "data": {
+                "user_id": str(self_id),
+                "nickname": _sanitize_name(IMAGE_FORWARD_MERGE_NICKNAME, max_len=32),
+                "content": [
+                    {"type": "image", "data": {"file": f"file://{str(path.resolve())}"}},
+                ],
+            },
+        }
+        nodes.append(node)
+    if len(nodes) < 2:
+        return False
+    try:
+        # [2026-07-18] 合并转发多张大图很慢，NoneBot 默认 api_timeout(30s) 容易超时。
+        # 通过 _timeout 临时抬高本次 API 调用的等待时间（每张预估 45s，封顶 240s），
+        # 减少“实际已发出却报超时”的情况。
+        call_timeout = min(240.0, max(60.0, len(nodes) * 45.0))
+        if forward_type == "group":
+            await bot.call_api(
+                "send_group_forward_msg", group_id=forward_id, messages=nodes, _timeout=call_timeout,
+            )
+        else:
+            await bot.call_api(
+                "send_private_forward_msg", user_id=forward_id, messages=nodes, _timeout=call_timeout,
+            )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        # [2026-07-18] 关键修复：合并转发是大耗时操作，NapCat 处理时间常
+        # 超过 NoneBot 默认 API 响应超时，报 "WebSocket call api ... timeout"，
+        # 但实际 NapCat *已把合并消息发出*（日志已证实）。此时若回退逐张
+        # 直发，就会造成“先逐张发 4 张 + 后合并发 1 次”的重复。
+        # 因此：API 调用超时视为“已发出”（返回 True），不再回退逐张。
+        if _is_api_call_timeout(exc) or _is_napcat_sendmsg_timeout(exc):
+            logger.warning(
+                "多图合并转发疑似超时但可能已送达，不回退逐张以避免重复发送 (%d 张): %s",
+                len(nodes), exc,
+            )
+            return True
+        # 其它失败（NapCat 版本不支持/权限/参数错），才回退到逐张直发。
+        logger.warning("多图合并转发失败，回退逐张直发 (%d 张): %s", len(nodes), exc)
+        return False
+
+
 async def _send_attachments(bot: Bot, target: Dict[str, Any], attachments: List[Any]) -> None:
     """发送 Clonoth 返回的附件列表。
 
     每发出一个附件，就把返回的 message_id -> 本地附件路径 登记下来，
     让用户引用这条（如绘图产物）时能把原图作为附件送回给 AI。
     """
-    for attachment in attachments:
+    # [2026-07-17] 多图合并转发优化：当图片张数 ≥ 阈值时，优先用
+    # send_group_forward_msg 一次性发送，避免逐张 sendMsg 超时与 WS 拖断。
+    if ENABLE_IMAGE_FORWARD_MERGE:
+        image_atts = [
+            att for att in attachments
+            if (p := _resolve_attachment_path(att)) is not None
+            and p.exists() and p.suffix.lower() in _IMAGE_SUFFIXES
+        ]
+        non_image_atts = [
+            att for att in attachments
+            if (p := _resolve_attachment_path(att)) is None
+            or not p.exists() or p.suffix.lower() not in _IMAGE_SUFFIXES
+        ]
+        if len(image_atts) >= IMAGE_FORWARD_MERGE_THRESHOLD:
+            merged = await _try_send_images_as_forward(bot, target, image_atts)
+            if merged:
+                # 合并转发不返回逐张 message_id，无法逐张登记 message_id->path；
+                # 但会路非图片附件继续逐个发送。
+                if non_image_atts:
+                    await _send_attachments_one_by_one(bot, target, non_image_atts)
+                return
+            # 合并转发失败，回退到逐张直发（下方通用循环）。
+    await _send_attachments_one_by_one(bot, target, attachments)
+
+
+async def _send_attachments_one_by_one(bot: Bot, target: Dict[str, Any], attachments: List[Any]) -> None:
+    """逐张/逐个发送附件，单个失败不阻断后续。"""
+    # [2026-07-17] 批量发图（如一次生 4 张）时，单张 sendMsg 可能耗时较长；
+    # 若其中一张抛异常（如 NapCat 超时/WS 短暂断开），旧逻辑会让整个循环
+    # 中断，导致后续图片全部丢失（现象：“要 4 张只发出 1 张”）。
+    # 这里逐张单独容错，单张失败不阻断后续图片发送。
+    total = len(attachments)
+    for idx, attachment in enumerate(attachments):
         path = _resolve_attachment_path(attachment)
         filename = _attachment_filename(attachment)
         if path is None:
@@ -4279,7 +4438,14 @@ async def _send_attachments(bot: Bot, target: Dict[str, Any], attachments: List[
             else:
                 logger.warning("skip unsupported QQ attachment payload: %r", attachment)
             continue
-        message_id = await _send_attachment_path(bot, target, path, filename=filename)
+        try:
+            message_id = await _send_attachment_path(bot, target, path, filename=filename)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "批量发图第 %d/%d 张失败，跳过并继续 (%s): %s",
+                idx + 1, total, filename or path.name, exc,
+            )
+            continue
         if message_id:
             _remember_message_attachments(message_id, [attachment])
 
@@ -4396,6 +4562,47 @@ def _recent_sent_attachment_records(bucket_key: str, *, only_images: bool = Fals
     return records
 
 
+# [2026-07-18] 发图后台化：
+# QQ 所有事件走同一条反向 WebSocket，并在 SDK 事件循环里被串行 await。
+# 发图（尤其多图/大图，每张 sendMsg 要等 NapCat ack 十几秒）会把整条事件
+# 处理卡住，导致其它群消息/任务一起阻塞。因此把“发附件”丢到后台 task，
+# 让回调本身尽快返回；同一会话用一把信号量串行，保证同一批图片有序、
+# 不与同会话的下一次发图交错。
+_attachment_send_locks: Dict[str, asyncio.Lock] = {}
+_attachment_send_tasks: "set[asyncio.Task]" = set()
+
+
+def _attachment_send_lock_for(target: Dict[str, Any]) -> asyncio.Lock:
+    key = _sent_attachment_bucket_key(target) or str(target.get("conversation_key") or "default")
+    lock = _attachment_send_locks.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _attachment_send_locks[key] = lock
+    return lock
+
+
+async def _send_attachments_background(bot: Bot, target: Dict[str, Any], attachments: List[Any]) -> None:
+    """在后台串行发送附件（同会话上锁），并在发完后登记最近附件索引。"""
+    lock = _attachment_send_lock_for(target)
+    try:
+        async with lock:
+            await _send_attachments(bot, target, attachments)
+            _record_sent_attachments(target, attachments)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("后台发送附件失败: %s", exc, exc_info=True)
+    finally:
+        conv_key = target.get("conversation_key")
+        if conv_key:
+            _mark_qq_reply_finished(str(conv_key))
+
+
+def _spawn_attachment_send(bot: Bot, target: Dict[str, Any], attachments: List[Any]) -> None:
+    """启动后台发附件 task 并保持引用，避免被 GC。"""
+    task = asyncio.create_task(_send_attachments_background(bot, target, list(attachments)))
+    _attachment_send_tasks.add(task)
+    task.add_done_callback(_attachment_send_tasks.discard)
+
+
 async def _send_text_and_attachments(bot: Bot, target: Dict[str, Any], text: str, attachments: List[Any]) -> None:
     """统一发送最终文本与附件，并仅在群聊中把最终文本写回群历史。"""
     conv_key = target.get("conversation_key")
@@ -4407,8 +4614,10 @@ async def _send_text_and_attachments(bot: Bot, target: Dict[str, Any], text: str
             if group_id is not None:
                 _record_bot_reply(int(group_id), text)
     if attachments:
-        await _send_attachments(bot, target, attachments)
-        _record_sent_attachments(target, attachments)
+        # [2026-07-18] 附件发送丢到后台，不阻塞当前回调/事件循环。
+        # 注：_mark_qq_reply_finished 改由后台 task 在附件真正发完后调用。
+        _spawn_attachment_send(bot, target, attachments)
+        return
     if conv_key:
         _mark_qq_reply_finished(str(conv_key))
 

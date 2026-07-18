@@ -118,6 +118,20 @@ IMAGE_WAIT_AFTER_TEXT_SECONDS = _env_float("ONEBOT_IMAGE_WAIT_AFTER_TEXT_SECONDS
 IMAGE_PREFER_SAME_SENDER = _env_bool("ONEBOT_IMAGE_PREFER_SAME_SENDER", True)
 MAX_IMAGES_PER_TURN = _env_int("ONEBOT_MAX_IMAGES_PER_TURN", 4, min_value=1, max_value=16)
 
+# [2026-07-17] 多图合并转发（forward node）发送：
+# NapCat/NTQQ 逐张 send_group_msg 发大图时，每张都要 base64 上传并等 NTQQ ack。
+# [2026-07-18] 实测结论：合并转发反而更慢，且会阻塞其它任务——
+# 所有 QQ 事件走同一条反向 WebSocket 并在 SDK 里串行 await，而
+# send_group_forward_msg 把 4 张大图一次交给 NapCat 处理需几十秒，
+# 期间这条 WS 上的其它 call_api（发消息/React）全部排队，整个 bot 卡死。
+# 因此默认关闭，回到“逐张直发”（逐张已通过 sendMsg 超时容错与单张
+# 容错解决了重复发/丢图问题）。如需重新启用可设 ONEBOT_ENABLE_IMAGE_FORWARD_MERGE=1。
+ENABLE_IMAGE_FORWARD_MERGE = _env_bool("ONEBOT_ENABLE_IMAGE_FORWARD_MERGE", False)
+# 至少多少张图才使用合并转发（少于此数继续逐张直发，保留“图片直接出现在聊天”的观感）。
+IMAGE_FORWARD_MERGE_THRESHOLD = _env_int("ONEBOT_IMAGE_FORWARD_MERGE_THRESHOLD", 2, min_value=2, max_value=16)
+# 合并转发单个 node 的署名。
+IMAGE_FORWARD_MERGE_NICKNAME = _env_first("ONEBOT_IMAGE_FORWARD_MERGE_NICKNAME", default="Clonoth")
+
 # QQ 文件/附件输入配置。用于管理员自然语言转发“这文件/上面的文件”等请求。
 ENABLE_FILE_INPUT = _env_bool("ONEBOT_ENABLE_FILE_INPUT", True)
 FILE_MAX_BYTES = _env_int("ONEBOT_FILE_MAX_BYTES", 50 * 1024 * 1024, min_value=1024)

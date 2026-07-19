@@ -5,11 +5,12 @@ GPT Image 2 生图工具 (Clonoth external tool)
 
 运行方式：通过 stdin 接收 JSON 参数，stdout 输出 JSON 结果
 
-发图机制（参考 NovelAI 插件）：
-  - async_mode=False：同步执行，出图后直接返回 attachments，引擎据此发图，
-    finish_guard 也能正确记录“工具成功”。
-  - 同时在生成完成后立即通过 emit_intermediate() POST 到 supervisor 的
-    /v1/sessions/{id}/events，让图片“后台即时发送”，不占用 bot 的最终回复。
+发图机制（完全对齐 NovelAI 插件）：
+  - async_mode=False：同步执行，出图后只返回 attachments。
+  - 图片发送统一交给 supervisor 的 dispatch_attachment 路由（子节点任务完成时
+    自动把 attachments 发给用户，不占用 bot 最终回复）。
+  - 【重要】工具本身**不再** POST intermediate_reply 推图，否则会与 dispatch_attachment
+    双发（同一张图发两次）——这正是 NovelAI 插件当年修复过的坑。
 
 API 渠道配置（与 read_image / system_models 一致）：
   优先读 data/config.yaml 的 system_models.image_gpt（model/base_url/api_key），
@@ -71,42 +72,8 @@ if __name__ == "__main__":
     import base64, json, urllib.request, urllib.error, os, time, hashlib
     from pathlib import Path
 
-    # ------------------------------------------------------------------ #
-    # 后台即时推图：出图后立即 POST 到 supervisor，让图片不占用 bot 最终回复
-    # （与 tools/drawtools/nai_generate_from_plan.py 的 emit_intermediate 一致）
-    # ------------------------------------------------------------------ #
-    def emit_intermediate(text, attachments=None):
-        supervisor_url = os.environ.get("CLONOTH_SUPERVISOR_URL", "").rstrip("/")
-        session_id = os.environ.get("CLONOTH_PARENT_SESSION_ID") or os.environ.get("CLONOTH_SESSION_ID") or ""
-        if not supervisor_url or not session_id:
-            return False
-        _payload = {
-            "node_id": os.environ.get("CLONOTH_NODE_ID", ""),
-            "task_id": os.environ.get("CLONOTH_TASK_ID", ""),
-            "text": str(text or ""),
-            "attachments": attachments or [],
-        }
-        # [2026-07-19] 从源头带上入口会话 conversation_key，让 SDK 能直接拿到
-        # 正确发图目标，不依赖 session_conv_map 映射。
-        _conv_key = os.environ.get("CLONOTH_CONVERSATION_KEY", "").strip()
-        if _conv_key:
-            _payload["conversation_key"] = _conv_key
-        payload = {
-            "type": "intermediate_reply",
-            "payload": _payload,
-        }
-        try:
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            req = urllib.request.Request(
-                f"{supervisor_url}/v1/sessions/{session_id}/events",
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib.request.urlopen(req, timeout=5).read()
-            return True
-        except Exception:
-            return False
+    # [2026-07-19] 方案 X：工具不再自己推图，发图统一交给 supervisor 的
+    # dispatch_attachment 路由（和 NovelAI 一致），避免与它双发同一张图。
 
     prompt = args.get('prompt', '')
     size = args.get('size', '1024x1024')
@@ -316,24 +283,19 @@ if __name__ == "__main__":
         "name": os.path.basename(out_path),
     }
 
-    # === 后台即时推图：生成成功后立即发送，不占用 bot 最终回复 ===
-    pushed = emit_intermediate("", [attachment])
-
+    # === 只返回 attachments，发图交给 supervisor 的 dispatch_attachment 统一处理 ===
     output({
         'ok': True,
         'data': {
             'result': (
-                'Image generated and sent to user automatically. '
+                'Image generated and will be sent to the user automatically. '
                 'Do NOT resend it via reply/finish.'
-                if pushed else
-                f'Image generated: {out_path}'
             ),
             'path': out_path,
             'attachments': [attachment],
             'size': actual_size,
             'quality': quality,
             'bytes': len(img_data),
-            'pushed': pushed,
         },
         'attachments': [attachment]
     })

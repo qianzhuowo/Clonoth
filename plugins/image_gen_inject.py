@@ -94,20 +94,19 @@ class _Resolver:
         return ""
 
     def gpt_available(self) -> bool:
-        # 与 tools/gpt_image_2.py 一致：api_key 回退 OPENAI_API_KEY，
-        # base_url 回退 OPENAI_BASE_URL；两者都需具备。
-        api_key = self._pick("image_gpt", "api_key", "GPT_API_KEY", self._env("OPENAI_API_KEY"))
-        base_url = self._pick("image_gpt", "base_url", "GPT_BASE_URL", self._env("OPENAI_BASE_URL"))
-        return bool(api_key and base_url)
+        # [2026-07-19] 只认显式配置的 model（config.system_models.image_gpt.model
+        # 或 env CLONOTH_IMAGE_GPT_MODEL 非空），不再因回退主渠道而判为可用。
+        return self._model_configured("image_gpt", "CLONOTH_IMAGE_GPT_MODEL")
 
     def gemini_available(self) -> bool:
-        # 与 tools/gemini_image.py 一致：api_key 回退 GEMINI_API_KEY>OPENAI_API_KEY；
-        # base_url 有默认公有端点，故只要有 api_key 即视为可用。
-        api_key = self._pick(
-            "image_gemini", "api_key", "GEMINI_API_KEY",
-            self._env("GEMINI_API_KEY"), self._env("OPENAI_API_KEY"),
-        )
-        return bool(api_key)
+        # [2026-07-19] 同上，只认显式配置的 gemini model。
+        return self._model_configured("image_gemini", "CLONOTH_IMAGE_GEMINI_MODEL")
+
+    def _model_configured(self, slot: str, env_model_key: str) -> bool:
+        cfg_model = self._resolve_ref(str(self._slot(slot).get("model") or ""))
+        if cfg_model.strip():
+            return True
+        return bool(self._env(env_model_key))
 
 
 def _build_availability_text(gpt_ok: bool, gemini_ok: bool) -> str:

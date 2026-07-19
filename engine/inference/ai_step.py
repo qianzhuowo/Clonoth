@@ -1902,10 +1902,33 @@ async def run_ai_node(
 
     # ---- 构建工具列表 ----
     tool_specs = _filter_tool_specs(node, registry.list_specs())
+    # [2026-07-19] 生图渠道门控（只认显式配置的 model）。
+    # 未显式配置该渠道 model 的生图工具（gpt_image_2 / gemini_image）直接从模型
+    # 可用工具列表里彻底移除，杜绝“未配置却被误调用 / 调用后 404”。
+    try:
+        from ..builtin.image_gen_gating import disabled_image_tools, IMAGE_GEN_TOOLS
+        _disabled_img = disabled_image_tools(rctx.workspace_root)
+        if _disabled_img:
+            _before = {s.get("name") for s in tool_specs}
+            tool_specs = [s for s in tool_specs if s.get("name") not in _disabled_img]
+            _removed = _before & _disabled_img
+            if _removed:
+                logger.info("image_gen_gating: removed unconfigured image tools %s (node=%s)", sorted(_removed), node.id)
+    except Exception as _exc:  # noqa: BLE001
+        logger.warning("image_gen_gating tool filter skipped: %s", _exc)
     _allowed_real_tools = {s.get("name") for s in tool_specs if s.get("name")}
     openai_tools = _to_openai_tools(tool_specs) if tool_specs else []
 
     delegate_targets = list(node.delegate_targets)
+    # [2026-07-19] 两个生图渠道都未显式配置 model 时，draw.image_gen 不参与委派
+    # （orchestrator 看不到这个委派目标），避免把生图任务派到一个无可用渠道的节点。
+    try:
+        from ..builtin.image_gen_gating import any_image_channel_enabled, IMAGE_GEN_NODE_ID
+        if IMAGE_GEN_NODE_ID in delegate_targets and not any_image_channel_enabled(rctx.workspace_root):
+            delegate_targets = [t for t in delegate_targets if t != IMAGE_GEN_NODE_ID]
+            logger.info("image_gen_gating: removed delegate target %s (no image channel configured, node=%s)", IMAGE_GEN_NODE_ID, node.id)
+    except Exception as _exc:  # noqa: BLE001
+        logger.warning("image_gen_gating delegate filter skipped: %s", _exc)
     if delegate_targets:
         # [2026-05-04] Register one dynamic dispatch tool per delegate target.
         # Why: target selection should happen through tool choice, not through an

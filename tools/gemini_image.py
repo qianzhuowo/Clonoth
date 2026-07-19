@@ -9,8 +9,8 @@ as an attachment path compatible with Clonoth's multimodal pipeline.
 发图机制（参考 NovelAI 插件）：
   - async_mode=False：同步执行，出图后直接返回 attachments，引擎据此发图，
     finish_guard 也能正确记录“工具成功”。
-  - 同时在生成完成后立即通过 emit_intermediate() POST 到 supervisor 的
-    /v1/sessions/{id}/events，让图片“后台即时发送”，不占用 bot 的最终回复。
+  - 图片发送统一交给 supervisor 的 dispatch_attachment 路由（子节点任务完成时
+    自动发送），工具本身不再 POST intermediate_reply，避免双发同一张图。
 
 API 渠道配置（与 read_image / system_models 一致）：
   优先读 data/config.yaml 的 system_models.image_gemini（model/base_url/api_key），
@@ -86,40 +86,8 @@ if __name__ == "__main__":
         print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False))
         sys.exit(1)
 
-    def emit_intermediate(text, attachments=None):
-        # 后台即时推图：出图后立即发送，不占用 bot 最终回复
-        # （与 tools/drawtools/nai_generate_from_plan.py 一致）
-        supervisor_url = os.environ.get("CLONOTH_SUPERVISOR_URL", "").rstrip("/")
-        session_id = os.environ.get("CLONOTH_PARENT_SESSION_ID") or os.environ.get("CLONOTH_SESSION_ID") or ""
-        if not supervisor_url or not session_id:
-            return False
-        _payload = {
-            "node_id": os.environ.get("CLONOTH_NODE_ID", ""),
-            "task_id": os.environ.get("CLONOTH_TASK_ID", ""),
-            "text": str(text or ""),
-            "attachments": attachments or [],
-        }
-        # [2026-07-19] 从源头带上入口会话 conversation_key，让 SDK 能直接拿到
-        # 正确发图目标，不依赖 session_conv_map 映射。
-        _conv_key = os.environ.get("CLONOTH_CONVERSATION_KEY", "").strip()
-        if _conv_key:
-            _payload["conversation_key"] = _conv_key
-        payload = {
-            "type": "intermediate_reply",
-            "payload": _payload,
-        }
-        try:
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            req = urllib_request.Request(
-                f"{supervisor_url}/v1/sessions/{session_id}/events",
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            urllib_request.urlopen(req, timeout=5).read()
-            return True
-        except Exception:
-            return False
+    # [2026-07-19] 方案 X：工具不再自己推图，发图统一交给 supervisor 的
+    # dispatch_attachment 路由（和 NovelAI 一致），避免与它双发同一张图。
 
     args = _input
 
@@ -378,9 +346,7 @@ if __name__ == "__main__":
 
     text = "\n".join(text_parts).strip()
 
-    # === 后台即时推图：生成成功后立即发送，不占用 bot 最终回复 ===
-    pushed = emit_intermediate("", image_saved)
-
+    # === 只返回 attachments，发图交给 supervisor 的 dispatch_attachment 统一处理 ===
     # [AutoC 2026-05-31] Why: generated image tools now expose their primary text
     # and attachment metadata under data, but legacy attachment collection still
     # reads the top-level field. How: store text, attachments, and image metadata in
@@ -390,15 +356,13 @@ if __name__ == "__main__":
         "ok": True,
         "data": {
             "result": (
-                "Image generated and sent to user automatically. "
+                "Image generated and will be sent to the user automatically. "
                 "Do NOT resend it via reply/finish."
-                if pushed else (text or "Image generated.")
             ),
             "text": text,
             "attachments": image_saved,
             "image_path": image_saved[0]["path"] if image_saved else "",
             "image_count": len(image_saved),
-            "pushed": pushed,
         },
         "attachments": image_saved,
     })

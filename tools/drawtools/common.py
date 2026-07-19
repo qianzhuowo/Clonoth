@@ -142,13 +142,19 @@ def set_selected_preset(preset_ref: str) -> dict[str, Any]:
 
 
 def resolve_api_key(settings: dict[str, Any]) -> str:
+    # settings.yaml 优先：用户在 settings.yaml 里显式写了 api_key 就以它为准，
+    # 仅当为空时才回退到环境变量（api_key_env 指定的变量名，默认 NOVELAI_API_KEY）。
+    # 避免部署环境里遗留的同名环境变量静默覆盖用户配置。
     api_cfg = settings.get("api") if isinstance(settings.get("api"), dict) else {}
+    key = str(api_cfg.get("api_key") or "").strip()
+    if key:
+        return key
     env_name = str(api_cfg.get("api_key_env") or "NOVELAI_API_KEY").strip()
     if env_name:
         value = os.environ.get(env_name, "").strip()
         if value:
             return value
-    return str(api_cfg.get("api_key") or "").strip()
+    return ""
 
 
 def resolve_base_url(settings: dict[str, Any]) -> str:

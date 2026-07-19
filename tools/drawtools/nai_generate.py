@@ -332,7 +332,9 @@ if __name__ == "__main__":
                     timeout=timeout_sec + 10,
                 )
                 http_code = (result.stdout or "").strip()
-                if http_code == "200":
+                # 兼容中转/反代（如 touhounai）返回 201 Created 的情况：
+                # 只要是 2xx 就视为成功，响应体（zip/PNG）后续统一解析。
+                if http_code.startswith("2") and len(http_code) == 3:
                     break
                 body = read_error_body()
                 last_error = f"NovelAI API returned HTTP {http_code}: {body or result.stderr}"

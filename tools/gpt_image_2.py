@@ -53,12 +53,15 @@ SPEC = {
     }
 }
 
-TIMEOUT_SEC = 600.0
+# [2026-07-19] 超时/重试对齐：单次请求 120s（正常生图 30-90s，超过基本是挂了），
+# 重试 2 次，退避 5s；内部最坏耗时 ≈ 2×120+5 = 245s < 工具总超时 300s，
+# 两个超时对齐，避免子进程挂死 15 分钟。
+TIMEOUT_SEC = 300.0
 
 # API 请求重试参数（参考 NovelAI：429/5xx/超时/网络错误自动重试）
-_MAX_ATTEMPTS = 3
-_RETRY_BACKOFF_SEC = (3.0, 8.0)  # 第 1、2 次失败后的等待秒数
-_REQUEST_TIMEOUT = 300
+_MAX_ATTEMPTS = 2
+_RETRY_BACKOFF_SEC = (5.0,)  # 第 1 次失败后等待秒数
+_REQUEST_TIMEOUT = 120
 
 
 if __name__ == "__main__":

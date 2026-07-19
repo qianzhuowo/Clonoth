@@ -687,7 +687,16 @@ class EventRouter:
                 pass
 
         # Fallback: 通过 session_conv_map 发送到频道
-        conv_key = self._state.get_conversation_key(event.session_id) or ""
+        # [2026-07-19] 与 _handle_outbound_message Path 2 对齐：优先使用事件 payload
+        # 里显式携带的 conversation_key（生图工具 emit_intermediate 会带上入口会话
+        # key），再退回 session_conv_map。目的：子节点（如 draw.image_gen）的
+        # session_id 是子/分支会话，直接查 session_conv_map 可能 miss，导致发图目标
+        # 与 qq_forward op=recent 的登记桶对不上；从源头带上正确 conv_key 可根治。
+        conv_key = (
+            str(p.get("conversation_key") or "").strip()
+            or self._state.get_conversation_key(event.session_id)
+            or ""
+        )
         text = strip_protocol_markers((p.get("text") or "").strip())
         attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
         if text or attachments:

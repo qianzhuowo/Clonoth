@@ -196,6 +196,11 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                     "CLONOTH_PARENT_SESSION_ID": str(getattr(ctx, "parent_session_id", "") or ""),
                     "CLONOTH_TASK_ID": str(getattr(ctx, "task_id", "") or ""),
                     "CLONOTH_NODE_ID": str(getattr(ctx, "node_id", "") or ""),
+                    # [2026-07-19] 把入口会话的 conversation_key 也传给工具子进程，
+                    # 供生图工具 emit_intermediate 时随事件携带。目的：让 SDK
+                    # _handle_intermediate_reply 能从源头拿到正确 conv_key，避免子
+                    # 会话 session 查 session_conv_map miss 导致发图目标/登记桶错位。
+                    "CLONOTH_CONVERSATION_KEY": str(getattr(ctx, "conversation_key", "") or ""),
                 },
                 # Fix: run in new session so os.killpg can kill the entire
                 # process tree, preventing orphaned grandchildren from holding

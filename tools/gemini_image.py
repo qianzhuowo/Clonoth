@@ -6,6 +6,12 @@ Uses the Gemini generativeLanguage REST API with responseModalities=["TEXT","IMA
 to generate images. The generated image is saved under data/attachments/ and returned
 as an attachment path compatible with Clonoth's multimodal pipeline.
 
+发图机制（参考 NovelAI 插件）：
+  - async_mode=False：同步执行，出图后直接返回 attachments，引擎据此发图，
+    finish_guard 也能正确记录“工具成功”。
+  - 同时在生成完成后立即通过 emit_intermediate() POST 到 supervisor 的
+    /v1/sessions/{id}/events，让图片“后台即时发送”，不占用 bot 的最终回复。
+
 API 渠道配置（与 read_image / system_models 一致）：
   优先读 data/config.yaml 的 system_models.image_gemini（model/base_url/api_key），
   其次 slot 专属环境变量 CLONOTH_IMAGE_GEMINI_*，留空则回退主渠道
@@ -15,13 +21,13 @@ API 渠道配置（与 read_image / system_models 一致）：
 
 SPEC = {
     "name": "gemini_image",
-    "async_mode": True,
+    "async_mode": False,
     "description": (
         "Generate an image using Gemini (Nano Banana). "
         "Provide a text prompt describing the desired image. "
         "Optionally specify aspect_ratio (1:1, 3:4, 4:3, 9:16, 16:9) and "
         "model (gemini-3-pro-image-preview, gemini-2.5-flash-image, gemini-3.1-flash-image-preview). "
-        "Returns the generated image path under data/attachments/."
+        "The generated image is sent to the user automatically."
     ),
     "input_schema": {
         "type": "object",
@@ -49,12 +55,18 @@ SPEC = {
     },
 }
 
-TIMEOUT_SEC = 240
+TIMEOUT_SEC = 300
+
+# API 请求重试参数（参考 NovelAI：429/5xx/超时/网络错误自动重试）
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_SEC = (3.0, 8.0)
+_REQUEST_TIMEOUT = 180
 
 if __name__ == "__main__":
     import json
     import sys
     import os
+    import time
     import base64
     import uuid
     from pathlib import Path
@@ -73,6 +85,41 @@ if __name__ == "__main__":
         # exiting non-zero. Purpose: let the registry preserve detailed API errors.
         print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False))
         sys.exit(1)
+
+    def emit_intermediate(text, attachments=None):
+        # 后台即时推图：出图后立即发送，不占用 bot 最终回复
+        # （与 tools/drawtools/nai_generate_from_plan.py 一致）
+        supervisor_url = os.environ.get("CLONOTH_SUPERVISOR_URL", "").rstrip("/")
+        session_id = os.environ.get("CLONOTH_PARENT_SESSION_ID") or os.environ.get("CLONOTH_SESSION_ID") or ""
+        if not supervisor_url or not session_id:
+            return False
+        _payload = {
+            "node_id": os.environ.get("CLONOTH_NODE_ID", ""),
+            "task_id": os.environ.get("CLONOTH_TASK_ID", ""),
+            "text": str(text or ""),
+            "attachments": attachments or [],
+        }
+        # [2026-07-19] 从源头带上入口会话 conversation_key，让 SDK 能直接拿到
+        # 正确发图目标，不依赖 session_conv_map 映射。
+        _conv_key = os.environ.get("CLONOTH_CONVERSATION_KEY", "").strip()
+        if _conv_key:
+            _payload["conversation_key"] = _conv_key
+        payload = {
+            "type": "intermediate_reply",
+            "payload": _payload,
+        }
+        try:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib_request.Request(
+                f"{supervisor_url}/v1/sessions/{session_id}/events",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib_request.urlopen(req, timeout=5).read()
+            return True
+        except Exception:
+            return False
 
     args = _input
 
@@ -224,28 +271,46 @@ if __name__ == "__main__":
     }
 
     req_data = json.dumps(body).encode("utf-8")
-    req = urllib_request.Request(
-        url,
-        data=req_data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
 
-    # ---- 发送请求 ----
-    try:
-        with urllib_request.urlopen(req, timeout=180) as resp:
-            resp_data = json.loads(resp.read().decode("utf-8"))
-    except HTTPError as e:
-        error_body = ""
+    # ---- 发送请求（带自动重试） ----
+    def _retryable_http(code: int) -> bool:
+        return code in (408, 409, 425, 429, 500, 502, 503, 504)
+
+    resp_data = None
+    last_error = ""
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        req = urllib_request.Request(
+            url,
+            data=req_data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
         try:
-            error_body = e.read().decode("utf-8", errors="replace")[:2000]
-        except Exception:
-            pass
-        fail(f"Gemini API HTTP {e.code}: {error_body}")
-    except URLError as e:
-        fail(f"Gemini API connection error: {e.reason}")
-    except Exception as e:
-        fail(f"Gemini API request failed: {e}")
+            with urllib_request.urlopen(req, timeout=_REQUEST_TIMEOUT) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+            break
+        except HTTPError as e:
+            error_body = ""
+            try:
+                error_body = e.read().decode("utf-8", errors="replace")[:2000]
+            except Exception:
+                pass
+            last_error = f"Gemini API HTTP {e.code}: {error_body}"
+            retryable = _retryable_http(e.code)
+        except URLError as e:
+            last_error = f"Gemini API connection error: {e.reason}"
+            retryable = True
+        except Exception as e:
+            last_error = f"Gemini API request failed: {e}"
+            retryable = True
+        else:
+            retryable = False
+        if resp_data is not None:
+            break
+        if attempt < _MAX_ATTEMPTS and retryable:
+            time.sleep(_RETRY_BACKOFF_SEC[min(attempt - 1, len(_RETRY_BACKOFF_SEC) - 1)])
+            continue
+        fail(last_error)
 
     # ---- 解析响应 ----
     candidates = resp_data.get("candidates")
@@ -312,6 +377,10 @@ if __name__ == "__main__":
         fail(f"Gemini did not return any image. Text response: {' '.join(text_parts)[:500]}")
 
     text = "\n".join(text_parts).strip()
+
+    # === 后台即时推图：生成成功后立即发送，不占用 bot 最终回复 ===
+    pushed = emit_intermediate("", image_saved)
+
     # [AutoC 2026-05-31] Why: generated image tools now expose their primary text
     # and attachment metadata under data, but legacy attachment collection still
     # reads the top-level field. How: store text, attachments, and image metadata in
@@ -320,11 +389,16 @@ if __name__ == "__main__":
     output({
         "ok": True,
         "data": {
-            "result": text,
+            "result": (
+                "Image generated and sent to user automatically. "
+                "Do NOT resend it via reply/finish."
+                if pushed else (text or "Image generated.")
+            ),
             "text": text,
             "attachments": image_saved,
             "image_path": image_saved[0]["path"] if image_saved else "",
             "image_count": len(image_saved),
+            "pushed": pushed,
         },
         "attachments": image_saved,
     })

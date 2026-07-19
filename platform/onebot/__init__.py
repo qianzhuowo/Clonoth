@@ -4581,13 +4581,37 @@ def _attachment_send_lock_for(target: Dict[str, Any]) -> asyncio.Lock:
     return lock
 
 
+def _ensure_bucket_target(target: Dict[str, Any]) -> Dict[str, Any]:
+    """补齐 target 的 group_id/user_id，使最近附件登记 bucket 稳定可查。
+
+    [2026-07-19] 生图（gpt_image_2 / gemini_image）经 emit_intermediate 后台
+    推图时，走 send_to_channel fallback，其 target 可能只有 conversation_key
+    而缺 group_id/user_id。若不补齐，_sent_attachment_bucket_key 会退化成
+    conv:<key> 桶，而 qq_forward op=recent 用 group:<群号>/private:<qq> 桶查询，
+    两者对不上导致查不到刚生成的图。这里从 conversation_key 反解出
+    group_id/user_id 补进 target，保证登记与查询命中同一个桶。
+    """
+    ttype = str(target.get("type") or "")
+    conv_key = _real_conversation_key(str(target.get("conversation_key") or ""))
+    if ttype == "group" and target.get("group_id") is None and conv_key:
+        gid = _group_id_from_conversation_key(conv_key)
+        if gid is not None:
+            target["group_id"] = gid
+    if ttype == "private" and target.get("user_id") is None and conv_key:
+        uid = _private_user_id_from_conversation_key(conv_key)
+        if uid is not None:
+            target["user_id"] = uid
+    return target
+
+
 async def _send_attachments_background(bot: Bot, target: Dict[str, Any], attachments: List[Any]) -> None:
     """在后台串行发送附件（同会话上锁），并在发完后登记最近附件索引。"""
     lock = _attachment_send_lock_for(target)
     try:
         async with lock:
             await _send_attachments(bot, target, attachments)
-            _record_sent_attachments(target, attachments)
+            # [2026-07-19] 登记前补齐 bucket 依据，保证与 op=recent 查询同桶。
+            _record_sent_attachments(_ensure_bucket_target(dict(target)), attachments)
     except Exception as exc:  # noqa: BLE001
         logger.warning("后台发送附件失败: %s", exc, exc_info=True)
     finally:
@@ -4800,6 +4824,13 @@ class TangQiuCallbacks:
         target = _target_from_conversation_key(conversation_key)
         if target is None:
             return
+        # [2026-07-19] 修复生图 op=recent 查不到图：_target_from_conversation_key
+        # 只返回 {type, group_id/user_id}，缺 conversation_key，导致
+        # _send_attachments_background 的 finally 与最近附件登记链路信息不全。
+        # 这里补回 conversation_key（用真实会话 key），让附件登记 bucket 与
+        # qq_forward op=recent 的查询 bucket 保持一致。
+        if not target.get("conversation_key"):
+            target["conversation_key"] = _real_conversation_key(conversation_key)
         bot = _conversation_bots.get(conversation_key) or _get_fallback_bot()
         if bot:
             await _send_text_and_attachments(bot, target, text or "", attachments or [])

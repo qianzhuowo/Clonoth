@@ -5,6 +5,12 @@ GPT Image 2 生图工具 (Clonoth external tool)
 
 运行方式：通过 stdin 接收 JSON 参数，stdout 输出 JSON 结果
 
+发图机制（参考 NovelAI 插件）：
+  - async_mode=False：同步执行，出图后直接返回 attachments，引擎据此发图，
+    finish_guard 也能正确记录“工具成功”。
+  - 同时在生成完成后立即通过 emit_intermediate() POST 到 supervisor 的
+    /v1/sessions/{id}/events，让图片“后台即时发送”，不占用 bot 的最终回复。
+
 API 渠道配置（与 read_image / system_models 一致）：
   优先读 data/config.yaml 的 system_models.image_gpt（model/base_url/api_key），
   其次 slot 专属环境变量 CLONOTH_IMAGE_GPT_*，留空则回退主渠道
@@ -13,8 +19,8 @@ API 渠道配置（与 read_image / system_models 一致）：
 
 SPEC = {
     'name': 'gpt_image_2',
-    'description': '使用 gpt-image-2 模型生成图片。支持自定义分辨率（宽高需被16整除）、quality 参数。',
-    'async_mode': True,
+    'description': '使用 gpt-image-2 模型生成图片。支持自定义分辨率（宽高需被16整除）、quality 参数。图片生成后会自动发送给用户。',
+    'async_mode': False,
     'input_schema': {
         'type': 'object',
         'required': ['prompt'],
@@ -46,7 +52,12 @@ SPEC = {
     }
 }
 
-TIMEOUT_SEC = 540.0
+TIMEOUT_SEC = 600.0
+
+# API 请求重试参数（参考 NovelAI：429/5xx/超时/网络错误自动重试）
+_MAX_ATTEMPTS = 3
+_RETRY_BACKOFF_SEC = (3.0, 8.0)  # 第 1、2 次失败后的等待秒数
+_REQUEST_TIMEOUT = 300
 
 
 if __name__ == "__main__":
@@ -57,8 +68,45 @@ if __name__ == "__main__":
     def fail(error):
         print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False)); sys.exit(1)
     args = _input
-    import base64, json, urllib.request, os, time, hashlib
+    import base64, json, urllib.request, urllib.error, os, time, hashlib
     from pathlib import Path
+
+    # ------------------------------------------------------------------ #
+    # 后台即时推图：出图后立即 POST 到 supervisor，让图片不占用 bot 最终回复
+    # （与 tools/drawtools/nai_generate_from_plan.py 的 emit_intermediate 一致）
+    # ------------------------------------------------------------------ #
+    def emit_intermediate(text, attachments=None):
+        supervisor_url = os.environ.get("CLONOTH_SUPERVISOR_URL", "").rstrip("/")
+        session_id = os.environ.get("CLONOTH_PARENT_SESSION_ID") or os.environ.get("CLONOTH_SESSION_ID") or ""
+        if not supervisor_url or not session_id:
+            return False
+        _payload = {
+            "node_id": os.environ.get("CLONOTH_NODE_ID", ""),
+            "task_id": os.environ.get("CLONOTH_TASK_ID", ""),
+            "text": str(text or ""),
+            "attachments": attachments or [],
+        }
+        # [2026-07-19] 从源头带上入口会话 conversation_key，让 SDK 能直接拿到
+        # 正确发图目标，不依赖 session_conv_map 映射。
+        _conv_key = os.environ.get("CLONOTH_CONVERSATION_KEY", "").strip()
+        if _conv_key:
+            _payload["conversation_key"] = _conv_key
+        payload = {
+            "type": "intermediate_reply",
+            "payload": _payload,
+        }
+        try:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(
+                f"{supervisor_url}/v1/sessions/{session_id}/events",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=5).read()
+            return True
+        except Exception:
+            return False
 
     prompt = args.get('prompt', '')
     size = args.get('size', '1024x1024')
@@ -84,8 +132,6 @@ if __name__ == "__main__":
     # API 渠道配置解析
     # 优先级：config.yaml system_models.image_gpt > 环境变量 CLONOTH_IMAGE_GPT_*
     #        > 主渠道 OPENAI_BASE_URL / OPENAI_API_KEY（model 默认 gpt-image-2）
-    # 本工具是独立子进程，无法导入 clonoth_runtime，故本地实现一份轻量解析
-    # （与 clonoth_runtime.resolve_system_model / read_image 策略一致）。
     # ============================================================
     def _load_dotenv():
         env_path = Path.cwd() / ".env"
@@ -142,11 +188,8 @@ if __name__ == "__main__":
                 return fb.strip()
         return ""
 
-    # api_key: image_gpt 专属 > OPENAI_API_KEY（主渠道）
     api_key = _pick("api_key", "API_KEY", _env("OPENAI_API_KEY"))
-    # base_url: image_gpt 专属 > OPENAI_BASE_URL（主渠道）
     base_url = _pick("base_url", "BASE_URL", _env("OPENAI_BASE_URL")).rstrip("/")
-    # model: image_gpt 专属 > CLONOTH_IMAGE_GPT_MODEL > 默认 gpt-image-2
     model_name = _pick("model", "MODEL", "gpt-image-2")
 
     if not api_key:
@@ -154,7 +197,6 @@ if __name__ == "__main__":
     if not base_url:
         fail('No base_url configured (system_models.image_gpt / OPENAI_BASE_URL)')
 
-    # 拼接 chat/completions 端点（base_url 若已含完整路径则直接使用）
     if base_url.endswith("/chat/completions"):
         url = base_url
     else:
@@ -186,7 +228,6 @@ if __name__ == "__main__":
         content_parts.append({'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}})
     content_parts.append({'type': 'text', 'text': prompt})
 
-    # 没有垫图时用纯文本，有垫图时用多模态数组
     msg_content = content_parts if len(content_parts) > 1 else prompt
 
     payload = {
@@ -195,21 +236,39 @@ if __name__ == "__main__":
         'size': size,
         'quality': quality
     }
-
     payload_json = json.dumps(payload)
-    req = urllib.request.Request(url, data=payload_json.encode('utf-8'), headers=headers, method='POST')
 
-    try:
-        resp = urllib.request.urlopen(req, timeout=480)
-        res_data = json.loads(resp.read().decode('utf-8'))
-    except Exception as e:
-        err_body = ''
-        if hasattr(e, 'read'):
-            try:
-                err_body = e.read().decode()[:500]
-            except:
-                pass
-        fail(f'API request failed: {e} {err_body}')
+    # === 发起请求（带自动重试） ===
+    def _is_retryable(exc) -> bool:
+        if isinstance(exc, urllib.error.HTTPError):
+            return exc.code in (408, 409, 425, 429, 500, 502, 503, 504)
+        # URLError / timeout / 网络错误 → 可重试
+        return True
+
+    res_data = None
+    last_error = ""
+    for attempt in range(1, _MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(url, data=payload_json.encode('utf-8'), headers=headers, method='POST')
+        try:
+            resp = urllib.request.urlopen(req, timeout=_REQUEST_TIMEOUT)
+            res_data = json.loads(resp.read().decode('utf-8'))
+            break
+        except Exception as e:
+            err_body = ''
+            if hasattr(e, 'read'):
+                try:
+                    err_body = e.read().decode()[:500]
+                except Exception:
+                    pass
+            last_error = f'{e} {err_body}'.strip()
+            if attempt < _MAX_ATTEMPTS and _is_retryable(e):
+                wait = _RETRY_BACKOFF_SEC[min(attempt - 1, len(_RETRY_BACKOFF_SEC) - 1)]
+                time.sleep(wait)
+                continue
+            fail(f'API request failed after {attempt} attempt(s): {last_error}')
+
+    if res_data is None:
+        fail(f'API request failed: {last_error}')
 
     # === 从响应中提取图片数据 ===
     msg = res_data.get('choices', [{}])[0].get('message', {})
@@ -217,11 +276,9 @@ if __name__ == "__main__":
 
     img_data = None
     if images:
-        # 方式1: message.images 数组（部分反代返回这种格式）
         raw = images[0]
         img_data = base64.b64decode(raw.split(',')[-1] if ',' in raw else raw)
     else:
-        # 方式2: 从 content 中提取 base64 data URI
         content = msg.get('content', '')
         if content:
             import re
@@ -238,29 +295,45 @@ if __name__ == "__main__":
         h = hashlib.md5(ts + prompt[:50].encode()).hexdigest()[:10]
         filename = f'gpt_image_{h}.png'
 
-    out_dir = os.path.join('data', 'attachments')
+    out_dir = os.path.join('data', 'attachments', 'gpt_image')
     os.makedirs(out_dir, exist_ok=True)
-    out_path = os.path.join(out_dir, filename)
+    out_path = os.path.join(out_dir, filename).replace('\\', '/')
     with open(out_path, 'wb') as f:
         f.write(img_data)
 
-    # 尝试读取实际分辨率
     try:
         from PIL import Image
         img = Image.open(out_path)
         actual_size = f'{img.size[0]}x{img.size[1]}'
-    except:
+    except Exception:
         actual_size = size
+
+    # 附件结构（与 gemini_image / 平台附件路由兼容）
+    attachment = {
+        "type": "image",
+        "path": out_path,
+        "mime_type": "image/png",
+        "name": os.path.basename(out_path),
+    }
+
+    # === 后台即时推图：生成成功后立即发送，不占用 bot 最终回复 ===
+    pushed = emit_intermediate("", [attachment])
 
     output({
         'ok': True,
         'data': {
-            'result': f'Image generated: {out_path}',
+            'result': (
+                'Image generated and sent to user automatically. '
+                'Do NOT resend it via reply/finish.'
+                if pushed else
+                f'Image generated: {out_path}'
+            ),
             'path': out_path,
-            'attachments': [out_path],
+            'attachments': [attachment],
             'size': actual_size,
             'quality': quality,
-            'bytes': len(img_data)
+            'bytes': len(img_data),
+            'pushed': pushed,
         },
-        'attachments': [out_path]
+        'attachments': [attachment]
     })

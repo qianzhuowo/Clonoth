@@ -3857,7 +3857,16 @@ def _message_from_processed_segments(segments: List[Dict[str, Any]]) -> Message:
         elif segment.get("type") == "image":
             url = segment.get("url")
             if url:
-                message_segments.append(MessageSegment.image(url))
+                if segment.get("emoji"):
+                    # QQ 收藏表情：在普通 image 段基础上补 sub_type=1（表情子类型），
+                    # 让 QQ 客户端按小图/贴纸渲染而不是普通大图；summary 提供
+                    # "[表情]" 占位，兼容不支持 sub_type 的客户端摘要显示。
+                    emoji_seg = MessageSegment.image(url)
+                    emoji_seg.data["sub_type"] = 1
+                    emoji_seg.data.setdefault("summary", "[表情]")
+                    message_segments.append(emoji_seg)
+                else:
+                    message_segments.append(MessageSegment.image(url))
         elif segment.get("type") == "at":
             qq_id = segment.get("qq")
             if qq_id:

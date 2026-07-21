@@ -719,7 +719,9 @@ async def process_emojis(
             if not url:
                 url = _custom_face_url(face) if face is not None else ""
             if url:
-                segments.append({"type": "image", "url": url})
+                # 标记 emoji=True：这是 QQ 收藏表情，发送时走 image 表情子类型
+                # （sub_type=1），让客户端按小图/贴纸渲染，而不是普通大图。
+                segments.append({"type": "image", "url": url, "emoji": True})
             else:
                 # 未命中或未取到可发送地址时保留可读占位，避免内容无声丢失。
                 segments.append({"type": "text", "content": f"[表情:{name}]"})

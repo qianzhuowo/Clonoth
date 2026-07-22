@@ -1272,6 +1272,14 @@ async def _execute_real_tools(
             _t_result = None
             _t_fmt = "text"
             _t_raw_inline = f'\u23f3 Async tool "{_t_name}" started (id: {_async_id}). Result will be delivered via preempt when ready.'
+            # [2026-07-22] Why: 异步工具（如 nai_generate）成功启动后立即返回占位，
+            # 永远走不到下方同步分支的 succeeded_real_tools 登记，导致 finish_guard 的
+            # finish_requires_tool 硬校验永远判定“无成功工具”，画图节点因此陷入反复
+            # Rejected finish 死循环、回复迟迟发不出（现象：用户追问“图呢”）。
+            # How: 异步工具“成功发起”即视为满足 finish 前置——图片由工具子进程直发平台，
+            # 模型只需在结果回传后 finish 播报，不需要自己再发图。Purpose: 让异步生图
+            # 节点能正常 finish，不再空转。
+            ls.succeeded_real_tools.add(_t_name)
             _tool_entries.append({
                 "id": _rtc.get("id", ""),
                 "name": _t_name,

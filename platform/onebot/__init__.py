@@ -182,6 +182,9 @@ _REACT_CLEANUP_EMOJIS = tuple(_REACT_STAGE_EMOJIS.values())
 _SEARCH_PROGRESS_FIRST_NOTICE = "已收到联网搜索请求，正在检索网页资料，可能需要几秒钟……"
 _SEARCH_PROGRESS_STILL_RUNNING_NOTICE = "还在联网搜索中，我会拿到结果后马上整理回复。"
 _SEARCH_PROGRESS_STILL_RUNNING_INTERVAL_SEC = 20.0
+# [2026-07-22] 图片 sendMsg 超时后，延迟多久再用 base64:// 补发一次。
+# 给 NapCat/NTQQ 一点时间把“已提交但未 ack”的首发真正落地，降低补发双发概率。
+_IMAGE_TIMEOUT_RESEND_DELAY_SEC = float(os.environ.get("ONEBOT_IMAGE_TIMEOUT_RESEND_DELAY_SEC", "3") or "3")
 _SEARCH_PROGRESS_KEYWORDS = ("web_search", "exa_search", "x_search")
 
 # 群聊上下文只保留最近 N 条。这样可以给入口节点提供社交语境，
@@ -3891,6 +3894,39 @@ def _message_dedup_text(message: Any) -> str:
     return str(message or "")
 
 
+def _image_resend_dedup_key(target: Dict[str, Any], path: Path) -> str:
+    """[2026-07-22] 为“图片超时补发”生成基于目标+本地图路径的幂等键。
+
+    Why: sendMsg 超时时图片*大概率已发出*但偶尔真失败。需要“补发一次但不重复”，
+    而首次发用本地路径、补发用 base64://，两者消息文本不同，无法靠通用
+    _should_skip_duplicate_send 互相去重。How: 用 target+图片绝对路径作为稳定指纹，
+    同一张图短时内只能“超时补发”一次。Purpose: 避免超时重试造成同图双发。
+    """
+    ttype = str(target.get("type") or "")
+    tid = str(target.get("group_id") if ttype == "group" else target.get("user_id") or "")
+    try:
+        p = str(path.resolve())
+    except Exception:
+        p = str(path)
+    return hashlib.sha256(f"imgresend:{ttype}:{tid}:{p}".encode("utf-8", "ignore")).hexdigest()
+
+
+def _mark_and_check_image_resend(target: Dict[str, Any], path: Path, *, ttl: float = 120.0) -> bool:
+    """[2026-07-22] 判定并登记一张图是否已做过超时补发。
+
+    返回 True 表示短时内已补发过、本次应跳过；False 表示首次、可补发。
+    复用 _sent_reply_cache 同一套 LRU 缓存以免无限增长。
+    """
+    key = _image_resend_dedup_key(target, path)
+    now = time.time()
+    ts = _sent_reply_cache.get(key)
+    if ts and now - ts <= ttl:
+        return True
+    _sent_reply_cache[key] = now
+    _sent_reply_cache_order.append(key)
+    return False
+
+
 def _should_skip_duplicate_send(target: Dict[str, Any], message: Any, *, ttl: float = 30.0) -> bool:
     """短时间内跳过同一会话的完全相同消息，防止事件重放/双路径重复发送。"""
     target_type = str(target.get("type") or "")
@@ -4139,6 +4175,20 @@ async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any, *, de
                 logger.warning("send_group_msg failed (%s); retry with at-as-text", exc)
                 result = await bot.send_group_msg(group_id=int(group_id), message=fallback)
                 return _extract_sent_message_id(result)
+            # [2026-07-22] 失败与 at 无关（fallback 与原消息相同）时的补发：
+            #   - sendMsg 超时：消息大概率已发出，不重发，直接 raise（避免重复）。
+            #   - ENOENT（NapCat 容器 temp 临时文件缺失，retcode=1200）：真失败、消息未发出，
+            #     原样重发一次（dedupe=False）给一次补发机会，避免“漏回复”。
+            #   图片类消息的 base64 重发已在 _send_attachment_path 处理，这里主要兼顾
+            #   文本/引用回复等非图片消息因 ENOENT 整条失败的场景。
+            if _is_napcat_sendmsg_timeout(exc):
+                raise
+            if _is_napcat_enoent(exc):
+                logger.warning(
+                    "send_group_msg failed (ENOENT %s); retry once (dedupe off)", exc,
+                )
+                result = await bot.send_group_msg(group_id=int(group_id), message=safe_message)
+                return _extract_sent_message_id(result)
             raise
     raise ValueError(f"unknown QQ target type: {target!r}")
 
@@ -4226,14 +4276,31 @@ def _is_napcat_sendmsg_timeout(exc: Exception) -> bool:
 
     Why: NapCat 在图片/大消息上常回 retcode=1200、message 包含
     "Timeout: NTEvent ... sendMsg"，但实际消息已提交给 NTQQ 并发出。
-    How: 同时看 retcode==1200 与 message/wording 中是否包含 timeout+sendMsg
-    关键字，命中则视为“超时但可能已送达”。Purpose: 避免 file:// 重试
-    造成同一张图重复发送。
+    How: 只看 message/wording 中是否包含 timeout+sendMsg 关键字，命中才视为
+    “超时但可能已送达”。Purpose: 避免 file:// 重试造成同一张图重复发送。
+
+    [2026-07-22] 修复漏发：原实现把 retcode==1200 也当作“超时已送达”，
+    但 1200 是 NapCat 的通用失败码——ENOENT（容器内临时文件缺失）等真失败
+    同样回 1200，被误判为已送达后直接吞掉、既不重试也不补发，导致图片/回复
+    彻底漏发。这里去掉 retcode==1200 兜底，只用 timeout+sendMsg 文本特征判定。
     """
-    retcode = getattr(exc, "retcode", None)
     text = f"{getattr(exc, 'message', '') or ''} {getattr(exc, 'wording', '') or ''} {exc}".lower()
-    has_timeout_sendmsg = ("timeout" in text and "sendmsg" in text)
-    return retcode == 1200 or has_timeout_sendmsg
+    return "timeout" in text and "sendmsg" in text
+
+
+def _is_napcat_enoent(exc: Exception) -> bool:
+    """判断异常是否为 NapCat 容器内找不到临时文件（ENOENT）。
+
+    Why: NapCat 跑在 Docker 里，发图/合成消息时会先落地到容器自己的
+    /app/.config/QQ/NapCat/temp/ 临时目录再发送；该目录被过早清理或并发
+    竞争时，NapCat 读不到自己的临时文件，报 retcode=1200 且 message 含
+    "ENOENT: no such file or directory"。这类是**真失败**，消息没发出，
+    必须补发（用 base64:// 内联绕开 temp 目录）。How: 匹配 message/wording
+    中的 enoent / no such file 关键字。Purpose: 与“超时已送达”区分开，
+    让 ENOENT 走 base64 补发而不是被静默吞掉。
+    """
+    text = f"{getattr(exc, 'message', '') or ''} {getattr(exc, 'wording', '') or ''} {exc}".lower()
+    return "enoent" in text or "no such file" in text
 
 
 def _is_api_call_timeout(exc: Exception) -> bool:
@@ -4263,26 +4330,68 @@ async def _send_attachment_path(bot: Bot, target: Dict[str, Any], path: Path, fi
         try:
             return await _send_qq_message(bot, target, MessageSegment.image(file=file_path))
         except Exception as exc:  # noqa: BLE001
-            # [2026-07-17] 区分两类失败，避免「同一张图发两次」：
-            #   1) NapCat sendMsg 超时（retcode=1200 / message 含 Timeout+sendMsg）：
-            #      这类是 NapCat 已把消息交给 NTQQ、只是没在超时窗口内回 ack，
-            #      图片*大概率已经发出*。此时若再 file:// 重试（且 dedupe=False）就会
-            #      造成重复发送。因此对 sendMsg 超时不重试，直接吞掉异常返回空 mid。
-            #   2) 其它失败（如本地路径格式不被接受）：才用 file:// URI 重试。
-            #      重试必须绕过去重，否则会被当成重复消息跳过，导致图片没发出去。
+            # [2026-07-17] 区分三类失败，既避免「同一张图发两次」又避免漏发：
+            #   1) NapCat sendMsg 超时（message 含 Timeout+sendMsg）：这类是 NapCat
+            #      已把消息交给 NTQQ、只是没在超时窗口内回 ack，图片*大概率已发出*。
+            #      此时不重试，直接吞掉异常返回空 mid。
+            #   2) [2026-07-22] ENOENT（NapCat 容器内 temp 临时文件缺失，retcode=1200）：
+            #      这是真失败、图没发出。旧逐辑靠 retcode==1200 把它误归为“超时已送达”
+            #      而静默吞掉，造成漏发。现改为用 base64:// 内联重发，彻底绕开 NapCat
+            #      容器的 temp 目录依赖。
+            #   3) 其它失败（如本地路径格式不被接受）：同样先 base64:// 再 file:// 重试。
+            #      重试必须绕过去重（dedupe=False），否则会被当成重复消息跳过，导致漏发。
             if _is_napcat_sendmsg_timeout(exc):
+                # [2026-07-22] sendMsg 超时：图片*大概率已发出*但偶尔真失败。
+                # 旧逻辑直接吞掉不补发，造成偶发漏图。现改为：等待
+                # 短暂延迟后用 base64:// “带去重”补发一次——依靠图片路径级幂等键
+                # 保证同一张图只补发一次；若首发其实已成功，补发依据发送文本去重
+                # （_should_skip_duplicate_send）也会被拦住，最大限度避免双发。
+                if _mark_and_check_image_resend(target, path):
+                    logger.warning(
+                        "图片发送疑似超时，且短时内已补发过，不再重发 (%s): %s",
+                        display_name, exc,
+                    )
+                    return ""
                 logger.warning(
-                    "图片发送疑似超时但可能已送达，不重试以避免重复发送 (%s): %s",
+                    "图片发送疑似超时，延迟后用 base64:// 带去重补发一次 (%s): %s",
                     display_name, exc,
                 )
-                return ""
-            logger.warning("图片发送失败，改用 file:// 重试 (%s): %s", display_name, exc, exc_info=True)
-            return await _send_qq_message(
-                bot,
-                target,
-                MessageSegment.image(file=f"file://{file_path}"),
-                dedupe=False,
+                try:
+                    await asyncio.sleep(_IMAGE_TIMEOUT_RESEND_DELAY_SEC)
+                    _b64 = "base64://" + base64.b64encode(path.read_bytes()).decode("ascii")
+                    # 保留 dedupe=True：若首发已成功（相同图片段文本），这次会被去重拦住。
+                    return await _send_qq_message(bot, target, MessageSegment.image(file=_b64))
+                except Exception as resend_exc:  # noqa: BLE001
+                    logger.warning(
+                        "图片超时补发失败 (%s): %s", display_name, resend_exc,
+                    )
+                    return ""
+            _enoent = _is_napcat_enoent(exc)
+            logger.warning(
+                "图片发送失败，改用 base64:// 重发 (%s%s): %s",
+                display_name, " | ENOENT" if _enoent else "", exc,
+                exc_info=not _enoent,
             )
+            # 优先 base64:// 内联重发（绕开 NapCat 容器 temp/挂载目录问题）。
+            try:
+                _b64 = "base64://" + base64.b64encode(path.read_bytes()).decode("ascii")
+                return await _send_qq_message(
+                    bot,
+                    target,
+                    MessageSegment.image(file=_b64),
+                    dedupe=False,
+                )
+            except Exception as b64_exc:  # noqa: BLE001
+                logger.warning(
+                    "base64:// 重发仍失败，回退 file:// 重试 (%s): %s",
+                    display_name, b64_exc,
+                )
+                return await _send_qq_message(
+                    bot,
+                    target,
+                    MessageSegment.image(file=f"file://{file_path}"),
+                    dedupe=False,
+                )
     # [2026-05-08] 非图片附件通过 NapCat upload_group_file / upload_private_file 发送
     # [2026-07-08] 改用 base64:// 传输文件内容，避免把宿主机绝对路径交给 NapCat：
     # NapCat 运行在 Docker 容器内，只挂载了部分目录，直接传本地路径会因容器内

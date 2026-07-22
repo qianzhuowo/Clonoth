@@ -134,6 +134,16 @@ class FinishGuardHandler:
         if succeeded & required_any:
             return None
 
+        # [2026-07-22] Why: 异步工具（如 nai_generate）成功启动后其结果通过
+        # async_tool_result 注入会 fork 出一个新的 branch task，新 task 的 loop_state
+        # 是全新实例，succeeded_real_tools 为空，导致模型在新 task 里 finish 播报时
+        # 又被这里拦下，陷入反复 Rejected finish 死循环、回复发不出（现象：用户追问
+        # “图呢”）。How: 当本 task 的 succeeded 集合不满足时，回退扫描消息历史，若历史
+        # 里出现过所需工具“已成功发起异步执行”的占位记录（async_started），也视为满足
+        # finish 前置。Purpose: 让异步生图结果回传后的 finish 播报能正常通过。
+        if self._history_has_async_started_tool(ctx, required_any):
+            return None
+
         logger.warning(
             "Rejected finish without required tool success (node=%s, step=%d, required=%s, succeeded=%s)",
             getattr(node, "id", ""),
@@ -149,6 +159,36 @@ class FinishGuardHandler:
                 tools=", ".join(sorted(required_any)),
             ),
         )
+
+    def _history_has_async_started_tool(self, ctx: Any, required_any: set[str]) -> bool:
+        """Scan message history for a successfully *started* async required tool.
+
+        Why: async tools (nai_generate) return an ``async_started`` placeholder in
+        the current task and their real result is injected into a NEW forked task,
+        whose fresh loop_state has an empty ``succeeded_real_tools``. Without this
+        fallback the model's finish in that new task keeps getting rejected. How:
+        walk ctx.messages and match the async placeholder text (which embeds the
+        tool name) emitted by ai_step for started async tools. Purpose: treat a
+        genuinely dispatched async generation as satisfying the finish precondition.
+        """
+        messages = getattr(ctx, "messages", None)
+        if not isinstance(messages, list):
+            return False
+        for msg in messages:
+            try:
+                content = msg.get("content") if isinstance(msg, dict) else None
+            except Exception:
+                content = None
+            if not content:
+                continue
+            text = content if isinstance(content, str) else str(content)
+            # ai_step 的异步占位文本：'⏳ Async tool "<name>" started (id: ...)'
+            if "Async tool" not in text or "started" not in text:
+                continue
+            for name in required_any:
+                if f'"{name}"' in text or f"'{name}'" in text:
+                    return True
+        return False
 
 
 def _finish_required_tools(node: Any) -> set[str]:

@@ -89,7 +89,19 @@ class ProcessManager:
             shell_new_console = False
 
         self.shell_new_console = shell_new_console
-        self.spawn_shell_cli = get_bool(runtime_cfg, "supervisor.process_manager.spawn_shell_cli", True)
+        # [2026-08-01] Why: supervisor default spawns a shell TUI child
+        # (platform.shell.tui); in some deployments that module fails to import
+        # and crashes startup, yet shell TUI is not a core component.
+        # How: default to NOT auto-spawning (False); config can still enable it,
+        # and env var CLONOTH_SPAWN_SHELL_CLI overrides config (1/true/yes to
+        # enable, 0/false/no to disable).
+        # Purpose: production no longer crashes on the optional shell TUI.
+        self.spawn_shell_cli = get_bool(runtime_cfg, "supervisor.process_manager.spawn_shell_cli", False)
+        _spawn_shell_env = os.getenv("CLONOTH_SPAWN_SHELL_CLI", "").strip().lower()
+        if _spawn_shell_env in {"1", "true", "yes"}:
+            self.spawn_shell_cli = True
+        elif _spawn_shell_env in {"0", "false", "no"}:
+            self.spawn_shell_cli = False
 
         # 注册清理：supervisor 退出时杀掉所有子进程
         atexit.register(self._cleanup)

@@ -4,12 +4,20 @@ name: "通用生图（GPT / Gemini）"
 description: "通用生图分析与生成节点。将用户生图/图片编辑需求转成合适工具调用，使用 gpt_image_2 或 gemini_image 生成图片，支持垫图。生成的图片由平台自动发送。"
 
 provider: openai
-model: $ENV{DRAW_PLANNER_MODEL}
-api_key: $ENV{DRAW_PLANNER_API_KEY}
-base_url: $ENV{DRAW_PLANNER_BASE_URL}
+# [2026-08-01] 绘图分析(写 tag/prompt)专用模型，与压缩/摘要/读图/生图隔离。
+# 新变量 DRAW_TAG_* 优先，未配置时回退旧变量 DRAW_PLANNER_*（向后兼容）。
+model: $ENV{DRAW_TAG_MODEL|DRAW_PLANNER_MODEL}
+api_key: $ENV{DRAW_TAG_API_KEY|DRAW_PLANNER_API_KEY}
+base_url: $ENV{DRAW_TAG_BASE_URL|DRAW_PLANNER_BASE_URL}
 
 tool_mode: json
 output_mode: hybrid
+
+# [2026-08-01] 本节点分析模型为纯文本（不支持视觉），收到带 image_url 的多模态
+# 消息会 400 报错（unknown variant `image_url`, expected `text`）。开启后引擎在调
+# provider 前剥掉图片内容块，只保留文字（含图片路径 [Attached images: ...]）。
+# 垂图需求仍可用：模型把路径填进生图工具的 image_paths，由生图模型真正看图。
+strip_images: true
 
 tool_access:
   mode: allowlist

@@ -192,12 +192,34 @@ def load_text_file(path: Path, default: str = "") -> str:
         return default
 
 
+def _resolve_env_names(names: str) -> str:
+    """Resolve a ``|``-separated list of env var names with fallback.
+
+    Why: config wants "new var wins, fall back to old var" without duplicating
+    node YAML. How: split on ``|``; return the first env var whose value is a
+    non-empty string (after strip); otherwise "". Purpose: e.g.
+    ``DRAW_TAG_MODEL|DRAW_PLANNER_MODEL`` prefers the new name but stays
+    backward compatible with the old one.
+    """
+    for name in names.split("|"):
+        key = name.strip()
+        if not key:
+            continue
+        val = os.getenv(key, "")
+        if val is not None and val.strip() != "":
+            return val
+    return ""
+
+
 def resolve_env_ref(text: str) -> str:
     s = str(text or "")
+    # Supports single names and ``|``-separated fallback lists, e.g.
+    #   $ENV{NEW_VAR}                 -> os.getenv("NEW_VAR")
+    #   $ENV{NEW_VAR|OLD_VAR}         -> NEW_VAR if set (non-empty) else OLD_VAR
     if s.startswith("$ENV{") and s.endswith("}"):
-        return os.getenv(s[5:-1], "")
+        return _resolve_env_names(s[5:-1])
     if s.startswith("${") and s.endswith("}") and len(s) > 3:
-        return os.getenv(s[2:-1], "")
+        return _resolve_env_names(s[2:-1])
     return s
 
 

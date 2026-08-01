@@ -27,6 +27,58 @@ from engine.signals.types import make_span_id
 
 _RETRYABLE_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
 
+
+def _node_strips_images(node: Any) -> bool:
+    """Whether this node's model should never receive image_url content blocks.
+
+    Why: draw/analysis nodes may run on non-vision models (e.g. deepseek-v4-flash)
+    that reject multimodal content with an HTTP 400 like
+    ``unknown variant `image_url`, expected `text```. How: opt-in via YAML; unknown
+    keys land in ``Node.extra``. Accept ``strip_images`` or ``no_vision`` truthy.
+    Purpose: keep the behavior generic and configuration-driven per node.
+    """
+    extra = getattr(node, "extra", None)
+    if not isinstance(extra, dict):
+        return False
+    for key in ("strip_images", "no_vision"):
+        val = extra.get(key)
+        if isinstance(val, bool):
+            if val:
+                return True
+        elif isinstance(val, str) and val.strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+    return False
+
+
+def _strip_image_blocks(messages: list[dict]) -> list[dict]:
+    """Remove image_url content blocks from all messages (non-vision safety).
+
+    Mirrors engine.builtin.fallback_provider._strip_image_blocks so non-vision
+    primary providers get the same protection as non-vision fallbacks. If a
+    message becomes empty after stripping, replace with placeholder text; if it
+    collapses to a single text part, flatten to a plain string.
+    """
+    result: list[dict] = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            result.append(msg)
+            continue
+        filtered = [
+            p for p in content
+            if not (isinstance(p, dict) and p.get("type") == "image_url")
+        ]
+        if len(filtered) == len(content):
+            result.append(msg)
+            continue
+        if not filtered:
+            result.append({**msg, "content": "[image content removed]"})
+        elif len(filtered) == 1 and isinstance(filtered[0], dict) and filtered[0].get("type") == "text":
+            result.append({**msg, "content": filtered[0].get("text", "")})
+        else:
+            result.append({**msg, "content": filtered})
+    return result
+
 # [fix 2026-05-07] Why: some OpenAI-compatible proxy layers return upstream
 # key-pool exhaustion as HTTP 400/402/403 instead of 429, and some provider
 # adapters use status_code=0 for transport exceptions. How: keep the strict HTTP
@@ -170,6 +222,13 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     # 注意：不能修改 ls.messages 本身，它是运行时状态。
     _formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
     llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
+    # [2026-08-01] 节点级图片剥离开关：某些节点（如绘图分析节点）使用的模型
+    # 不支持视觉（如 deepseek-v4-flash），收到 image_url 多模态消息会直接 400
+    # 报错（unknown variant `image_url`, expected `text`）。当节点 YAML 声明
+    # strip_images: true（或 no_vision: true）时，在调 provider 前剥掉所有 image_url
+    # 内容块，只保留文字，避免整个绘图任务因附带图片而崩溃。
+    if _node_strips_images(ls.node):
+        llm_messages = _strip_image_blocks(llm_messages)
 
     resp = None
     _retry_attempt = 0

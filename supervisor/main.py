@@ -177,7 +177,13 @@ def main() -> None:
                         if a.status == ApprovalStatus.pending:
                             _sessions_with_pending_approval.add(a.session_id)
 
-                    for task in state.tasks.values():
+                    # [fix 2026-08-04] Why: 循环体内会调用 _route_completed_task_locked
+                    # 与 _cleanup_stale_sessions_locked，它们可能增删 state.tasks，
+                    # 直接遍历 state.tasks.values() 会抛
+                    # "dictionary changed size during iteration"，导致本轮 reaping
+                    # 提前中断、僵尸任务清不干净。How: 先对当前任务集合
+                    # 做快照（list(...)）再遍历。Purpose: reaping 在锁内安全修改任务。
+                    for task in list(state.tasks.values()):
                         if task.status != TaskStatus.running:
                             continue
                         # [Fork/Merge 2026-05-17] Why: approvals and user-visible

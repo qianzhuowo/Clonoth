@@ -210,18 +210,55 @@ def _create_fallback_provider(
     Supports any provider registered in providers/__init__.py — no hardcoding.
     """
     try:
+        import inspect
+
+        import httpx
+
         from providers import registry
         provider_cls = registry.get(provider_type)
         if provider_cls is None:
             logger.warning("fallback_provider: unknown provider type '%s' (available: %s)",
                            provider_type, registry.list())
             return None
-        # Build kwargs — different providers accept different params
+
+        # [fix 2026-08-04] Why: 不同 provider 的 __init__ 签名并不一致——
+        # 例如 OpenAIProvider 是 keyword-only，要求外部传入 httpx.AsyncClient
+        # 的 `http`，且不接受 `timeout`；而 DeepSeekProvider 接受可选 `http`
+        # 和 `timeout`。旧代码固定传 `timeout` 会让所有 openai 类型的 fallback
+        # 因 "unexpected keyword argument 'timeout'" 创建失败，导致 fallback
+        # 形同虚设（主渠道 900s 超时后无任何备选生效）。
+        # How: 用 inspect 读取目标构造函数接受的参数名，只投递它真正支持的
+        # kwargs；当 provider 需要 `http` 但不接受 `timeout` 时，为它构造一个
+        # 带超时的 httpx.AsyncClient。Purpose: 让 fallback 对任意 provider 通用
+        # 生效，且超时语义不丢失。
+        try:
+            sig_params = inspect.signature(provider_cls.__init__).parameters
+            accepted = set(sig_params.keys())
+            has_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
+            )
+        except (TypeError, ValueError):
+            accepted = set()
+            has_var_kw = True  # 无法内省时不做过滤，保持旧行为
+
+        def _wanted(name: str) -> bool:
+            return has_var_kw or name in accepted
+
         kwargs: dict[str, Any] = {"model": model, "api_key": api_key}
         if base_url:
             kwargs["base_url"] = base_url
-        if timeout:
+
+        if _wanted("timeout") and timeout:
             kwargs["timeout"] = timeout
+
+        # provider 需要外部注入 http 客户端（如 OpenAIProvider）时，构造一个
+        # 带超时的 AsyncClient。它的生命周期随 provider 释放（此处不显式关闭，
+        # 交由进程退出/GC 回收，fallback provider 为一次性使用）。
+        if _wanted("http") and "http" not in kwargs:
+            kwargs["http"] = httpx.AsyncClient(
+                timeout=httpx.Timeout(timeout or 600.0, connect=10.0)
+            )
+
         return provider_cls(**kwargs)
     except Exception as exc:
         logger.warning("fallback_provider: failed to create %s provider: %s", provider_type, exc)

@@ -100,9 +100,13 @@ def get_quote(resolved: ResolvedSymbol, *, refresh: bool = False, include_raw: b
             ("yfinance", yfinance_source.quote),
         ]
     else:
+        # See HK/US note above. AkShare full-market snapshot endpoints are
+        # frequently rate-limited or drop connections on some servers, forcing
+        # a slow fail-then-fallback each call. Prefer the lightweight Tencent
+        # quote, keeping AkShare as a fallback for extra coverage.
         funcs = [
-            ("akshare.stock_zh_a_spot_em", akshare_source.quote_cn),
             ("tencent.qt.gtimg.cn", tencent_source.quote),
+            ("akshare.stock_zh_a_spot_em", akshare_source.quote_cn),
         ]
 
     quote = _try_chain(resolved, funcs)

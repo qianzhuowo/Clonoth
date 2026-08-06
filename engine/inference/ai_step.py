@@ -1672,15 +1672,36 @@ def _handle_plaintext_response(ls: _LoopState, resp, step: int) -> TaskAction | 
         ls.use_stream = ls.streaming
         return None
 
-    # 重试耗尽后：返回 FAIL 而非 FINISH
-    # 引擎内核不认可裸正文作为合法结束，只有 finish 工具才能产生 ACTION_FINISH。
-    # 将原先的 ACTION_FINISH 改为 ACTION_FAIL，error 中附带截断原始文本用于调试。
+    # [2026-08-06] 格式保底：重试耗尽后不再 FAIL（FAIL 不产 outbound，用户侧回复会“没了”），
+    # 而是把裸文本包装为隐式 finish 正常投递给用户（对齐 hybrid 模式/plaintext.py 行为）。
+    _assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
+    _provider_name = getattr(ls.provider, 'name', '') or 'unknown'
+    _implicit_meta = MessageMeta(
+        provider=_provider_name,
+        tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
+        message_type="assistant",
+        timestamp=datetime.now(timezone.utc).isoformat(),
+        metadata={},
+        tool_call_ids=[],
+        reasoning="",
+        has_reasoning=False,
+        usage=dict(ls.last_usage) if ls.last_usage else {},
+    )
+    set_message_meta(_assistant_msg, _implicit_meta)
+    ls.messages.append(_assistant_msg)
+    _shadow_write(ls, _assistant_msg, MessageType.ASSISTANT)
+
     ctx_ref = _persist_ctx(ls, step + 1)
     return TaskAction(
-        action=ACTION_FAIL, node_id=ls.node.id,
-        error=f"模型未使用 finish 工具，裸文本不被内核认可为合法结束。原始文本: {_short(text, 200)}",
+        action=ACTION_FINISH, node_id=ls.node.id,
+        result={
+            "text": text,
+            "attachments": list(ls.tool_produced_attachments),
+            "implicit_finish": True,
+            "plaintext_recovery": True,
+        },
         context_ref=ctx_ref,
-        summary="plaintext_without_finish",
+        summary=_short(text, 240),
     )
 
 

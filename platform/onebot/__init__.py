@@ -4157,8 +4157,26 @@ async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any, *, de
         user_id = target.get("user_id")
         if user_id is None:
             raise ValueError("private target missing user_id")
-        result = await bot.send_private_msg(user_id=int(user_id), message=message)
-        return _extract_sent_message_id(result)
+        try:
+            result = await bot.send_private_msg(user_id=int(user_id), message=message)
+            return _extract_sent_message_id(result)
+        except ActionFailed as exc:
+            # [2026-08-06] 私聊补 ENOENT 兜底，与群聊分支对齐。
+            # 原因：收藏表情/图片走 image(url) 时 NapCat 先落地到容器 temp/ 再上传，
+            # temp 文件被并发清理时报 retcode=1200 ENOENT（真失败、未发出）。原私聊
+            # 分支无补发保护，异常直接冒泡到 send_reply，导致整条回复被吞。
+            #   - sendMsg 超时：大概率已送达，raise 不重发（避免双发）。
+            #   - ENOENT：真失败，原样重发一次。
+            #   - 其它失败：raise 交由上层记录。
+            if _is_napcat_sendmsg_timeout(exc):
+                raise
+            if _is_napcat_enoent(exc):
+                logger.warning(
+                    "send_private_msg failed (ENOENT %s); retry once", exc,
+                )
+                result = await bot.send_private_msg(user_id=int(user_id), message=message)
+                return _extract_sent_message_id(result)
+            raise
     if target.get("type") == "group":
         group_id = target.get("group_id")
         if group_id is None:

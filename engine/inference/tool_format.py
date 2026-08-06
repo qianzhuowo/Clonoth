@@ -356,6 +356,12 @@ class FakeNativeToolFormatter(ToolFormatter):
 #  JSON 模式：文本内嵌工具调用（预留接口）
 # ---------------------------------------------------------------------------
 
+_NAME_FALLBACK_RE = re.compile(
+    '["\'“”]name["\'“”]\\s*[:\\uff1a]\\s*["\'“”]([A-Za-z_][A-Za-z0-9_]*)["\'“”]',
+    re.DOTALL,
+)
+
+
 class JsonToolFormatter(ToolFormatter):
     """使用 JSON 文本块内嵌工具调用的格式。
 
@@ -650,6 +656,10 @@ class JsonToolFormatter(ToolFormatter):
         if brace_index >= 0:
             raw = raw[brace_index:]
         name_match = re.search(r'"name"\s*:\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw, re.DOTALL)
+        if not name_match:
+            # [2026-08-06] 弱模型格式保底：兼容单引叶/中文引号包裹的 name，
+            # 尽量把“看上去像 finish 调用”的畤形 JSON 修回合法工具调用，避免 QQ 端吞回复。
+            name_match = _NAME_FALLBACK_RE.search(raw)
         if not name_match:
             return None
         try:

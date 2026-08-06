@@ -71,18 +71,23 @@ class PlaintextRetryHandler:
             ls.use_stream = ls.streaming
             return hook_result(modified=True)
 
-        ctx_ref = _persist_ctx(ls, ctx.step + 1)
-        return hook_result(action=TaskAction(
-            action=ACTION_FAIL,
-            node_id=ls.node.id,
-            error=f"模型未使用 finish 工具，裸文本不被内核认可为合法结束。原始文本: {_short(text, 200)}",
-            context_ref=ctx_ref,
-            summary="plaintext_without_finish",
+        # [2026-08-06] 格式保底：tool_only 重试耗尽后不再 FAIL（FAIL 不产 outbound，
+        # 表现为用户侧“回复无了”）。低智商模型反复不会调 finish 工具时，
+        # 把裸正文包装为隐式 finish 正常投递给用户（对齐 hybrid 模式行为），
+        # result 中标记 implicit_finish=True 与 plaintext_recovery=True 供事件/管理区分。
+        return hook_result(action=_build_implicit_finish(
+            ctx, ls, resp, text, plaintext_recovery=True,
         ))
 
 
-def _build_implicit_finish(ctx: Any, ls: Any, resp: Any, text: str) -> TaskAction:
-    """Build the same implicit finish action used by hybrid output mode."""
+def _build_implicit_finish(
+    ctx: Any, ls: Any, resp: Any, text: str, *, plaintext_recovery: bool = False,
+) -> TaskAction:
+    """Build the same implicit finish action used by hybrid output mode.
+
+    plaintext_recovery=True 表示 tool_only 模式重试耗尽后的裸文本兜底投递，
+    额外在 result 中打 plaintext_recovery 标记，便于事件日志区分。
+    """
     from engine.inference.ai_step import _shadow_write
 
     assistant_msg = ls.formatter.build_assistant_message(resp, text, [])
@@ -110,6 +115,7 @@ def _build_implicit_finish(ctx: Any, ls: Any, resp: Any, text: str) -> TaskActio
             "text": text,
             "attachments": list(ls.tool_produced_attachments),
             "implicit_finish": True,
+            **({"plaintext_recovery": True} if plaintext_recovery else {}),
         },
         context_ref=ctx_ref,
         summary=_short(text, 240),

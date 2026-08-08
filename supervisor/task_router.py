@@ -1102,6 +1102,8 @@ class TaskRouterMixin:
         node_id: str = "",
         task_id: str = "",
         tool_name: str = "",
+        success: bool | None = None,
+        error: str = "",
     ) -> dict[str, Any]:
         """注入异步工具结果到 session，并创建新的 inbound 分支。
 
@@ -1115,10 +1117,13 @@ class TaskRouterMixin:
                 return {"ok": False, "error": "session not found"}
 
             result_atts = list(attachments or [])
-            event_node_id = str(node_id or tool_name or "").strip()
+            event_node_id = str(node_id or "").strip()
             event_task_id = str(task_id or "").strip()
 
-            if result_atts:
+            # Successful media tools keep the existing direct-outbound fast path.
+            # A failed result must deliver its failure text/metadata instead of
+            # silently sending any incidental attachment and dropping the error.
+            if result_atts and success is not False:
                 payload: dict[str, Any] = {
                     "text": "",
                     "attachments": [{"path": p} for p in result_atts],
@@ -1167,6 +1172,20 @@ class TaskRouterMixin:
                 "message_id": msg_id,
                 "text": text,
             }
+            if event_node_id:
+                payload["node_id"] = event_node_id
+            if event_task_id:
+                payload["task_id"] = event_task_id
+            tool = str(tool_name or "").strip()
+            if tool:
+                payload["tool_name"] = tool
+            if success is not None:
+                payload["route_hints"] = {
+                    "async_tool_success": success,
+                    "async_tool_failed": not success,
+                    "async_tool_name": tool,
+                    "async_tool_error": str(error)[:1000] if error else "",
+                }
 
             evt = self.eventlog.append(
                 session_id=session_id,

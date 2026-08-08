@@ -921,6 +921,7 @@ async def _run_async_deliver(
     tool_args: dict,
     async_tool_id: str,
     started_at: float,
+    node_id: str = "",
     result: Any = None,
     error: Exception | None = None,
 ) -> None:
@@ -936,20 +937,29 @@ async def _run_async_deliver(
         _summary = summarize_result(tool_name, result, args=tool_args)
         _tool_spec = registry.get_spec(tool_name)
         _fmt, raw = result_to_raw(tool_name, result, tool_spec=_tool_spec)
+        failure_error = _async_tool_failure(result)
 
         _async_tool_tasks[async_tool_id] = {
             "tool_name": tool_name,
-            "status": "done",
+            "status": "failed" if failure_error else "done",
             "task_id": task_id,
             "started_at": started_at,
             "finished_at": time.monotonic(),
             "elapsed": round(_elapsed, 1),
+            **({"error": failure_error} if failure_error else {}),
         }
 
-        preempt_text = (
-            f'\u2705 Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
-            f'\nSummary: {_summary}\nResult:\n{raw}'
-        )
+        if failure_error:
+            preempt_text = (
+                f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed in {_elapsed:.1f}s: '
+                f'{failure_error}\nDo not infer or fabricate the missing tool result. '
+                "Tell the user the operation failed and ask them to retry."
+            )
+        else:
+            preempt_text = (
+                f'\u2705 Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
+                f'\nSummary: {_summary}\nResult:\n{raw}'
+            )
 
         attachments: list[str] = []
         if isinstance(result, dict):
@@ -962,9 +972,14 @@ async def _run_async_deliver(
                     elif isinstance(a, str):
                         attachments.append(a)
 
-        payload: dict = {"message": preempt_text, "tool_name": tool_name, "task_id": task_id}
-        if attachments:
-            payload["attachment_paths"] = attachments
+        payload = _build_async_result_payload(
+            message=preempt_text,
+            tool_name=tool_name,
+            task_id=task_id,
+            node_id=str(node_id or ""),
+            failure_error=failure_error,
+            attachments=attachments,
+        )
 
         await http.post(
             f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
@@ -983,10 +998,61 @@ async def _run_async_deliver(
         try:
             await http.post(
                 f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
-                json={"message": f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}'},
+                json=_build_async_result_payload(
+                    message=(
+                        f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}\n'
+                        "Do not infer or fabricate the missing tool result. Tell the user the operation failed."
+                    ),
+                    tool_name=tool_name,
+                    task_id=task_id,
+                    node_id=str(node_id or ""),
+                    failure_error=str(e),
+                ),
             )
         except Exception:
             pass
+
+
+def _build_async_result_payload(
+    *,
+    message: str,
+    tool_name: str,
+    task_id: str,
+    node_id: str,
+    failure_error: str = "",
+    attachments: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build the shared Supervisor callback contract for all async paths."""
+    payload: dict[str, Any] = {
+        "message": str(message or ""),
+        "tool_name": str(tool_name or ""),
+        "task_id": str(task_id or ""),
+        "node_id": str(node_id or ""),
+        "success": not bool(failure_error),
+    }
+    if failure_error:
+        payload["error"] = str(failure_error)
+    if attachments:
+        payload["attachment_paths"] = list(attachments)
+    return payload
+
+
+def _async_tool_failure(result: Any) -> str:
+    """Return a readable error when a tool returned an explicit failed envelope.
+
+    Async tools normally report failures as ``{"ok": false, ...}`` instead of
+    raising. Treating that envelope as a completed call produced a misleading ✅
+    callback and let the next model turn invent a result. Keep the decision in a
+    small pure helper so both behavior and regression tests stay deterministic.
+    """
+    if not isinstance(result, dict) or result.get("ok") is not False:
+        return ""
+    error = str(result.get("error") or "").strip()
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    rendered = str(data.get("result") or "").strip()
+    if rendered.upper().startswith("ERROR:"):
+        rendered = rendered[6:].strip()
+    return error or rendered or "tool returned ok=false"
 
 
 async def _run_async_tool(
@@ -1026,19 +1092,28 @@ async def _run_async_tool(
         _tool_spec = registry.get_spec(tool_name)
         _fmt, raw = result_to_raw(tool_name, result, tool_spec=_tool_spec)
 
+        failure_error = _async_tool_failure(result)
         _async_tool_tasks[async_tool_id] = {
             "tool_name": tool_name,
-            "status": "done",
+            "status": "failed" if failure_error else "done",
             "task_id": task_id,
             "started_at": _started,
             "finished_at": time.monotonic(),
             "elapsed": round(_elapsed, 1),
+            **({"error": failure_error} if failure_error else {}),
         }
 
-        preempt_text = (
-            f'\u2705 Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
-            f'\nSummary: {_summary}\nResult:\n{raw}'
-        )
+        if failure_error:
+            preempt_text = (
+                f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed in {_elapsed:.1f}s: '
+                f'{failure_error}\nDo not infer or fabricate the missing tool result. '
+                "Tell the user the operation failed and ask them to retry or provide the input again."
+            )
+        else:
+            preempt_text = (
+                f'\u2705 Async tool "{tool_name}" (id: {async_tool_id}) completed in {_elapsed:.1f}s.'
+                f'\nSummary: {_summary}\nResult:\n{raw}'
+            )
 
         attachments: list[str] = []
         if isinstance(result, dict):
@@ -1055,9 +1130,14 @@ async def _run_async_tool(
                     elif isinstance(a, str):
                         attachments.append(a)
 
-        payload: dict = {"message": preempt_text, "tool_name": tool_name, "task_id": task_id}
-        if attachments:
-            payload["attachment_paths"] = attachments
+        payload = _build_async_result_payload(
+            message=preempt_text,
+            tool_name=tool_name,
+            task_id=task_id,
+            node_id=str(getattr(tool_ctx, "node_id", "") or ""),
+            failure_error=failure_error,
+            attachments=attachments,
+        )
 
         # [Fork/Merge 2026-05-12] Use the route session, not necessarily the runtime session.
         # Why: branch sessions are internal and may not have SDK channel mappings. How: the caller
@@ -1080,7 +1160,16 @@ async def _run_async_tool(
         try:
             await http.post(
                 f"{supervisor_url}/v1/sessions/{session_id}/async_tool_result",
-                json={"message": f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}'},
+                json=_build_async_result_payload(
+                    message=(
+                        f'\u274c Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}\n'
+                        "Do not infer or fabricate the missing tool result. Tell the user the operation failed."
+                    ),
+                    tool_name=tool_name,
+                    task_id=task_id,
+                    node_id=str(getattr(tool_ctx, "node_id", "") or ""),
+                    failure_error=str(e),
+                ),
             )
         except Exception:
             pass
@@ -1368,6 +1457,7 @@ async def _execute_real_tools(
                         tool_args=_t_args,
                         async_tool_id=_async_id,
                         started_at=_tool_t0,
+                        node_id=ls.node.id,
                     ),
                     name=f"async_upgrade_{_t_name}_{_async_id}",
                 )

@@ -29,6 +29,13 @@ _REQUIRE_TOOL_MESSAGE = (
     "If the tool keeps failing, finish with an honest failure message instead."
 )
 
+_VISION_FAILURE_REJECT_MESSAGE = (
+    "\u274c REJECTED: the latest image-reading operation failed, so you do not have "
+    "grounded visual information. Do not describe, OCR, translate, identify, or infer "
+    "anything from the image or chat history. Call finish() with only a brief honest "
+    "failure notice and ask the user to resend/re-reference the image or retry later."
+)
+
 
 # Why: the built-in loader discovers handlers from per-file metadata.
 # How: declare the handler class, hook methods, and priority in one place.
@@ -64,20 +71,22 @@ class FinishGuardHandler:
         if pseudo_calls is not None or real_tool_calls is not None:
             pseudo_list = list(pseudo_calls or [])
             real_list = list(real_tool_calls or [])
-            terminal_name = next(
-                (_tool_name(call) for call in pseudo_list if _tool_name(call) in terminal_tools),
-                "",
+            terminal_call = next(
+                (call for call in pseudo_list if _tool_name(call) in terminal_tools),
+                None,
             )
+            terminal_name = _tool_name(terminal_call) if terminal_call is not None else ""
             has_terminal = bool(terminal_name)
             has_non_reply_others = bool(real_list) or any(
                 _tool_name(call) not in (*terminal_tools, "reply") for call in pseudo_list
             )
         else:
             calls = list(ctx.tool_calls or [])
-            terminal_name = next(
-                (_tool_name(call) for call in calls if _tool_name(call) in terminal_tools),
-                "",
+            terminal_call = next(
+                (call for call in calls if _tool_name(call) in terminal_tools),
+                None,
             )
+            terminal_name = _tool_name(terminal_call) if terminal_call is not None else ""
             has_terminal = bool(terminal_name)
             has_non_reply_others = any(
                 _tool_name(call) not in (*terminal_tools, "reply") for call in calls
@@ -88,6 +97,19 @@ class FinishGuardHandler:
         # 只对 finish 生效（ask 不受限，因为 ask 是向用户提问而非声称完成）。
         _finish_terminal = terminal_name if 'terminal_name' in dir() else ""
         if _finish_terminal == "finish":
+            if _has_unresolved_vision_failure_for_context(ctx):
+                finish_text = _finish_text(terminal_call)
+                if not _is_honest_vision_failure_text(finish_text):
+                    logger.warning(
+                        "Rejected ungrounded finish after vision failure (node=%s, step=%d)",
+                        getattr(ctx.node, "id", ""),
+                        ctx.step,
+                    )
+                    return hook_result(
+                        block=True,
+                        reason="vision_failure_ungrounded_finish",
+                        error_message=_VISION_FAILURE_REJECT_MESSAGE,
+                    )
             _require_reject = self._check_finish_requires_tool(ctx)
             if _require_reject is not None:
                 return _require_reject
@@ -216,6 +238,92 @@ def _finish_required_tools(node: Any) -> set[str]:
     else:
         names = []
     return {str(n).strip() for n in names if str(n).strip()}
+
+
+def _has_unresolved_vision_failure_for_context(ctx: Any) -> bool:
+    """Prefer structured current-task tool state, then inspect resumed callbacks."""
+    loop_state = ctx.extra.get("loop_state") if isinstance(getattr(ctx, "extra", None), dict) else None
+    succeeded = set(getattr(loop_state, "succeeded_real_tools", set()) or set()) if loop_state else set()
+    failed = set(getattr(loop_state, "failed_real_tools", set()) or set()) if loop_state else set()
+    read_succeeded = "read_image" in succeeded
+    read_failed = "read_image" in failed
+    if read_succeeded and not read_failed:
+        return False
+    if read_failed and not read_succeeded:
+        return True
+    # Both sets are cumulative. When retries produced both outcomes, use the
+    # ordered message history to determine which result happened last.
+    return _has_unresolved_vision_failure(getattr(ctx, "messages", None))
+
+
+def _has_unresolved_vision_failure(messages: Any) -> bool:
+    """Find the latest vision status within the current user turn.
+
+    Scan backwards without an arbitrary message-count window. Stop at the current
+    turn's ordinary user input so a failure from an older turn cannot poison later,
+    unrelated requests, while any number of tool messages after a current failure
+    still cannot push it out of the guard.
+    """
+    if not isinstance(messages, list):
+        return False
+    for message in reversed(messages):
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        text = content.strip()
+        is_read_image_result = text.startswith('Tool result for "read_image"')
+        failed_result = is_read_image_result and any(
+            marker in text for marker in ("ERROR:", '"ok": false', "must_not_guess")
+        )
+        if (
+            text.startswith('\u274c Async tool "read_image"')
+            or text.startswith('Tool "read_image" 执行失败')
+            or text.startswith("下游节点 qq.vision 执行失败")
+            or text.startswith("read_image 工具调用失败")
+            or failed_result
+        ):
+            return True
+        if (
+            text.startswith('\u2705 Async tool "read_image"')
+            or text.startswith("下游节点 qq.vision 已完成")
+            or (is_read_image_result and not failed_result)
+        ):
+            return False
+        if str(message.get("role") or "") == "user":
+            return False
+    return False
+
+
+def _finish_text(call: Any) -> str:
+    """Extract finish text from dict/object tool-call shapes."""
+    if call is None:
+        return ""
+    arguments = call.get("arguments") if isinstance(call, dict) else getattr(call, "arguments", None)
+    if isinstance(arguments, dict):
+        return str(arguments.get("text") or "").strip()
+    return ""
+
+
+def _is_honest_vision_failure_text(text: str) -> bool:
+    """Allow only concise failure notices after an unresolved vision failure."""
+    value = str(text or "").strip()
+    if not value or len(value) > 500:
+        return False
+    lowered = value.lower()
+    failure_markers = (
+        "识图失败", "读取图片失败", "图片读取", "读取接口", "无法读取", "没能读取",
+        "看不到图片", "视觉模型", "超时", "限流", "image reading failed",
+        "cannot read the image", "unable to read", "timeout", "rate limit",
+    )
+    visual_claim_markers = (
+        "图中", "画面中", "这张图是", "图片内容", "我看到", "识别到",
+        "文字为", "翻译如下", "the image shows", "i can see",
+    )
+    return any(marker in lowered for marker in failure_markers) and not any(
+        marker in lowered for marker in visual_claim_markers
+    )
 
 
 def _tool_name(call: Any) -> str:

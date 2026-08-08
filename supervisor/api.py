@@ -359,6 +359,8 @@ def create_app(
             node_id=str(body.get("node_id") or ""),
             task_id=str(body.get("task_id") or ""),
             tool_name=str(body.get("tool_name") or ""),
+            success=body.get("success") if isinstance(body.get("success"), bool) else None,
+            error=str(body.get("error") or ""),
         )
         if not result.get("ok"):
             raise HTTPException(status_code=500, detail=result.get("error", "unknown"))

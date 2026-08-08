@@ -24,6 +24,20 @@ from engine.inference.llm_call import _build_messages_for_provider
 from engine.attachments import prepare_messages_for_llm
 
 
+def _messages_contain_images(messages: list[dict[str, Any]]) -> bool:
+    """Return whether provider-ready messages contain multimodal image blocks."""
+    for message in messages:
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        if any(
+            isinstance(part, dict) and part.get("type") in {"image_url", "input_image", "image"}
+            for part in content
+        ):
+            return True
+    return False
+
+
 def _strip_image_blocks(messages: list[dict]) -> list[dict]:
     """Remove image_url content blocks from all messages.
 
@@ -123,11 +137,20 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
     # [fix 2026-07-09] Resolve ${VAR}/$ENV{VAR} for both the fallback entry and
     # the inherited provider block so secrets can live in .env. Explicit values
     # on the fallback entry still take precedence over the provider block.
+    supports_vision_raw = fb_cfg.get("supports_vision")
+    if supports_vision_raw is None:
+        supports_vision_raw = provider_block.get("supports_vision", False)
+    if isinstance(supports_vision_raw, str):
+        supports_vision = supports_vision_raw.strip().lower() in {"1", "true", "yes", "on"}
+    else:
+        supports_vision = bool(supports_vision_raw)
+
     return {
         "provider": provider_name,
         "base_url": _resolve_env_value(fb_cfg.get("base_url")) or _resolve_env_value(provider_block.get("base_url")),
         "api_key": _resolve_env_value(fb_cfg.get("api_key")) or _resolve_env_value(provider_block.get("api_key")),
         "model": _resolve_env_value(fb_cfg.get("model")) or _resolve_env_value(provider_block.get("model")),
+        "supports_vision": supports_vision,
     }
 
 
@@ -157,7 +180,10 @@ def _select_fallbacks_for_node(full_cfg: dict[str, Any], node_id: str) -> list[A
     node_map = full_cfg.get("node_fallbacks")
     if node_id and isinstance(node_map, dict):
         entry = node_map.get(node_id)
-        if isinstance(entry, list) and entry:
+        # An explicit empty list disables fallback for this node. This is
+        # particularly important for vision nodes: silently falling through to
+        # the global text-only chain would remove the image and invite guesses.
+        if isinstance(entry, list):
             return entry
     return full_cfg.get("fallbacks", []) or []
 
@@ -307,6 +333,7 @@ class FallbackProviderHandler:
         messages = ctx.messages
         tools = ctx.tools
         original_provider = ctx.provider
+        has_image_input = _messages_contain_images(messages)
         original_model = getattr(original_provider, "model", "unknown")
 
         # [fix 2026-05-28] Retrieve formatter from loop_state so we can run the
@@ -336,6 +363,18 @@ class FallbackProviderHandler:
             fb_base_url = fb_cfg["base_url"]
             fb_api_key = fb_cfg["api_key"]
             fb_model = fb_cfg["model"] or original_model
+            fb_supports_vision = bool(fb_cfg.get("supports_vision"))
+
+            if has_image_input and not fb_supports_vision:
+                logger.warning(
+                    "fallback_provider: skipping fallback[%d] (%s/%s) — "
+                    "request contains images but fallback is not marked supports_vision=true",
+                    i, fb_provider_type, fb_model,
+                )
+                fallback_errors.append(
+                    f"[Fallback {fb_provider_type}/{fb_model} skipped: vision unsupported]"
+                )
+                continue
 
             if not fb_base_url or not fb_api_key:
                 logger.warning(
@@ -378,11 +417,12 @@ class FallbackProviderHandler:
                     _fb_formatted, workspace_root,
                 ) if workspace_root else _fb_formatted
 
-                # [fix 2026-05-28] Strip image_url blocks for non-vision
-                # fallback providers (e.g. DeepSeek). Without this, messages
-                # containing multimodal content cause deserialization errors
-                # like: unknown variant `image_url`, expected `text`.
-                _fb_messages = _strip_image_blocks(_fb_messages)
+                # Only text-only fallbacks may strip image blocks. Multimodal
+                # requests are filtered above unless the entry explicitly opts in
+                # with supports_vision=true, in which case the original image
+                # blocks must reach the fallback provider unchanged.
+                if not fb_supports_vision:
+                    _fb_messages = _strip_image_blocks(_fb_messages)
 
                 t0 = time.monotonic()
                 new_resp = await fb_provider.chat(

@@ -88,6 +88,12 @@ from .config import (
     REPLY_ATTACHMENT_CACHE_FILE,
     ANON_MAP_FILE,
 )
+from .attachment_policy import (
+    looks_like_image_query,
+    select_recent_image_entries,
+    should_fallback_to_recent_images,
+    source_attachments_from_merged,
+)
 from .emoji_handler import (
     count_duplicate_face_names,
     extract_named_custom_face_metadata,
@@ -1183,29 +1189,38 @@ def _forward_nodes_from_cached_reply(bot: Bot, reply_message_id: Any) -> list[di
     return [node] if node else []
 
 
-def _recent_images_for_text(conversation_key: str, event: Event) -> List[Dict[str, Any]]:
-    now = time.time()
-    sender_id = str(getattr(event, "user_id", "") or "")
-    entries = [
-        item for item in _recent_images.get(conversation_key, ())
-        if now - item.created_at <= RECENT_IMAGE_MAX_AGE_SECONDS
+def _cached_reply_image_attachments(message_id: Any, conversation_key: str = "") -> List[Dict[str, Any]]:
+    """Return persisted source images bound to an inbound or Bot reply message."""
+    mid = str(message_id or "").strip()
+    if not mid:
+        return []
+    item = _reply_attachment_cache.get(mid)
+    if not isinstance(item, dict):
+        return []
+    cached_conversation = str(item.get("conversation_key") or "")
+    if conversation_key and cached_conversation and cached_conversation != str(conversation_key):
+        return []
+    attachments = item.get("attachments") if isinstance(item.get("attachments"), list) else []
+    return [
+        dict(att)
+        for att in attachments[:MAX_IMAGES_PER_TURN]
+        if isinstance(att, dict) and str(att.get("type") or "") == "image" and att.get("path")
     ]
-    if IMAGE_PREFER_SAME_SENDER:
-        same_sender = [item for item in entries if item.sender_id == sender_id]
-        if same_sender:
-            entries = same_sender
-    return [dict(item.attachment) for item in entries[-MAX_IMAGES_PER_TURN:]]
+
+
+def _recent_images_for_text(conversation_key: str, event: Event) -> List[Dict[str, Any]]:
+    """Return one unambiguous recent image batch from the current sender only."""
+    return select_recent_image_entries(
+        _recent_images.get(conversation_key, ()),
+        sender_id=str(getattr(event, "user_id", "") or ""),
+        now=time.time(),
+        max_age_seconds=RECENT_IMAGE_MAX_AGE_SECONDS,
+        max_images=MAX_IMAGES_PER_TURN,
+    )
 
 
 def _text_looks_like_image_query(text: str) -> bool:
-    value = (text or "").strip().lower()
-    if not value:
-        return False
-    keywords = (
-        "图", "图片", "截图", "照片", "看下", "看看", "看一下", "识别", "读一下",
-        "ocr", "文字", "这是什么", "什么意思", "表情包", "image", "photo", "screenshot",
-    )
-    return any(k in value for k in keywords)
+    return looks_like_image_query(text)
 
 
 async def _merge_recent_images_after_text(
@@ -1215,7 +1230,20 @@ async def _merge_recent_images_after_text(
     user_text: str,
     attachments: List[Dict[str, Any]],
 ) -> None:
-    if attachments or not ENABLE_IMAGE_INPUT or not _text_looks_like_image_query(user_text):
+    reply_message_id = _extract_reply_message_id(
+        event.get_message() if hasattr(event, "get_message") else None,
+        getattr(event, "raw_message", None),
+    )
+    # A reply must stay on its explicit message chain. _build_reply_context will
+    # recover an image directly from the quoted message or from the Bot reply's
+    # persisted source-image binding. Falling back to an unrelated recent image
+    # here caused "再仔细看看图" to replace the intended PNG with an older GIF.
+    if not should_fallback_to_recent_images(
+        has_attachments=bool(attachments),
+        image_input_enabled=ENABLE_IMAGE_INPUT,
+        looks_like_image_query=_text_looks_like_image_query(user_text),
+        reply_message_id=reply_message_id,
+    ):
         return
     if IMAGE_WAIT_AFTER_TEXT_SECONDS > 0:
         await asyncio.sleep(IMAGE_WAIT_AFTER_TEXT_SECONDS)
@@ -2804,6 +2832,11 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
         # message_id -> 本地路径），则把原图作为附件送给 AI，支持“引用该图继续改”。
         quoted_attachments = []
         bot_msg_atts = _message_attachment_records(reply_message_id, only_images=True)
+        if not bot_msg_atts:
+            # Text-only Bot replies are bound to the source images of their task
+            # when sent. This persistent cache lets a user's follow-up reply keep
+            # the original image even after adapter restart.
+            bot_msg_atts = _cached_reply_image_attachments(reply_message_id, conversation_key)
         if bot_msg_atts:
             for att in bot_msg_atts:
                 rel_path = _to_workspace_rel_path(att["path"])
@@ -3705,7 +3738,13 @@ async def _enqueue_or_submit_inbound(item: QueuedInbound) -> bool:
             existing.text = f"{existing.text}\n\n【排队期间追加消息】\n{item.text}"
             existing.attachments.extend(item.attachments)
             existing.event = item.event
-            existing.platform_updates = item.platform_updates
+            existing.platform_updates = dict(item.platform_updates)
+            # The merged task uses all accumulated attachments, so its eventual
+            # Bot text reply must bind all of those same source images rather than
+            # only the last queued message's list.
+            existing.platform_updates["_source_attachments"] = source_attachments_from_merged(
+                existing.attachments
+            )
             existing.user_text = item.user_text
         else:
             _qq_queue.append(item)
@@ -4211,8 +4250,14 @@ async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any, *, de
     raise ValueError(f"unknown QQ target type: {target!r}")
 
 
-async def _send_split_text(bot: Bot, target: Dict[str, Any], text: str) -> bool:
-    """按 [SPLIT] 拆分最终文本，逐段发送并清理 QQ 不支持的标记。"""
+async def _send_split_text(
+    bot: Bot,
+    target: Dict[str, Any],
+    text: str,
+    *,
+    source_attachments: List[Dict[str, Any]] | None = None,
+) -> bool:
+    """按 [SPLIT] 拆分文本，并把每段回复绑定到本轮来源图片。"""
     # 2026-05-01 修改原因：文本拆分逻辑对群聊和私聊相同，实际发送交给
     # _send_qq_message 处理，确保私聊也能复用表情替换和分段发送能力。
     sent_any = False
@@ -4237,7 +4282,14 @@ async def _send_split_text(bot: Bot, target: Dict[str, Any], text: str) -> bool:
             if target.get("reply_sender_id"):
                 prefix = prefix + MessageSegment.at(target["reply_sender_id"]) + MessageSegment.text(" ")
             msg = prefix + msg
-        await _send_qq_message(bot, target, msg)
+        sent_message_id = await _send_qq_message(bot, target, msg)
+        if sent_message_id and source_attachments:
+            _remember_reply_attachments(
+                sent_message_id,
+                str(target.get("conversation_key") or ""),
+                str(getattr(bot, "self_id", "") or ""),
+                source_attachments,
+            )
         sent_any = True
         if index < len(parts) - 1:
             await asyncio.sleep(0.5)
@@ -4763,13 +4815,25 @@ def _spawn_attachment_send(bot: Bot, target: Dict[str, Any], attachments: List[A
     task.add_done_callback(_attachment_send_tasks.discard)
 
 
-async def _send_text_and_attachments(bot: Bot, target: Dict[str, Any], text: str, attachments: List[Any]) -> None:
-    """统一发送最终文本与附件，并仅在群聊中把最终文本写回群历史。"""
+async def _send_text_and_attachments(
+    bot: Bot,
+    target: Dict[str, Any],
+    text: str,
+    attachments: List[Any],
+    *,
+    source_attachments: List[Dict[str, Any]] | None = None,
+) -> None:
+    """统一发送最终文本/附件，并持久绑定回复所依据的来源图片。"""
     conv_key = target.get("conversation_key")
     # 2026-05-01 修改原因：私聊没有群历史缓存，不应写入 _group_history；群聊
     # 仍保留原来的 Bot 回复入库逻辑，维持后续 @Bot 请求的上下文连续性。
     if text:
-        if await _send_split_text(bot, target, text) and target.get("type") == "group":
+        if await _send_split_text(
+            bot,
+            target,
+            text,
+            source_attachments=source_attachments,
+        ) and target.get("type") == "group":
             group_id = target.get("group_id")
             if group_id is not None:
                 _record_bot_reply(int(group_id), text)
@@ -4907,7 +4971,16 @@ class TangQiuCallbacks:
             final_text, reactions = _extract_reactions(final_text)
             if reactions:
                 await self.add_reactions(trigger, reactions)
-        await _send_text_and_attachments(bot, target, final_text, attachments or [])
+        source_attachments = platform_data.get("_source_attachments")
+        if not isinstance(source_attachments, list):
+            source_attachments = []
+        await _send_text_and_attachments(
+            bot,
+            target,
+            final_text,
+            attachments or [],
+            source_attachments=source_attachments,
+        )
         # 2026-05-03 修改原因：最终回复到达时，触发消息上可能仍残留生命周期 React。
         # 做法是调用统一清理函数移除 76、281、178、97、326，目的在于把本轮
         # 新增的推理和工具阶段也纳入最终收尾。
@@ -4943,7 +5016,15 @@ class TangQiuCallbacks:
         if reactions:
             await self.add_reactions(trigger, reactions)
         if text:
-            if await _send_split_text(bot, target, text):
+            source_attachments = platform_data.get("_source_attachments")
+            if not isinstance(source_attachments, list):
+                source_attachments = []
+            if await _send_split_text(
+                bot,
+                target,
+                text,
+                source_attachments=source_attachments,
+            ):
                 conv_key = target.get("conversation_key")
                 if conv_key:
                     _mark_qq_reply_finished(str(conv_key))
@@ -5978,6 +6059,10 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     draw_direct_prompt = _parse_direct_draw_command(user_text)
     entry_node_id = DRAW_NODE_ID if draw_direct_prompt is not None else ""
     inbound_text = await _build_draw_direct_inbound_text(event, draw_direct_prompt, False) if draw_direct_prompt is not None else await _build_inbound_text(event, bot, user_text, stable_conversation_key, attachments)
+    if _text_looks_like_image_query(user_text) and not attachments:
+        attachment_errors.append(
+            "当前消息或引用链未能绑定到可确认的图片；不得从聊天历史猜测图片内容，请让用户重新发送或直接引用原图。"
+        )
     if attachment_errors:
         inbound_text += "\n\n【图片处理提示】\n" + "\n".join(dict.fromkeys(attachment_errors))
     if attachments:
@@ -5990,6 +6075,7 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
         "type": "group",
         "group_id": group_id,
         "conversation_key": stable_conversation_key,
+        "_source_attachments": [dict(att) for att in attachments if isinstance(att, dict)],
     }
     try:
         ok = await _enqueue_or_submit_inbound(QueuedInbound(
@@ -6129,6 +6215,10 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     draw_direct_prompt = _parse_direct_draw_command(user_text)
     entry_node_id = DRAW_NODE_ID if draw_direct_prompt is not None else ""
     inbound_text = await _build_draw_direct_inbound_text(event, draw_direct_prompt, True) if draw_direct_prompt is not None else await _build_private_inbound_text(event, bot, user_text, stable_conversation_key, attachments)
+    if _text_looks_like_image_query(user_text) and not attachments:
+        attachment_errors.append(
+            "当前消息或引用链未能绑定到可确认的图片；不得从聊天历史猜测图片内容，请让用户重新发送或直接引用原图。"
+        )
     if attachment_errors:
         inbound_text += "\n\n【图片处理提示】\n" + "\n".join(dict.fromkeys(attachment_errors))
     if attachments:
@@ -6141,6 +6231,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
         "type": "private",
         "user_id": user_id,
         "conversation_key": stable_conversation_key,
+        "_source_attachments": [dict(att) for att in attachments if isinstance(att, dict)],
     }
     try:
         ok = await _enqueue_or_submit_inbound(QueuedInbound(

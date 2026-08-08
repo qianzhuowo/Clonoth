@@ -111,6 +111,8 @@ openai:
 #     也是继承字段的配置块名（同名块的 base_url/api_key/model 会被继承）。
 #   - fallback 条目里显式写的字段优先于被继承的 provider 块。
 #   - base_url / api_key / model 均支持 ${VAR} 从 .env 展开。
+#   - 多模态请求只会尝试显式标记 `supports_vision: true` 的备选；未标记的
+#     文本模型会被跳过，避免剥掉图片后根据聊天上下文猜图。
 
 # 备选渠道用到的 provider 配置块（key 建议直接用 provider 类型名）。
 # api_key / base_url 放 .env，用 ${VAR} 引用即可。
@@ -137,6 +139,7 @@ fallbacks:
     base_url: "${OPENAI_BACKUP_BASE_URL}"   # 例如 https://backup-relay.example.com/v1
     api_key: "${OPENAI_BACKUP_API_KEY}"
     model: gpt-4o
+    supports_vision: true                   # 只有确认支持图片输入时才设为 true
 
 # ---------------------------------------------------------------------------
 # 按节点的专属备选链（node_fallbacks，可选）
@@ -148,12 +151,14 @@ fallbacks:
 #   1) 节点调用失败时，先看 node_fallbacks 里有没有以该节点 id 为 key 的条目；
 #      命中则用这个专属备选链。
 #   2) 未命中则回退到上方全局 fallbacks。
+#   3) 显式配置空列表（如 `qq.vision: []`）可禁用该节点的全部 fallback。
 # 每个条目的写法与 fallbacks 完全一致（provider 名 + 可选覆盖 base_url/api_key/model，
 # 支持 ${VAR} 展开，可继承同名 provider 块）。
 #
 # 常用节点 id：
 #   system.compactor        上下文压缩节点
 #   system.turn_summarizer  轮摘要节点
+#   qq.vision               QQ 原生视觉入口（备选必须 supports_vision: true）
 # （read_image 是工具而非 AI 节点，不走 fallback；它的模型由 CLONOTH_IMAGE_MODEL 控制。）
 #
 # node_fallbacks:

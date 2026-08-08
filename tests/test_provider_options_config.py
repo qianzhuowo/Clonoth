@@ -7,8 +7,12 @@ provider adapters can rely on one combined options dictionary.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
+
+import yaml
 
 # Why: the project is tested directly from a source checkout. How: put the
 # repository root on sys.path before importing local modules. Purpose: exercise
@@ -17,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from clonoth_runtime import DEFAULT_RUNTIME_CONFIG  # noqa: E402
 from engine.runner import _merge_provider_options  # noqa: E402
+from engine.builtin import fallback_provider as fallback_module  # noqa: E402
 
 
 def test_default_openai_provider_declares_options_dict() -> None:
@@ -55,3 +60,119 @@ def test_provider_options_merge_keeps_global_defaults_and_node_overrides() -> No
     }
     assert global_options["reasoning"]["effort"] == "medium"
     assert node_options["reasoning"] == {"effort": "high"}
+
+
+_IMAGE_MESSAGES = [
+    {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ],
+    }
+]
+
+
+def test_explicit_empty_node_fallback_disables_global_chain() -> None:
+    cfg = {"fallbacks": [{"provider": "openai"}], "node_fallbacks": {"qq.vision": []}}
+    assert fallback_module._select_fallbacks_for_node(cfg, "qq.vision") == []
+
+
+def test_fallback_supports_vision_override_and_inheritance() -> None:
+    cfg = {
+        "openai": {
+            "base_url": "https://example.test/v1",
+            "api_key": "test-key",
+            "model": "vision-model",
+            "supports_vision": True,
+        }
+    }
+    inherited = fallback_module._resolve_fallback_entry({"provider": "openai"}, cfg)
+    overridden = fallback_module._resolve_fallback_entry(
+        {"provider": "openai", "supports_vision": "false"}, cfg
+    )
+    assert inherited["supports_vision"] is True
+    assert overridden["supports_vision"] is False
+
+
+def _fallback_ctx(tmp_path: Path) -> SimpleNamespace:
+    return SimpleNamespace(
+        response=SimpleNamespace(ok=False, status_code=500, error="primary failed"),
+        rctx=SimpleNamespace(workspace_root=tmp_path),
+        node=SimpleNamespace(id="qq.vision"),
+        messages=_IMAGE_MESSAGES,
+        tools=[],
+        provider=SimpleNamespace(model="primary", timeout=10.0),
+        extra={"loop_state": SimpleNamespace(formatter=None)},
+    )
+
+
+def test_text_only_fallback_is_skipped_for_image_request(tmp_path, monkeypatch) -> None:
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "config.yaml").write_text(
+        yaml.safe_dump({
+            "fallbacks": [{
+                "provider": "openai",
+                "base_url": "https://example.test/v1",
+                "api_key": "test-key",
+                "model": "text-only",
+            }]
+        }),
+        encoding="utf-8",
+    )
+    called = False
+
+    def _unexpected_create(**kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("text-only vision fallback must not be created")
+
+    monkeypatch.setattr(fallback_module, "_create_fallback_provider", _unexpected_create)
+    ctx = _fallback_ctx(tmp_path)
+    asyncio.run(fallback_module.FallbackProviderHandler().handle(ctx))
+
+    assert called is False
+    assert ctx.response.ok is False
+    assert "vision unsupported" in ctx.response.error
+
+
+def test_vision_fallback_preserves_image_blocks(tmp_path, monkeypatch) -> None:
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "config.yaml").write_text(
+        yaml.safe_dump({
+            "fallbacks": [{
+                "provider": "openai",
+                "base_url": "https://example.test/v1",
+                "api_key": "test-key",
+                "model": "vision-backup",
+                "supports_vision": True,
+            }]
+        }),
+        encoding="utf-8",
+    )
+    captured = {}
+
+    class _Provider:
+        model = "vision-backup"
+
+        async def chat(self, *, messages, tools):
+            captured["messages"] = messages
+            return SimpleNamespace(ok=True, status_code=200, error="")
+
+    monkeypatch.setattr(fallback_module, "_create_fallback_provider", lambda **kwargs: _Provider())
+    monkeypatch.setattr(
+        fallback_module,
+        "_build_messages_for_provider",
+        lambda messages, formatter, provider: messages,
+    )
+    monkeypatch.setattr(
+        fallback_module,
+        "prepare_messages_for_llm",
+        lambda messages, workspace_root: messages,
+    )
+
+    ctx = _fallback_ctx(tmp_path)
+    asyncio.run(fallback_module.FallbackProviderHandler().handle(ctx))
+
+    assert ctx.response.ok is True
+    assert fallback_module._messages_contain_images(captured["messages"])

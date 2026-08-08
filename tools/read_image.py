@@ -12,7 +12,10 @@ Requires GEMINI_API_KEY or OPENAI_API_KEY environment variable.
 
 SPEC = {
     "name": "read_image",
-    "async_mode": True,
+    # Image understanding is a dependency of the current answer, not a detached
+    # deliverable. Keep it synchronous so the model must observe the real success
+    # or failure before it can finish the turn.
+    "async_mode": False,
     "description": (
         "[ONLY for text-only models like DeepSeek. Do NOT use if you can see images natively.] "
         "Analyze image(s) and return a comprehensive text description including all visible text (OCR), "
@@ -63,7 +66,15 @@ if __name__ == "__main__":
         # description, but the engine still expects data.result for readable tool
         # history. How: include ERROR text under data.result in the failure JSON.
         # Purpose: keep vision-tool failures understandable after schema migration.
-        print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False))
+        print(json.dumps({
+            "ok": False,
+            "error": str(error),
+            "data": {
+                "result": f"ERROR: {error}",
+                "vision_failed": True,
+                "must_not_guess": True,
+            },
+        }, ensure_ascii=False))
         sys.exit(1)
 
     args = _input
@@ -241,14 +252,30 @@ if __name__ == "__main__":
     # ---- Send request ----
     try:
         with urllib_request.urlopen(req, timeout=100) as resp:
-            resp_json = json.loads(resp.read().decode("utf-8"))
-    except HTTPError as e:
-        error_body = ""
+            response_status = int(getattr(resp, "status", 200) or 200)
+            response_type = str(resp.headers.get("Content-Type") or "unknown")
+            response_text = resp.read().decode("utf-8", errors="replace")
         try:
-            error_body = e.read().decode("utf-8", errors="replace")[:2000]
+            resp_json = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            # Do not echo an upstream body into the tool transcript: proxy login
+            # pages and gateway diagnostics may contain cookies, request metadata,
+            # or reflected secrets. Status, type, size and parse location are enough
+            # for safe diagnosis.
+            fail(
+                "API returned invalid JSON "
+                f"(status={response_status}, content_type={response_type}, "
+                f"body_bytes={len(response_text.encode('utf-8'))}, parse_error={exc})"
+            )
+    except HTTPError as e:
+        content_type = "unknown"
+        body_bytes = 0
+        try:
+            content_type = str(e.headers.get("Content-Type") or "unknown")
+            body_bytes = len(e.read())
         except Exception:
             pass
-        fail(f"API HTTP {e.code}: {error_body}")
+        fail(f"API HTTP {e.code} (content_type={content_type}, body_bytes={body_bytes})")
     except URLError as e:
         fail(f"API connection error: {e.reason}")
     except Exception as e:

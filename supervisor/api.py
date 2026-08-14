@@ -1488,13 +1488,13 @@ def create_app(
         app.mount("/web", StaticFiles(directory=str(web_dist), html=True), name="web")
         print(f"[web] 前端地址: http://{{host}}:{{port}}/web/", flush=True)
 
-    # 启动时打印 token 并写入共享文件供 engine 读取
+    # 启动时初始化 token 并写入共享文件供 engine 读取；严禁输出 token 原文。
     token = get_admin_token()
     _token_file = state.workspace_root / "data" / ".admin_token"
     _token_file.parent.mkdir(parents=True, exist_ok=True)
     _token_file.write_text(token, encoding="utf-8")
     print(f"[admin] 管理界面地址: http://{{host}}:{{port}}/admin/", flush=True)
-    print(f"[admin] 管理 Token: {token}", flush=True)
+    print("[admin] 管理 Token 已初始化（内容不输出）", flush=True)
     print(f"[admin] Token 已写入: {_token_file}", flush=True)
 
     return app

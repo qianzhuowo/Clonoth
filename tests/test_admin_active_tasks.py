@@ -174,3 +174,38 @@ def test_admin_active_tasks_returns_summaries_sorted_and_requires_auth(tmp_path:
         assert "large_prompt" not in str(item)
         assert "secret_input" not in str(item)
         assert "must-not-leak" not in str(item)
+
+
+def test_generated_admin_token_is_never_printed(monkeypatch, capsys) -> None:
+    """Auto-generated credentials must not be exposed through startup stdout."""
+    secret = "generated-admin-token-must-stay-secret"
+    monkeypatch.delenv("CLONOTH_ADMIN_TOKEN", raising=False)
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+    monkeypatch.setattr(admin_api.secrets, "token_urlsafe", lambda _length: secret)
+
+    assert admin_api.get_admin_token() == secret
+
+    output = capsys.readouterr().out
+    assert secret not in output
+    assert "内容不输出" in output
+
+
+def test_create_app_writes_but_does_not_print_admin_token(
+    tmp_path: Path, monkeypatch, capsys,
+) -> None:
+    """Startup may persist the token for workers, but must never log its value."""
+    secret = "configured-admin-token-must-stay-secret"
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", secret)
+    monkeypatch.setattr(admin_api, "_admin_token", "")
+
+    state = _make_state(tmp_path)
+    create_app(
+        state=state,
+        process_manager=None,
+        config_store=ConfigStore(path=tmp_path / "data" / "config.yaml"),
+    )
+
+    output = capsys.readouterr().out
+    assert secret not in output
+    assert "管理 Token 已初始化（内容不输出）" in output
+    assert (tmp_path / "data" / ".admin_token").read_text(encoding="utf-8") == secret

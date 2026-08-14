@@ -377,6 +377,7 @@ class SchedulerThread:
                     }
                     task.updated_at = _now_ts
                     task.lease_expires_at = None
+                    self._state._reset_task_route_state_locked(task)
                     self._state._event_task_snapshot("task_completed", task, component="supervisor")
                     self._state._route_completed_task_locked(task)
                     log.warning(f"[scheduler] reaped stale running task {tid} (node={task.node_id}, reason={_reason})")

@@ -24,10 +24,13 @@ session 信息仍可从此文件完整恢复。
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import tempfile
+import threading
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -35,6 +38,12 @@ from typing import Any
 from ._helpers import SessionInfo, _now
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RegistrySnapshot:
+    generation: int
+    registry: dict[str, dict[str, Any]]
 
 
 class SessionStore:
@@ -46,8 +55,11 @@ class SessionStore:
 
     def __init__(self, path: Path):
         self._path = path
-        # 内存中保存完整的 raw dict 副本，避免每次写入前重新读文件
+        self._lock = threading.RLock()
+        # 内存中保存完整的 raw dict 副本，所有访问均经公共线程安全 API。
         self._registry: dict[str, dict[str, Any]] = {}
+        self._generation = 0
+        self._flushed_generation = 0
 
     # ------------------------------------------------------------------ #
     #  启动时加载
@@ -149,6 +161,10 @@ class SessionStore:
             except Exception as exc:
                 logger.warning("sessions.json: bad entry %s (%s); skipping", sid, exc)
 
+        with self._lock:
+            if self._registry:
+                self._generation = 1
+                self._flushed_generation = 1
         logger.info(
             "sessions.json: loaded %d active sessions, %d child sessions (%d total entries)",
             len(sessions),
@@ -158,60 +174,99 @@ class SessionStore:
         return sessions, conv_map, child_map, parent_children
 
     # ------------------------------------------------------------------ #
-    #  写入接口（调用方须持有 _lock）
+    #  Thread-safe registry API
+    # ------------------------------------------------------------------ #
+
+    def _changed_locked(self) -> RegistrySnapshot:
+        self._generation += 1
+        return RegistrySnapshot(self._generation, copy.deepcopy(self._registry))
+
+    def snapshot(self) -> RegistrySnapshot:
+        """Copy one immutable registry generation without exposing shared dicts."""
+        with self._lock:
+            return RegistrySnapshot(self._generation, copy.deepcopy(self._registry))
+
+    def get_entry(self, session_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            entry = self._registry.get(session_id)
+            return copy.deepcopy(entry) if isinstance(entry, dict) else None
+
+    def items_snapshot(self) -> list[tuple[str, dict[str, Any]]]:
+        with self._lock:
+            return [(sid, copy.deepcopy(entry)) for sid, entry in self._registry.items()]
+
+    def keys_snapshot(self) -> list[str]:
+        with self._lock:
+            return list(self._registry.keys())
+
+    def upsert_entry(
+        self, session_id: str, entry: dict[str, Any], *, flush: bool = True,
+    ) -> RegistrySnapshot:
+        with self._lock:
+            self._registry[session_id] = copy.deepcopy(entry)
+            snapshot = self._changed_locked()
+        if flush:
+            self.flush_snapshot(snapshot)
+        return snapshot
+
+    def set_entry_field(
+        self, session_id: str, field: str, value: Any, *, flush: bool = True,
+    ) -> RegistrySnapshot | None:
+        with self._lock:
+            entry = self._registry.get(session_id)
+            if entry is None:
+                return None
+            entry[field] = copy.deepcopy(value)
+            snapshot = self._changed_locked()
+        if flush:
+            self.flush_snapshot(snapshot)
+        return snapshot
+
+    def remove_sessions(
+        self, session_ids: list[str] | set[str], *, flush: bool = True,
+    ) -> RegistrySnapshot | None:
+        with self._lock:
+            changed = False
+            for session_id in session_ids:
+                changed = self._registry.pop(str(session_id), None) is not None or changed
+            if not changed:
+                return None
+            snapshot = self._changed_locked()
+        if flush:
+            self.flush_snapshot(snapshot)
+        return snapshot
+
+    # ------------------------------------------------------------------ #
+    #  写入接口
     # ------------------------------------------------------------------ #
 
     def on_session_created(self, info: SessionInfo) -> None:
-        """持久化一个新创建的 session。"""
-        self._registry[info.session_id] = {
-            "session_id": info.session_id,
-            "channel": info.channel,
-            "conversation_key": info.conversation_key,
-            "created_at": info.created_at.isoformat(),
-            "updated_at": info.updated_at.isoformat() if info.updated_at else info.created_at.isoformat(),
-            "reset": False,
-            # Why: session creation can already know the desired entry node in
-            # restored or specialized flows. How: serialize the SessionInfo field
-            # beside the existing metadata. Purpose: restart recovery can route
-            # inbound callbacks without relying on volatile supervisor memory.
-            "entry_node_id": info.entry_node_id,
-            # [AutoC 2026-06-01] Why: session-scoped provider selection must
-            # survive supervisor restart. How: serialize the SessionInfo override
-            # dict beside other session metadata. Purpose: engine can recover the
-            # same provider/model choice through the supervisor API after restart.
-            "provider_override": dict(info.provider_override or {}),
-        }
-        self._flush()
+        """Persist a new session through one versioned immutable snapshot."""
+        with self._lock:
+            self._registry[info.session_id] = {
+                "session_id": info.session_id,
+                "channel": info.channel,
+                "conversation_key": info.conversation_key,
+                "created_at": info.created_at.isoformat(),
+                "updated_at": info.updated_at.isoformat() if info.updated_at else info.created_at.isoformat(),
+                "reset": False,
+                "entry_node_id": info.entry_node_id,
+                "provider_override": dict(info.provider_override or {}),
+            }
+            snapshot = self._changed_locked()
+        self.flush_snapshot(snapshot)
 
     def update_provider_override(self, session_id: str, provider_override: dict[str, Any]) -> None:
         """更新 session 的 provider_override 并落盘。"""
-        entry = self._registry.get(session_id)
-        if entry is not None:
-            # [AutoC 2026-06-01] Why: provider_override changes are requested after
-            # session creation through admin APIs. How: replace only this field in
-            # the in-memory registry and flush atomically. Purpose: preserve all
-            # other session metadata while making the override durable.
-            entry["provider_override"] = dict(provider_override or {})
-            self._flush()
+        self.set_entry_field(session_id, "provider_override", dict(provider_override or {}))
 
     def update_entry_node(self, session_id: str, entry_node_id: str) -> None:
         """更新 session 的入口节点并落盘。"""
-        entry = self._registry.get(session_id)
-        if entry is not None:
-            # Why: switch_node and first inbound routing can change the effective
-            # session entry after the session row was created. How: update only
-            # the entry_node_id field on the in-memory registry and flush the
-            # complete sessions.json atomically. Purpose: preserve all other
-            # session metadata while making the new route survive restarts.
-            entry["entry_node_id"] = entry_node_id
-            self._flush()
+        self.set_entry_field(session_id, "entry_node_id", entry_node_id)
 
     def on_session_reset(self, session_id: str) -> None:
         """将 session 标记为已重置。"""
-        entry = self._registry.get(session_id)
-        if entry is not None:
-            entry["reset"] = True
-            self._flush()
+        self.set_entry_field(session_id, "reset", True)
 
     def remove_session(self, session_id: str) -> None:
         """从 sessions.json 中物理删除一个 session 条目。
@@ -221,9 +276,7 @@ class SessionStore:
         How: 从 registry 中 pop 并 flush。
         Purpose: 立即释放已完成 branch 和已过期 child 的注册记录。
         """
-        if session_id in self._registry:
-            self._registry.pop(session_id)
-            self._flush()
+        self.remove_sessions([session_id])
 
     def on_child_session_created(
         self,
@@ -241,26 +294,24 @@ class SessionStore:
         now_str = _now().isoformat()
         # Inherit parent's conversation_key so child tasks can resolve
         # the originating channel (e.g. for approval UI routing).
-        parent_info = self._registry.get(parent_session_id)
-        parent_conv_key = parent_info.get("conversation_key", "") if parent_info else ""
-        self._registry[child_session_id] = {
-            "session_id": child_session_id,
-            "channel": "internal",
-            "conversation_key": parent_conv_key,
-            "created_at": now_str,
-            "reset": False,
-            "is_child": True,
-            "parent_session_id": parent_session_id,
-            "node_id": node_id,
-            "context_key": context_key,
-            # [AutoC 2026-05-30] Why: stale cleanup must distinguish fresh/fork
-            # children from accumulate children. How: persist a placeholder here
-            # and let the caller set the concrete context_mode immediately after
-            # creation. Purpose: 24h TTL cleanup can skip accumulate sessions.
-            "context_mode": "",
-            "last_active_at": now_str,
-        }
-        self._flush()
+        with self._lock:
+            parent_info = self._registry.get(parent_session_id)
+            parent_conv_key = parent_info.get("conversation_key", "") if parent_info else ""
+            self._registry[child_session_id] = {
+                "session_id": child_session_id,
+                "channel": "internal",
+                "conversation_key": parent_conv_key,
+                "created_at": now_str,
+                "reset": False,
+                "is_child": True,
+                "parent_session_id": parent_session_id,
+                "node_id": node_id,
+                "context_key": context_key,
+                "context_mode": "",
+                "last_active_at": now_str,
+            }
+            snapshot = self._changed_locked()
+        self.flush_snapshot(snapshot)
 
     def touch_updated_at(self, session_id: str, updated_at: datetime) -> None:
         """Sync updated_at into the registry (no immediate flush).
@@ -272,9 +323,11 @@ class SessionStore:
         How: update the registry entry in memory; periodic _flush persists it.
         Purpose: updated_at survives restarts without per-message disk writes.
         """
-        entry = self._registry.get(session_id)
-        if entry is not None and not entry.get("is_child") and not entry.get("reset"):
-            entry["updated_at"] = updated_at.isoformat()
+        with self._lock:
+            entry = self._registry.get(session_id)
+            if entry is not None and not entry.get("is_child") and not entry.get("reset"):
+                entry["updated_at"] = updated_at.isoformat()
+                self._generation += 1
 
     def update_last_active(self, child_session_id: str) -> None:
         """更新 child session 的 last_active_at 时间戳。
@@ -282,39 +335,57 @@ class SessionStore:
         Child Session 隔离（Phase A）：在 child session 被 accumulate 模式复用时，
         以及子 task 创建/完成时调用，用于 TTL 过期判定。
         """
-        entry = self._registry.get(child_session_id)
-        if entry is not None and entry.get("is_child"):
+        with self._lock:
+            entry = self._registry.get(child_session_id)
+            if entry is None or not entry.get("is_child"):
+                return
             entry["last_active_at"] = _now().isoformat()
-            self._flush()
+            snapshot = self._changed_locked()
+        self.flush_snapshot(snapshot)
 
     # ------------------------------------------------------------------ #
     #  内部：原子写入
     # ------------------------------------------------------------------ #
 
-    def _flush(self) -> None:
-        """将内存 registry 原子写入 sessions.json。
-
-        策略：先写临时文件，再 os.replace 覆盖目标文件。
-        即使写入过程中进程崩溃，也不会损坏已有文件。
-        """
+    def flush_snapshot(self, snapshot: RegistrySnapshot) -> bool:
+        """Write one immutable generation; stale snapshots never replace newer state."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path: str | None = None
         try:
             fd, tmp_path = tempfile.mkstemp(
                 dir=str(self._path.parent),
-                prefix=".sessions_",
+                prefix=f".sessions_g{snapshot.generation}_",
                 suffix=".tmp",
             )
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(self._registry, f, ensure_ascii=False, indent=2)
-                f.write("\n")
-            os.replace(tmp_path, str(self._path))
-            tmp_path = None  # rename 成功，不需要清理
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                json.dump(snapshot.registry, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+            retry_snapshot: RegistrySnapshot | None = None
+            with self._lock:
+                if snapshot.generation <= self._flushed_generation:
+                    return True
+                if snapshot.generation < self._generation:
+                    retry_snapshot = RegistrySnapshot(
+                        self._generation, copy.deepcopy(self._registry),
+                    )
+                else:
+                    os.replace(tmp_path, str(self._path))
+                    tmp_path = None
+                    self._flushed_generation = snapshot.generation
+            if retry_snapshot is not None:
+                # Flush the newest immutable view; never let the old file win.
+                return self.flush_snapshot(retry_snapshot)
+            return True
         except Exception as exc:
-            logger.error("sessions.json: atomic write failed: %s", exc)
+            logger.error("sessions.json: snapshot flush failed: %s", exc)
+            return False
         finally:
             if tmp_path is not None:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
+
+    def _flush(self) -> bool:
+        """Compatibility wrapper that snapshots under lock and writes lock-free."""
+        return self.flush_snapshot(self.snapshot())

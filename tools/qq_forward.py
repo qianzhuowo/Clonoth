@@ -125,11 +125,16 @@ TIMEOUT_SEC = 30.0
 
 
 if __name__ == "__main__":
+    import hashlib
+    import http.client
     import json
     import os
+    import socket
     import sys
+    import time
     import urllib.error
     import urllib.request
+    import uuid
 
     def _read_input():
         raw = (sys.stdin.read() or "{}").lstrip("\ufeff")
@@ -162,6 +167,36 @@ if __name__ == "__main__":
 
     args = _read_input()
 
+    def _logical_request_id():
+        """Return one identity for this tool invocation, reused by HTTP retries.
+
+        A tool-call/invocation id identifies the logical call directly and can be
+        deterministically derived. Task/LLM request ids can contain multiple tool
+        calls, so they are only used as a namespace for a per-process nonce.
+        """
+        exact_context = _env_first(
+            "CLONOTH_TOOL_CALL_ID",
+            "CLONOTH_TOOL_REQUEST_ID",
+            "CLONOTH_TOOL_INVOCATION_ID",
+            default="",
+        ) or str(args.get("_tool_call_id") or args.get("tool_call_id") or "").strip()
+        if exact_context:
+            digest = hashlib.sha256(f"qq_forward:tool:{exact_context}".encode("utf-8")).hexdigest()
+            return f"qqf-{digest}"
+
+        broad_context = _env_first(
+            "CLONOTH_REQUEST_ID",
+            "CLONOTH_LLM_REQUEST_ID",
+            "CLONOTH_TASK_ID",
+            default="",
+        ) or str(args.get("_request_id") or args.get("task_id") or "").strip()
+        nonce = uuid.uuid4().hex
+        if broad_context:
+            digest = hashlib.sha256(f"qq_forward:context:{broad_context}".encode("utf-8")).hexdigest()[:16]
+            return f"qqf-{digest}-{nonce}"
+        return f"qqf-{nonce}"
+
+    request_id = _logical_request_id()
     op = str(args.get("op") or "").strip().lower()
     if op not in {"list", "forward", "send", "remind", "file", "recent"}:
         fail(
@@ -188,6 +223,7 @@ if __name__ == "__main__":
 
     payload = {
         "op": op,
+        "request_id": request_id,
         "session_id": session_id,
         "parent_session_id": parent_session_id,
         "runtime_session_id": runtime_session_id,
@@ -274,35 +310,68 @@ if __name__ == "__main__":
             )
 
     url = f"http://{host}:{port}/qq_forward"
-    headers = {"Content-Type": "application/json"}
+    headers = {
+        "Content-Type": "application/json",
+        "Idempotency-Key": request_id,
+        "X-Request-ID": request_id,
+    }
     if token:
         headers["X-Forward-Token"] = token
 
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-
+    encoded_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     try:
-        with urllib.request.urlopen(req, timeout=25) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        try:
-            err_body = json.loads(e.read().decode("utf-8"))
-            fail(err_body.get("error", f"HTTP {e.code}"))
-        except SystemExit:
-            raise
-        except Exception:
-            fail(f"转发 Bridge 返回 HTTP {e.code}")
-    except urllib.error.URLError as e:
-        fail(
-            f"无法连接 QQ 转发 Bridge（{url}）：{e}",
-            "请确认 QQ Bot 进程已启动且 ONEBOT_ENABLE_FORWARD_BRIDGE 未关闭。",
+        http_attempts = max(1, min(5, int(_env_first("ONEBOT_FORWARD_HTTP_ATTEMPTS", default="2"))))
+    except Exception:
+        http_attempts = 2
+    try:
+        retry_delay = max(0.0, float(_env_first("ONEBOT_FORWARD_HTTP_RETRY_DELAY", default="0.2")))
+    except Exception:
+        retry_delay = 0.2
+
+    body = None
+    last_transport_error = None
+    for attempt in range(1, http_attempts + 1):
+        # Recreate the transport request for each attempt, but preserve the logical
+        # request_id in both JSON and headers so the Bridge can return its sent claim.
+        req = urllib.request.Request(
+            url,
+            data=encoded_payload,
+            headers=headers,
+            method="POST",
         )
-    except Exception as e:
-        fail(f"调用 QQ 转发 Bridge 失败：{e}")
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = json.loads(e.read().decode("utf-8"))
+                fail(err_body.get("error", f"HTTP {e.code}"))
+            except SystemExit:
+                raise
+            except Exception:
+                fail(f"转发 Bridge 返回 HTTP {e.code}")
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            socket.timeout,
+            ConnectionError,
+            http.client.RemoteDisconnected,
+        ) as e:
+            last_transport_error = e
+            if attempt < http_attempts:
+                if retry_delay:
+                    time.sleep(retry_delay)
+                continue
+            fail(
+                f"无法连接 QQ 转发 Bridge（{url}）：{e}",
+                "请确认 QQ Bot 进程已启动且 ONEBOT_ENABLE_FORWARD_BRIDGE 未关闭。",
+            )
+        except Exception as e:
+            fail(f"调用 QQ 转发 Bridge 失败：{e}")
+
+    if body is None:
+        fail(f"调用 QQ 转发 Bridge 失败：{last_transport_error or '未收到响应'}")
 
     if not isinstance(body, dict) or not body.get("ok"):
         fail(str((body or {}).get("error") or "转发失败。"))

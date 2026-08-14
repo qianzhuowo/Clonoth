@@ -119,6 +119,8 @@ def load_external_plugins(hook_registry: HookRegistry, plugins_dir: Path) -> int
                 class_name = str(raw_meta["handler_class"]).strip()
                 cls = getattr(module, class_name)
                 instance = cls()
+                if "post_work_idempotent" in raw_meta:
+                    setattr(instance, "post_work_idempotent", bool(raw_meta.get("post_work_idempotent")))
                 priority = raw_meta.get("priority", getattr(instance, "priority", None))
                 for item in raw_meta["hook_points"]:
                     if isinstance(item, (tuple, list)) and len(item) == 2:

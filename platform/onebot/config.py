@@ -175,6 +175,22 @@ ONEBOT_STATE_FILE = _env_first(
     "ONEBOT_STATE_FILE",
     default=os.path.join(CLONOTH_WORKSPACE, "data", "onebot_plugin_state.json"),
 )
+# Durable pending/sent claims must survive SDK outbox replay and adapter restart.
+ONEBOT_IDEMPOTENCY_STORE_FILE = _env_first(
+    "ONEBOT_IDEMPOTENCY_STORE_FILE",
+    default=os.path.join(CLONOTH_WORKSPACE, "data", "onebot_outbound_idempotency.sqlite3"),
+)
+# Durable SDK/request identities outlive normal SDK backoff, but sent claims are
+# retained for a finite period. Context-free safety fallback is intentionally short.
+ONEBOT_IDEMPOTENCY_SENT_TTL_SECONDS = _env_float(
+    "ONEBOT_IDEMPOTENCY_SENT_TTL_SECONDS", 7 * 24 * 3600.0, min_value=300.0,
+)
+ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS = _env_float(
+    "ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS", 600.0, min_value=30.0,
+)
+ONEBOT_IDEMPOTENCY_MAX_ITEMS = _env_int(
+    "ONEBOT_IDEMPOTENCY_MAX_ITEMS", 50_000, min_value=100, max_value=2_000_000,
+)
 
 # 引用消息附件索引缓存：保存 message_id -> 已落盘图片附件路径，用于 get_msg 失败时兜底转发。
 # 与路由状态分离，避免 onebot_plugin_state.json 被临时缓存污染。

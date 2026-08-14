@@ -22,6 +22,7 @@ from __future__ import annotations
 from typing import Any, Protocol
 
 from .state import ChildTaskState, MainTaskState, TriggerInfo
+from .types import DeliveryContext
 
 
 class AdapterCallbacks(Protocol):
@@ -35,8 +36,13 @@ class AdapterCallbacks(Protocol):
     trigger 匹配、状态管理等协议细节。
 
     异常处理约定：
-      所有回调中的异常由适配器自行 try/except 并记录日志，
-      不应向 SDK 抛出，以免阻断事件处理循环。
+      durable outbound 回调只有在平台操作全部成功后才可返回；发送失败必须抛出异常。
+      异常可提供 ``retryable`` 属性：False 进入 dead letter，True 进入持久重试。
+      SDK 传入的 ``DeliveryContext.idempotency_key`` 是适配器平台侧去重身份；
+      force replay 会产生新 generation/key，从而明确绕过去重并真实重发。
+      一旦进入平台 send await，适配器必须 shield 到平台 claim commit；若底层
+      acknowledgement 仍不明确，应持久标记 ambiguous 并抛 ``retryable=False``，
+      不能把 pending claim release 成普通自动重试。只有明确未开始发送才可 release。
     """
 
     # ================================================================
@@ -51,6 +57,7 @@ class AdapterCallbacks(Protocol):
         attachments: list[dict[str, Any]],
         *,
         main_state: MainTaskState | None = None,
+        delivery_context: DeliveryContext | None = None,
     ) -> None:
         """主节点最终回复到达，发送到平台。
 
@@ -58,9 +65,13 @@ class AdapterCallbacks(Protocol):
         对应 bot_adapter.py L1297-1373 的主节点回复处理分支。
 
         SDK 已完成：
-          - 通过 source_inbound_seq 精确匹配并消费 trigger（从 triggers 中移除）
-          - 移除关联的 MainTaskState（通过 main_state 参数传出）
+          - 通过 source_inbound_seq 精确匹配 trigger
           - 清理内部协议标记（[CLONOTH_TOOL_TRACE v...]...）
+          - 回调成功返回后才消费 trigger、移除关联 MainTaskState 并确认本地 outbox
+
+        失败语义：
+          - 回调抛出异常时 trigger/MainTaskState 保持不变，事件进入本地持久化重试
+          - 适配器应在确认平台发送失败时抛出异常，成功时正常返回
 
         适配器需要：
           - 删除 trigger 的 status_msg（platform_data["status_msg"]，「⏳处理中」提示）
@@ -77,7 +88,7 @@ class AdapterCallbacks(Protocol):
                   仍包含 Bot 自定义标记，适配器自行解析处理。
             attachments: 附件列表，每个元素为 dict（含 path / filename 等字段），
                          格式由 Supervisor 定义。
-            main_state: 被移除的主任务状态。包含 progress_records（进度记录列表）、
+            main_state: 待在成功后移除的主任务状态。包含 progress_records（进度记录列表）、
                         platform_data（log_msg 等平台引用）。
                         为 None 表示该 trigger 没有关联的任务状态记录。
         """
@@ -87,6 +98,8 @@ class AdapterCallbacks(Protocol):
         self,
         trigger: TriggerInfo,
         text: str,
+        *,
+        delivery_context: DeliveryContext | None = None,
     ) -> None:
         """主节点中间回复到达，发送到平台。
 
@@ -118,6 +131,7 @@ class AdapterCallbacks(Protocol):
         attachments: list[dict[str, Any]],
         *,
         node_id: str = "",
+        delivery_context: DeliveryContext | None = None,
     ) -> None:
         """消息需要发送到频道，但没有匹配的 trigger（fallback 路径）。
 

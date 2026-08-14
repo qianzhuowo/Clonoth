@@ -2,14 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from engine.eventlog_rotation import eventlog_file_lock, rotate_event_log_locked
+
+
+logger = logging.getLogger(__name__)
 
 SYSTEM_SESSION_ID = "__system__"
 _MAX_MEMORY_EVENTS = 5000
@@ -81,34 +87,26 @@ class EventLog:
         return self._path
 
     def _load_existing(self) -> None:
-        if not self._path.exists():
-            return
-
+        """Restore global seq and the recent cache across active and backups."""
         max_seq = 0
-        recent_events: list[dict[str, Any]] = []
-        # Why: ClonothZX can have hundreds of megabytes of historical events,
-        # including old windows with very large task snapshots. How: read only a
-        # bounded tail of the JSONL file, then parse that tail. Purpose: avoid the
-        # startup RSS spike caused by parsing every old line or by sliding a
-        # 5000-event window across historical large snapshots.
-        for line in self._read_recent_lines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                evt = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            recent_events.append(evt)
-            seq = evt.get("seq")
-            if isinstance(seq, int) and seq > max_seq:
-                max_seq = seq
-
+        recent_events: deque[dict[str, Any]] = deque(maxlen=_MAX_MEMORY_EVENTS)
+        # The active file may have just been renamed to .1 and not yet recreated.
+        # Scan every retained file oldest-first so seq never rolls back and the
+        # bounded memory cache preserves true recovery order across rotations.
+        # Initialization must observe one stable active+backup snapshot.  Without
+        # the shared file lock, a concurrent cleanup could stage files between
+        # existence checks and make seq recovery roll backwards.
+        with eventlog_file_lock(self._path):
+            for event in self._iter_persisted_events_locked():
+                recent_events.append(event)
+                seq = event.get("seq")
+                if isinstance(seq, int) and seq > max_seq:
+                    max_seq = seq
         self._seq = max_seq
-        self._events = recent_events[-_MAX_MEMORY_EVENTS:]
+        self._events = list(recent_events)
 
-    def _read_recent_lines(self) -> list[str]:
-        """Return raw JSONL lines from the bounded file tail."""
+    def _read_recent_lines_locked(self) -> list[str]:
+        """Return raw JSONL tail lines while the shared file lock is held."""
         chunks: list[bytes] = []
         total_read = 0
         newline_count = 0
@@ -142,40 +140,32 @@ class EventLog:
         raw_lines = raw_lines[-_MAX_MEMORY_EVENTS:]
         return [line.decode("utf-8", errors="replace") for line in raw_lines]
 
-    def _maybe_rotate_locked(self) -> None:
-        """Rotate the active events file if it exceeds the online size cap.
+    def _read_recent_lines(self) -> list[str]:
+        """Return raw JSONL tail lines from one stable active-file snapshot."""
+        with eventlog_file_lock(self._path):
+            return self._read_recent_lines_locked()
 
-        [2026-07-16] Must be called while holding self._lock. Why: only the
-        append() writer touches the active file, so rotating under the same lock
-        keeps writes and the rename atomic w.r.t. this process. How: mirror
-        engine/data_cleanup.rotate_events (.N -> .N+1, active -> .1, drop oldest).
-        Purpose: give runaway event growth a hard ceiling between hourly cleanup
-        timer runs. A concurrent data_cleanup rename is tolerated because a
-        missing active file simply resets the seq-based memory buffer; new writes
-        recreate the file.
+    def _maybe_rotate_locked(self) -> None:
+        """Rotate an oversized active file while holding ``self._lock``.
+
+        The cross-process lock is shared with data_cleanup and append().  Size and
+        backup state are re-checked inside that lock, so an earlier observation of
+        the active inode cannot trigger a second rotation after another process
+        already moved it.
         """
         if _ONLINE_ROTATE_MAX_BYTES <= 0:
             return
         try:
-            sz = self._path.stat().st_size
-        except OSError:
-            return
-        if sz < _ONLINE_ROTATE_MAX_BYTES:
-            return
-        data_dir = self._path.parent
-        stem = self._path.name  # e.g. events.jsonl
-        try:
-            for i in range(_ONLINE_ROTATE_BACKUPS, 0, -1):
-                p = data_dir / f"{stem}.{i}"
-                if i == _ONLINE_ROTATE_BACKUPS and p.exists():
-                    p.unlink()
-                elif p.exists():
-                    p.rename(data_dir / f"{stem}.{i + 1}")
-            if self._path.exists():
-                self._path.rename(data_dir / f"{stem}.1")
-        except OSError:
-            # 轮转失败不应中断写入；下次抽检或定时 timer 会再试。
-            return
+            with eventlog_file_lock(self._path):
+                rotate_event_log_locked(
+                    self._path,
+                    max_bytes=_ONLINE_ROTATE_MAX_BYTES,
+                    backups=_ONLINE_ROTATE_BACKUPS,
+                )
+        except (OSError, TimeoutError):
+            # Rotation failure must not corrupt the append path; a later online
+            # check or cleanup timer retries the same lock-protected operation.
+            logger.warning("event log online rotation failed", exc_info=True)
 
     def append(
         self,
@@ -206,14 +196,23 @@ class EventLog:
 
             if not transient:
                 line = json.dumps(evt, ensure_ascii=False)
-                with self._path.open("a", encoding="utf-8") as f:
-                    f.write(line + "\n")
-                # [2026-07-16] 在线轮转护栏：在写盘后、仍持有 self._lock
-                # 时抽检文件大小，避免与定时轮转/其他写入竞争。
-                self._append_since_size_check += 1
-                if self._append_since_size_check >= _ONLINE_ROTATE_CHECK_EVERY:
-                    self._append_since_size_check = 0
-                    self._maybe_rotate_locked()
+                # append and both rotation entry points participate in the same
+                # cross-process protocol.  Cleanup can never rename between open
+                # and write, including on Windows where an open file blocks rename.
+                with eventlog_file_lock(self._path):
+                    with self._path.open("a", encoding="utf-8") as f:
+                        f.write(line + "\n")
+                    self._append_since_size_check += 1
+                    if self._append_since_size_check >= _ONLINE_ROTATE_CHECK_EVERY:
+                        self._append_since_size_check = 0
+                        try:
+                            rotate_event_log_locked(
+                                self._path,
+                                max_bytes=_ONLINE_ROTATE_MAX_BYTES,
+                                backups=_ONLINE_ROTATE_BACKUPS,
+                            )
+                        except OSError:
+                            logger.warning("event log online rotation failed", exc_info=True)
 
             self._events.append(evt)
             # Trim with hysteresis to prevent unbounded memory growth
@@ -248,6 +247,68 @@ class EventLog:
                 # cannot affect EventLog writes or session-specific streams.
                 continue
         return evt
+
+    def _iter_persisted_events_locked(self):
+        """Yield a stable retained snapshot; caller must hold eventlog_file_lock."""
+        paths = [
+            self._path.parent / f"{self._path.name}.{index}"
+            for index in range(_ONLINE_ROTATE_BACKUPS, 0, -1)
+        ]
+        paths.append(self._path)
+        for path in paths:
+            if not path.exists():
+                continue
+            try:
+                with path.open("r", encoding="utf-8") as stream:
+                    for line in stream:
+                        try:
+                            event = json.loads(line)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            continue
+                        if isinstance(event, dict):
+                            yield event
+            except OSError:
+                continue
+
+    def iter_persisted_events(self):
+        """Yield retained durable events oldest-first from one locked snapshot.
+
+        The lock remains held for the generator's entire consumption.  Internal
+        callers that already own it use ``_iter_persisted_events_locked`` to avoid
+        attempting to acquire the non-reentrant cross-process lock twice.
+        """
+        with eventlog_file_lock(self._path):
+            yield from self._iter_persisted_events_locked()
+
+    def find_delivery_event(
+        self, delivery_id: str, *, event_type: str,
+    ) -> dict[str, Any] | None:
+        """Find a retained durable event by type and idempotency key."""
+        key = str(delivery_id or "").strip()
+        if not key:
+            return None
+        for event in reversed(self._events):
+            payload = event.get("payload")
+            if (
+                event.get("type") == event_type
+                and isinstance(payload, dict)
+                and str(payload.get("delivery_id") or "").strip() == key
+            ):
+                return event
+        found = None
+        for event in self.iter_persisted_events():
+            payload = event.get("payload")
+            if (
+                event.get("type") == event_type
+                and isinstance(payload, dict)
+                and str(payload.get("delivery_id") or "").strip() == key
+            ):
+                found = event
+        return found
+
+    def find_outbound_delivery(self, delivery_id: str) -> dict[str, Any] | None:
+        """Find a retained outbound event by its durable idempotency key."""
+        return self.find_delivery_event(delivery_id, event_type="outbound_message")
 
     def subscribe(self, session_id: str) -> asyncio.Queue:
         """Subscribe to new events for one session.

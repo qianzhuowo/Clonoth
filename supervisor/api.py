@@ -403,6 +403,7 @@ def create_app(
                     task.updated_at = now
                     task.lease_expires_at = None
                     task.result = {"action": "fail", "error": "lease expired (zombie reaped)"}
+                    st._reset_task_route_state_locked(task)
                     # 写事件，使 events.jsonl 与内存状态一致
                     st.eventlog.append(
                         session_id=task.session_id,
@@ -525,6 +526,7 @@ def create_app(
                 attachments=body.attachments,
                 source_inbound_seq=body.source_inbound_seq,
                 llm_request_id=body.llm_request_id,
+                delivery_id=body.delivery_id,
             )
         except KeyError:
             raise HTTPException(status_code=404, detail="session not found")

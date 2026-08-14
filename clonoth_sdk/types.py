@@ -6,7 +6,8 @@ Phase 1 (2026-04-17): 初始创建，从 bot_adapter.py 协议交互中提取。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import hashlib
 from typing import Any
 
 
@@ -20,6 +21,34 @@ class InboundResult:
     session_id: str
     inbound_seq: int
     accepted: bool = True
+
+
+@dataclass(frozen=True)
+class DeliveryContext:
+    """Immutable identity/audit context for one adapter callback delivery.
+
+    ``force_replay`` increments ``replay_generation`` and changes
+    ``idempotency_key``. Adapters must use that key (not only ``event_id``), so an
+    operator-requested replay intentionally bypasses the prior platform ``sent``
+    claim while ordinary retries remain deduplicated.
+    """
+
+    event_id: str = ""
+    event_seq: int = 0
+    task_id: str = ""
+    source_inbound_seq: int = 0
+    conversation_key: str = ""
+    attempt: int = 1
+    idempotency_key: str = ""
+    replay_generation: int = 0
+    force_replay: bool = False
+
+    def child(self, identity: str) -> "DeliveryContext":
+        """Derive a stable logical-message context without mutating the parent."""
+        digest = hashlib.sha256(identity.encode("utf-8", "ignore")).hexdigest()[:24]
+        event_id = f"{self.event_id}:{digest}" if self.event_id else ""
+        key = f"{self.idempotency_key}:{digest}" if self.idempotency_key else ""
+        return replace(self, event_id=event_id, idempotency_key=key)
 
 
 @dataclass
@@ -42,6 +71,20 @@ class Event:
     # dataclass field so existing positional construction remains compatible.
     # Purpose: raw-event hooks can inspect the schema version when needed.
     schema_version: int = 1
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize the event without losing replay identity or payload fields."""
+        return {
+            "seq": self.seq,
+            "event_id": self.event_id,
+            "ts": self.ts,
+            "run_id": self.run_id,
+            "session_id": self.session_id,
+            "component": self.component,
+            "type": self.type,
+            "payload": dict(self.payload),
+            "schema_version": self.schema_version,
+        }
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Event:

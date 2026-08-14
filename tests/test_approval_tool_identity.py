@@ -1,8 +1,16 @@
 """Tests for attaching approval events to tool executions."""
 from __future__ import annotations
 
+import asyncio
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
 import sys
+import threading
 from pathlib import Path
+from typing import Any
+
+import httpx
+import pytest
 
 
 # Why: these tests run from a source checkout rather than an installed package.
@@ -11,6 +19,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from supervisor._helpers import SessionInfo, _now  # noqa: E402
+from toolbox.context import ToolContext  # noqa: E402
+from toolbox.registry import ToolRegistry  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
@@ -166,3 +176,114 @@ def test_scheduler_task_does_not_bypass_denied_command(tmp_path: Path) -> None:
     assert out.safety_level == SafetyLevel.deny
     assert out.approval_id is None
     assert state.approvals == {}
+
+
+def _tool_context(
+    workspace: Path, registry: ToolRegistry, http: httpx.AsyncClient, tool_call_id: str,
+) -> ToolContext:
+    return ToolContext(
+        supervisor_url="http://supervisor.invalid",
+        session_id="session-script",
+        run_id="engine-run-shared-by-many-calls",
+        worker_id="worker-test",
+        workspace_root=workspace,
+        http=http,
+        registry=registry,
+        task_id="task-script",
+        tool_call_id=tool_call_id,
+        node_id="node-script",
+    )
+
+
+def test_real_tool_context_registry_injects_only_explicit_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    tools_dir = tmp_path / "tools"
+    tools_dir.mkdir()
+    (tools_dir / "identity_probe.py").write_text(
+        "SPEC = {'name': 'identity_probe', 'description': 'probe', "
+        "'input_schema': {'type': 'object', 'properties': {}}}\n"
+        "if __name__ == '__main__':\n"
+        " import json, os, sys\n"
+        " json.load(sys.stdin)\n"
+        " names = ('CLONOTH_TOOL_CALL_ID', 'CLONOTH_REQUEST_ID', "
+        "'CLONOTH_TOOL_INVOCATION_ID', 'CLONOTH_UNRELATED_PROVIDER_CONTEXT')\n"
+        " values = {name: os.environ[name] for name in names if name in os.environ}\n"
+        " print(json.dumps({'ok': True, 'data': {'result': 'ok', 'env': values}}))\n",
+        encoding="utf-8",
+    )
+    registry = ToolRegistry(workspace_root=tmp_path, tools_dir=tools_dir)
+    monkeypatch.setenv("CLONOTH_TOOL_CALL_ID", "stale-parent-call")
+    monkeypatch.setenv("CLONOTH_REQUEST_ID", "stale-parent-request")
+    monkeypatch.setenv("CLONOTH_TOOL_INVOCATION_ID", "stale-parent-invocation")
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient() as http:
+            ctx = _tool_context(tmp_path, registry, http, "provider-call-17")
+            ctx.request_id = "provider-request-4"  # type: ignore[attr-defined]
+            ctx.invocation_id = "provider-invocation-9"  # type: ignore[attr-defined]
+            ctx.unrelated_provider_context = "must-not-leak"  # type: ignore[attr-defined]
+            result = await registry.execute(name="identity_probe", arguments={}, ctx=ctx)
+            empty_ctx = _tool_context(tmp_path, registry, http, "")
+            empty_result = await registry.execute(
+                name="identity_probe", arguments={}, ctx=empty_ctx,
+            )
+        assert result["data"]["env"] == {
+            "CLONOTH_TOOL_CALL_ID": "provider-call-17",
+            "CLONOTH_REQUEST_ID": "provider-request-4",
+            "CLONOTH_TOOL_INVOCATION_ID": "provider-invocation-9",
+        }
+        assert empty_result["data"]["env"] == {}
+
+    asyncio.run(exercise())
+
+
+def test_qq_forward_registry_replay_uses_provider_tool_call_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    received_ids: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:  # noqa: N802 - stdlib HTTP contract
+            length = int(self.headers.get("Content-Length", "0"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            received_ids.append(str(payload["request_id"]))
+            body = json.dumps({"ok": True, "result": "sent"}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("ONEBOT_FORWARD_BRIDGE_HOST", "127.0.0.1")
+    monkeypatch.setenv("ONEBOT_FORWARD_BRIDGE_PORT", str(server.server_port))
+    monkeypatch.setenv("ONEBOT_FORWARD_HTTP_ATTEMPTS", "1")
+    registry = ToolRegistry(workspace_root=root, tools_dir=root / "tools")
+    arguments = {"op": "remind", "target_type": "self", "text": "same"}
+
+    async def exercise() -> None:
+        async with httpx.AsyncClient() as http:
+            ctx = _tool_context(root, registry, http, "provider-call-same")
+            first = await registry.execute(name="qq_forward", arguments=arguments, ctx=ctx)
+            second = await registry.execute(name="qq_forward", arguments=arguments, ctx=ctx)
+            ctx.tool_call_id = "provider-call-different"
+            third = await registry.execute(name="qq_forward", arguments=arguments, ctx=ctx)
+        assert first["ok"] and second["ok"] and third["ok"]
+
+    try:
+        asyncio.run(exercise())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+    assert len(received_ids) == 3
+    assert received_ids[0] == received_ids[1]
+    assert received_ids[0] != received_ids[2]

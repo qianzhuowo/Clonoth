@@ -1,6 +1,7 @@
 """Session 管理 mixin —— 会话创建、inbound/outbound 队列、消息记录。"""
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -10,6 +11,7 @@ from .eventlog import SYSTEM_SESSION_ID
 from .types import ApprovalStatus, TaskStatus
 
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 #  多模态消息构建（内联版本，避免 supervisor → engine 依赖）
@@ -303,7 +305,7 @@ class SessionMixin:
         if not branch:
             return
         parent = self.entry_branch_parents.pop(branch, "")
-        entry = self._session_store._registry.get(branch)
+        entry = self._session_store.get_entry(branch)
         if not parent and isinstance(entry, dict):
             parent = str(entry.get("parent_session_id") or "")
 
@@ -478,6 +480,11 @@ class SessionMixin:
     def _apply_outbound_message(self, *, seq: int, session_id: str, payload: dict[str, Any]) -> None:
         if not session_id or not isinstance(payload, dict):
             return
+        delivery_id = str(payload.get("delivery_id") or "").strip()
+        if delivery_id:
+            if not hasattr(self, "_outbound_delivery_ids"):
+                self._outbound_delivery_ids = set()
+            self._outbound_delivery_ids.add(delivery_id)
         src = payload.get("source_inbound_seq")
         try:
             inbound_seq = int(src) if src is not None else 0
@@ -696,6 +703,7 @@ class SessionMixin:
         node_id: str | None = None,
         action_type: str | None = None,
         llm_request_id: str | None = None,
+        delivery_id: str | None = None,
     ) -> dict[str, Any]:
         text_clean = str(text or "").strip()
         # [Fix] 当 source_inbound_seq 存在时，允许空文本通过。
@@ -713,9 +721,38 @@ class SessionMixin:
             if v > 0:
                 src_seq = v
 
+        delivery_key = str(delivery_id or "").strip()
         with self._lock:
             if session_id not in self.sessions:
                 raise KeyError("session not found")
+
+            # delivery_id is the durable idempotency key. Rebuild this index from
+            # EventLog's persisted tail and update it when events are applied, so a
+            # retry after process failure cannot append a second visible message.
+            if not hasattr(self, "_outbound_delivery_ids"):
+                self._outbound_delivery_ids = set()
+            existing_delivery_event = None
+            if delivery_key and delivery_key not in self._outbound_delivery_ids:
+                existing_delivery_event = self.eventlog.find_outbound_delivery(delivery_key)
+                if existing_delivery_event is not None:
+                    self._outbound_delivery_ids.add(delivery_key)
+            if delivery_key and delivery_key in self._outbound_delivery_ids:
+                logger.info(
+                    "outbound delivery already appended; deduping",
+                    extra={
+                        "event": "outbound_delivery_deduped",
+                        "delivery_id": delivery_key,
+                        "session_id": session_id,
+                        "source_inbound_seq": src_seq,
+                    },
+                )
+                return {
+                    "ok": True,
+                    "deduped": True,
+                    "delivery_id": delivery_key,
+                    "event_id": str((existing_delivery_event or {}).get("event_id") or ""),
+                    "event_seq": int((existing_delivery_event or {}).get("seq", 0) or 0),
+                }
 
             if src_seq is not None:
                 inbound_evt = self._inbound_events.get(src_seq)
@@ -725,10 +762,19 @@ class SessionMixin:
                     raise ValueError("source_inbound_seq session mismatch")
 
                 existing = self._inbound_routed.get(src_seq)
-                if isinstance(existing, dict) and existing.get("action") == "reply":
+                # Legacy callers without delivery_id retain one-reply-per-inbound
+                # dedupe. Versioned completion routes dedupe by their phase-specific
+                # delivery key instead, allowing a later completion generation.
+                if (
+                    not delivery_key
+                    and isinstance(existing, dict)
+                    and existing.get("action") == "reply"
+                ):
                     return {"ok": True, "deduped": True, "route": existing}
 
             payload: dict[str, Any] = {"text": text_clean}
+            if delivery_key:
+                payload["delivery_id"] = delivery_key
             if attachments:
                 payload["attachments"] = list(attachments)
             if src_seq is not None:
@@ -757,14 +803,34 @@ class SessionMixin:
                 payload=payload,
             )
 
+            if delivery_key:
+                self._outbound_delivery_ids.add(delivery_key)
             if src_seq is not None and src_seq not in self._inbound_routed:
                 self._inbound_routed[src_seq] = {
                     "action": "reply",
                     "session_id": session_id,
                     "event_seq": int(evt.get("seq", 0) or 0),
+                    "delivery_id": delivery_key,
                 }
 
-            return {"ok": True, "deduped": False, "event_seq": int(evt.get("seq", 0) or 0)}
+            logger.info(
+                "outbound delivery appended",
+                extra={
+                    "event": "outbound_delivery_appended",
+                    "delivery_id": delivery_key,
+                    "event_id": str(evt.get("event_id") or ""),
+                    "event_seq": int(evt.get("seq", 0) or 0),
+                    "session_id": session_id,
+                    "source_inbound_seq": src_seq,
+                },
+            )
+            return {
+                "ok": True,
+                "deduped": False,
+                "event_seq": int(evt.get("seq", 0) or 0),
+                "event_id": str(evt.get("event_id") or ""),
+                "delivery_id": delivery_key,
+            }
 
     def reset_conversation(self, *, conversation_key: str) -> dict[str, Any]:
         """Reset a conversation by removing the conversation_map entry.

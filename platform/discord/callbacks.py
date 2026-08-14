@@ -7,15 +7,19 @@ one runtime object instead of module-level globals.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import time
+
+from collections.abc import Awaitable, Callable
 from collections import deque
 from typing import Any
 
 import discord  # type: ignore[import-untyped]
 
 from clonoth_sdk import ChildTaskState, MainTaskState, TriggerInfo
-from clonoth_sdk.types import Event
+from clonoth_sdk.types import DeliveryContext, Event
 
 from .messaging import (
     _atts_to_discord_files,
@@ -24,6 +28,13 @@ from .messaging import (
     _record_bot_reply,
     _safe_restart,
     _send_split_text,
+    _truncate,
+)
+from .send_contract import (
+    DiscordAmbiguousAckError,
+    DiscordIdempotencyStore,
+    DiscordSendContractError,
+    classify_discord_send_exception,
 )
 
 
@@ -53,6 +64,217 @@ class EreunaCallbacks:
         self._channel_edit_timestamps: dict[int, deque[float]] = {}
         self._dot_states: dict[int, dict[str, Any]] = {}
         self._child_dot_states: dict[str, dict[str, Any]] = {}
+        self._outbound_idempotency = DiscordIdempotencyStore(
+            self.rt.workspace / "data" / "discord_outbound_idempotency.sqlite3"
+        )
+
+    @staticmethod
+    def _delivery_extra(
+        context: DeliveryContext | None,
+        *,
+        platform_message_ids: list[str] | tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        context = context or DeliveryContext()
+        ids = [str(item) for item in platform_message_ids]
+        return {
+            "event_id": context.event_id,
+            "event_seq": context.event_seq,
+            "task_id": context.task_id,
+            "source_inbound_seq": context.source_inbound_seq,
+            "conversation_key": context.conversation_key,
+            "attempt": context.attempt,
+            "idempotency_key": context.idempotency_key,
+            "replay_generation": context.replay_generation,
+            "platform_message_id": ids[0] if len(ids) == 1 else "",
+            "platform_message_ids": ids,
+        }
+
+    async def _send_delivery_unit(
+        self,
+        context: DeliveryContext | None,
+        identity: str,
+        operation: Callable[[], Awaitable[list[Any]]],
+    ) -> list[str]:
+        """Send one stable child unit and commit its platform ids before returning."""
+        if context is None or not context.idempotency_key:
+            try:
+                sent = await operation()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                classified = classify_discord_send_exception(exc)
+                raise classified from exc
+            return [str(item.id) for item in sent if getattr(item, "id", None) is not None]
+
+        child = context.child(identity)
+        key = child.idempotency_key
+        while True:
+            claim = await self._outbound_idempotency.begin(key)
+            if claim.acquired:
+                break
+            if claim.state == "ambiguous":
+                raise DiscordAmbiguousAckError(
+                    f"Discord child delivery remains ambiguous: {key} ({claim.last_error})"
+                )
+            if claim.state == "sent":
+                logger.info(
+                    "discord_outbound_child_already_sent",
+                    extra=self._delivery_extra(
+                        child, platform_message_ids=claim.platform_message_ids,
+                    ),
+                )
+                return list(claim.platform_message_ids)
+            resolved = await self._outbound_idempotency.wait_for_resolution(key)
+            if resolved is not None and resolved.state == "sent":
+                logger.info(
+                    "discord_outbound_child_already_sent",
+                    extra=self._delivery_extra(
+                        child, platform_message_ids=resolved.platform_message_ids,
+                    ),
+                )
+                return list(resolved.platform_message_ids)
+
+        async def send_and_commit() -> list[str]:
+            try:
+                sent = await operation()
+            except asyncio.CancelledError as exc:
+                # Once platform I/O has been awaited, cancellation has unknown ack
+                # state unless the platform raised an explicit ordinary failure.
+                await asyncio.shield(self._outbound_idempotency.mark_ambiguous(
+                    claim, error=exc,
+                ))
+                raise DiscordAmbiguousAckError(
+                    f"Discord send cancelled with ambiguous acknowledgement: {key}",
+                    cause=exc,
+                ) from exc
+            except Exception as exc:
+                classified = classify_discord_send_exception(exc)
+                if classified.ambiguous_ack:
+                    await self._outbound_idempotency.mark_ambiguous(claim, error=classified)
+                else:
+                    await self._outbound_idempotency.release(claim)
+                logger.error(
+                    "discord_outbound_child_failed",
+                    exc_info=True,
+                    extra={
+                        **self._delivery_extra(child),
+                        "retryable": classified.retryable,
+                        "ambiguous_ack": classified.ambiguous_ack,
+                    },
+                )
+                raise classified from exc
+
+            message_ids = [
+                str(item.id) for item in sent if getattr(item, "id", None) is not None
+            ]
+            try:
+                await self._outbound_idempotency.commit(claim, message_ids)
+            except asyncio.CancelledError as exc:
+                await asyncio.shield(self._outbound_idempotency.mark_ambiguous(
+                    claim, platform_message_ids=message_ids, error=exc,
+                ))
+                raise DiscordAmbiguousAckError(
+                    f"Discord commit cancelled after platform send: {key}", cause=exc,
+                ) from exc
+            except Exception as exc:
+                await self._outbound_idempotency.mark_ambiguous(
+                    claim, platform_message_ids=message_ids, error=exc,
+                )
+                raise DiscordAmbiguousAckError(
+                    f"Discord platform sent but idempotency commit failed: {key}", cause=exc,
+                ) from exc
+            return message_ids
+
+        protected = asyncio.create_task(send_and_commit())
+        while True:
+            try:
+                message_ids = await asyncio.shield(protected)
+                break
+            except asyncio.CancelledError:
+                # Outer shutdown cancellation cannot interrupt send+commit. Consume
+                # every cancellation until the protected transaction is terminal.
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    current.uncancel()
+                if protected.done():
+                    message_ids = protected.result()
+                    break
+
+        logger.info(
+            "discord_outbound_child_sent",
+            extra=self._delivery_extra(child, platform_message_ids=message_ids),
+        )
+        return message_ids
+
+    async def _send_message_units(
+        self,
+        channel: Any,
+        text: str,
+        files: list[discord.File],
+        *,
+        reply_to: discord.Message | None,
+        delivery_context: DeliveryContext | None,
+    ) -> list[str]:
+        if channel is None:
+            raise DiscordSendContractError("Discord send missing channel")
+        if self.rt.split_signal in text:
+            parts = [part.strip() for part in text.split(self.rt.split_signal) if part.strip()]
+        else:
+            parts = [_truncate(text)] if text or files else []
+        if files and not parts:
+            parts = [""]
+
+        attachment_identity = json.dumps(
+            [
+                {
+                    "filename": str(getattr(item, "filename", "")),
+                    "path": str(getattr(getattr(item, "fp", None), "name", "")),
+                }
+                for item in files
+            ],
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        result: list[str] = []
+        for index, raw_part in enumerate(parts):
+            part = _truncate(raw_part)
+            part_files = files if index == 0 else []
+            digest = hashlib.sha256(part.encode("utf-8", "ignore")).hexdigest()
+            file_digest = hashlib.sha256(attachment_identity.encode("utf-8")).hexdigest() if part_files else ""
+            identity = f"message:{index}:text:{digest}:attachments:{file_digest}"
+
+            async def send_one(
+                part: str = part,
+                part_files: list[discord.File] = part_files,
+                index: int = index,
+            ) -> list[Any]:
+                return await _send_split_text(
+                    self.rt,
+                    channel,
+                    part,
+                    reply_to=reply_to if index == 0 else None,
+                    files=part_files or None,
+                )
+
+            result.extend(await self._send_delivery_unit(delivery_context, identity, send_one))
+        return result
+
+    async def _send_reactions(
+        self,
+        message: discord.Message,
+        reactions: list[str],
+        delivery_context: DeliveryContext | None,
+    ) -> None:
+        for index, reaction in enumerate(reactions):
+            emoji = reaction.strip()
+
+            async def add_one(emoji: str = emoji) -> list[Any]:
+                await message.add_reaction(emoji)
+                return []
+
+            await self._send_delivery_unit(
+                delivery_context, f"reaction:{index}:{emoji}", add_one
+            )
 
     def _should_edit(self, key: int | str, min_interval: float = 1.0, *, channel_id: int = 0) -> bool:
         """检查 per-key 节流和可选的 per-channel edit 令牌桶。"""
@@ -154,17 +376,23 @@ class EreunaCallbacks:
         attachments: list[dict[str, Any]],
         *,
         main_state: MainTaskState | None = None,
+        delivery_context: DeliveryContext | None = None,
     ) -> None:
         pd = trigger.platform_data
-        msg: discord.Message = pd.get("message")
+        msg: discord.Message | None = pd.get("message")
         channel_id: int = pd.get("channel_id", 0)
+        if msg is None:
+            raise DiscordSendContractError("Discord reply missing trigger message")
+        ch = getattr(msg, "channel", None)
+        if ch is None:
+            raise DiscordSendContractError("Discord reply trigger has no channel")
 
         status_msg = pd.get("status_msg")
         if status_msg:
             try:
                 await status_msg.delete()
             except Exception:
-                pass
+                logger.warning("Discord status message deletion failed", exc_info=True)
 
         if main_state:
             await self._settle_log_msg(main_state, "✓ 完成")
@@ -174,23 +402,30 @@ class EreunaCallbacks:
             should_restart = True
             text = text.rstrip()[:-len(self.rt.restart_signal)].strip()
 
+        reactions: list[str] = []
         if text:
-            text, reacts = _extract_reactions(self.rt, text)
-            for r in reacts:
-                try:
-                    await msg.add_reaction(r.strip())
-                except Exception:
-                    pass
+            text, reactions = _extract_reactions(self.rt, text)
+        await self._send_reactions(msg, reactions, delivery_context)
 
-        ch = msg.channel
-        if text or attachments:
+        try:
             files = _atts_to_discord_files(self.rt, attachments) if attachments else []
-            try:
-                await _send_split_text(self.rt, ch, text or "", reply_to=msg, files=files or None)
-            except Exception:
-                pass
-            if text:
-                _record_bot_reply(self.rt, channel_id, text)
+        except Exception as exc:
+            classified = classify_discord_send_exception(exc)
+            raise classified from exc
+        if len(files) != len(attachments):
+            raise DiscordSendContractError(
+                "One or more Discord outbound attachments are missing or unreadable"
+            )
+        message_ids = await self._send_message_units(
+            ch,
+            text or "",
+            files,
+            reply_to=msg,
+            delivery_context=delivery_context,
+        )
+        if text:
+            first_message_id = int(message_ids[0]) if message_ids and message_ids[0].isdigit() else None
+            _record_bot_reply(self.rt, channel_id, text, msg_id=first_message_id)
 
         seq = trigger.inbound_seq
         self._dot_states.pop(seq, None)
@@ -199,35 +434,49 @@ class EreunaCallbacks:
         if should_restart:
             asyncio.create_task(_safe_restart(self.rt, channel_id=channel_id, delay=2.0))
 
-        logger.info("send_reply ch=%s seq=%s", channel_id, seq)
+        logger.info(
+            "discord_send_reply_succeeded",
+            extra=self._delivery_extra(
+                delivery_context, platform_message_ids=message_ids,
+            ),
+        )
 
     async def send_intermediate_reply(
         self,
         trigger: TriggerInfo,
         text: str,
+        *,
+        delivery_context: DeliveryContext | None = None,
     ) -> None:
         pd = trigger.platform_data
-        msg: discord.Message = pd.get("message")
+        msg: discord.Message | None = pd.get("message")
         channel_id: int = pd.get("channel_id", 0)
+        if msg is None:
+            raise DiscordSendContractError("Discord intermediate reply missing trigger message")
+        ch = getattr(msg, "channel", None)
+        if ch is None:
+            raise DiscordSendContractError("Discord intermediate reply trigger has no channel")
 
+        message_ids: list[str] = []
         if text:
-            text, reacts = _extract_reactions(self.rt, text)
-            for r in reacts:
-                try:
-                    await msg.add_reaction(r.strip())
-                except Exception:
-                    pass
-            if text:
-                int_sent_id = None
-                try:
-                    int_sent = await _send_split_text(self.rt, msg.channel, text, reply_to=msg)
-                    if int_sent:
-                        int_sent_id = int_sent[0].id
-                except Exception:
-                    pass
-                _record_bot_reply(self.rt, channel_id, text, msg_id=int_sent_id)
+            text, reactions = _extract_reactions(self.rt, text)
+            await self._send_reactions(msg, reactions, delivery_context)
+            message_ids = await self._send_message_units(
+                ch,
+                text,
+                [],
+                reply_to=msg,
+                delivery_context=delivery_context,
+            )
+            first_message_id = int(message_ids[0]) if message_ids and message_ids[0].isdigit() else None
+            _record_bot_reply(self.rt, channel_id, text, msg_id=first_message_id)
 
-        logger.info("send_intermediate_reply ch=%s", channel_id)
+        logger.info(
+            "discord_send_intermediate_reply_succeeded",
+            extra=self._delivery_extra(
+                delivery_context, platform_message_ids=message_ids,
+            ),
+        )
 
     async def send_to_channel(
         self,
@@ -236,10 +485,23 @@ class EreunaCallbacks:
         attachments: list[dict[str, Any]],
         *,
         node_id: str = "",
+        delivery_context: DeliveryContext | None = None,
     ) -> None:
         if not conversation_key.startswith("discord:"):
-            logger.debug("send_to_channel SKIP non-discord conv_key=%s", conversation_key)
-            return
+            raise DiscordSendContractError(
+                f"Discord send received invalid conversation key: {conversation_key!r}"
+            )
+        try:
+            channel_id = int(conversation_key[len("discord:"):])
+        except ValueError as exc:
+            raise DiscordSendContractError(
+                f"Discord conversation key has invalid channel id: {conversation_key!r}",
+                cause=exc,
+            ) from exc
+        if channel_id <= 0:
+            raise DiscordSendContractError(
+                f"Discord conversation key has invalid channel id: {conversation_key!r}"
+            )
 
         poller_restart = False
         if text and text.rstrip().endswith(self.rt.restart_signal):
@@ -253,22 +515,46 @@ class EreunaCallbacks:
             prefix = self.rt.child_node_display_names.get(node_id, f"🔧 [{node_id}]")
             text = f"{prefix}\n{text}"
 
-        ch = await self._resolve_channel_from_conv_key(conversation_key)
-        if ch:
-            files = _atts_to_discord_files(self.rt, attachments) if attachments else []
+        ch = self.rt.dc_client.get_channel(channel_id)
+        if ch is None:
             try:
-                await _send_split_text(self.rt, ch, text or "", files=files or None)
-            except Exception as e:
-                logger.error("send_to_channel failed: %s", e)
-        else:
-            logger.warning("send_to_channel: channel not found for %s", conversation_key)
+                ch = await self.rt.dc_client.fetch_channel(channel_id)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                classified = classify_discord_send_exception(exc)
+                raise classified from exc
+        if ch is None:
+            raise DiscordSendContractError(
+                f"Discord channel does not exist: {channel_id}"
+            )
+
+        try:
+            files = _atts_to_discord_files(self.rt, attachments) if attachments else []
+        except Exception as exc:
+            classified = classify_discord_send_exception(exc)
+            raise classified from exc
+        if len(files) != len(attachments):
+            raise DiscordSendContractError(
+                "One or more Discord outbound attachments are missing or unreadable"
+            )
+        message_ids = await self._send_message_units(
+            ch,
+            text or "",
+            files,
+            reply_to=None,
+            delivery_context=delivery_context,
+        )
 
         if poller_restart:
-            try:
-                ch_id = int(conversation_key[len("discord:"):])
-                asyncio.create_task(_safe_restart(self.rt, channel_id=ch_id, delay=2.0))
-            except ValueError:
-                pass
+            asyncio.create_task(_safe_restart(self.rt, channel_id=channel_id, delay=2.0))
+
+        logger.info(
+            "discord_send_to_channel_succeeded",
+            extra=self._delivery_extra(
+                delivery_context, platform_message_ids=message_ids,
+            ),
+        )
 
     async def delete_status_message(
         self,

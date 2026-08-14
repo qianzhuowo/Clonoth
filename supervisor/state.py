@@ -14,6 +14,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from ._helpers import SessionInfo, _now
+from .branch_finalize_store import BranchFinalizeClaimStore
 from .eventlog import EventLog, SYSTEM_SESSION_ID
 from engine.builtin.loader import auto_discover_and_register
 from engine.hooks import HookRegistry
@@ -29,6 +30,7 @@ from .types import (
     OpRequestOut,
     SafetyLevel,
     Task,
+    RouteStatus,
     TaskKind,
     TaskStatus,
 )
@@ -62,6 +64,27 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         self._inbound_processed: set[int] = set()
         self._inbound_routed: dict[int, dict[str, Any]] = {}
         self._inbound_cursor: int = 0
+        self._post_work_states: dict[str, str] = {}
+        self._post_work_enqueued: set[str] = set()
+        self._post_work_running: set[str] = set()
+        self._post_phase_states: dict[str, str] = {}
+        self._post_effect_states: dict[str, str] = {}
+        self._memory_extract_intents: dict[str, dict[str, Any]] = {}
+        self._memory_extract_intent_timers: dict[str, threading.Timer] = {}
+        self._recovered_post_works: dict[str, Any] = {}
+        self._defer_post_work_enqueue = True
+        self._branch_finalize_claims: dict[str, dict[str, Any]] = {}
+        self._branch_finalize_lease_seconds = 6.0
+        self._branch_finalize_store = BranchFinalizeClaimStore(
+            workspace_root / "data" / "branch_finalize_claims.sqlite3",
+        )
+        self._outbound_delivery_ids: set[str] = {
+            str((event.get("payload") or {}).get("delivery_id") or "").strip()
+            for event in eventlog.events
+            if event.get("type") == "outbound_message"
+            and isinstance(event.get("payload"), dict)
+            and str((event.get("payload") or {}).get("delivery_id") or "").strip()
+        }
 
         @dataclass
         class _InboundLease:
@@ -139,12 +162,456 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # async dispatch can resolve branch sessions correctly after supervisor restart.
         for psid, children in self.parent_children.items():
             for child_sid in children:
-                raw = self._session_store._registry.get(child_sid)
+                raw = self._session_store.get_entry(child_sid)
                 if isinstance(raw, dict) and raw.get("node_id") == "__entry_branch__":
                     self.entry_branch_parents[child_sid] = psid
                     self.parent_entry_branches.setdefault(psid, set()).add(child_sid)
 
+        self._restore_post_completion_work_from_events()
+        self._restore_branch_finalize_claims_from_events()
+        self._restore_memory_extract_intents_from_events()
+        self._restore_recoverable_routes_from_events()
+        self.recover_pending_completion_routes()
         self._reconcile_after_restart()
+        self._recover_memory_extract_intents()
+        self._defer_post_work_enqueue = False
+        self.recover_pending_post_completion_work()
+
+    def _restore_branch_finalize_claims_from_events(self) -> int:
+        """Seed missing SQLite identities from legacy EventLog ownership receipts."""
+        event_types = {
+            "task_branch_finalize_claimed", "task_branch_finalize_started",
+            "task_branch_finalize_heartbeat", "task_branch_finalize_completed",
+            "task_branch_finalize_failed",
+        }
+        claims: dict[str, dict[str, Any]] = {}
+        for event in self.eventlog.iter_persisted_events():
+            if event.get("type") not in event_types:
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            identity = str(payload.get("identity") or "").strip()
+            if identity:
+                claims[identity] = dict(payload)
+        for identity, legacy_claim in claims.items():
+            self._branch_finalize_store.seed_legacy(identity, legacy_claim)
+            current = self._branch_finalize_store.get(identity)
+            if current is not None:
+                self._branch_finalize_claims[identity] = dict(current.__dict__)
+        return len(claims)
+
+    def _restore_post_completion_work_from_events(self) -> int:
+        """Rebuild schema-v2 work plus each phase/effect's latest ledger state."""
+        from .task_router import PostCompletionWork
+
+        works: dict[str, PostCompletionWork] = {}
+        states: dict[str, str] = {}
+        status_types = {
+            "task_post_work_pending",
+            "task_post_work_started",
+            "task_post_work_completed",
+            "task_post_work_failed",
+        }
+        for event in self.eventlog.iter_persisted_events():
+            event_type = str(event.get("type") or "")
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if event_type == "task_routed":
+                if int(payload.get("post_work_schema_version") or 0) < 2:
+                    continue
+                post_work_id = str(payload.get("post_work_id") or "").strip()
+                if not post_work_id:
+                    continue
+                try:
+                    task = Task.model_validate(payload)
+                except Exception:
+                    logger.exception(
+                        "invalid post-work intent snapshot",
+                        extra={"event": "task_post_work_restore_invalid", "post_work_id": post_work_id},
+                    )
+                    continue
+                route_session_id = str(
+                    (task.route_context or {}).get("route_session_id")
+                    or (task.input or {}).get("_route_session_id")
+                    or (task.input or {}).get("parent_session_id")
+                    or task.session_id
+                )
+                works[post_work_id] = PostCompletionWork(
+                    task=task,
+                    route_session_id=route_session_id,
+                    session_generation=task.session_generation,
+                    post_work_id=post_work_id,
+                    schema_version=int(task.post_work_schema_version or 2),
+                    phases=[dict(phase) for phase in task.post_work_phases if isinstance(phase, dict)],
+                )
+                states[post_work_id] = str(task.post_work_status or "pending")
+            elif event_type in status_types:
+                if int(payload.get("post_work_schema_version") or 0) < 2:
+                    continue
+                post_work_id = str(payload.get("post_work_id") or "").strip()
+                if post_work_id:
+                    states[post_work_id] = str(payload.get("status") or "")
+            elif event_type.startswith("task_post_phase_"):
+                if int(payload.get("post_work_schema_version") or 0) < 2:
+                    continue
+                phase_id = str(payload.get("phase_id") or "").strip()
+                if phase_id:
+                    self._post_phase_states[phase_id] = str(payload.get("status") or event_type.rsplit("_", 1)[-1])
+            elif event_type in {"task_post_effect_started", "task_post_effect_completed"}:
+                if int(payload.get("post_work_schema_version") or 0) < 2:
+                    continue
+                effect_id = str(payload.get("effect_id") or "").strip()
+                if effect_id:
+                    self._post_effect_states[effect_id] = str(payload.get("status") or event_type.rsplit("_", 1)[-1])
+
+        self._post_work_states.update(states)
+        self._recovered_post_works.update({
+            work_id: work for work_id, work in works.items()
+            if states.get(work_id, "pending") in {"pending", "started", "partial"}
+        })
+        logger.info(
+            "post-completion work intents restored",
+            extra={
+                "event": "task_post_work_restore_scanned",
+                "pending_count": len(self._recovered_post_works),
+            },
+        )
+        return len(self._recovered_post_works)
+
+    def _restore_memory_extract_intents_from_events(self) -> int:
+        """Restore the latest durable state of each delayed extraction intent."""
+        restored: dict[str, dict[str, Any]] = {}
+        for event in self.eventlog.iter_persisted_events():
+            event_type = str(event.get("type") or "")
+            if event_type not in {
+                "memory_extract_intent_scheduled",
+                "memory_extract_intent_cancelled",
+                "memory_extract_intent_completed",
+            }:
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            intent_id = str(payload.get("intent_id") or "").strip()
+            if not intent_id:
+                continue
+            if event_type == "memory_extract_intent_scheduled":
+                intent = payload.get("intent")
+                if isinstance(intent, dict):
+                    restored[intent_id] = dict(intent)
+            else:
+                restored.pop(intent_id, None)
+        self._memory_extract_intents.update(restored)
+        logger.info(
+            "memory extraction intents restored",
+            extra={"event": "memory_extract_intent_restore", "pending_count": len(restored)},
+        )
+        return len(restored)
+
+    def _memory_extract_intent_session(self, intent: dict[str, Any]) -> str:
+        return str(intent.get("session_id") or "").strip() or SYSTEM_SESSION_ID
+
+    def _append_memory_extract_intent_event_locked(
+        self, event_type: str, intent: dict[str, Any],
+    ) -> None:
+        intent_id = str(intent.get("intent_id") or "").strip()
+        payload: dict[str, Any] = {
+            "intent_id": intent_id,
+            "effect_id": str(intent.get("effect_id") or ""),
+            "phase_id": str(intent.get("phase_id") or ""),
+            "post_work_id": str(intent.get("post_work_id") or ""),
+            "task_id": str(intent.get("source_task_id") or ""),
+            "session_id": str(intent.get("session_id") or ""),
+            "node_id": str(intent.get("extractor_node") or ""),
+            "due_at": str(intent.get("due_at") or ""),
+        }
+        if event_type == "memory_extract_intent_scheduled":
+            payload["intent"] = dict(intent)
+        self.eventlog.append(
+            session_id=self._memory_extract_intent_session(intent),
+            component="supervisor",
+            type_=event_type,
+            payload=payload,
+        )
+
+    @staticmethod
+    def _intent_delay(intent: dict[str, Any]) -> float:
+        raw = str(intent.get("due_at") or "").strip()
+        if not raw:
+            return 0.0
+        try:
+            due = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if due.tzinfo is None:
+                due = due.replace(tzinfo=timezone.utc)
+            return max(0.0, (due - _now()).total_seconds())
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _arm_memory_extract_intent_locked(
+        self, intent: dict[str, Any], *, retry_delay: float | None = None,
+    ) -> None:
+        intent_id = str(intent.get("intent_id") or "").strip()
+        if not intent_id:
+            return
+        old = self._memory_extract_intent_timers.pop(intent_id, None)
+        if old is not None:
+            old.cancel()
+        delay = max(0.0, retry_delay if retry_delay is not None else self._intent_delay(intent))
+        timer = threading.Timer(delay, self._fire_memory_extract_intent, args=[intent_id])
+        timer.daemon = True
+        self._memory_extract_intent_timers[intent_id] = timer
+        timer.start()
+
+    def _persist_memory_extract_intent(self, intent: dict[str, Any]) -> bool:
+        """Durably publish and arm one delayed extraction before the hook returns."""
+        value = dict(intent or {})
+        intent_id = str(value.get("intent_id") or value.get("effect_id") or "").strip()
+        if not intent_id:
+            raise ValueError("memory extraction intent requires intent_id")
+        value["intent_id"] = intent_id
+        if not str(value.get("session_id") or "").strip():
+            raise ValueError("memory extraction intent requires session_id")
+        with self._lock:
+            effect_id = str(value.get("effect_id") or "").strip()
+            if effect_id and self._post_effect_states.get(effect_id) == "completed":
+                return False
+            previous = self._memory_extract_intents.get(intent_id)
+            if isinstance(previous, dict):
+                # A replay may recompute a later due_at. Keep the first durable
+                # schedule so repeated recovery cannot postpone or duplicate it.
+                self._arm_memory_extract_intent_locked(previous)
+                return True
+            self._append_memory_extract_intent_event_locked(
+                "memory_extract_intent_scheduled", value,
+            )
+            self._memory_extract_intents[intent_id] = value
+            self._arm_memory_extract_intent_locked(value)
+            return True
+
+    def _finish_memory_extract_intent_locked(
+        self, intent: dict[str, Any], *, cancelled: bool,
+    ) -> None:
+        intent_id = str(intent.get("intent_id") or "").strip()
+        if not intent_id or intent_id not in self._memory_extract_intents:
+            return
+        timer = self._memory_extract_intent_timers.pop(intent_id, None)
+        if timer is not None:
+            timer.cancel()
+        self._append_memory_extract_intent_event_locked(
+            "memory_extract_intent_cancelled" if cancelled else "memory_extract_intent_completed",
+            intent,
+        )
+        self._memory_extract_intents.pop(intent_id, None)
+        effect_id = str(intent.get("effect_id") or "").strip()
+        if effect_id and self._post_effect_states.get(effect_id) != "completed":
+            self.eventlog.append(
+                session_id=self._memory_extract_intent_session(intent),
+                component="supervisor",
+                type_="task_post_effect_completed",
+                payload={
+                    "post_work_schema_version": 2,
+                    "post_work_id": str(intent.get("post_work_id") or ""),
+                    "phase_id": str(intent.get("phase_id") or ""),
+                    "phase_kind": "hook",
+                    "phase_name": "memory_extract",
+                    "effect_id": effect_id,
+                    "status": "completed",
+                    "task_id": str(intent.get("source_task_id") or ""),
+                    "session_id": str(intent.get("session_id") or ""),
+                },
+            )
+            self._post_effect_states[effect_id] = "completed"
+
+    def _complete_memory_extract_intent(self, intent_id: str) -> None:
+        with self._lock:
+            intent = self._memory_extract_intents.get(str(intent_id or "").strip())
+            if isinstance(intent, dict):
+                self._finish_memory_extract_intent_locked(intent, cancelled=False)
+
+    def _cancel_memory_extract_intents(self, session_id: str) -> int:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return 0
+        with self._lock:
+            matches = [
+                intent for intent in self._memory_extract_intents.values()
+                if str(intent.get("session_id") or "").strip() == sid
+            ]
+            for intent in matches:
+                self._finish_memory_extract_intent_locked(intent, cancelled=True)
+            return len(matches)
+
+    def _memory_extract_task_exists(self, intent_id: str) -> bool:
+        key = str(intent_id or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            if any(
+                str((task.input or {}).get("_memory_extract_intent_id") or "") == key
+                for task in self.tasks.values()
+            ):
+                return True
+        for event in self.eventlog.iter_persisted_events():
+            if event.get("type") != "task_created":
+                continue
+            payload = event.get("payload")
+            task_input = payload.get("input") if isinstance(payload, dict) else None
+            if isinstance(task_input, dict) and str(task_input.get("_memory_extract_intent_id") or "") == key:
+                return True
+        return False
+
+    def _fire_memory_extract_intent(self, intent_id: str) -> None:
+        key = str(intent_id or "").strip()
+        with self._lock:
+            self._memory_extract_intent_timers.pop(key, None)
+            intent = self._memory_extract_intents.get(key)
+        if not isinstance(intent, dict):
+            return
+        handler = self._memory_extract_handler
+        if handler is None or not hasattr(handler, "fire_persisted_intent"):
+            logger.error("memory extraction intent has no capable handler", extra={"intent_id": key})
+            with self._lock:
+                if key in self._memory_extract_intents:
+                    self._arm_memory_extract_intent_locked(intent, retry_delay=5.0)
+            return
+        try:
+            handler.fire_persisted_intent(self._build_supervisor_hook_ctx(), dict(intent))
+        except Exception:
+            logger.exception("memory extraction intent execution failed", extra={"intent_id": key})
+            with self._lock:
+                if key in self._memory_extract_intents:
+                    self._arm_memory_extract_intent_locked(intent, retry_delay=5.0)
+
+    def _recover_memory_extract_intents(self) -> int:
+        handler = self._memory_extract_handler
+        intents = list(self._memory_extract_intents.values())
+        if handler is not None and hasattr(handler, "restore_persisted_intent"):
+            for intent in intents:
+                handler.restore_persisted_intent(dict(intent))
+        with self._lock:
+            for intent in intents:
+                self._arm_memory_extract_intent_locked(intent)
+        return len(intents)
+
+
+    def recover_pending_post_completion_work(self) -> int:
+        """Idempotently queue restored pending/started post work."""
+        queued = 0
+        for work_id, work in list(self._recovered_post_works.items()):
+            if self._post_work_states.get(work_id, "pending") not in {"pending", "started", "partial"}:
+                continue
+            if self._enqueue_post_completion_work(work):
+                queued += 1
+        return queued
+
+    def _restore_recoverable_routes_from_events(self) -> int:
+        """Restore only versioned terminal route intents from the EventLog tail.
+
+        Legacy terminal snapshots lack route_schema_version and are deliberately
+        considered handled. Non-terminal snapshots are not reintroduced into the
+        live worker queue by this completion-only recovery path.
+        """
+        task_event_types = {
+            "task_created", "task_started", "task_completed", "task_cancelled",
+            "task_cancel_requested", "task_requeued", "task_suspended",
+            "task_resumed", "task_route_failed", "task_branch_finalized", "task_routed",
+        }
+        snapshots: dict[str, dict[str, Any]] = {}
+        order: list[str] = []
+        for event in self.eventlog.iter_persisted_events():
+            if event.get("type") not in task_event_types:
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            task_id = str(payload.get("task_id") or "").strip()
+            if not task_id:
+                continue
+            previous = snapshots.get(task_id)
+            merged = dict(payload)
+            raw_input = merged.get("input")
+            if (
+                isinstance(raw_input, dict)
+                and raw_input.get("_input_slimmed")
+                and isinstance(previous, dict)
+                and isinstance(previous.get("input"), dict)
+            ):
+                preserved_input = dict(previous["input"])
+                preserved_input.update({
+                    key: value for key, value in raw_input.items()
+                    if key != "_input_slimmed"
+                })
+                merged["input"] = preserved_input
+            snapshots[task_id] = merged
+            if task_id not in order:
+                order.append(task_id)
+
+        restored = 0
+        legacy_terminal = 0
+        for task_id in order:
+            payload = snapshots[task_id]
+            status = str(payload.get("status") or "")
+            terminal = status in {"completed", "failed", "cancelled"}
+            if not terminal:
+                continue
+            if int(payload.get("route_schema_version") or 0) < 1:
+                legacy_terminal += 1
+                continue
+            if str(payload.get("route_status") or "pending") == RouteStatus.routed.value:
+                continue
+            if not str(payload.get("delivery_id") or "").strip():
+                continue
+            try:
+                task = Task.model_validate(payload)
+            except Exception:
+                logger.exception(
+                    "invalid recoverable completion snapshot",
+                    extra={"event": "task_route_restore_invalid", "task_id": task_id},
+                )
+                continue
+            self.tasks[task_id] = task
+            self._task_order.append(task_id)
+            restored += 1
+
+        logger.info(
+            "completion route intents restored",
+            extra={
+                "event": "task_route_restore_scanned",
+                "restored_count": restored,
+                "legacy_terminal_skipped": legacy_terminal,
+            },
+        )
+        return restored
+
+    def recover_pending_completion_routes(self) -> int:
+        """Retry restored versioned terminal routes without replaying legacy tasks."""
+        recovered = 0
+        with self._lock:
+            candidates = [
+                task for task in self.tasks.values()
+                if self._task_terminal(task)
+                and int(task.route_schema_version or 0) >= 1
+                and bool(str(task.delivery_id or "").strip())
+                and task.route_status != RouteStatus.routed
+            ]
+        for task in candidates:
+            try:
+                self._route_completed_task(task)
+                recovered += 1
+            except Exception:
+                with self._lock:
+                    extra = self._task_route_log_extra_locked(
+                        task, event="task_route_recovery_failed",
+                    )
+                logger.exception("startup completion route recovery failed", extra=extra)
+        if recovered:
+            logger.info(
+                "startup completion routes recovered",
+                extra={"event": "task_route_recovered", "recovered_count": recovered},
+            )
+        return recovered
 
     def _build_supervisor_hook_ctx(self, **extra: Any) -> dict[str, Any]:
         """Build the callback-only context passed to built-in supervisor hooks."""
@@ -161,6 +628,10 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             "current_session_generation": lambda sid: self._current_session_generation_locked(sid),
             "session_count": lambda: len(self.sessions),
             "task_snapshots": self._task_snapshots_from_hook_locked,
+            "persist_memory_extract_intent": self._persist_memory_extract_intent,
+            "cancel_memory_extract_intents": self._cancel_memory_extract_intents,
+            "complete_memory_extract_intent": self._complete_memory_extract_intent,
+            "memory_extract_task_exists": self._memory_extract_task_exists,
         }
         ctx.update(extra)
         return ctx
@@ -294,12 +765,12 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 stale_sids.append(sid)
 
         # 1. 清理 sessions.json 中 reset=true 的条目。
-        for sid, entry in list(self._session_store._registry.items()):
+        for sid, entry in self._session_store.items_snapshot():
             if isinstance(entry, dict) and entry.get("reset"):
                 mark_stale(sid)
 
         # 2. 清理 orphan branch session（重启后上一进程的 branch 不再有活跃任务）。
-        for sid in list(self._session_store._registry.keys()):
+        for sid in self._session_store.keys_snapshot():
             if str(sid).startswith("branch_"):
                 mark_stale(sid)
 
@@ -309,7 +780,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         #   - 无 context_mode（历史遗留）: 直接清理，不等 TTL
         #   - fresh/fork: 24h 无活动后清理
         stale_threshold = datetime.now(timezone.utc) - timedelta(hours=24)
-        for sid, entry in list(self._session_store._registry.items()):
+        for sid, entry in self._session_store.items_snapshot():
             if sid in seen_stale or not isinstance(entry, dict):
                 continue
             if not entry.get("is_child"):
@@ -393,7 +864,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     tr_path.unlink()
                 except Exception:
                     pass
-            if self._session_store._registry.pop(sid, None) is not None:
+            if self._session_store.remove_sessions([sid], flush=False) is not None:
                 cleaned += 1
 
         if cleaned:
@@ -455,7 +926,11 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 self._apply_approval_requested(payload)
             elif et == "approval_decided":
                 self._apply_approval_decided(payload)
-            elif et in {"task_created", "task_started", "task_completed", "task_cancelled", "task_cancel_requested", "task_requeued", "task_suspended", "task_resumed"}:
+            elif et in {
+                "task_created", "task_started", "task_completed", "task_cancelled",
+                "task_cancel_requested", "task_requeued", "task_suspended",
+                "task_resumed", "task_route_failed", "task_branch_finalized", "task_routed",
+            }:
                 self._apply_task_snapshot(payload)
             elif et == "context_reset":
                 conv = payload.get("conversation_key")
@@ -788,8 +1263,9 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # context_mode，才能删除 fresh/fork 并永久保留 accumulate。How: child
         # 创建后立即补写 context_mode 到持久 registry 并落盘。Purpose: 重启后
         # stale cleanup 仍能按模式执行正确清理。
-        self._session_store._registry[child_sid]["context_mode"] = str(context_mode or "").strip()
-        self._session_store._flush()
+        self._session_store.set_entry_field(
+            child_sid, "context_mode", str(context_mode or "").strip(),
+        )
 
         logger.info(
             "child session created: %s (parent=%s, node=%s, key=%s)",
@@ -807,7 +1283,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         runtime_cfg = load_runtime_config(self.workspace_root)
         ttl_hours = get_int(runtime_cfg, "engine.child_session.ttl_hours", 24, min_value=1)
 
-        entry = self._session_store._registry.get(child_session_id)
+        entry = self._session_store.get_entry(child_session_id)
         if entry is None or entry.get("reset"):
             return True
         # [AutoC 2026-05-30] Why: accumulate child session 是长期上下文，老大要求
@@ -874,7 +1350,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         stale_threshold = now - timedelta(hours=24)
         to_remove: list[str] = []
 
-        for sid, info in list(self._session_store._registry.items()):
+        for sid, info in self._session_store.items_snapshot():
             if not isinstance(info, dict):
                 continue
             # [AutoC 2026-05-30] Why: reset=true 条目已经不会参与活跃会话恢复。
@@ -925,8 +1401,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                     pass
 
         if to_remove:
+            self._session_store.remove_sessions(set(to_remove), flush=False)
             for sid in to_remove:
-                self._session_store._registry.pop(sid, None)
                 self.sessions.pop(sid, None)
                 self.session_generations.pop(sid, None)
                 self._cancelled_sessions.discard(sid)

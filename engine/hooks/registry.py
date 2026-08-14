@@ -142,6 +142,21 @@ class HookRegistry:
                 logger.warning("Hook %s.%s failed: %s", hook_point, entry.name, exc)
         return HookResult(modified=modified)
 
+    def handlers_for(self, hook_point: str) -> list[dict[str, Any]]:
+        """Return stable handler descriptors for per-plugin Supervisor ledgers."""
+        result: list[dict[str, Any]] = []
+        for entry in list(self._hooks.get(_normalize_hook_point(hook_point), [])):
+            owner = getattr(entry.callback, "__self__", None)
+            result.append({
+                "name": entry.name,
+                "callback": entry.callback,
+                "post_work_idempotent": bool(
+                    getattr(owner, "post_work_idempotent", False)
+                    or getattr(entry.callback, "post_work_idempotent", False)
+                ),
+            })
+        return result
+
     def list_hooks(self) -> dict[str, list[str]]:
         """Return registered hook points and handler names."""
         return {

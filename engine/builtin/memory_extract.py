@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,9 @@ class MemoryExtractHandler:
     """
 
     name = "memory_extract"
+    # Delayed extraction is replay-safe because its intent and created-task marker
+    # are durable; the effect is completed only after task creation is durable.
+    post_work_idempotent = True
 
     def __init__(self) -> None:
         # [2026-05-23] Why: compacted conversations can shrink message counts,
@@ -69,7 +73,7 @@ class MemoryExtractHandler:
         self._memory_extract_pending: dict[str, dict[str, Any]] = {}
 
     def on_task_complete(self, ctx: dict[str, Any]) -> None:
-        """Schedule memory extraction after a qualifying entry task finishes."""
+        """Schedule memory extraction once for one durable post-work phase."""
         task = ctx.get("task")
         if task is None:
             return
@@ -80,6 +84,9 @@ class MemoryExtractHandler:
         session_id = str(ctx.get("session_id") or "").strip()
         if not session_id:
             return
+        cancel_persisted = ctx.get("cancel_memory_extract_intents")
+        if callable(cancel_persisted):
+            cancel_persisted(session_id)
         lock = ctx.get("acquire_lock")
         if lock is None:
             self._cancel_memory_extract_idle_locked(session_id)
@@ -309,6 +316,7 @@ class MemoryExtractHandler:
         conversation_key = str(task_context.get("conversation_key") or "").strip()
         return {
             "session_id": session_id,
+            "source_task_id": str(getattr(task, "task_id", "") or ""),
             "session_generation": int(getattr(task, "session_generation", 0) or 0),
             "transcript": transcript,
             "task_count": task_count,
@@ -329,21 +337,44 @@ class MemoryExtractHandler:
         delay_sec: int,
         timer_label: str,
     ) -> None:
-        """Replace the per-session idle timer with a prepared extraction payload."""
-        # Why: fallback and normal idle extraction must share one cancellation slot.
-        # How: cancel any existing Timer for the session before storing the new
-        # pending payload and Timer. Purpose: a later finish or inbound cannot leave
-        # stale normal or fallback callbacks active for the same session.
+        """Persist a delayed extraction intent; use a local Timer only for legacy contexts."""
+        phase_id = str(ctx.get("post_phase_id") or "").strip()
+        effect_id = f"{phase_id}:memory_extract_schedule" if phase_id else f"memory_extract:{session_id}"
+        intent = dict(pending_extract)
+        intent.update({
+            "intent_id": effect_id,
+            "effect_id": effect_id,
+            "phase_id": phase_id,
+            "post_work_id": str(ctx.get("post_work_id") or ""),
+            "due_at": (datetime.now(timezone.utc) + timedelta(seconds=delay_sec)).isoformat(),
+            "timer_label": timer_label,
+        })
+        persist_intent = ctx.get("persist_memory_extract_intent")
+        if callable(persist_intent):
+            # Persist first: a crash after the effect-start ledger write can no
+            # longer strand a started effect without the delayed work payload.
+            persisted = persist_intent(intent)
+            if persisted is False:
+                log.info("memory_extract: completed durable intent suppressed effect=%s", effect_id)
+                return
+            claim_effect = ctx.get("claim_phase_effect")
+            if effect_id and callable(claim_effect):
+                claim_effect(effect_id)
+            self._memory_extract_pending[session_id] = intent
+            log.debug(
+                "memory_extract TRACE: durable intent scheduled [%s] session=%s due_at=%s",
+                timer_label, session_id, intent["due_at"],
+            )
+            return
+
         old_timer = self._memory_extract_timers.pop(session_id, None)
         if old_timer is not None:
             old_timer.cancel()
-            log.debug("memory_extract TRACE: cancelled old timer for session %s", session_id)
-        self._memory_extract_pending[session_id] = pending_extract
+        self._memory_extract_pending[session_id] = intent
         timer = threading.Timer(delay_sec, self._fire_memory_extract_idle, args=[dict(ctx), session_id])
         timer.daemon = True
         self._memory_extract_timers[session_id] = timer
         timer.start()
-        log.debug("memory_extract TRACE: TIMER STARTED [%s] session=%s delay=%ds", timer_label, session_id, delay_sec)
 
     def _cancel_memory_extract_idle_locked(self, session_id: str) -> None:
         """Cancel a pending idle memory extraction for one session."""
@@ -357,54 +388,53 @@ class MemoryExtractHandler:
         if timer is not None or pending is not None:
             log.debug("memory_extract TRACE: INBOUND CANCEL timer for session %s (had_timer=%s had_pending=%s)", sid, timer is not None, pending is not None)
 
+    def restore_persisted_intent(self, intent: dict[str, Any]) -> None:
+        """Rebuild handler counters needed if a recovered intent is later cancelled."""
+        sid = str(intent.get("session_id") or "").strip()
+        if not sid:
+            return
+        task_count = _safe_int(intent.get("task_count"), 0)
+        pending_ids = [str(item) for item in (intent.get("pending_task_ids") or []) if str(item)]
+        self._memory_extract_task_counts[sid] = max(
+            task_count, self._memory_extract_task_counts.get(sid, 0),
+        )
+        self._memory_extract_pending_task_ids[sid] = pending_ids
+        self._memory_extract_pending[sid] = dict(intent)
+
     def _fire_memory_extract_idle(self, ctx: dict[str, Any], session_id: str) -> None:
-        """Fire a pending automatic memory extraction after the idle window."""
+        """Legacy local-Timer path; durable Supervisor timers call the same executor."""
         sid = str(session_id or "").strip()
         if not sid:
             return
+        pending_extract = self._memory_extract_pending.get(sid)
+        self._memory_extract_timers.pop(sid, None)
+        if isinstance(pending_extract, dict):
+            self.fire_persisted_intent(ctx, pending_extract)
 
-        lock = ctx.get("acquire_lock")
-        if lock is None:
-            return
-        # Why: threading.Timer runs outside the supervisor request/event thread.
-        # How: take the injected lock before touching pending state or creating
-        # tasks. Purpose: serialize timer callbacks with inbound handling and task
-        # routing while keeping handler-owned dictionaries consistent.
-        with lock:
-            pending_extract = self._memory_extract_pending.pop(sid, None)
-            self._memory_extract_timers.pop(sid, None)
-            if not isinstance(pending_extract, dict):
-                return
+    def fire_persisted_intent(self, ctx: dict[str, Any], pending_extract: dict[str, Any]) -> None:
+        """Create the real extractor task once, then complete the durable intent/effect."""
+        sid = str(pending_extract.get("session_id") or "").strip()
+        intent_id = str(pending_extract.get("intent_id") or pending_extract.get("effect_id") or "").strip()
+        transcript = str(pending_extract.get("transcript") or "")
+        if not sid or not intent_id or not transcript.strip():
+            raise ValueError("invalid persisted memory extraction intent")
 
-            transcript = str(pending_extract.get("transcript") or "")
-            if not transcript.strip():
-                return
-            task_count = _safe_int(pending_extract.get("task_count"), self._memory_extract_task_counts.get(sid, 0))
-            session_generation = _safe_int(pending_extract.get("session_generation"), 0)
-            if session_generation <= 0:
-                current_generation = ctx.get("current_session_generation")
-                session_generation = int(current_generation(sid) or 1) if callable(current_generation) else 1
-            extractor_node = str(pending_extract.get("extractor_node") or "system.memory_extractor").strip()
-            extractor_node = extractor_node or "system.memory_extractor"
+        task_exists = ctx.get("memory_extract_task_exists")
+        already_created = bool(callable(task_exists) and task_exists(intent_id))
+        task_count = _safe_int(
+            pending_extract.get("task_count"), self._memory_extract_task_counts.get(sid, 0),
+        )
+        session_generation = _safe_int(pending_extract.get("session_generation"), 0)
+        if session_generation <= 0:
+            current_generation = ctx.get("current_session_generation")
+            session_generation = int(current_generation(sid) or 1) if callable(current_generation) else 1
+        extractor_node = str(pending_extract.get("extractor_node") or "system.memory_extractor").strip()
+        extractor_node = extractor_node or "system.memory_extractor"
 
-            # [AutoC 2026-05-24] Why: cancelled idle windows must not mark task
-            # ids as extracted. How: commit the total task count and clear the
-            # pending source_task_id list only inside the timer callback after
-            # pending data is popped. Purpose: cancelled idle windows still
-            # contribute to future extraction without losing transcript scope.
-            self._memory_extract_task_counts[sid] = task_count
-            self._memory_extract_last_extracted_task_counts[sid] = task_count
-            self._memory_extract_pending_task_ids[sid] = []
-
+        if not already_created:
             create_task = ctx.get("create_task")
             if not callable(create_task):
-                return
-            # [AutoC 2026-05-31] Why: the extractor prompt no longer embeds a
-            # static book taxonomy, so the task input must carry the current
-            # memory books. How: resolve workspace_root from hook context first
-            # and fall back to pending payloads, then prefix the transcript with
-            # the sorted data/memory/*.yaml stems. Purpose: prefer existing books
-            # while still allowing the extractor to create a new semantic book.
+                raise RuntimeError("memory extraction create_task callback is unavailable")
             workspace_value = ctx.get("workspace_root") or pending_extract.get("workspace_root")
             workspace_root = Path(workspace_value) if workspace_value is not None else None
             conversation_key = str(pending_extract.get("conversation_key") or "").strip()
@@ -417,14 +447,14 @@ class MemoryExtractHandler:
             if mem_dir is not None and memory_namespace:
                 mem_dir = mem_dir / memory_namespace
             book_names = sorted(
-                p.stem for p in mem_dir.glob("*.yaml")
+                path.stem for path in mem_dir.glob("*.yaml")
             ) if mem_dir is not None and mem_dir.exists() else []
             book_list_header = ""
             if book_names:
-                book_list_header = f"当前已有的 memory book 列表：{', '.join(book_names)}\n保存时优先使用已有 book，也可以创建新 book。\n\n"
-
-            # [2026-04-26] child_session_id isolation prevents the system task's
-            # instruction from being written into the main session JSONL history.
+                book_list_header = (
+                    f"当前已有的 memory book 列表：{', '.join(book_names)}\n"
+                    "保存时优先使用已有 book，也可以创建新 book。\n\n"
+                )
             child_sid = f"child_{uuid.uuid4().hex[:12]}"
             create_task(
                 session_id=sid,
@@ -435,14 +465,22 @@ class MemoryExtractHandler:
                     "instruction": book_list_header + transcript,
                     "child_session_id": child_sid,
                     "_system_task": True,
-                    "task_context": {
-                        "conversation_key": conversation_key,
-                    },
+                    "_memory_extract_intent_id": intent_id,
+                    "task_context": {"conversation_key": conversation_key},
                 },
                 continuation={},
                 source_inbound_seq=None,
                 caller_task_id=None,
             )
+
+        # Move cursors only after task_created is durable (or observed on recovery).
+        self._memory_extract_task_counts[sid] = task_count
+        self._memory_extract_last_extracted_task_counts[sid] = task_count
+        self._memory_extract_pending_task_ids[sid] = []
+        self._memory_extract_pending.pop(sid, None)
+        complete_intent = ctx.get("complete_memory_extract_intent")
+        if callable(complete_intent):
+            complete_intent(intent_id)
 
 
 def _task_kind_is_node(task: Any) -> bool:

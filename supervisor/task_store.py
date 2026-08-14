@@ -1,6 +1,7 @@
 """Task 生命周期 mixin —— 创建、领取、完成、取消。"""
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import timedelta
 from typing import Any
@@ -8,7 +9,10 @@ from typing import Any
 from clonoth_runtime import get_str, load_runtime_config
 
 from ._helpers import _now
-from .types import Task, TaskKind, TaskStatus
+from .types import RouteStatus, Task, TaskKind, TaskStatus
+
+
+logger = logging.getLogger(__name__)
 
 
 class TaskStoreMixin:
@@ -72,10 +76,49 @@ class TaskStoreMixin:
         except Exception:
             return None
 
+    def _reset_task_route_state_locked(self, task: Task) -> None:
+        """Persist a stable intent identity for a newly produced completion phase."""
+        task.route_schema_version = 1
+        task.route_generation = max(0, int(task.route_generation or 0)) + 1
+        task.delivery_id = f"task:{task.task_id}:completion:{task.route_generation}:v1"
+        task.route_status = RouteStatus.pending
+        task.routed_at = None
+        task.route_error = ""
+        task.post_work_schema_version = 0
+        task.post_work_id = ""
+        task.post_work_status = ""
+        task.post_work_error = ""
+        task.post_work_phases = []
+        raw_input = task.input if isinstance(task.input, dict) else {}
+        task_context = raw_input.get("task_context")
+        try:
+            base_count = int(raw_input.get("base_count") or 0)
+        except (TypeError, ValueError):
+            base_count = 0
+        task.route_context = {
+            "runtime_session_id": task.session_id,
+            "route_session_id": str(
+                raw_input.get("_route_session_id")
+                or raw_input.get("parent_session_id")
+                or task.session_id
+                or ""
+            ),
+            "parent_session_id": str(raw_input.get("parent_session_id") or ""),
+            "branch_session_id": str(raw_input.get("branch_session_id") or ""),
+            "base_count": base_count,
+            "conversation_key": str(
+                task_context.get("conversation_key")
+                if isinstance(task_context, dict)
+                else ""
+            ),
+        }
+
     # ---- 内部 task 创建 ----
 
-    def _event_task_snapshot(self, event_type: str, task: Task, *, component: str = "supervisor") -> None:
-        self.eventlog.append(
+    def _event_task_snapshot(
+        self, event_type: str, task: Task, *, component: str = "supervisor",
+    ) -> dict[str, Any]:
+        return self.eventlog.append(
             session_id=task.session_id,
             component=component,
             type_=event_type,
@@ -116,8 +159,9 @@ class TaskStoreMixin:
                 slim_input: dict[str, Any] = {"_input_slimmed": True}
                 for _k in (
                     "task_context", "_dispatch_origin", "dispatch_context_mode",
-                    "parent_session_id", "child_session_id",
-                    "_compact_dispatch_pending",
+                    "parent_session_id", "branch_session_id", "base_count",
+                    "_route_session_id", "_branch_finalized", "child_session_id",
+                    "_compact_dispatch_pending", "_system_task", "_async_dispatch",
                 ):
                     if _k in raw_input:
                         slim_input[_k] = raw_input[_k]
@@ -816,42 +860,51 @@ class TaskStoreMixin:
         wid = (worker_id or "").strip()
         if not tid or not wid:
             return None
+        should_route = False
+        finalize_only = False
         with self._lock:
             task = self.tasks.get(tid)
             if task is None:
                 return None
             if self._task_terminal(task):
-                return task
-            if task.worker_id and task.worker_id != wid and task.lease_expires_at and task.lease_expires_at > _now():
-                return None
-
-            current_gen = self._current_session_generation_locked(task.session_id)
-            if task.cancel_requested or (current_gen and task.session_generation != current_gen):
-                task.cancel_requested = True
-                task.status = TaskStatus.cancelled
-                task.updated_at = _now()
-                task.lease_expires_at = None
-                task.result = dict(result or {})
-                # [Fork/Merge 2026-05-12] 运行中的入口分支被取消时仍需收束分支。
-                # 原因：cancel_requested 分支原先直接 return，不会进入 task_router 的终态路由。
-                # 做法：在写 task_cancelled 事件前调用分支 finalize，执行 merge 与 cleanup。
-                # 目的：finish/fail/cancel 三类终态都能把分支历史回写主 session。
-                self._finalize_branch_task_locked(task, merge=True)
-                self._event_task_snapshot("task_cancelled", task, component="engine")
-                return task
-
-            task.result = dict(result or {})
-            task.updated_at = _now()
-            task.lease_expires_at = None
-
-            act = str(task.result.get("action") or "").strip()
-            if act == "cancelled":
-                task.status = TaskStatus.cancelled
-            elif act == "fail":
-                task.status = TaskStatus.failed
+                should_route = task.route_status != RouteStatus.routed
+                if not should_route:
+                    logger.info(
+                        "task completion already routed; skipping duplicate route",
+                        extra=self._task_route_log_extra_locked(task, event="task_route_skipped"),
+                    )
             else:
-                task.status = TaskStatus.completed
+                if task.worker_id and task.worker_id != wid and task.lease_expires_at and task.lease_expires_at > _now():
+                    return None
+                current_gen = self._current_session_generation_locked(task.session_id)
+                if task.cancel_requested or (current_gen and task.session_generation != current_gen):
+                    task.cancel_requested = True
+                    task.status = TaskStatus.cancelled
+                    task.updated_at = _now()
+                    task.lease_expires_at = None
+                    task.result = dict(result or {})
+                    task.route_status = RouteStatus.routed
+                    task.routed_at = task.updated_at
+                    task.route_error = ""
+                    self._event_task_snapshot("task_cancelled", task, component="engine")
+                    finalize_only = True
+                else:
+                    task.result = dict(result or {})
+                    task.updated_at = _now()
+                    task.lease_expires_at = None
+                    act = str(task.result.get("action") or "").strip()
+                    if act == "cancelled":
+                        task.status = TaskStatus.cancelled
+                    elif act == "fail":
+                        task.status = TaskStatus.failed
+                    else:
+                        task.status = TaskStatus.completed
+                    self._reset_task_route_state_locked(task)
+                    self._event_task_snapshot("task_completed", task, component="engine")
+                    should_route = True
 
-            self._event_task_snapshot("task_completed", task, component="engine")
-            self._route_completed_task_locked(task)
-            return task
+        if finalize_only:
+            self._finalize_branch_task(task, merge=True)
+        elif should_route:
+            self._route_completed_task(task)
+        return task

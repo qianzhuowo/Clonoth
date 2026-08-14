@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import time
+import uuid
 from collections import OrderedDict, defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +86,10 @@ from .config import (
     TRIGGER_PREFIXES,
     USER_PROFILES_PATH,
     ONEBOT_STATE_FILE,
+    ONEBOT_IDEMPOTENCY_STORE_FILE,
+    ONEBOT_IDEMPOTENCY_SENT_TTL_SECONDS,
+    ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS,
+    ONEBOT_IDEMPOTENCY_MAX_ITEMS,
     REPLY_ATTACHMENT_CACHE_FILE,
     ANON_MAP_FILE,
 )
@@ -93,6 +98,22 @@ from .attachment_policy import (
     select_recent_image_entries,
     should_fallback_to_recent_images,
     source_attachments_from_merged,
+)
+from .send_contract import (
+    IdempotencyClaim,
+    IdempotencyOwnershipError,
+    OneBotAmbiguousAckError,
+    OneBotAttachmentBatchError,
+    OneBotSendContractError,
+    OneBotSendNotStartedError,
+    OutboundSendContext,
+    TwoPhaseIdempotencyStore,
+    classify_send_exception,
+    context_from_sources,
+    image_content_identity,
+    make_idempotency_key,
+    protected_claim_send,
+    validate_send_request,
 )
 from .emoji_handler import (
     count_duplicate_face_names,
@@ -147,7 +168,7 @@ _CUSTOM_FACE_LIST_RE = re.compile(r"^(?:表情列表|收藏表情列表|emoji列
 _CUSTOM_FACE_DETAIL_LIST_RE = re.compile(r"^(?:表情详情列表|收藏表情详情|表情管理列表)(?:\s+(\d+))?$", re.IGNORECASE)
 _CUSTOM_FACE_SYNC_RE = re.compile(r"^(?:同步表情列表|刷新表情列表|更新表情列表)$", re.IGNORECASE)
 _CUSTOM_FACE_HELP_RE = re.compile(r"^(?:表情包帮助|表情帮助|表情包命令|表情命令帮助)$", re.IGNORECASE)
-_CUSTOM_FACE_ADD_RE = re.compile(r"^(?:收藏表情|添加表情|保存表情)\s+(.+?)\s*$", re.IGNORECASE)
+_CUSTOM_FACE_ADD_RE = re.compile(r"^(?:收藏表情|添加表情|保存表情|表情收藏)\s+(.+?)\s*$", re.IGNORECASE)
 _CUSTOM_FACE_RENAME_RE = re.compile(r"^(?:命名表情|重命名表情|改名表情)\s+(\S+)\s+(.+?)\s*$", re.IGNORECASE)
 _CUSTOM_FACE_DELETE_RE = re.compile(r"^(?:删除表情|移除表情|取消收藏表情)\s+(.+?)\s*$", re.IGNORECASE)
 _DRAW_DIRECT_RE = re.compile(r"^(?:[/／!！]?\s*(?:生图|画图|绘图|nai生图|novelai生图)|/(?:draw|nai|novelai))\s*(.*)$", re.IGNORECASE)
@@ -278,8 +299,13 @@ _reply_message_cache_order: Deque[str] = deque()
 # 持久化的“message_id -> 本地附件”索引。用于 NapCat get_msg 取不到引用消息时，
 # 仍能转发此前已经下载到 Clonoth 的图片/表情包。只保存路径和少量路由元数据。
 _reply_attachment_cache: Dict[str, Dict[str, Any]] = {}
-_sent_reply_cache: Dict[str, float] = {}
-_sent_reply_cache_order: Deque[str] = deque()
+# Outbound replay protection uses pending/sent phases: failed sends release pending,
+# while only acknowledged sends become sent.
+_outbound_idempotency = TwoPhaseIdempotencyStore(
+    ONEBOT_IDEMPOTENCY_STORE_FILE,
+    sent_ttl=ONEBOT_IDEMPOTENCY_SENT_TTL_SECONDS,
+    max_items=ONEBOT_IDEMPOTENCY_MAX_ITEMS,
+)
 _route_state_lock = asyncio.Lock()
 _anon_users: Dict[str, str] = {}
 _anon_groups: Dict[str, str] = {}
@@ -2472,11 +2498,62 @@ async def _forward_nodes_from_reply(bot: Bot, event: Event, conversation_key: st
     return [node] if node else []
 
 
-async def _send_forward_nodes(bot: Bot, target: ProactiveTarget, nodes: list[dict[str, Any]]) -> None:
-    if target.target_type == "group":
-        await bot.call_api("send_group_forward_msg", group_id=int(target.target_id), messages=nodes)
-    else:
-        await bot.call_api("send_private_forward_msg", user_id=int(target.target_id), messages=nodes)
+def _request_send_context(
+    scope: str, request_identity: str, conversation_key: str = "",
+) -> OutboundSendContext:
+    digest = hashlib.sha256(request_identity.encode("utf-8", "ignore")).hexdigest()
+    return OutboundSendContext(
+        conversation_key=conversation_key,
+        idempotency_key=f"request:{scope}:{digest}",
+    )
+
+
+async def _send_forward_nodes(
+    bot: Bot,
+    target: ProactiveTarget,
+    nodes: list[dict[str, Any]],
+    *,
+    send_context: OutboundSendContext | None = None,
+) -> None:
+    target_dict = _target_to_send_dict(target)
+    identity = "forward-nodes:" + hashlib.sha256(
+        json.dumps(nodes, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    context = (send_context or OutboundSendContext()).child(identity)
+    key = make_idempotency_key(
+        target_dict, identity, event_id=context.idempotency_key or context.event_id,
+    )
+    claim = await _outbound_idempotency.begin(key)
+    if not claim.acquired and claim.state == "pending":
+        resolved = await _outbound_idempotency.wait_for_resolution(key)
+        claim = (
+            await _outbound_idempotency.begin(key)
+            if resolved is None else IdempotencyClaim(key, False, resolved)
+        )
+    if not claim.acquired:
+        return
+    heartbeat = asyncio.create_task(_heartbeat_idempotency_claim(claim))
+    try:
+        async def send_forward() -> Any:
+            if target.target_type == "group":
+                return await bot.call_api(
+                    "send_group_forward_msg", group_id=int(target.target_id), messages=nodes,
+                )
+            return await bot.call_api(
+                "send_private_forward_msg", user_id=int(target.target_id), messages=nodes,
+            )
+
+        await protected_claim_send(
+            _outbound_idempotency,
+            claim,
+            send_forward,
+            sent_ttl=_sent_ttl_for_context(context),
+            message_id_getter=_extract_sent_message_id,
+        )
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
 
 
 # 注意：自然语言转发（“把 xx 转发给 xx”等）不再在 Bot 入口做本地正则拦截，
@@ -2538,20 +2615,28 @@ async def _maybe_handle_proactive_command(
         return error or "目标解析失败。"
     send_target = _target_to_send_dict(target)
     label = _target_display_label(target.target_type, target.label)
+    request_id = str(getattr(event, "message_id", "") or uuid.uuid4().hex)
+    send_context = _request_send_context(
+        "proactive", f"{conversation_key}:{request_id}", conversation_key,
+    )
 
     if action == "send":
         body = str(command.get("body") or "").strip()
         attachments = current_attachments or []
         if not body and not attachments:
             return "发送内容为空。"
-        await _send_text_and_attachments(bot, send_target, body, attachments)
+        await _send_text_and_attachments(
+            bot, send_target, body, attachments, send_context=send_context,
+        )
         return f"已发送到{label}。"
 
     if action == "file":
         attachment, file_error = _parse_file_send_body(command.get("body") or "")
         if attachment is None:
             return file_error
-        await _send_attachments(bot, send_target, [attachment])
+        await _send_attachments(
+            bot, send_target, [attachment], send_context=send_context,
+        )
         return f"已向{label}发送文件：{attachment.get('name') or attachment.get('path')}"
 
     if action == "forward":
@@ -2573,7 +2658,9 @@ async def _maybe_handle_proactive_command(
         if not nodes:
             return "没有可转发内容。请提供文本，或引用一条消息/合并转发卡片。"
         try:
-            await _send_forward_nodes(bot, target, nodes)
+            await _send_forward_nodes(
+                bot, target, nodes, send_context=send_context,
+            )
         except Exception as exc:
             logger.warning("send forward message failed: %s", exc, exc_info=True)
             return "合并转发发送失败：当前 OneBot/NapCat 可能不支持该接口，或目标不可达。"
@@ -3933,65 +4020,6 @@ def _message_dedup_text(message: Any) -> str:
     return str(message or "")
 
 
-def _image_resend_dedup_key(target: Dict[str, Any], path: Path) -> str:
-    """[2026-07-22] 为“图片超时补发”生成基于目标+本地图路径的幂等键。
-
-    Why: sendMsg 超时时图片*大概率已发出*但偶尔真失败。需要“补发一次但不重复”，
-    而首次发用本地路径、补发用 base64://，两者消息文本不同，无法靠通用
-    _should_skip_duplicate_send 互相去重。How: 用 target+图片绝对路径作为稳定指纹，
-    同一张图短时内只能“超时补发”一次。Purpose: 避免超时重试造成同图双发。
-    """
-    ttype = str(target.get("type") or "")
-    tid = str(target.get("group_id") if ttype == "group" else target.get("user_id") or "")
-    try:
-        p = str(path.resolve())
-    except Exception:
-        p = str(path)
-    return hashlib.sha256(f"imgresend:{ttype}:{tid}:{p}".encode("utf-8", "ignore")).hexdigest()
-
-
-def _mark_and_check_image_resend(target: Dict[str, Any], path: Path, *, ttl: float = 120.0) -> bool:
-    """[2026-07-22] 判定并登记一张图是否已做过超时补发。
-
-    返回 True 表示短时内已补发过、本次应跳过；False 表示首次、可补发。
-    复用 _sent_reply_cache 同一套 LRU 缓存以免无限增长。
-    """
-    key = _image_resend_dedup_key(target, path)
-    now = time.time()
-    ts = _sent_reply_cache.get(key)
-    if ts and now - ts <= ttl:
-        return True
-    _sent_reply_cache[key] = now
-    _sent_reply_cache_order.append(key)
-    return False
-
-
-def _should_skip_duplicate_send(target: Dict[str, Any], message: Any, *, ttl: float = 30.0) -> bool:
-    """短时间内跳过同一会话的完全相同消息，防止事件重放/双路径重复发送。"""
-    target_type = str(target.get("type") or "")
-    target_id = str(target.get("group_id") if target_type == "group" else target.get("user_id") or "")
-    body = _message_dedup_text(message).strip()
-    if not target_type or not target_id or not body:
-        return False
-    digest = hashlib.sha256(f"{target_type}:{target_id}:{body}".encode("utf-8", "ignore")).hexdigest()
-    now = time.time()
-    while _sent_reply_cache_order:
-        old = _sent_reply_cache_order[0]
-        ts = _sent_reply_cache.get(old, 0.0)
-        if now - ts <= ttl and len(_sent_reply_cache_order) <= 512:
-            break
-        _sent_reply_cache_order.popleft()
-        if ts and now - ts > ttl:
-            _sent_reply_cache.pop(old, None)
-    ts = _sent_reply_cache.get(digest)
-    if ts and now - ts <= ttl:
-        logger.warning("skip duplicate QQ send target=%s:%s digest=%s", target_type, target_id, digest[:10])
-        return True
-    _sent_reply_cache[digest] = now
-    _sent_reply_cache_order.append(digest)
-    return False
-
-
 # 群成员缓存：group_id -> (过期时间, {user_id 集合}, {名片/昵称小写 -> user_id},
 #                         {user_id -> (card, nickname)})。
 # 用于（1）发送前校验 at 目标是否本群成员，避免 NapCat 对无法解析的 uid
@@ -4186,12 +4214,10 @@ def _extract_sent_message_id(result: Any) -> str:
     return ""
 
 
-async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any, *, dedupe: bool = True) -> str:
-    """按 QQ 会话类型选择 OneBot 发送接口，返回新消息的 message_id（取不到时为空串）。"""
+async def _send_qq_message_once(bot: Bot, target: Dict[str, Any], message: Any, *, dedupe: bool = True) -> str:
+    """执行一次 OneBot 发送流程（含既有的协议级自动补发）。"""
     # 2026-05-01 修改原因：私聊回复必须调用 send_private_msg，群聊回复继续调用
     # send_group_msg。通过 target 分发，回调发送文本和附件时不再硬编码群聊接口。
-    if dedupe and _should_skip_duplicate_send(target, message):
-        return ""
     if target.get("type") == "private":
         user_id = target.get("user_id")
         if user_id is None:
@@ -4247,7 +4273,112 @@ async def _send_qq_message(bot: Bot, target: Dict[str, Any], message: Any, *, de
                 result = await bot.send_group_msg(group_id=int(group_id), message=safe_message)
                 return _extract_sent_message_id(result)
             raise
-    raise ValueError(f"unknown QQ target type: {target!r}")
+    raise OneBotSendContractError(f"unknown QQ target type: {target!r}")
+
+
+def _send_audit_fields(
+    context: OutboundSendContext,
+    *,
+    platform_message_id: str,
+    attempt: int,
+    idempotency_key: str,
+) -> Dict[str, Any]:
+    return {
+        "event_seq": context.event_seq,
+        "event_id": context.event_id,
+        "task_id": context.task_id,
+        "source_inbound_seq": context.source_inbound_seq,
+        "conversation_key": context.conversation_key,
+        "platform_message_id": platform_message_id,
+        "attempt": attempt,
+        "idempotency_key": idempotency_key,
+    }
+
+
+def _sent_ttl_for_context(context: OutboundSendContext) -> float | None:
+    """Use short retention only for the last-resort context-free content key."""
+    if context.idempotency_key or context.event_id:
+        return None
+    return ONEBOT_IDEMPOTENCY_FALLBACK_SENT_TTL_SECONDS
+
+
+async def _heartbeat_idempotency_claim(claim: IdempotencyClaim) -> None:
+    """Renew one logical-send owner until its platform operation finishes."""
+    interval = max(0.05, min(30.0, _outbound_idempotency.lease_seconds / 3))
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await _outbound_idempotency.heartbeat(claim)
+        except IdempotencyOwnershipError:
+            # The protected send commits pending -> sent/ambiguous atomically. A
+            # heartbeat already queued at that boundary will then observe that its
+            # pending ownership is gone; this is the normal terminal condition.
+            # A real takeover is still detected by the protected operation's strict
+            # owner-checked commit/release path.
+            return
+
+
+async def _send_qq_message(
+    bot: Bot,
+    target: Dict[str, Any],
+    message: Any,
+    *,
+    dedupe: bool = True,
+    send_context: OutboundSendContext | None = None,
+    content_identity: str = "",
+    idempotency_key: str = "",
+    attempt: int = 1,
+) -> str:
+    """Send with an explicit contract and pending/sent two-phase idempotency."""
+    validate_send_request(bot, target)
+    context = send_context or OutboundSendContext(
+        conversation_key=str(target.get("conversation_key") or "")
+    )
+    identity = content_identity or _message_dedup_text(message).strip()
+    key = idempotency_key or make_idempotency_key(
+        target, identity, event_id=context.idempotency_key or context.event_id,
+    )
+    claim = await _outbound_idempotency.begin(key)
+    if not claim.acquired and claim.state == "pending":
+        resolved = await _outbound_idempotency.wait_for_resolution(key)
+        if resolved is None:
+            claim = await _outbound_idempotency.begin(key)
+        else:
+            claim = IdempotencyClaim(key=key, acquired=False, state=resolved)
+    fields = _send_audit_fields(
+        context,
+        platform_message_id="",
+        attempt=attempt,
+        idempotency_key=key,
+    )
+    if not claim.acquired:
+        logger.info("onebot_send_duplicate", extra={**fields, "claim_state": claim.state})
+        return f"idempotent:{key}"
+    logger.info("onebot_send_started", extra=fields)
+    heartbeat = asyncio.create_task(_heartbeat_idempotency_claim(claim))
+    try:
+        async def send_once() -> str:
+            return await _send_qq_message_once(bot, target, message, dedupe=dedupe)
+
+        platform_message_id = await protected_claim_send(
+            _outbound_idempotency,
+            claim,
+            send_once,
+            sent_ttl=_sent_ttl_for_context(context),
+            message_id_getter=lambda result: str(result or ""),
+        )
+        logger.info(
+            "onebot_send_sent",
+            extra=_send_audit_fields(
+                context, platform_message_id=platform_message_id,
+                attempt=attempt, idempotency_key=key,
+            ),
+        )
+        return platform_message_id
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
 
 
 async def _send_split_text(
@@ -4256,6 +4387,7 @@ async def _send_split_text(
     text: str,
     *,
     source_attachments: List[Dict[str, Any]] | None = None,
+    send_context: OutboundSendContext | None = None,
 ) -> bool:
     """按 [SPLIT] 拆分文本，并把每段回复绑定到本轮来源图片。"""
     # 2026-05-01 修改原因：文本拆分逻辑对群聊和私聊相同，实际发送交给
@@ -4282,7 +4414,15 @@ async def _send_split_text(
             if target.get("reply_sender_id"):
                 prefix = prefix + MessageSegment.at(target["reply_sender_id"]) + MessageSegment.text(" ")
             msg = prefix + msg
-        sent_message_id = await _send_qq_message(bot, target, msg)
+        segment_identity = f"text:{index}:{_message_dedup_text(msg).strip()}"
+        segment_context = send_context.child(segment_identity) if send_context else None
+        sent_message_id = await _send_qq_message(
+            bot,
+            target,
+            msg,
+            send_context=segment_context,
+            content_identity=segment_identity,
+        )
         if sent_message_id and source_attachments:
             _remember_reply_attachments(
                 sent_message_id,
@@ -4388,111 +4528,146 @@ def _is_api_call_timeout(exc: Exception) -> bool:
     return "call api" in text or "networkerror" in text or "network error" in text
 
 
-async def _send_attachment_path(bot: Bot, target: Dict[str, Any], path: Path, filename: str = "") -> str:
-    """图片附件发送为图片消息；非图片附件通过 NapCat 文件上传 API 发送。
-
-    返回图片消息的 message_id（非图片/取不到时为空串），供调用方登记
-    message_id -> 本地图片路径，支持“引用 Bot 图片继续改”时把原图送给 AI。
-    """
+async def _send_attachment_path(
+    bot: Bot,
+    target: Dict[str, Any],
+    path: Path,
+    filename: str = "",
+    *,
+    send_context: OutboundSendContext | None = None,
+) -> str:
+    """Send one attachment under one persistent logical owner claim."""
     display_name = filename or path.name
-    if path.exists() and path.suffix.lower() in _IMAGE_SUFFIXES:
-        file_path = str(path.resolve())
-        try:
-            return await _send_qq_message(bot, target, MessageSegment.image(file=file_path))
-        except Exception as exc:  # noqa: BLE001
-            # [2026-07-17] 区分三类失败，既避免「同一张图发两次」又避免漏发：
-            #   1) NapCat sendMsg 超时（message 含 Timeout+sendMsg）：这类是 NapCat
-            #      已把消息交给 NTQQ、只是没在超时窗口内回 ack，图片*大概率已发出*。
-            #      此时不重试，直接吞掉异常返回空 mid。
-            #   2) [2026-07-22] ENOENT（NapCat 容器内 temp 临时文件缺失，retcode=1200）：
-            #      这是真失败、图没发出。旧逐辑靠 retcode==1200 把它误归为“超时已送达”
-            #      而静默吞掉，造成漏发。现改为用 base64:// 内联重发，彻底绕开 NapCat
-            #      容器的 temp 目录依赖。
-            #   3) 其它失败（如本地路径格式不被接受）：同样先 base64:// 再 file:// 重试。
-            #      重试必须绕过去重（dedupe=False），否则会被当成重复消息跳过，导致漏发。
-            if _is_napcat_sendmsg_timeout(exc):
-                # [2026-07-22] sendMsg 超时：图片*大概率已发出*但偶尔真失败。
-                # 旧逻辑直接吞掉不补发，造成偶发漏图。现改为：等待
-                # 短暂延迟后用 base64:// “带去重”补发一次——依靠图片路径级幂等键
-                # 保证同一张图只补发一次；若首发其实已成功，补发依据发送文本去重
-                # （_should_skip_duplicate_send）也会被拦住，最大限度避免双发。
-                if _mark_and_check_image_resend(target, path):
-                    logger.warning(
-                        "图片发送疑似超时，且短时内已补发过，不再重发 (%s): %s",
-                        display_name, exc,
-                    )
-                    return ""
-                logger.warning(
-                    "图片发送疑似超时，延迟后用 base64:// 带去重补发一次 (%s): %s",
-                    display_name, exc,
-                )
-                try:
-                    await asyncio.sleep(_IMAGE_TIMEOUT_RESEND_DELAY_SEC)
-                    _b64 = "base64://" + base64.b64encode(path.read_bytes()).decode("ascii")
-                    # 保留 dedupe=True：若首发已成功（相同图片段文本），这次会被去重拦住。
-                    return await _send_qq_message(bot, target, MessageSegment.image(file=_b64))
-                except Exception as resend_exc:  # noqa: BLE001
-                    logger.warning(
-                        "图片超时补发失败 (%s): %s", display_name, resend_exc,
-                    )
-                    return ""
-            _enoent = _is_napcat_enoent(exc)
-            logger.warning(
-                "图片发送失败，改用 base64:// 重发 (%s%s): %s",
-                display_name, " | ENOENT" if _enoent else "", exc,
-                exc_info=not _enoent,
-            )
-            # 优先 base64:// 内联重发（绕开 NapCat 容器 temp/挂载目录问题）。
-            try:
-                _b64 = "base64://" + base64.b64encode(path.read_bytes()).decode("ascii")
-                return await _send_qq_message(
-                    bot,
-                    target,
-                    MessageSegment.image(file=_b64),
-                    dedupe=False,
-                )
-            except Exception as b64_exc:  # noqa: BLE001
-                logger.warning(
-                    "base64:// 重发仍失败，回退 file:// 重试 (%s): %s",
-                    display_name, b64_exc,
-                )
-                return await _send_qq_message(
-                    bot,
-                    target,
-                    MessageSegment.image(file=f"file://{file_path}"),
-                    dedupe=False,
-                )
-    # [2026-05-08] 非图片附件通过 NapCat upload_group_file / upload_private_file 发送
-    # [2026-07-08] 改用 base64:// 传输文件内容，避免把宿主机绝对路径交给 NapCat：
-    # NapCat 运行在 Docker 容器内，只挂载了部分目录，直接传本地路径会因容器内
-    # 找不到文件而报 retcode=1200「识别URL失败」。base64 内联可彻底绕开路径/挂载问题。
     if not path.exists():
-        await _send_qq_message(bot, target, f"Clonoth 生成了文件：{display_name}（文件不存在）")
-        return ""
-    try:
+        raise OneBotSendContractError(f"attachment does not exist: {path}")
+    raw_bytes = path.read_bytes()
+    context = send_context or OutboundSendContext(
+        conversation_key=str(target.get("conversation_key") or "")
+    )
+
+    if path.suffix.lower() in _IMAGE_SUFFIXES:
+        identity = image_content_identity(raw_bytes)
+        context = context.child(identity)
+        key = make_idempotency_key(
+            target, identity, event_id=context.idempotency_key or context.event_id,
+        )
+        claim = await _outbound_idempotency.begin(key)
+        if not claim.acquired and claim.state == "pending":
+            resolved = await _outbound_idempotency.wait_for_resolution(key)
+            claim = (
+                await _outbound_idempotency.begin(key)
+                if resolved is None else IdempotencyClaim(key, False, resolved)
+            )
+        if not claim.acquired:
+            return f"idempotent:{key}"
+        heartbeat = asyncio.create_task(_heartbeat_idempotency_claim(claim))
+        errors: list[BaseException] = []
+        file_path = str(path.resolve())
+        encoded = "base64://" + base64.b64encode(raw_bytes).decode("ascii")
+        attempts = (
+            MessageSegment.image(file=file_path),
+            MessageSegment.image(file=encoded),
+            MessageSegment.image(file=f"file://{file_path}"),
+        )
+        fields = _send_audit_fields(
+            context, platform_message_id="", attempt=context.attempt,
+            idempotency_key=key,
+        )
         try:
-            raw_bytes = path.read_bytes()
-            file_str = "base64://" + base64.b64encode(raw_bytes).decode("ascii")
-        except Exception as read_exc:
-            # 读取失败时退回本地绝对路径（例如文件已被移动/权限问题）
-            logger.warning("文件读取失败，退回本地路径 (%s): %s", display_name, read_exc)
-            file_str = str(path.resolve())
-        if target.get("type") == "group":
-            group_id = target.get("group_id")
-            if group_id is not None:
-                await bot.call_api("upload_group_file", group_id=group_id, file=file_str, name=display_name)
-                return ""
-        elif target.get("type") == "private":
-            user_id = target.get("user_id")
-            if user_id is not None:
-                await bot.call_api("upload_private_file", user_id=user_id, file=file_str, name=display_name)
-                return ""
-        # fallback: 未知 target type
-        await _send_qq_message(bot, target, f"Clonoth 生成了文件：{display_name}")
-    except Exception as e:
-        logger.warning("文件上传失败 (%s): %s", display_name, e)
-        await _send_qq_message(bot, target, f"Clonoth 生成了文件：{display_name}（上传失败）")
-    return ""
+            async def send_image() -> str:
+                for index, message in enumerate(attempts, start=1):
+                    try:
+                        return await _send_qq_message_once(
+                            bot, target, message, dedupe=index == 1,
+                        )
+                    except Exception as exc:
+                        classified = classify_send_exception(exc)
+                        if classified.ambiguous_ack:
+                            raise classified from exc
+                        errors.append(classified)
+                failure = OneBotAttachmentBatchError(errors)
+                logger.warning(
+                    "onebot_send_failed",
+                    extra={**fields, "retryable": failure.retryable, "send_error": str(failure)},
+                )
+                raise failure
+
+            message_id = await protected_claim_send(
+                _outbound_idempotency,
+                claim,
+                send_image,
+                sent_ttl=_sent_ttl_for_context(context),
+                message_id_getter=lambda result: str(result or ""),
+            )
+            logger.info(
+                "onebot_send_sent",
+                extra=_send_audit_fields(
+                    context, platform_message_id=message_id,
+                    attempt=context.attempt, idempotency_key=key,
+                ),
+            )
+            return message_id
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
+
+    identity = f"file:sha256:{hashlib.sha256(raw_bytes).hexdigest()}"
+    context = context.child(identity)
+    key = make_idempotency_key(
+        target, identity, event_id=context.idempotency_key or context.event_id,
+    )
+    claim = await _outbound_idempotency.begin(key)
+    if not claim.acquired and claim.state == "pending":
+        resolved = await _outbound_idempotency.wait_for_resolution(key)
+        claim = (
+            await _outbound_idempotency.begin(key)
+            if resolved is None else IdempotencyClaim(key, False, resolved)
+        )
+    if not claim.acquired:
+        return f"idempotent:{key}"
+    heartbeat = asyncio.create_task(_heartbeat_idempotency_claim(claim))
+    fields = _send_audit_fields(
+        context, platform_message_id="", attempt=context.attempt,
+        idempotency_key=key,
+    )
+    try:
+        file_str = "base64://" + base64.b64encode(raw_bytes).decode("ascii")
+
+        async def upload_file() -> Any:
+            if target.get("type") == "group" and target.get("group_id") is not None:
+                return await bot.call_api(
+                    "upload_group_file", group_id=target["group_id"],
+                    file=file_str, name=display_name,
+                )
+            if target.get("type") == "private" and target.get("user_id") is not None:
+                return await bot.call_api(
+                    "upload_private_file", user_id=target["user_id"],
+                    file=file_str, name=display_name,
+                )
+            raise OneBotSendContractError(f"attachment target is invalid: {target!r}")
+
+        result = await protected_claim_send(
+            _outbound_idempotency,
+            claim,
+            upload_file,
+            sent_ttl=_sent_ttl_for_context(context),
+            message_id_getter=_extract_sent_message_id,
+        )
+        message_id = _extract_sent_message_id(result)
+        logger.info(
+            "onebot_file_upload_sent",
+            extra=_send_audit_fields(
+                context, platform_message_id=message_id,
+                attempt=context.attempt, idempotency_key=key,
+            ),
+        )
+        return message_id or f"uploaded:{key}"
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
+
 
 
 def _target_forward_kind(target: Dict[str, Any]) -> tuple[str, int] | None:
@@ -4512,7 +4687,11 @@ def _target_forward_kind(target: Dict[str, Any]) -> tuple[str, int] | None:
 
 
 async def _try_send_images_as_forward(
-    bot: Bot, target: Dict[str, Any], image_attachments: List[Any],
+    bot: Bot,
+    target: Dict[str, Any],
+    image_attachments: List[Any],
+    *,
+    send_context: OutboundSendContext | None = None,
 ) -> bool:
     """尝试把多张图片用合并转发（forward node）一次性发送。
 
@@ -4548,38 +4727,77 @@ async def _try_send_images_as_forward(
         nodes.append(node)
     if len(nodes) < 2:
         return False
-    try:
-        # [2026-07-18] 合并转发多张大图很慢，NoneBot 默认 api_timeout(30s) 容易超时。
-        # 通过 _timeout 临时抬高本次 API 调用的等待时间（每张预估 45s，封顶 240s），
-        # 减少“实际已发出却报超时”的情况。
-        call_timeout = min(240.0, max(60.0, len(nodes) * 45.0))
-        if forward_type == "group":
-            await bot.call_api(
-                "send_group_forward_msg", group_id=forward_id, messages=nodes, _timeout=call_timeout,
-            )
+    batch_identity = "forward:" + hashlib.sha256(
+        "|".join(
+            image_content_identity((_resolve_attachment_path(att) or Path()).read_bytes())
+            for att in image_attachments
+            if _resolve_attachment_path(att) is not None
+        ).encode("utf-8")
+    ).hexdigest()
+    context = send_context.child(batch_identity) if send_context else OutboundSendContext()
+    key = make_idempotency_key(
+        target, batch_identity, event_id=context.idempotency_key or context.event_id,
+    )
+    claim = await _outbound_idempotency.begin(key)
+    if not claim.acquired and claim.state == "pending":
+        resolved = await _outbound_idempotency.wait_for_resolution(key)
+        if resolved is None:
+            claim = await _outbound_idempotency.begin(key)
         else:
-            await bot.call_api(
+            claim = IdempotencyClaim(key, False, resolved)
+    if not claim.acquired:
+        return True
+    heartbeat = asyncio.create_task(_heartbeat_idempotency_claim(claim))
+    try:
+        call_timeout = min(240.0, max(60.0, len(nodes) * 45.0))
+
+        async def send_forward() -> Any:
+            if forward_type == "group":
+                return await bot.call_api(
+                    "send_group_forward_msg", group_id=forward_id, messages=nodes, _timeout=call_timeout,
+                )
+            return await bot.call_api(
                 "send_private_forward_msg", user_id=forward_id, messages=nodes, _timeout=call_timeout,
             )
+
+        result = await protected_claim_send(
+            _outbound_idempotency,
+            claim,
+            send_forward,
+            sent_ttl=_sent_ttl_for_context(context),
+            message_id_getter=_extract_sent_message_id,
+        )
+        logger.info(
+            "onebot_forward_sent",
+            extra=_send_audit_fields(
+                context, platform_message_id=_extract_sent_message_id(result),
+                attempt=context.attempt, idempotency_key=key,
+            ),
+        )
         return True
-    except Exception as exc:  # noqa: BLE001
-        # [2026-07-18] 关键修复：合并转发是大耗时操作，NapCat 处理时间常
-        # 超过 NoneBot 默认 API 响应超时，报 "WebSocket call api ... timeout"，
-        # 但实际 NapCat *已把合并消息发出*（日志已证实）。此时若回退逐张
-        # 直发，就会造成“先逐张发 4 张 + 后合并发 1 次”的重复。
-        # 因此：API 调用超时视为“已发出”（返回 True），不再回退逐张。
-        if _is_api_call_timeout(exc) or _is_napcat_sendmsg_timeout(exc):
-            logger.warning(
-                "多图合并转发疑似超时但可能已送达，不回退逐张以避免重复发送 (%d 张): %s",
-                len(nodes), exc,
-            )
-            return True
-        # 其它失败（NapCat 版本不支持/权限/参数错），才回退到逐张直发。
-        logger.warning("多图合并转发失败，回退逐张直发 (%d 张): %s", len(nodes), exc)
-        return False
+    except Exception as exc:
+        classified = classify_send_exception(exc)
+        logger.warning(
+            "onebot_forward_failed",
+            extra={
+                **_send_audit_fields(context, platform_message_id="", attempt=context.attempt, idempotency_key=key),
+                "retryable": classified.retryable, "send_error": str(classified),
+            },
+        )
+        raise classified from exc
+    finally:
+        heartbeat.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await heartbeat
 
 
-async def _send_attachments(bot: Bot, target: Dict[str, Any], attachments: List[Any]) -> None:
+async def _send_attachments(
+    bot: Bot,
+    target: Dict[str, Any],
+    attachments: List[Any],
+    *,
+    send_context: OutboundSendContext | None = None,
+) -> None:
     """发送 Clonoth 返回的附件列表。
 
     每发出一个附件，就把返回的 message_id -> 本地附件路径 登记下来，
@@ -4599,43 +4817,76 @@ async def _send_attachments(bot: Bot, target: Dict[str, Any], attachments: List[
             or not p.exists() or p.suffix.lower() not in _IMAGE_SUFFIXES
         ]
         if len(image_atts) >= IMAGE_FORWARD_MERGE_THRESHOLD:
-            merged = await _try_send_images_as_forward(bot, target, image_atts)
+            merged = await _try_send_images_as_forward(
+                bot, target, image_atts, send_context=send_context,
+            )
             if merged:
                 # 合并转发不返回逐张 message_id，无法逐张登记 message_id->path；
                 # 但会路非图片附件继续逐个发送。
                 if non_image_atts:
-                    await _send_attachments_one_by_one(bot, target, non_image_atts)
+                    await _send_attachments_one_by_one(
+                        bot, target, non_image_atts, send_context=send_context
+                    )
                 return
             # 合并转发失败，回退到逐张直发（下方通用循环）。
-    await _send_attachments_one_by_one(bot, target, attachments)
+    await _send_attachments_one_by_one(
+        bot, target, attachments, send_context=send_context
+    )
 
 
-async def _send_attachments_one_by_one(bot: Bot, target: Dict[str, Any], attachments: List[Any]) -> None:
+async def _send_attachments_one_by_one(
+    bot: Bot,
+    target: Dict[str, Any],
+    attachments: List[Any],
+    *,
+    send_context: OutboundSendContext | None = None,
+) -> None:
     """逐张/逐个发送附件，单个失败不阻断后续。"""
     # [2026-07-17] 批量发图（如一次生 4 张）时，单张 sendMsg 可能耗时较长；
     # 若其中一张抛异常（如 NapCat 超时/WS 短暂断开），旧逻辑会让整个循环
     # 中断，导致后续图片全部丢失（现象：“要 4 张只发出 1 张”）。
     # 这里逐张单独容错，单张失败不阻断后续图片发送。
     total = len(attachments)
+    failures: list[BaseException] = []
     for idx, attachment in enumerate(attachments):
         path = _resolve_attachment_path(attachment)
         filename = _attachment_filename(attachment)
         if path is None:
             if filename:
-                await _send_qq_message(bot, target, f"Clonoth 生成了文件：{filename}")
+                await _send_qq_message(
+                    bot, target, f"Clonoth 生成了文件：{filename}",
+                    send_context=(send_context.child(f"unsupported:{filename}") if send_context else None),
+                )
             else:
                 logger.warning("skip unsupported QQ attachment payload: %r", attachment)
             continue
         try:
-            message_id = await _send_attachment_path(bot, target, path, filename=filename)
+            message_id = await _send_attachment_path(
+                bot,
+                target,
+                path,
+                filename=filename,
+                send_context=send_context,
+            )
         except Exception as exc:  # noqa: BLE001
+            classified = classify_send_exception(exc)
+            failures.append(classified)
             logger.warning(
-                "批量发图第 %d/%d 张失败，跳过并继续 (%s): %s",
-                idx + 1, total, filename or path.name, exc,
+                "onebot_attachment_failed",
+                extra={
+                    "attachment_index": idx + 1, "attachment_total": total,
+                    "attachment_name": filename or path.name,
+                    "retryable": classified.retryable,
+                    "event_id": (send_context.event_id if send_context else ""),
+                    "attempt": (send_context.attempt if send_context else 1),
+                    "idempotency_key": (send_context.idempotency_key if send_context else ""),
+                },
             )
             continue
         if message_id:
             _remember_message_attachments(message_id, [attachment])
+    if failures:
+        raise OneBotAttachmentBatchError(failures)
 
 
 def _sent_attachment_bucket_key(target: Dict[str, Any]) -> str:
@@ -4750,14 +5001,9 @@ def _recent_sent_attachment_records(bucket_key: str, *, only_images: bool = Fals
     return records
 
 
-# [2026-07-18] 发图后台化：
-# QQ 所有事件走同一条反向 WebSocket，并在 SDK 事件循环里被串行 await。
-# 发图（尤其多图/大图，每张 sendMsg 要等 NapCat ack 十几秒）会把整条事件
-# 处理卡住，导致其它群消息/任务一起阻塞。因此把“发附件”丢到后台 task，
-# 让回调本身尽快返回；同一会话用一把信号量串行，保证同一批图片有序、
-# 不与同会话的下一次发图交错。
+# Attachment delivery remains ordered per conversation, but the callback awaits
+# this lock and the final platform acknowledgement before returning to the SDK.
 _attachment_send_locks: Dict[str, asyncio.Lock] = {}
-_attachment_send_tasks: "set[asyncio.Task]" = set()
 
 
 def _attachment_send_lock_for(target: Dict[str, Any]) -> asyncio.Lock:
@@ -4792,27 +5038,28 @@ def _ensure_bucket_target(target: Dict[str, Any]) -> Dict[str, Any]:
     return target
 
 
-async def _send_attachments_background(bot: Bot, target: Dict[str, Any], attachments: List[Any]) -> None:
-    """在后台串行发送附件（同会话上锁），并在发完后登记最近附件索引。"""
+async def _send_attachments_confirmed(
+    bot: Bot,
+    target: Dict[str, Any],
+    attachments: List[Any],
+    *,
+    send_context: OutboundSendContext | None = None,
+) -> None:
+    """串行发送附件，并仅在全部平台确认后登记最近附件索引。"""
     lock = _attachment_send_lock_for(target)
     try:
         async with lock:
-            await _send_attachments(bot, target, attachments)
-            # [2026-07-19] 登记前补齐 bucket 依据，保证与 op=recent 查询同桶。
+            await _send_attachments(
+                bot, target, attachments, send_context=send_context
+            )
+            # Register/finish only after every platform-visible send is confirmed.
             _record_sent_attachments(_ensure_bucket_target(dict(target)), attachments)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("后台发送附件失败: %s", exc, exc_info=True)
-    finally:
-        conv_key = target.get("conversation_key")
-        if conv_key:
-            _mark_qq_reply_finished(str(conv_key))
-
-
-def _spawn_attachment_send(bot: Bot, target: Dict[str, Any], attachments: List[Any]) -> None:
-    """启动后台发附件 task 并保持引用，避免被 GC。"""
-    task = asyncio.create_task(_send_attachments_background(bot, target, list(attachments)))
-    _attachment_send_tasks.add(task)
-    task.add_done_callback(_attachment_send_tasks.discard)
+    except Exception:
+        logger.warning("onebot_attachment_batch_failed", exc_info=True)
+        raise
+    conv_key = target.get("conversation_key")
+    if conv_key:
+        _mark_qq_reply_finished(str(conv_key))
 
 
 async def _send_text_and_attachments(
@@ -4822,6 +5069,7 @@ async def _send_text_and_attachments(
     attachments: List[Any],
     *,
     source_attachments: List[Dict[str, Any]] | None = None,
+    send_context: OutboundSendContext | None = None,
 ) -> None:
     """统一发送最终文本/附件，并持久绑定回复所依据的来源图片。"""
     conv_key = target.get("conversation_key")
@@ -4833,14 +5081,18 @@ async def _send_text_and_attachments(
             target,
             text,
             source_attachments=source_attachments,
+            send_context=send_context,
         ) and target.get("type") == "group":
             group_id = target.get("group_id")
             if group_id is not None:
                 _record_bot_reply(int(group_id), text)
     if attachments:
-        # [2026-07-18] 附件发送丢到后台，不阻塞当前回调/事件循环。
-        # 注：_mark_qq_reply_finished 改由后台 task 在附件真正发完后调用。
-        _spawn_attachment_send(bot, target, attachments)
+        # Delivery completion means the platform-confirmed final attachment send,
+        # not merely scheduling a background task.  Failures propagate to the SDK
+        # so its outbox cannot acknowledge/consume the trigger prematurely.
+        await _send_attachments_confirmed(
+            bot, target, attachments, send_context=send_context
+        )
         return
     if conv_key:
         _mark_qq_reply_finished(str(conv_key))
@@ -4922,11 +5174,21 @@ async def _maybe_send_search_progress_notice(
 ) -> None:
     """在 QQ 侧为长搜索任务发送低频可见进度提示。"""
     now = time.time()
+    request_identity = str(
+        platform_data.setdefault("_qq_search_request_identity", uuid.uuid4().hex)
+    )
+    context = _request_send_context(
+        "search-progress", request_identity,
+        str(target.get("conversation_key") or ""),
+    )
     if not platform_data.get("_qq_search_notice_sent"):
         platform_data["_qq_search_notice_sent"] = True
         platform_data["_qq_search_notice_last_at"] = now
         try:
-            await _send_qq_message(bot, target, _SEARCH_PROGRESS_FIRST_NOTICE)
+            await _send_qq_message(
+                bot, target, _SEARCH_PROGRESS_FIRST_NOTICE,
+                send_context=context.child("first"),
+            )
         except Exception:
             logger.debug("send QQ search progress notice failed", exc_info=True)
         return
@@ -4936,7 +5198,10 @@ async def _maybe_send_search_progress_notice(
         return
     platform_data["_qq_search_notice_last_at"] = now
     try:
-        await _send_qq_message(bot, target, _SEARCH_PROGRESS_STILL_RUNNING_NOTICE)
+        await _send_qq_message(
+            bot, target, _SEARCH_PROGRESS_STILL_RUNNING_NOTICE,
+            send_context=context.child(f"still:{int(now // _SEARCH_PROGRESS_STILL_RUNNING_INTERVAL_SEC)}"),
+        )
     except Exception:
         logger.debug("send QQ search still-running notice failed", exc_info=True)
 
@@ -4956,14 +5221,26 @@ class TangQiuCallbacks:
         attachments: List[Dict[str, Any]],
         *,
         main_state: Optional[MainTaskState] = None,
+        delivery_context: OutboundSendContext | None = None,
+        **callback_data: Any,
     ) -> None:
         """发送主节点最终回复。"""
         platform_data = trigger.platform_data
         bot = platform_data.get("bot") or _get_fallback_bot()
         target = _target_from_platform_data(platform_data) or _target_from_conversation_key(trigger.conversation_key)
-        if not bot or not target:
-            logger.warning("send_reply skipped: missing bot or target for session=%s", trigger.session_id)
-            return
+        if not bot:
+            raise OneBotSendContractError(
+                f"send_reply missing bot for session={trigger.session_id}"
+            )
+        if not target:
+            raise OneBotSendContractError(
+                f"send_reply missing target for session={trigger.session_id}"
+            )
+        send_context = delivery_context or context_from_sources(
+            trigger=trigger,
+            main_state=main_state,
+            platform_data=callback_data.get("platform_data"),
+        )
         # 提取 [REACT:ID] 标记
         final_text = text or ""
         if final_text:
@@ -4980,6 +5257,7 @@ class TangQiuCallbacks:
             final_text,
             attachments or [],
             source_attachments=source_attachments,
+            send_context=send_context,
         )
         # 2026-05-03 修改原因：最终回复到达时，触发消息上可能仍残留生命周期 React。
         # 做法是调用统一清理函数移除 76、281、178、97、326，目的在于把本轮
@@ -4991,20 +5269,42 @@ class TangQiuCallbacks:
         """兼容旧式 session_id 附件回调；当前 SDK 通常把附件放在 send_reply 中。"""
         target = _session_targets.get(session_id) or _persisted_session_targets.get(session_id)
         if not target:
-            return
+            raise OneBotSendContractError(
+                f"send_reply_attachment missing target for session={session_id}"
+            )
         bot = target.get("bot") or _get_fallback_bot()
-        if bot:
-            await _send_attachment_path(bot, target, Path(path))
+        if not bot:
+            raise OneBotSendContractError(
+                f"send_reply_attachment missing bot for session={session_id}"
+            )
+        await _send_attachment_path(bot, target, Path(path))
 
-    async def send_intermediate_reply(self, trigger: TriggerInfo, text: str) -> None:
+    async def send_intermediate_reply(
+        self,
+        trigger: TriggerInfo,
+        text: str,
+        *,
+        delivery_context: OutboundSendContext | None = None,
+        **callback_data: Any,
+    ) -> None:
         """发送主节点中间回复，但不写入群历史。"""
         if not text:
             return
         platform_data = trigger.platform_data
         bot = platform_data.get("bot") or _get_fallback_bot()
         target = _target_from_platform_data(platform_data) or _target_from_conversation_key(trigger.conversation_key)
-        if not bot or not target:
-            return
+        if not bot:
+            raise OneBotSendContractError(
+                f"send_intermediate_reply missing bot for session={trigger.session_id}"
+            )
+        if not target:
+            raise OneBotSendContractError(
+                f"send_intermediate_reply missing target for session={trigger.session_id}"
+            )
+        send_context = delivery_context or context_from_sources(
+            trigger=trigger,
+            platform_data=callback_data.get("platform_data"),
+        )
         # 2026-05-03 修改原因：中间回复回调表示 Clonoth 已经开始产出用户可见内容。
         # 做法是通过统一阶段切换进入 writing，目的在于从 281、178 或 97 中
         # 任一状态平滑切到 326，并继续让 React API 失败不影响中间文本发送。
@@ -5024,6 +5324,7 @@ class TangQiuCallbacks:
                 target,
                 text,
                 source_attachments=source_attachments,
+                send_context=send_context,
             ):
                 conv_key = target.get("conversation_key")
                 if conv_key:
@@ -5036,21 +5337,38 @@ class TangQiuCallbacks:
         attachments: List[Dict[str, Any]],
         *,
         node_id: str = "",
+        delivery_context: OutboundSendContext | None = None,
+        **callback_data: Any,
     ) -> None:
         """处理没有 trigger 的 fallback 最终输出。"""
         target = _target_from_conversation_key(conversation_key)
         if target is None:
-            return
+            raise OneBotSendContractError(
+                f"send_to_channel missing target for conversation={conversation_key}"
+            )
         # [2026-07-19] 修复生图 op=recent 查不到图：_target_from_conversation_key
         # 只返回 {type, group_id/user_id}，缺 conversation_key，导致
-        # _send_attachments_background 的 finally 与最近附件登记链路信息不全。
+        # _send_attachments_confirmed 的成功登记链路信息不全。
         # 这里补回 conversation_key（用真实会话 key），让附件登记 bucket 与
         # qq_forward op=recent 的查询 bucket 保持一致。
         if not target.get("conversation_key"):
             target["conversation_key"] = _real_conversation_key(conversation_key)
         bot = _conversation_bots.get(conversation_key) or _get_fallback_bot()
-        if bot:
-            await _send_text_and_attachments(bot, target, text or "", attachments or [])
+        if not bot:
+            raise OneBotSendContractError(
+                f"send_to_channel missing bot for conversation={conversation_key}"
+            )
+        send_context = delivery_context or context_from_sources(
+            platform_data=callback_data.get("platform_data"),
+            conversation_key=conversation_key,
+        )
+        await _send_text_and_attachments(
+            bot,
+            target,
+            text or "",
+            attachments or [],
+            send_context=send_context,
+        )
 
     async def delete_status_message(self, trigger: TriggerInfo) -> None:
         return None
@@ -5155,10 +5473,15 @@ class TangQiuCallbacks:
         delivered = 0
         for admin_id in ADMIN_QQ_USERS:
             try:
-                sent = await bot.send_private_msg(user_id=int(admin_id), message=summary)
+                approval_context = _request_send_context(
+                    "approval-admin", f"{approval_id}:{admin_id}", conversation_key,
+                )
+                sent_mid = await _send_qq_message(
+                    bot, {"type": "private", "user_id": int(admin_id)}, summary,
+                    send_context=approval_context,
+                )
                 delivered += 1
                 # 记录审批消息 id -> approval_id，使管理员可直接引用该消息回复“审批同意/拒绝”。
-                sent_mid = sent.get("message_id") if isinstance(sent, dict) else None
                 _remember_approval_message(sent_mid, approval_id)
             except Exception:
                 logger.exception("send approval request to QQ admin failed: admin=%s id=%s", admin_id, approval_id)
@@ -5166,7 +5489,12 @@ class TangQiuCallbacks:
         target = _target_from_conversation_key(conversation_key)
         if target:
             try:
-                await _send_qq_message(bot, target, "当前操作需要 Clonoth 管理员审批，已提交等待处理。")
+                await _send_qq_message(
+                    bot, target, "当前操作需要 Clonoth 管理员审批，已提交等待处理。",
+                    send_context=_request_send_context(
+                        "approval", approval_id, conversation_key,
+                    ),
+                )
             except Exception:
                 logger.debug("send approval pending notice failed: id=%s", approval_id, exc_info=True)
 
@@ -5589,7 +5917,21 @@ def _forward_bridge_resolve_files(raw_paths: Any, display_names: Any = None) -> 
 
 
 async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
-    """执行一次自然语言转发/发送/提醒请求。仅在 Bot 进程内运行。"""
+    """执行一次自然语言转发/发送/提醒请求。仅在 Bot 进程内运行。
+
+    The payload is mutated with ``_request_identity`` once. Re-entering the same
+    request object or retrying with the same caller request_id is stable; a future
+    independent request receives a new identity even when content is identical.
+    """
+    request_identity = str(
+        payload.get("_request_identity")
+        or payload.get("request_id")
+        or payload.get("idempotency_key")
+        or ""
+    ).strip()
+    if not request_identity:
+        request_identity = uuid.uuid4().hex
+    payload.setdefault("_request_identity", request_identity)
     try:
         bot = get_bot()
     except Exception:
@@ -5640,13 +5982,18 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
     send_target = _target_to_send_dict(target)
     label = _target_display_label(target.target_type, target.label)
     conversation_key = f"qq_forward:{target.target_type}:{target.target_id}"
+    send_context = _request_send_context(
+        "qq_forward", request_identity, conversation_key,
+    )
 
     # 纯提醒/通知：不涉及历史挑选，直接发一段文本。
     if action == "remind":
         body = extra_text
         if not body:
             return {"ok": False, "error": "提醒内容为空。"}
-        await _send_text_and_attachments(bot, send_target, body, [])
+        await _send_text_and_attachments(
+            bot, send_target, body, [], send_context=send_context,
+        )
         return {"ok": True, "result": f"已向{label}发送提醒。"}
 
     # 发送工作区文件：“把仓库里的 xx 文件发出来”。支持一次多个文件。
@@ -5672,8 +6019,12 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
             hint = "；".join(file_errors) if file_errors else "请在 file_paths 里给出工作区内的文件路径，或用 use_recent 发送最近生成的图片。"
             return {"ok": False, "error": f"没有可发送的文件：{hint}"}
         if extra_text:
-            await _send_text_and_attachments(bot, send_target, extra_text, [])
-        await _send_attachments(bot, send_target, attachments)
+            await _send_text_and_attachments(
+                bot, send_target, extra_text, [], send_context=send_context,
+            )
+        await _send_attachments(
+            bot, send_target, attachments, send_context=send_context,
+        )
         names = "、".join(_sanitize_name(att.get("name") or att.get("path"), max_len=40) for att in attachments)
         result = f"已向{label}发送 {len(attachments)} 个文件：{names}"
         if file_errors:
@@ -5695,7 +6046,9 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
         )[0]
         if not recent_atts:
             return {"ok": False, "error": "没有找到最近生成/发送的图片。可先用 op=recent 查看可选图片。"}
-        await _send_text_and_attachments(bot, send_target, extra_text, recent_atts)
+        await _send_text_and_attachments(
+            bot, send_target, extra_text, recent_atts, send_context=send_context,
+        )
         return {"ok": True, "result": f"已向{label}发送 {len(recent_atts)} 张最近生成/发送的图片。"}
 
     records = _forward_bridge_pick_records(
@@ -5720,7 +6073,10 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
                 ))
         if not body and not attachments:
             return {"ok": False, "error": "没有可发送的内容。"}
-        await _send_text_and_attachments(bot, send_target, _truncate_qq_text(body), attachments)
+        await _send_text_and_attachments(
+            bot, send_target, _truncate_qq_text(body), attachments,
+            send_context=send_context,
+        )
         return {"ok": True, "result": f"已发送到{label}（{len(records)} 条消息）。"}
 
     # 默认 action == "forward"：合并转发卡片，支持多选多条消息。
@@ -5738,7 +6094,9 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
     if not nodes:
         return {"ok": False, "error": "没有可转发的消息。请先用 list 查看上文消息并给出 message_indices 或 query。"}
     try:
-        await _send_forward_nodes(bot, target, nodes)
+        await _send_forward_nodes(
+            bot, target, nodes, send_context=send_context,
+        )
     except Exception as exc:
         logger.warning("qq_forward bridge send forward failed: %s", exc, exc_info=True)
         return {"ok": False, "error": "合并转发发送失败：当前 OneBot/NapCat 可能不支持该接口，或目标不可达。"}
@@ -5762,6 +6120,16 @@ async def _forward_bridge_http_handler(request: "Any") -> "Any":
         return web.json_response({"ok": False, "error": "invalid JSON"}, status=400)
     if not isinstance(payload, dict):
         return web.json_response({"ok": False, "error": "invalid payload"}, status=400)
+    caller_request_id = str(
+        payload.get("request_id")
+        or request.headers.get("Idempotency-Key", "")
+        or request.headers.get("X-Request-ID", "")
+        or uuid.uuid4().hex
+    ).strip()
+    # The private field is internal-only: always overwrite it with the identity from
+    # the public HTTP contract so a retry cannot accidentally fork the send claim.
+    payload["request_id"] = caller_request_id
+    payload["_request_identity"] = caller_request_id
     op = str(payload.get("op") or "").strip().lower()
     try:
         _parent_sid = str(payload.get("parent_session_id") or "")

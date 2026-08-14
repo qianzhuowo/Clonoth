@@ -180,7 +180,6 @@ def assemble_prompt(
 
     merged = _build_variables(workspace_root, node, variables)
     rendered = _render_variables(expanded, merged)
-    rendered = rendered.encode('raw_unicode_escape').decode('unicode_escape')
 
     # 拆分静态/动态段
     marker = "# %%DYNAMIC%%"

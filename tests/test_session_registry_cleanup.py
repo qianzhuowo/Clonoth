@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 from datetime import timedelta
 from pathlib import Path
 
@@ -19,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from supervisor._helpers import _now  # noqa: E402
 from supervisor.eventlog import EventLog  # noqa: E402
 from supervisor.policy import PolicyEngine  # noqa: E402
+from supervisor.session_store import SessionStore  # noqa: E402
 from supervisor.state import SupervisorState  # noqa: E402
 from supervisor.types import TaskKind, TaskStatus  # noqa: E402
 
@@ -59,7 +61,7 @@ def test_session_store_remove_session_physically_deletes_registry_entry(tmp_path
     # [AutoC 2026-05-30] Why: branch and child cleanup must shrink sessions.json.
     # How: assert the registry key is gone from both memory and disk. Purpose:
     # prevent a regression to reset-marker-only cleanup.
-    assert child_sid not in state._session_store._registry
+    assert state._session_store.get_entry(child_sid) is None
     assert child_sid not in _registry(tmp_path)
 
 
@@ -96,10 +98,10 @@ def _seed_stale_registry(state: SupervisorState, parent: str) -> tuple[str, str,
     accumulate_sid, _ = state.get_or_create_child_session(parent, "acc.node", "case", "accumulate")
 
     old_ts = (_now() - timedelta(hours=25)).isoformat()
-    state._session_store._registry[fresh_sid]["last_active_at"] = old_ts
-    state._session_store._registry[fork_sid]["last_active_at"] = old_ts
-    state._session_store._registry[accumulate_sid]["last_active_at"] = old_ts
-    state._session_store._registry["branch_orphan"] = {
+    state._session_store.set_entry_field(fresh_sid, "last_active_at", old_ts, flush=False)
+    state._session_store.set_entry_field(fork_sid, "last_active_at", old_ts, flush=False)
+    state._session_store.set_entry_field(accumulate_sid, "last_active_at", old_ts, flush=False)
+    state._session_store.upsert_entry("branch_orphan", {
         "session_id": "branch_orphan",
         "channel": "internal",
         "conversation_key": "",
@@ -111,14 +113,14 @@ def _seed_stale_registry(state: SupervisorState, parent: str) -> tuple[str, str,
         "context_key": "orphan",
         "context_mode": "branch",
         "last_active_at": old_ts,
-    }
-    state._session_store._registry["reset_old"] = {
+    }, flush=False)
+    state._session_store.upsert_entry("reset_old", {
         "session_id": "reset_old",
         "channel": "internal",
         "conversation_key": "",
         "created_at": old_ts,
         "reset": True,
-    }
+    }, flush=False)
     state.parent_children.setdefault(parent, set()).update({"branch_orphan"})
     state._session_store._flush()
     return fresh_sid, fork_sid, accumulate_sid, "branch_orphan"
@@ -244,9 +246,10 @@ def test_route_completed_batch_task_cleans_fresh_child_session_from_finally(tmp_
         )
         task.status = TaskStatus.completed
         task.result = {"action": "finish", "result": {"summary": "done", "text": "done"}}
-
+        state._reset_task_route_state_locked(task)
         state._route_completed_task_locked(task)
 
+    state._post_completion_queue.join()
     registry = _registry(tmp_path)
     assert child_sid not in registry
     assert child_sid not in state.sessions
@@ -323,3 +326,56 @@ def test_route_cleanup_prefers_registry_context_mode_over_task_input(tmp_path: P
     registry = _registry(tmp_path)
     assert child_sid in registry
     assert registry[child_sid]["context_mode"] == "accumulate"
+
+
+def test_session_store_out_of_order_snapshot_never_overwrites_newer_generation(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.json")
+    old_snapshot = store.upsert_entry("old", {"session_id": "old", "reset": False}, flush=False)
+    new_snapshot = store.upsert_entry("new", {"session_id": "new", "reset": False}, flush=False)
+    assert store.flush_snapshot(new_snapshot)
+    assert store.flush_snapshot(old_snapshot)
+    persisted = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
+    assert set(persisted) == {"old", "new"}
+
+
+def test_session_store_concurrent_mutation_and_cleanup_flush_keeps_latest_registry(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path / "sessions.json")
+    for index in range(25):
+        store.upsert_entry(f"stale-{index}", {"session_id": f"stale-{index}", "reset": False}, flush=False)
+    errors: list[Exception] = []
+    start = threading.Barrier(3)
+
+    def create_and_update() -> None:
+        try:
+            start.wait(timeout=2)
+            for index in range(40):
+                session_id = f"new-{index}"
+                store.upsert_entry(session_id, {"session_id": session_id, "reset": False, "value": 0}, flush=True)
+                store.set_entry_field(session_id, "value", 1, flush=True)
+        except Exception as exc:
+            errors.append(exc)
+
+    def cleanup_and_flush() -> None:
+        try:
+            start.wait(timeout=2)
+            for index in range(25):
+                store.remove_sessions([f"stale-{index}"], flush=True)
+        except Exception as exc:
+            errors.append(exc)
+
+    creators = threading.Thread(target=create_and_update)
+    cleanup = threading.Thread(target=cleanup_and_flush)
+    creators.start()
+    cleanup.start()
+    start.wait(timeout=2)
+    creators.join(timeout=5)
+    cleanup.join(timeout=5)
+    assert not creators.is_alive()
+    assert not cleanup.is_alive()
+    assert errors == []
+    assert store.flush_snapshot(store.snapshot())
+    persisted = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
+    expected = dict(store.items_snapshot())
+    assert persisted == expected
+    assert all(persisted[f"new-{index}"]["value"] == 1 for index in range(40))
+    assert not any(key.startswith("stale-") for key in persisted)

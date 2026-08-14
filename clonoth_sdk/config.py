@@ -43,3 +43,19 @@ class BotConfig:
     # True：工作区内部操作自动放行，仅外部操作需人工审批（bot_adapter.py 的现有行为）。
     # Bot 侧根据安全需求显式开启。
     auto_approve_internal: bool = False
+    # Durable adapter-side outbound recovery.  The optional path preserves the
+    # existing constructor API; when omitted EventRouter derives a per-prefix
+    # file below data/. Retry values are bounded to avoid a hot failure loop.
+    outbound_store_path: Path | None = None
+    outbound_retry_initial: float = 2.0
+    outbound_retry_max: float = 300.0
+    outbound_retry_scan_interval: float = 1.0
+    # Cross-instance delivery lease. Heartbeats run while an adapter callback is
+    # active, so long platform sends cannot be stolen by another SDK process.
+    outbound_lease_seconds: float = 600.0
+    outbound_heartbeat_interval: float = 30.0
+    # Sent tombstones retain retry dedupe for a conservative window, then their
+    # complete event JSON is reclaimed. Non-sent rows are never pruned.
+    outbound_sent_ttl: float = 7 * 24 * 3600.0
+    outbound_sent_max_rows: int = 50_000
+    outbound_prune_interval: float = 300.0

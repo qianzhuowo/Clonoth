@@ -33,6 +33,14 @@ class TaskKind(str, Enum):
     tool = "tool"
 
 
+class RouteStatus(str, Enum):
+    """Durable completion-routing state for retryable Supervisor delivery."""
+
+    pending = "pending"
+    routed = "routed"
+    failed = "failed"
+
+
 class Event(BaseModel):
     schema_version: int = 1
     seq: int
@@ -84,6 +92,7 @@ class OutboundMessageIn(BaseModel):
     # task results carry. Purpose: the API contract remains consistent across outbound
     # producers.
     llm_request_id: str | None = None
+    delivery_id: str | None = None
 
 
 class OutboundMessageOut(BaseModel):
@@ -137,6 +146,23 @@ class Task(BaseModel):
     updated_at: datetime
     lease_expires_at: datetime | None = None
     result: dict[str, Any] = Field(default_factory=dict)
+    # route_schema_version=0 identifies legacy snapshots. Legacy terminal tasks
+    # are intentionally treated as already handled during startup migration; only
+    # versioned route intents may be replayed.
+    route_schema_version: int = 0
+    route_status: RouteStatus = RouteStatus.pending
+    route_generation: int = 0
+    delivery_id: str = ""
+    route_context: dict[str, Any] = Field(default_factory=dict)
+    # Durable non-critical work intent. It is first persisted in task_routed;
+    # legacy routed tasks keep schema 0 and are never post-work replayed.
+    post_work_schema_version: int = 0
+    post_work_id: str = ""
+    post_work_status: str = ""
+    post_work_error: str = ""
+    post_work_phases: list[dict[str, Any]] = Field(default_factory=list)
+    routed_at: datetime | None = None
+    route_error: str = ""
     # [AutoC 2026-06-04] Runtime-only task activity tracking. Not persisted.
     # Updated by supervisor when transient events (stream_delta, tool_call_*,
     # approval_*) arrive. Read by GET /v1/admin/tasks/active.

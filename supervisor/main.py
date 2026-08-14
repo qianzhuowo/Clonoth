@@ -220,6 +220,7 @@ def main() -> None:
                         task.updated_at = now
                         task.lease_expires_at = None
                         task.result = {"action": "fail", "error": reason}
+                        state._reset_task_route_state_locked(task)
                         state._event_task_snapshot("task_completed", task)
                         # [Fork/Merge 2026-05-17] Why: failing a branch task must
                         # still merge/cleanup the branch and emit a parent-routed

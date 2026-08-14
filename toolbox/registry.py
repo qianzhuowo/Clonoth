@@ -151,6 +151,48 @@ def _extract_tool_spec(py: Path) -> tuple[dict[str, Any] | None, float | None]:
     return spec, timeout_sec
 
 
+_SCRIPT_IDENTITY_ENV_KEYS = {
+    "CLONOTH_TOOL_CALL_ID",
+    "CLONOTH_REQUEST_ID",
+    "CLONOTH_TOOL_INVOCATION_ID",
+}
+
+
+def _script_tool_env(ctx: Any) -> dict[str, str]:
+    """Build the external-tool environment with an explicit identity allowlist.
+
+    Parent-process identity variables are removed first: a missing value on the
+    current ToolContext must never inherit a stale provider call from the Engine.
+    ``run_id`` is intentionally excluded because it can span multiple tool calls.
+    """
+    env = _safe_subprocess_env()
+    for key in list(env):
+        if key.upper() in _SCRIPT_IDENTITY_ENV_KEYS:
+            env.pop(key, None)
+
+    env.update({
+        "CLONOTH_SUPERVISOR_URL": str(getattr(ctx, "supervisor_url", "") or ""),
+        "CLONOTH_SESSION_ID": str(getattr(ctx, "session_id", "") or ""),
+        "CLONOTH_PARENT_SESSION_ID": str(getattr(ctx, "parent_session_id", "") or ""),
+        "CLONOTH_TASK_ID": str(getattr(ctx, "task_id", "") or ""),
+        "CLONOTH_NODE_ID": str(getattr(ctx, "node_id", "") or ""),
+        "CLONOTH_CONVERSATION_KEY": str(getattr(ctx, "conversation_key", "") or ""),
+    })
+
+    optional_identity = (
+        ("CLONOTH_TOOL_CALL_ID", ("tool_call_id",)),
+        ("CLONOTH_REQUEST_ID", ("request_id", "llm_request_id", "current_llm_request_id")),
+        ("CLONOTH_TOOL_INVOCATION_ID", ("tool_invocation_id", "invocation_id")),
+    )
+    for env_name, attr_names in optional_identity:
+        for attr_name in attr_names:
+            value = str(getattr(ctx, attr_name, "") or "").strip()
+            if value:
+                env[env_name] = value
+                break
+    return env
+
+
 def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFunc:
     """Create a tool function that runs a Python script as a subprocess.
 
@@ -189,19 +231,7 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(root) if isinstance(root, Path) else None,
-                env={
-                    **_safe_subprocess_env(),
-                    "CLONOTH_SUPERVISOR_URL": str(getattr(ctx, "supervisor_url", "") or ""),
-                    "CLONOTH_SESSION_ID": str(getattr(ctx, "session_id", "") or ""),
-                    "CLONOTH_PARENT_SESSION_ID": str(getattr(ctx, "parent_session_id", "") or ""),
-                    "CLONOTH_TASK_ID": str(getattr(ctx, "task_id", "") or ""),
-                    "CLONOTH_NODE_ID": str(getattr(ctx, "node_id", "") or ""),
-                    # [2026-07-19] 把入口会话的 conversation_key 也传给工具子进程，
-                    # 供生图工具 emit_intermediate 时随事件携带。目的：让 SDK
-                    # _handle_intermediate_reply 能从源头拿到正确 conv_key，避免子
-                    # 会话 session 查 session_conv_map miss 导致发图目标/登记桶错位。
-                    "CLONOTH_CONVERSATION_KEY": str(getattr(ctx, "conversation_key", "") or ""),
-                },
+                env=_script_tool_env(ctx),
                 # Fix: run in new session so os.killpg can kill the entire
                 # process tree, preventing orphaned grandchildren from holding
                 # pipe fds and causing communicate() to hang forever.

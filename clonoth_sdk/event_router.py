@@ -25,17 +25,22 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
+from pathlib import Path
 import re
 import time
+import uuid
+from dataclasses import replace
 from typing import Any, Awaitable, Callable
 
 from .approval import ApprovalTracker, auto_approve, is_external_operation
 from .callbacks import AdapterCallbacks
 from .client import ClonothClient
 from .config import BotConfig
+from .outbound_store import OutboundRecord, OutboundStore
 from .state import ChildTaskState, MainTaskState, SessionState, TriggerInfo
-from .types import Event
+from .types import DeliveryContext, Event
 
 logger = logging.getLogger("clonoth_sdk.event_router")
 
@@ -125,7 +130,16 @@ class EventRouter:
         self._config = config
         self._approval = approval_tracker or ApprovalTracker()
         self._entry_node_id = entry_node_id or config.entry_node_id
-        self._after_seq = 0
+        store_path = config.outbound_store_path or self._default_outbound_store_path(config)
+        store_path = Path(store_path)
+        if not store_path.is_absolute():
+            store_path = Path(config.workspace_root or Path.cwd()) / store_path
+        self._outbound_store = OutboundStore(store_path)
+        self._after_seq = self._outbound_store.processed_seq
+        self._outbound_inflight: set[str] = set()
+        self._outbound_owner = f"router:{uuid.uuid4().hex}"
+        self._outbound_retry_wakeup = asyncio.Event()
+        self._last_outbound_prune = 0.0
         self._running = False
         # [2026-05-29 restart detection fix] Why: request_restart(target=engine)
         # actually triggers a FULL restart (supervisor+engine), wiping supervisor's
@@ -140,6 +154,13 @@ class EventRouter:
         # Layer 1 hook: 原始事件拦截器
         # 返回 None → SDK 继续默认处理；返回 'handled' → SDK 跳过此事件
         self._on_raw_event: Callable[[Event], Awaitable[str | None]] | None = None
+
+    @staticmethod
+    def _default_outbound_store_path(config: BotConfig) -> Path:
+        """Derive an adapter-local path without changing existing constructors."""
+        identity = config.conversation_key_prefix or config.entry_node_id or "default"
+        safe_identity = re.sub(r"[^A-Za-z0-9_.-]+", "_", identity).strip("._")
+        return Path("data") / f"clonoth_sdk_outbound_{safe_identity or 'default'}.sqlite3"
 
     # ------------------------------------------------------------------
     #  公共接口
@@ -163,34 +184,88 @@ class EventRouter:
         """当前事件流游标（最近处理的 seq）。"""
         return self._after_seq
 
+    def force_replay(
+        self, *, event_id: str = "", seq: int = 0, record_type: str = "",
+    ) -> OutboundRecord:
+        """Explicitly replay one pending/dead-letter/sent event by identity."""
+        record = self._outbound_store.force_replay(
+            event_id=event_id, seq=seq, record_type=record_type,
+        )
+        self._outbound_retry_wakeup.set()
+        return record
+
+    @staticmethod
+    def _event_delivery_context(
+        event: Event, conversation_key: str = "", *, attempt: int = 1,
+    ) -> DeliveryContext:
+        payload = event.payload
+        return DeliveryContext(
+            event_id=event.event_id, event_seq=event.seq,
+            task_id=str(payload.get("task_id") or ""),
+            source_inbound_seq=int(payload.get("source_inbound_seq") or 0),
+            conversation_key=conversation_key,
+            attempt=attempt,
+            idempotency_key=OutboundStore.stable_key(
+                event.event_id, event.seq, event.type,
+            ),
+        )
+
+    async def _invoke_callback(
+        self, method_name: str, *args: Any, delivery_context: DeliveryContext, **kwargs: Any,
+    ) -> Any:
+        """Pass formal context while preserving adapters with old signatures."""
+        callback = getattr(self._cb, method_name)
+        signature = inspect.signature(callback)
+        accepts_context = "delivery_context" in signature.parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            for parameter in signature.parameters.values()
+        )
+        if accepts_context:
+            kwargs["delivery_context"] = delivery_context
+        return await callback(*args, **kwargs)
+
     async def run(self) -> None:
-        """事件主循环。纯 WS，断线指数退避重连，永不降级 HTTP poll。"""
+        """事件主循环。纯 WS，并行恢复本地已接收但未成功发送的事件。"""
         self._running = True
-        logger.info("EventRouter started (WS-only mode)")
+        retry_task = asyncio.create_task(self._run_outbound_retry_loop())
+        logger.info(
+            "EventRouter started (WS-only mode) outbound_path=%s pending=%s processed_seq=%s",
+            self._outbound_store.path,
+            len(self._outbound_store.pending()),
+            self._outbound_store.processed_seq,
+        )
 
         retry_delay = self._WS_RETRY_DELAY
-        while self._running:
-            try:
-                await self._run_ws()
-                retry_delay = self._WS_RETRY_DELAY  # reset on clean close
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                if not self._running:
+        try:
+            while self._running:
+                try:
+                    await self._run_ws()
+                    retry_delay = self._WS_RETRY_DELAY  # reset on clean close
+                except asyncio.CancelledError:
                     break
-                logger.warning(
-                    "WS connection failed: %s; retrying in %.1fs",
-                    e, retry_delay,
-                    exc_info=True,
-                )
-                await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, self._WS_MAX_RETRY_DELAY)
+                except Exception as e:
+                    if not self._running:
+                        break
+                    logger.warning(
+                        "WS connection failed: %s; retrying in %.1fs",
+                        e, retry_delay,
+                        exc_info=True,
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, self._WS_MAX_RETRY_DELAY)
+        finally:
+            self._running = False
+            self._outbound_retry_wakeup.set()
+            retry_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await retry_task
 
         logger.info("EventRouter stopped")
 
     def stop(self) -> None:
-        """通知主循环停止。下一轮 poll 结束后退出。"""
+        """通知主循环停止，并唤醒可能正在等待的恢复任务。"""
         self._running = False
+        self._outbound_retry_wakeup.set()
 
     async def _run_ws(self) -> None:
         """WebSocket 模式主循环。断线或连接结束时抛异常交给 run()。"""
@@ -207,8 +282,13 @@ class EventRouter:
                 if raw_event.get("type") == "ping":
                     continue
                 event = Event.from_dict(raw_event)
-                self._after_seq = max(self._after_seq, event.seq)
-                await self._dispatch(event)
+                accepted = await self._dispatch(event)
+                # Runtime receive cursor may advance after local outbox acceptance.
+                # A persistence failure deliberately leaves it unchanged. The
+                # durable processing cursor advances only on successful outbound
+                # delivery in OutboundStore.acknowledge().
+                if accepted:
+                    self._after_seq = max(self._after_seq, event.seq)
             if self._running:
                 raise ConnectionError("WebSocket stream ended")
         finally:
@@ -269,14 +349,17 @@ class EventRouter:
     #  分发
     # ------------------------------------------------------------------
 
-    async def _dispatch(self, event: Event) -> None:
-        """将单个事件路由到 Layer 1 钩子，然后到协议处理器。"""
+    async def _dispatch(self, event: Event) -> bool:
+        """Route one event and report whether it is safe to advance receive state."""
+        if event.type in {"outbound_message", "intermediate_reply"}:
+            return await self._dispatch_durable_outbound(event)
+
         # Layer 1: 原始事件拦截
         if self._on_raw_event:
             try:
                 result = await self._on_raw_event(event)
                 if result == "handled":
-                    return
+                    return True
             except Exception as e:
                 logger.error("on_raw_event hook error: %s", e)
 
@@ -289,6 +372,253 @@ class EventRouter:
                 logger.error(
                     "Handler error for %s: %s", event.type, e, exc_info=True,
                 )
+        return True
+
+    # ------------------------------------------------------------------
+    #  Durable outbound delivery
+    # ------------------------------------------------------------------
+
+    def _outbound_delivery_metadata(self, event: Event) -> dict[str, Any]:
+        """Capture restart-safe routing metadata available at receive time."""
+        payload = event.payload
+        src_seq = int(payload.get("source_inbound_seq") or 0)
+        trigger = self._state.get_trigger(src_seq) if src_seq else None
+        return {
+            "source_inbound_seq": src_seq,
+            "conversation_key": (
+                trigger.conversation_key if trigger else
+                str(payload.get("conversation_key") or "").strip()
+                or self._state.get_conversation_key(event.session_id)
+                or ""
+            ),
+            "session_id": trigger.session_id if trigger else event.session_id,
+            "had_trigger": bool(trigger),
+        }
+
+    async def _dispatch_durable_outbound(self, event: Event) -> bool:
+        """Persist/deliver one outbound and report whether local receipt is safe."""
+        try:
+            record = self._outbound_store.enqueue(
+                event, delivery=self._outbound_delivery_metadata(event),
+            )
+        except Exception as exc:
+            # Never invoke a platform send if the recovery record could not be
+            # made durable; reconnect/replay may still supply the event later.
+            logger.error(
+                "outbound_persist_failed event_id=%s seq=%s task_id=%s outcome=persist_failed error=%s",
+                event.event_id, event.seq,
+                str(event.payload.get("task_id") or ""), exc,
+                exc_info=True,
+                extra={
+                    "event_id": event.event_id,
+                    "event_seq": event.seq,
+                    "task_id": str(event.payload.get("task_id") or ""),
+                    "outcome": "persist_failed",
+                },
+            )
+            return False
+        if record is None:
+            logger.info(
+                "outbound_duplicate_acknowledged event_id=%s seq=%s outcome=duplicate",
+                event.event_id, event.seq,
+                extra={
+                    "event_id": event.event_id,
+                    "event_seq": event.seq,
+                    "task_id": str(event.payload.get("task_id") or ""),
+                    "outcome": "duplicate",
+                },
+            )
+            return True
+        if record.attempt > 0 and record.next_retry > time.time():
+            logger.info(
+                "outbound_duplicate_deferred event_id=%s seq=%s task_id=%s attempt=%s next_retry=%s outcome=deferred",
+                record.event_id, record.seq, record.task_id, record.attempt,
+                record.next_retry,
+                extra={
+                    "event_id": record.event_id,
+                    "event_seq": record.seq,
+                    "task_id": record.task_id,
+                    "attempt": record.attempt,
+                    "next_retry": record.next_retry,
+                    "outcome": "deferred",
+                },
+            )
+            self._outbound_retry_wakeup.set()
+            return True
+        await self._deliver_outbound_record(record)
+        return True
+
+    async def _heartbeat_outbound_lease(self, record: OutboundRecord) -> None:
+        interval = max(0.1, min(
+            self._config.outbound_heartbeat_interval,
+            self._config.outbound_lease_seconds / 3,
+        ))
+        while True:
+            await asyncio.sleep(interval)
+            self._outbound_store.heartbeat(
+                record, owner=self._outbound_owner,
+                lease_seconds=self._config.outbound_lease_seconds,
+            )
+
+    async def _deliver_outbound_record(self, record: OutboundRecord) -> bool:
+        """Atomically claim, heartbeat, and deliver one row across SDK instances."""
+        if record.key in self._outbound_inflight:
+            return False
+        claimed = self._outbound_store.claim(
+            record, owner=self._outbound_owner,
+            lease_seconds=self._config.outbound_lease_seconds,
+        )
+        if claimed is None:
+            return False
+        record = claimed
+        self._outbound_inflight.add(record.key)
+        heartbeat = asyncio.create_task(self._heartbeat_outbound_lease(record))
+        event = Event.from_dict(record.event)
+        attempt = record.attempt + 1
+        route = str(record.delivery.get("conversation_key") or "")
+        delivery_key = record.key
+        if record.replay_generation:
+            delivery_key = f"{record.key}:replay:{record.replay_generation}"
+        try:
+            logger.info(
+                "outbound_delivery_start",
+                extra={
+                    "event_id": record.event_id, "event_seq": record.seq,
+                    "task_id": record.task_id, "attempt": attempt,
+                    "idempotency_key": delivery_key, "conversation_key": route,
+                    "replay_generation": record.replay_generation, "outcome": "attempt",
+                },
+            )
+            delivery_context = DeliveryContext(
+                event_id=record.event_id, event_seq=record.seq, task_id=record.task_id,
+                source_inbound_seq=int(event.payload.get("source_inbound_seq") or 0),
+                conversation_key=route, attempt=attempt,
+                idempotency_key=delivery_key,
+                replay_generation=record.replay_generation,
+                force_replay=record.replay_generation > 0,
+            )
+            if event.type == "intermediate_reply":
+                await self._deliver_intermediate_reply(
+                    event, record.delivery, delivery_context=delivery_context,
+                )
+            else:
+                await self._deliver_outbound_message(
+                    event, record.delivery, delivery_context=delivery_context,
+                )
+            self._outbound_store.acknowledge(record, owner=self._outbound_owner)
+            self._after_seq = max(self._after_seq, record.seq)
+            self._maybe_prune_outbound_sent()
+            logger.info(
+                "outbound_delivery_succeeded",
+                extra={
+                    "event_id": record.event_id, "event_seq": record.seq,
+                    "task_id": record.task_id, "attempt": attempt,
+                    "idempotency_key": delivery_key, "conversation_key": route,
+                    "replay_generation": record.replay_generation, "outcome": "succeeded",
+                },
+            )
+            return True
+        except asyncio.CancelledError:
+            # Durable adapters must shield any platform-send/claim-commit window.
+            # Therefore a raw cancellation reaching the router means delivery did
+            # not enter (or has already safely exited) that protected window.
+            with contextlib.suppress(Exception):
+                self._outbound_store.release_claim(record, owner=self._outbound_owner)
+            raise
+        except Exception as exc:
+            retryable = getattr(exc, "retryable", True) is not False
+            ambiguous_ack = getattr(exc, "ambiguous_ack", False) is True
+            try:
+                if not retryable:
+                    self._outbound_store.mark_dead_letter(
+                        record, exc, owner=self._outbound_owner,
+                    )
+                    logger.error(
+                        "outbound_delivery_dead_letter", exc_info=True,
+                        extra={
+                            "event_id": record.event_id, "event_seq": record.seq,
+                            "task_id": record.task_id, "attempt": record.attempt,
+                            "idempotency_key": delivery_key, "conversation_key": route,
+                            "replay_generation": record.replay_generation,
+                            "outcome": "dead_letter", "retryable": False,
+                            "ambiguous_ack": ambiguous_ack,
+                        },
+                    )
+                    return False
+                delay = self._outbound_store.mark_failed(
+                    record, exc, owner=self._outbound_owner,
+                    initial_delay=max(0.05, self._config.outbound_retry_initial),
+                    max_delay=max(max(0.05, self._config.outbound_retry_initial), self._config.outbound_retry_max),
+                )
+            except Exception as persist_exc:
+                logger.critical(
+                    "outbound_retry_persist_failed", exc_info=True,
+                    extra={
+                        "event_id": record.event_id, "event_seq": record.seq,
+                        "task_id": record.task_id, "idempotency_key": delivery_key,
+                        "persist_error": str(persist_exc),
+                    },
+                )
+                return False
+            self._outbound_retry_wakeup.set()
+            logger.error(
+                "outbound_delivery_failed", exc_info=True,
+                extra={
+                    "event_id": record.event_id, "event_seq": record.seq,
+                    "task_id": record.task_id, "attempt": record.attempt,
+                    "idempotency_key": delivery_key, "last_error": record.last_error,
+                    "next_retry": record.next_retry, "retry_delay": delay,
+                    "conversation_key": route, "replay_generation": record.replay_generation,
+                    "outcome": "retry", "ambiguous_ack": ambiguous_ack,
+                },
+            )
+            return False
+        finally:
+            heartbeat.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await heartbeat
+            self._outbound_inflight.discard(record.key)
+
+    def _maybe_prune_outbound_sent(self, *, force: bool = False) -> int:
+        now = time.time()
+        interval = max(1.0, self._config.outbound_prune_interval)
+        if not force and now - self._last_outbound_prune < interval:
+            return 0
+        removed = self._outbound_store.prune_sent(
+            ttl_seconds=max(0.0, self._config.outbound_sent_ttl),
+            max_rows=max(0, self._config.outbound_sent_max_rows),
+            now=now,
+        )
+        self._last_outbound_prune = now
+        if removed:
+            logger.info(
+                "outbound_sent_pruned",
+                extra={"removed_rows": removed, "outcome": "pruned"},
+            )
+        return removed
+
+    async def _run_outbound_retry_loop(self) -> None:
+        """Replay locally received rows with bounded sleeps and backoff."""
+        minimum_scan = max(0.05, self._config.outbound_retry_scan_interval)
+        while self._running:
+            now = time.time()
+            self._maybe_prune_outbound_sent()
+            for record in self._outbound_store.due(now):
+                if not self._running:
+                    return
+                await self._deliver_outbound_record(record)
+
+            next_retry = self._outbound_store.next_retry_at()
+            timeout = minimum_scan
+            if next_retry is not None:
+                timeout = max(0.05, min(minimum_scan, next_retry - time.time()))
+            self._outbound_retry_wakeup.clear()
+            try:
+                await asyncio.wait_for(
+                    self._outbound_retry_wakeup.wait(), timeout=timeout,
+                )
+            except asyncio.TimeoutError:
+                pass
 
     # ==================================================================
     #  事件处理器
@@ -582,132 +912,151 @@ class EventRouter:
     # ------------------------------------------------------------------
 
     async def _handle_outbound_message(self, event: Event) -> None:
-        """处理 outbound_message 事件。
+        """Backward-compatible direct handler; normal dispatch is durable."""
+        await self._deliver_outbound_message(
+            event, self._outbound_delivery_metadata(event),
+        )
 
-        两条路径：
-          Path 1（主节点回复）：src_seq 命中 trigger → 消费 trigger，
-              移除 MainTaskState，清理协议标记，调用 send_reply。
-              对应 bot_adapter.py L1297-1373。
-          Path 2（Fallback）：无 trigger 匹配 → 过滤 system.* 节点，
-              通过 session_conv_map 解析 conv_key，调用 send_to_channel。
-              对应 bot_adapter.py L1375-1434。
-        """
+    async def _deliver_outbound_message(
+        self,
+        event: Event,
+        delivery: dict[str, Any],
+        *,
+        delivery_context: DeliveryContext | None = None,
+    ) -> None:
+        """Deliver once; mutate trigger state only after callback success."""
         p = event.payload
         src_seq = int(p.get("source_inbound_seq") or 0)
+        context = delivery_context or DeliveryContext(
+            event_id=event.event_id,
+            event_seq=event.seq,
+            task_id=str(p.get("task_id") or ""),
+            source_inbound_seq=src_seq,
+            conversation_key=str(delivery.get("conversation_key") or ""),
+            attempt=1,
+            idempotency_key=OutboundStore.stable_key(
+                event.event_id, event.seq, event.type,
+            ),
+        )
+        text = strip_protocol_markers((p.get("text") or "").strip())
+        attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
 
-        # Path 1: 主节点回复（src_seq 在 triggers 中）
-        if src_seq and src_seq in self._state.triggers:
-            trigger = self._state.consume_trigger(src_seq)
-            main_state = self._state.remove_main_state(src_seq)
-            text = strip_protocol_markers((p.get("text") or "").strip())
-            attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
-            try:
-                await self._cb.send_reply(
-                    trigger, text, attachments, main_state=main_state,
-                )
-            except Exception as e:
-                logger.error("send_reply failed: %s", e)
+        # Main reply: retain both objects while the callback is in flight. This
+        # lets a failed send retry with the exact same adapter-owned references.
+        trigger = self._state.get_trigger(src_seq) if src_seq else None
+        if trigger is not None:
+            main_state = self._state.get_main_state(src_seq)
+            await self._invoke_callback(
+                "send_reply", trigger, text, attachments,
+                main_state=main_state, delivery_context=context,
+            )
+            # A callback may synchronously replace state during a preempt flow;
+            # only remove the objects that were actually delivered.
+            if self._state.get_trigger(src_seq) is trigger:
+                self._state.consume_trigger(src_seq)
+            if self._state.get_main_state(src_seq) is main_state:
+                self._state.remove_main_state(src_seq)
             return
 
-        # Path 2: Fallback（子节点 / 调度任务输出）
+        # Recovery after an adapter restart cannot reconstruct opaque platform
+        # objects in TriggerInfo. Use the route captured when the event was first
+        # received so local replay remains possible without server replay.
         node_id = p.get("node_id", "") or ""
-        # 过滤系统内部节点，不向平台发送
         if node_id.startswith("system."):
             logger.debug("Skip system node outbound: %s", node_id)
             return
-
-        conv_key = str(p.get("conversation_key") or "").strip() or self._state.get_conversation_key(event.session_id) or ""
-        text = strip_protocol_markers((p.get("text") or "").strip())
-        attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
         if not text and not attachments:
             return
 
-        try:
-            await self._cb.send_to_channel(
-                conv_key, text, attachments, node_id=node_id,
-            )
-        except Exception as e:
-            logger.error("send_to_channel failed: %s", e)
+        conv_key = (
+            str(delivery.get("conversation_key") or "").strip()
+            or str(p.get("conversation_key") or "").strip()
+            or self._state.get_conversation_key(event.session_id)
+            or ""
+        )
+        if conv_key != context.conversation_key:
+            context = replace(context, conversation_key=conv_key)
+        await self._invoke_callback(
+            "send_to_channel", conv_key, text, attachments,
+            node_id=node_id, delivery_context=context,
+        )
 
     # ------------------------------------------------------------------
     #  intermediate_reply — 中间回复（入口节点 / 子节点）
     # ------------------------------------------------------------------
 
     async def _handle_intermediate_reply(self, event: Event) -> None:
-        """处理 intermediate_reply 事件。
+        """Backward-compatible direct handler; normal dispatch is durable."""
+        await self._deliver_intermediate_reply(
+            event, self._outbound_delivery_metadata(event),
+        )
 
-        两条路径：
-          Path 1（入口节点中间回复）：src_seq 命中 trigger 且为入口节点 →
-              刷新 trigger、清空 stream buffer、调用 send_intermediate_reply。
-              对应 bot_adapter.py L1435-1465。
-          Path 2（子节点/Fallback）：非入口节点 → 更新子任务日志，
-              通过 session_conv_map fallback 调用 send_to_channel。
-              对应 bot_adapter.py L1467-1520。
-        """
+    async def _deliver_intermediate_reply(
+        self,
+        event: Event,
+        delivery: dict[str, Any],
+        *,
+        delivery_context: DeliveryContext | None = None,
+    ) -> None:
+        """Deliver one intermediate reply without consuming the final trigger."""
         p = event.payload
         src_seq = int(p.get("source_inbound_seq") or 0)
-        node_id = p.get("node_id", "")
+        node_id = str(p.get("node_id") or "")
+        text = strip_protocol_markers((p.get("text") or "").strip())
+        attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
+        conv_key = (
+            str(delivery.get("conversation_key") or "").strip()
+            or str(p.get("conversation_key") or "").strip()
+            or self._state.get_conversation_key(event.session_id)
+            or ""
+        )
+        context = delivery_context or self._event_delivery_context(event, conv_key)
+        if conv_key != context.conversation_key:
+            context = replace(context, conversation_key=conv_key)
 
-        # Path 1: 入口节点中间回复
-        if (
-            src_seq
-            and src_seq in self._state.triggers
-            and node_id == self._entry_node_id
-        ):
-            trigger = self._state.get_trigger(src_seq)
+        trigger = self._state.get_trigger(src_seq) if src_seq else None
+        if trigger is not None and node_id == self._entry_node_id:
             trigger.refresh()
-            text = strip_protocol_markers((p.get("text") or "").strip())
-            attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
-            # 清空流式 buffer（中间回复已包含完整内容）
             main_state = self._state.get_main_state(src_seq)
             if main_state:
                 main_state.stream_parts.clear()
             if text or attachments:
-                try:
-                    if attachments:
-                        await self._cb.send_to_channel(trigger.conversation_key, text, attachments, node_id=node_id)
-                    else:
-                        await self._cb.send_intermediate_reply(trigger, text)
-                except Exception as e:
-                    logger.error("send_intermediate_reply failed: %s", e)
+                if attachments:
+                    await self._invoke_callback(
+                        "send_to_channel", trigger.conversation_key, text, attachments,
+                        node_id=node_id,
+                        delivery_context=replace(
+                            context, conversation_key=trigger.conversation_key,
+                        ),
+                    )
+                else:
+                    await self._invoke_callback(
+                        "send_intermediate_reply", trigger, text,
+                        delivery_context=replace(
+                            context, conversation_key=trigger.conversation_key,
+                        ),
+                    )
+            # Intermediate delivery never consumes trigger/MainTaskState. They are
+            # reserved for the later final outbound_message acknowledgement.
             return
 
-        # 过滤系统内部节点
-        if (node_id or "").startswith("system."):
+        if node_id.startswith("system.") or not (text or attachments):
             return
+        await self._invoke_callback(
+            "send_to_channel", conv_key, text, attachments,
+            node_id=node_id, delivery_context=context,
+        )
 
-        # 更新子任务日志（如存在）
+        # Mark child progress only after the user-visible send succeeds. Retries do
+        # not append duplicate progress lines on failed attempts.
         task_key = p.get("task_id") or f"{node_id}:{event.session_id}"
         child_state = self._state.get_child_state(task_key)
-        if child_state:
+        if child_state and (not child_state.lines or child_state.lines[-1] != "↳ 已发送中间回复"):
             child_state.lines.append("↳ 已发送中间回复")
             try:
                 await self._cb.update_child_progress(task_key, child_state)
             except Exception:
                 pass
-
-        # Fallback: 通过 session_conv_map 发送到频道
-        # [2026-07-19] 与 _handle_outbound_message Path 2 对齐：优先使用事件 payload
-        # 里显式携带的 conversation_key（生图工具 emit_intermediate 会带上入口会话
-        # key），再退回 session_conv_map。目的：子节点（如 draw.image_gen）的
-        # session_id 是子/分支会话，直接查 session_conv_map 可能 miss，导致发图目标
-        # 与 qq_forward op=recent 的登记桶对不上；从源头带上正确 conv_key 可根治。
-        conv_key = (
-            str(p.get("conversation_key") or "").strip()
-            or self._state.get_conversation_key(event.session_id)
-            or ""
-        )
-        text = strip_protocol_markers((p.get("text") or "").strip())
-        attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
-        if text or attachments:
-            try:
-                await self._cb.send_to_channel(
-                    conv_key, text, attachments, node_id=node_id,
-                )
-            except Exception as e:
-                logger.error(
-                    "intermediate_reply send_to_channel failed: %s", e,
-                )
 
     # ------------------------------------------------------------------
     #  node_started / node_completed — 节点生命周期

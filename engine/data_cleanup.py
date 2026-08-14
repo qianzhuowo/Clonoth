@@ -16,6 +16,12 @@ from pathlib import Path
 
 import yaml
 
+try:
+    # Normal package import when launched from the repository root/runtime.
+    from engine.eventlog_rotation import rotate_event_log
+except ModuleNotFoundError:  # pragma: no cover - direct ``python engine/data_cleanup.py``
+    from eventlog_rotation import rotate_event_log
+
 # ── Paths ──────────────────────────────────────
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 EVENTS_FILE = DATA_DIR / "events.jsonl"
@@ -109,22 +115,21 @@ def _log_init():
 
 # ── 1. events.jsonl rotation ──────────────────
 def rotate_events():
-    if not EVENTS_FILE.exists():
+    # The shared helper acquires the same cross-process lock used by EventLog
+    # append/online rotation and re-checks active size plus backup state inside it.
+    try:
+        rotated = rotate_event_log(
+            EVENTS_FILE,
+            max_bytes=EVENTS_MAX_BYTES,
+            backups=EVENTS_BACKUPS,
+        )
+    except (OSError, TimeoutError):
+        logging.exception("[events] rotation failed")
         return
-    sz = EVENTS_FILE.stat().st_size
-    if sz < EVENTS_MAX_BYTES:
-        logging.info("[events] %dKB < %dMB threshold, skip",
-                     sz // 1024, EVENTS_MAX_BYTES // (1024 * 1024))
-        return
-    logging.info("[events] %dMB — rotating", sz // (1024 * 1024))
-    for i in range(EVENTS_BACKUPS, 0, -1):
-        p = DATA_DIR / f"events.jsonl.{i}"
-        if i == EVENTS_BACKUPS and p.exists():
-            p.unlink()
-        elif p.exists():
-            p.rename(DATA_DIR / f"events.jsonl.{i + 1}")
-    EVENTS_FILE.rename(DATA_DIR / "events.jsonl.1")
-    logging.info("[events] done")
+    if rotated:
+        logging.info("[events] rotated")
+    else:
+        logging.info("[events] absent or below threshold, skip")
 
 
 # ── 1b. signals.jsonl rotation ────────────────

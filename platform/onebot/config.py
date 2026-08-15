@@ -137,6 +137,11 @@ ENABLE_FILE_INPUT = _env_bool("ONEBOT_ENABLE_FILE_INPUT", True)
 FILE_MAX_BYTES = _env_int("ONEBOT_FILE_MAX_BYTES", 50 * 1024 * 1024, min_value=1024)
 MAX_FILES_PER_TURN = _env_int("ONEBOT_MAX_FILES_PER_TURN", 3, min_value=1, max_value=16)
 
+# OneBot 输出格式配置。
+# 默认忠实保留 LLM 输出中的 Markdown 样式符号（*、_），避免误伤
+# PUB_CACHE、user_id 等普通标识符。需要旧的纯文本显示时可显式启用。
+STRIP_MARKDOWN_STYLES = _env_bool("ONEBOT_STRIP_MARKDOWN_STYLES", False)
+
 # OneBot 扩展功能开关。
 ENABLE_REACTIONS = _env_bool("ONEBOT_ENABLE_REACTIONS", True)
 REPLY_TO_TRIGGER = _env_bool("ONEBOT_REPLY_TO_TRIGGER", True)

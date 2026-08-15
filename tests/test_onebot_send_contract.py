@@ -30,6 +30,17 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 sys.modules[_SPEC.name] = _MODULE
 _SPEC.loader.exec_module(_MODULE)
 
+_EMOJI_MODULE_PATH = Path(__file__).resolve().parents[1] / "platform" / "onebot" / "emoji_handler.py"
+_EMOJI_SPEC = importlib.util.spec_from_file_location("_onebot_emoji_handler", _EMOJI_MODULE_PATH)
+assert _EMOJI_SPEC is not None and _EMOJI_SPEC.loader is not None
+_EMOJI_MODULE = importlib.util.module_from_spec(_EMOJI_SPEC)
+sys.modules[_EMOJI_SPEC.name] = _EMOJI_MODULE
+_EMOJI_SPEC.loader.exec_module(_EMOJI_MODULE)
+
+from _onebot_emoji_handler import (  # type: ignore[import-not-found]  # noqa: E402
+    process_emojis,
+    strip_output_markers,
+)
 from _onebot_send_contract import (  # type: ignore[import-not-found]  # noqa: E402
     IdempotencyOwnershipError,
     OneBotAmbiguousAckError,
@@ -48,6 +59,45 @@ from _onebot_send_contract import (  # type: ignore[import-not-found]  # noqa: E
 
 class _Bot:
     pass
+
+
+def test_markdown_styles_are_preserved_by_default() -> None:
+    source = (
+        "抓到真凶了！你写成了 PUB_CACHE，正确叫法是 PUB_CACHE；"
+        "同时保留 *斜体*、**粗体**、_下划线斜体_ 和 __下划线粗体__。"
+    )
+
+    assert strip_output_markers(source) == source
+
+    segments = asyncio.run(process_emojis(source, _Bot(), []))
+    assert "".join(str(item.get("content") or "") for item in segments) == source
+
+
+def test_markdown_style_cleanup_can_be_explicitly_enabled() -> None:
+    source = "*斜体*、**粗体**、_下划线斜体_、__下划线粗体__"
+
+    assert strip_output_markers(source, strip_markdown_styles=True) == (
+        "斜体、粗体、下划线斜体、下划线粗体"
+    )
+
+
+def test_markdown_style_cleanup_config_defaults_off_and_can_be_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path = _ROOT / "platform" / "onebot" / "config.py"
+
+    def load_config(name: str):
+        spec = importlib.util.spec_from_file_location(name, config_path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    monkeypatch.delenv("ONEBOT_STRIP_MARKDOWN_STYLES", raising=False)
+    assert load_config("_onebot_config_markdown_default").STRIP_MARKDOWN_STYLES is False
+
+    monkeypatch.setenv("ONEBOT_STRIP_MARKDOWN_STYLES", "1")
+    assert load_config("_onebot_config_markdown_enabled").STRIP_MARKDOWN_STYLES is True
 
 
 def test_missing_bot_and_target_are_explicit_contract_errors() -> None:

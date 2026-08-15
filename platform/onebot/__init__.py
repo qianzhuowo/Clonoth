@@ -83,6 +83,7 @@ from .config import (
     RECENT_IMAGE_MAX_AGE_SECONDS,
     RECENT_IMAGE_MAX_ITEMS,
     REPLY_TO_TRIGGER,
+    STRIP_MARKDOWN_STYLES,
     TRIGGER_PREFIXES,
     USER_PROFILES_PATH,
     ONEBOT_STATE_FILE,
@@ -2850,7 +2851,10 @@ def _record_bot_reply(group_id: int, text: str) -> None:
     """把 Bot 最终回复写回群历史，保持后续对话连续性。"""
     if not text:
         return
-    text = strip_output_markers(text).replace(_SPLIT_SIGNAL, " ")
+    text = strip_output_markers(
+        text,
+        strip_markdown_styles=STRIP_MARKDOWN_STYLES,
+    ).replace(_SPLIT_SIGNAL, " ")
     text = _QQ_EMOJI_MARK_RE.sub(lambda m: f"[表情:{m.group(1)}]", text)
     text = _anonymize_text_for_ai(_compact_text(text))
     if text:
@@ -4404,6 +4408,7 @@ async def _send_split_text(
             _bqbs,
             _current_custom_face_names(),
             _current_custom_face_metadata(),
+            strip_markdown_styles=STRIP_MARKDOWN_STYLES,
         )
         if not segments:
             continue

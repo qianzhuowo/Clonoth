@@ -248,11 +248,12 @@ def write_custom_face_metadata(path: str, items: List[Dict[str, Any]]) -> None:
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def strip_output_markers(text: str) -> str:
-    """清理 QQ 不支持的输出标记并剥离基础 Markdown。
+def strip_output_markers(text: str, *, strip_markdown_styles: bool = False) -> str:
+    """清理平台专用标记，并按配置选择是否剥离 Markdown 样式。
 
-    这样处理的目的，是把 Clonoth 面向多平台的输出转换成 QQ 可直接阅读的文本。
-    这里只做保守替换，不重写内容语义。
+    默认忠实保留 LLM 输出中的 ``*`` 和 ``_``。单下划线常用于 PUB_CACHE、
+    user_id 等标识符；将其解析为 Markdown 斜体可能跨越多处标识符并误删内容。
+    旧的粗体/斜体纯文本清理逻辑仍可通过 ``strip_markdown_styles=True`` 启用。
     """
     if not text:
         return ""
@@ -262,10 +263,11 @@ def strip_output_markers(text: str) -> str:
     text = _CODE_BLOCK_RE.sub(lambda m: m.group(1), text)
     text = _INLINE_CODE_RE.sub(lambda m: m.group(1), text)
     text = _LINK_RE.sub(lambda m: f"{m.group(1)}（{m.group(2)}）", text)
-    text = _BOLD_RE.sub(lambda m: m.group(1), text)
-    text = _UNDERLINE_BOLD_RE.sub(lambda m: m.group(1), text)
-    text = _ITALIC_RE.sub(lambda m: m.group(1), text)
-    text = _UNDERLINE_ITALIC_RE.sub(lambda m: m.group(1), text)
+    if strip_markdown_styles:
+        text = _BOLD_RE.sub(lambda m: m.group(1), text)
+        text = _UNDERLINE_BOLD_RE.sub(lambda m: m.group(1), text)
+        text = _ITALIC_RE.sub(lambda m: m.group(1), text)
+        text = _UNDERLINE_ITALIC_RE.sub(lambda m: m.group(1), text)
     text = _HEADING_RE.sub("", text)
     return text.strip()
 
@@ -642,6 +644,8 @@ async def process_emojis(
     bqbs: List[str],
     preferred_names: List[str] | None = None,
     metadata: List[Dict[str, Any]] | None = None,
+    *,
+    strip_markdown_styles: bool = False,
 ) -> List[Dict[str, Any]]:
     """处理文本中的 QQ 收藏表情标记，返回可发送的消息段描述。
 
@@ -653,7 +657,10 @@ async def process_emojis(
     返回 dict 而不是直接返回 MessageSegment，是为了让该模块保持轻量，避免
     在工具层直接依赖 NoneBot2 的消息段实现。
     """
-    text = strip_output_markers(text)
+    text = strip_output_markers(
+        text,
+        strip_markdown_styles=strip_markdown_styles,
+    )
     segments: List[Dict[str, Any]] = []
     last_end = 0
     # 优先用持久化元数据里的 URL 直接发送，避免每条消息都拉 NapCat 详情。

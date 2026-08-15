@@ -138,9 +138,24 @@ FILE_MAX_BYTES = _env_int("ONEBOT_FILE_MAX_BYTES", 50 * 1024 * 1024, min_value=1
 MAX_FILES_PER_TURN = _env_int("ONEBOT_MAX_FILES_PER_TURN", 3, min_value=1, max_value=16)
 
 # OneBot 输出格式配置。
-# 默认忠实保留 LLM 输出中的 Markdown 样式符号（*、_），避免误伤
-# PUB_CACHE、user_id 等普通标识符。需要旧的纯文本显示时可显式启用。
-STRIP_MARKDOWN_STYLES = _env_bool("ONEBOT_STRIP_MARKDOWN_STYLES", False)
+# 默认剥离 *斜体* / **粗体** 的星号，但绝不把单/双下划线当作 Markdown，
+# 从而完整保留 PUB_CACHE、user_id、_literal_ 等原文。两个维度可独立调整。
+_LEGACY_STRIP_MARKDOWN_STYLES_RAW = os.environ.get("ONEBOT_STRIP_MARKDOWN_STYLES")
+if _LEGACY_STRIP_MARKDOWN_STYLES_RAW is None:
+    _legacy_strip_markdown_styles = None
+else:
+    _legacy_strip_markdown_styles = _env_bool("ONEBOT_STRIP_MARKDOWN_STYLES", False)
+
+STRIP_MARKDOWN_ASTERISK_STYLES = _env_bool(
+    "ONEBOT_STRIP_MARKDOWN_ASTERISK_STYLES",
+    True if _legacy_strip_markdown_styles is None else _legacy_strip_markdown_styles,
+)
+STRIP_MARKDOWN_UNDERSCORE_STYLES = _env_bool(
+    "ONEBOT_STRIP_MARKDOWN_UNDERSCORE_STYLES",
+    False if _legacy_strip_markdown_styles is None else _legacy_strip_markdown_styles,
+)
+# 兼容仍导入旧常量的扩展；新代码应使用上面两个独立开关。
+STRIP_MARKDOWN_STYLES = bool(_legacy_strip_markdown_styles)
 
 # OneBot 扩展功能开关。
 ENABLE_REACTIONS = _env_bool("ONEBOT_ENABLE_REACTIONS", True)

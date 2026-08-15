@@ -248,25 +248,36 @@ def write_custom_face_metadata(path: str, items: List[Dict[str, Any]]) -> None:
     target.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def strip_output_markers(text: str, *, strip_markdown_styles: bool = False) -> str:
+def strip_output_markers(
+    text: str,
+    *,
+    strip_asterisk_styles: bool = True,
+    strip_underscore_styles: bool = False,
+    strip_markdown_styles: bool | None = None,
+) -> str:
     """清理平台专用标记，并按配置选择是否剥离 Markdown 样式。
 
-    默认忠实保留 LLM 输出中的 ``*`` 和 ``_``。单下划线常用于 PUB_CACHE、
-    user_id 等标识符；将其解析为 Markdown 斜体可能跨越多处标识符并误删内容。
-    旧的粗体/斜体纯文本清理逻辑仍可通过 ``strip_markdown_styles=True`` 启用。
+    默认清理 ``*斜体*`` / ``**粗体**`` 的外层星号，但完整保留下划线。
+    单下划线常用于 PUB_CACHE、user_id 等标识符；解析它可能跨越多处标识符
+    并误删内容。``strip_markdown_styles`` 仅作为旧调用方的兼容总开关。
     """
     if not text:
         return ""
+
+    if strip_markdown_styles is not None:
+        strip_asterisk_styles = strip_markdown_styles
+        strip_underscore_styles = strip_markdown_styles
 
     text = _DC_EMOJI_RE.sub("", text)
     text = _REACT_RE.sub("", text)
     text = _CODE_BLOCK_RE.sub(lambda m: m.group(1), text)
     text = _INLINE_CODE_RE.sub(lambda m: m.group(1), text)
     text = _LINK_RE.sub(lambda m: f"{m.group(1)}（{m.group(2)}）", text)
-    if strip_markdown_styles:
+    if strip_asterisk_styles:
         text = _BOLD_RE.sub(lambda m: m.group(1), text)
-        text = _UNDERLINE_BOLD_RE.sub(lambda m: m.group(1), text)
         text = _ITALIC_RE.sub(lambda m: m.group(1), text)
+    if strip_underscore_styles:
+        text = _UNDERLINE_BOLD_RE.sub(lambda m: m.group(1), text)
         text = _UNDERLINE_ITALIC_RE.sub(lambda m: m.group(1), text)
     text = _HEADING_RE.sub("", text)
     return text.strip()
@@ -645,7 +656,9 @@ async def process_emojis(
     preferred_names: List[str] | None = None,
     metadata: List[Dict[str, Any]] | None = None,
     *,
-    strip_markdown_styles: bool = False,
+    strip_asterisk_styles: bool = True,
+    strip_underscore_styles: bool = False,
+    strip_markdown_styles: bool | None = None,
 ) -> List[Dict[str, Any]]:
     """处理文本中的 QQ 收藏表情标记，返回可发送的消息段描述。
 
@@ -659,6 +672,8 @@ async def process_emojis(
     """
     text = strip_output_markers(
         text,
+        strip_asterisk_styles=strip_asterisk_styles,
+        strip_underscore_styles=strip_underscore_styles,
         strip_markdown_styles=strip_markdown_styles,
     )
     segments: List[Dict[str, Any]] = []

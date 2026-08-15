@@ -61,16 +61,22 @@ class _Bot:
     pass
 
 
-def test_markdown_styles_are_preserved_by_default() -> None:
+def test_default_markdown_policy_strips_stars_but_preserves_underscores() -> None:
     source = (
         "抓到真凶了！你写成了 PUB_CACHE，正确叫法是 PUB_CACHE；"
-        "同时保留 *斜体*、**粗体**、_下划线斜体_ 和 __下划线粗体__。"
+        "样式 *斜体*、**粗体**、_下划线斜体_、__下划线粗体__；"
+        "行内代码 `PUB_CACHE`。"
+    )
+    expected = (
+        "抓到真凶了！你写成了 PUB_CACHE，正确叫法是 PUB_CACHE；"
+        "样式 斜体、粗体、_下划线斜体_、__下划线粗体__；"
+        "行内代码 PUB_CACHE。"
     )
 
-    assert strip_output_markers(source) == source
+    assert strip_output_markers(source) == expected
 
     segments = asyncio.run(process_emojis(source, _Bot(), []))
-    assert "".join(str(item.get("content") or "") for item in segments) == source
+    assert "".join(str(item.get("content") or "") for item in segments) == expected
 
 
 def test_markdown_style_cleanup_can_be_explicitly_enabled() -> None:
@@ -81,7 +87,7 @@ def test_markdown_style_cleanup_can_be_explicitly_enabled() -> None:
     )
 
 
-def test_markdown_style_cleanup_config_defaults_off_and_can_be_enabled(
+def test_markdown_style_cleanup_config_uses_safe_split_defaults(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = _ROOT / "platform" / "onebot" / "config.py"
@@ -93,11 +99,26 @@ def test_markdown_style_cleanup_config_defaults_off_and_can_be_enabled(
         spec.loader.exec_module(module)
         return module
 
-    monkeypatch.delenv("ONEBOT_STRIP_MARKDOWN_STYLES", raising=False)
-    assert load_config("_onebot_config_markdown_default").STRIP_MARKDOWN_STYLES is False
+    for key in (
+        "ONEBOT_STRIP_MARKDOWN_STYLES",
+        "ONEBOT_STRIP_MARKDOWN_ASTERISK_STYLES",
+        "ONEBOT_STRIP_MARKDOWN_UNDERSCORE_STYLES",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    default = load_config("_onebot_config_markdown_default")
+    assert default.STRIP_MARKDOWN_ASTERISK_STYLES is True
+    assert default.STRIP_MARKDOWN_UNDERSCORE_STYLES is False
 
+    monkeypatch.setenv("ONEBOT_STRIP_MARKDOWN_UNDERSCORE_STYLES", "1")
+    underscore_enabled = load_config("_onebot_config_markdown_underscore_enabled")
+    assert underscore_enabled.STRIP_MARKDOWN_ASTERISK_STYLES is True
+    assert underscore_enabled.STRIP_MARKDOWN_UNDERSCORE_STYLES is True
+
+    monkeypatch.delenv("ONEBOT_STRIP_MARKDOWN_UNDERSCORE_STYLES", raising=False)
     monkeypatch.setenv("ONEBOT_STRIP_MARKDOWN_STYLES", "1")
-    assert load_config("_onebot_config_markdown_enabled").STRIP_MARKDOWN_STYLES is True
+    legacy_enabled = load_config("_onebot_config_markdown_legacy_enabled")
+    assert legacy_enabled.STRIP_MARKDOWN_ASTERISK_STYLES is True
+    assert legacy_enabled.STRIP_MARKDOWN_UNDERSCORE_STYLES is True
 
 
 def test_missing_bot_and_target_are_explicit_contract_errors() -> None:

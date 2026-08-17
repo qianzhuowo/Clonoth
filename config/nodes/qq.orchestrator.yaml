@@ -2,6 +2,8 @@ id: qq.orchestrator
 type: ai
 name: "QQ 综合入口"
 description: "QQ Bot 综合入口。支持联网搜索、定时任务、重启、取消任务，并可委派项目/命令相关任务。"
+# 综合入口使用纯文本模型；剥离持久历史中的图片块，避免 provider 拒绝 image_url。
+strip_images: true
 delegate_targets:
   - bootstrap.executor
   - bootstrap.cmd_reviewer

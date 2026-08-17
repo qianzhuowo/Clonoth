@@ -24,6 +24,9 @@ INDEX_ALIASES = {
     "沪深300": "000300.SH",
     "zz500": "000905.SH",
     "中证500": "000905.SH",
+    "中证军工": "399967.SZ",
+    "中证军工指数": "399967.SZ",
+    "军工指数": "399967.SZ",
 }
 
 INDEX_NAMES = {
@@ -32,6 +35,7 @@ INDEX_NAMES = {
     "399006.SZ": "创业板指",
     "000300.SH": "沪深300",
     "000905.SH": "中证500",
+    "399967.SZ": "中证军工",
 }
 
 US_NAME_ALIASES = {
@@ -187,13 +191,14 @@ def _resolve_by_name(raw: str) -> ResolvedSymbol | None:
         return resolve_symbol(US_NAME_ALIASES[lower_key], raw_input=raw, forced_name=key)
 
     candidates: list[dict[str, str]] = []
-    candidates.extend(_load_akshare_name_map("cn_names"))
-    candidates.extend(_load_akshare_name_map("etf_names"))
-    candidates.extend(_load_akshare_name_map("hk_names"))
-
-    exact = [item for item in candidates if item.get("name") == key]
-    if exact:
-        return resolve_symbol(exact[0]["symbol"], raw_input=raw, forced_name=exact[0].get("name"))
+    # 按市场逐个加载并立即检查精确命中。旧逻辑会先串行请求 A股、ETF、港股
+    # 三份远端列表，即使第一个列表已找到名称也要等待全部完成。
+    for kind in ("cn_names", "etf_names", "hk_names"):
+        market_candidates = _load_akshare_name_map(kind)
+        exact = [item for item in market_candidates if item.get("name") == key]
+        if exact:
+            return resolve_symbol(exact[0]["symbol"], raw_input=raw, forced_name=exact[0].get("name"))
+        candidates.extend(market_candidates)
 
     fuzzy = [item for item in candidates if key and (key in item.get("name", "") or item.get("name", "") in key)]
     if fuzzy:

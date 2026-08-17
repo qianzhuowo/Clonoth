@@ -18,6 +18,9 @@ from typing import Any
 import sys
 import time
 
+import pytest
+import yaml
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from engine.conversation_store import ConversationStore, Message, MessageType  # noqa: E402
@@ -372,3 +375,113 @@ def test_finish_guard_allows_honest_read_image_failure_notice() -> None:
         finish_text="这次识图失败了，请重新发送或直接引用原图后再试。",
     )
     assert asyncio.run(FinishGuardHandler().handle(ctx)) is None
+
+
+def test_onebot_filename_is_not_treated_as_download_url() -> None:
+    item = _ATTACHMENT_POLICY.normalise_file_item(
+        {"file": "testyaml.yaml", "file_id": "file-token-1", "file_size": "123"}
+    )
+    assert item == {
+        "source": "", "name": "testyaml.yaml", "size": 123,
+        "file_id": "file-token-1", "busid": None, "file_hash": "",
+    }
+    assert not _ATTACHMENT_POLICY.is_downloadable_file_source("testyaml.yaml")
+    assert _ATTACHMENT_POLICY.is_downloadable_file_source("https://example.invalid/file.yaml")
+    assert _ATTACHMENT_POLICY.normalise_file_item({"file_id": "f", "busid": 0})["busid"] == 0
+
+
+def test_onebot_outbound_and_self_events_are_filtered() -> None:
+    assert _ATTACHMENT_POLICY.is_outbound_or_self_event(
+        post_type="message_sent", user_id=123, self_ids=[999]
+    )
+    assert _ATTACHMENT_POLICY.is_outbound_or_self_event(
+        post_type="message", user_id="999", self_ids=[999]
+    )
+    assert not _ATTACHMENT_POLICY.is_outbound_or_self_event(
+        post_type="message", user_id=123, self_ids=[999]
+    )
+
+
+def test_qq_orchestrator_declares_text_only_history_policy() -> None:
+    node = yaml.safe_load(
+        (Path(__file__).resolve().parents[1] / "config" / "nodes" / "qq.orchestrator.yaml").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert node["strip_images"] is True
+
+
+def test_stock_resolver_knows_zhongzheng_military_index() -> None:
+    from tools.stocktool.stocklib.resolver import resolve_symbol
+
+    resolved = resolve_symbol("中证军工")
+    assert resolved.symbol == "399967.SZ"
+    assert resolved.asset_type == "index"
+    assert resolved.name == "中证军工"
+
+
+def _resolved_cn_stock():
+    from tools.stocktool.stocklib.models import ResolvedSymbol
+
+    return ResolvedSymbol(
+        input="宝钛股份", symbol="600456.SH", query_symbol="600456",
+        name="宝钛股份", asset_type="stock", market="A股", exchange="SH", currency="CNY",
+    )
+
+
+def test_explicit_cn_history_range_prefers_date_aware_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.stocktool.stocklib import history
+
+    calls: list[str] = []
+
+    def fake_akshare(*args, **kwargs):
+        calls.append("akshare")
+        return [{"date": "2020-01-02", "close": 20.0}]
+
+    def fail_tencent(*args, **kwargs):
+        calls.append("tencent")
+        raise AssertionError("explicit CN ranges must try AkShare first")
+
+    monkeypatch.setattr(history, "fetch_history_akshare_cn", fake_akshare)
+    monkeypatch.setattr(history, "fetch_history_tencent", fail_tencent)
+    rows, source, errors = history.get_history(
+        _resolved_cn_stock(), start="20200101", end="20200131", limit=20
+    )
+    assert rows == [{"date": "2020-01-02", "close": 20.0}]
+    assert source == "akshare"
+    assert errors == []
+    assert calls == ["akshare"]
+
+
+def test_akshare_explicit_range_is_not_truncated_by_default_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.stocktool.stocklib import history
+
+    class FakeFrame:
+        def iterrows(self):
+            yield 0, {"日期": "2020-01-02", "开盘": 1, "收盘": 2, "最高": 3, "最低": 1, "成交量": 10}
+            yield 1, {"日期": "2020-01-03", "开盘": 2, "收盘": 3, "最高": 4, "最低": 2, "成交量": 20}
+
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(stock_zh_a_hist=lambda **kwargs: FakeFrame()))
+    rows = history.fetch_history_akshare_cn(
+        _resolved_cn_stock(), start="20200101", end="20200131", limit=1
+    )
+    assert [row["date"] for row in rows] == ["2020-01-02", "2020-01-03"]
+
+
+def test_tencent_empty_filtered_range_raises_for_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tools.stocktool.stocklib import history
+
+    monkeypatch.setattr(
+        history, "_fetch_one",
+        lambda *args, **kwargs: [["2026-08-10", "1", "2", "3", "0.5", "100"]],
+    )
+    with pytest.raises(RuntimeError, match="指定日期区间无数据"):
+        history.fetch_history_tencent(
+            _resolved_cn_stock(), start="20200101", end="20200131", limit=20
+        )

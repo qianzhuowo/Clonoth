@@ -107,6 +107,8 @@ def fetch_history_tencent(resolved: ResolvedSymbol, *, period: str = "day", limi
         out = [r for r in out if _dnorm(r["date"]) >= start]
     if end:
         out = [r for r in out if _dnorm(r["date"]) <= end]
+    if not out:
+        raise RuntimeError(f"腾讯K线在指定日期区间无数据：{resolved.symbol}")
     # Limit only caps results when no explicit range was requested.
     if not start and not end and limit and len(out) > int(limit):
         out = out[-int(limit):]
@@ -120,8 +122,19 @@ def fetch_history_akshare_cn(resolved: ResolvedSymbol, *, period: str = "day", l
     ak_period = {"day": "daily", "week": "weekly", "month": "monthly"}.get(period, "daily")
     s = (start or "19900101").replace("-", "")
     e = (end or datetime.now(CN_TZ).strftime("%Y%m%d")).replace("-", "")
-    df = ak.stock_zh_a_hist(symbol=resolved.query_symbol[-6:], period=ak_period,
-                            start_date=s, end_date=e, adjust=adjust or "")
+    code = resolved.symbol.split(".", 1)[0]
+    if resolved.asset_type == "index":
+        df = ak.index_zh_a_hist(
+            symbol=code, period=ak_period, start_date=s, end_date=e,
+        )
+    elif resolved.asset_type == "etf":
+        df = ak.fund_etf_hist_em(
+            symbol=code, period=ak_period, start_date=s, end_date=e, adjust=adjust or "",
+        )
+    else:
+        df = ak.stock_zh_a_hist(
+            symbol=code, period=ak_period, start_date=s, end_date=e, adjust=adjust or "",
+        )
     out = []
     for _, row in df.iterrows():
         out.append({
@@ -132,9 +145,11 @@ def fetch_history_akshare_cn(resolved: ResolvedSymbol, *, period: str = "day", l
             "low": safe_float(row.get("最低")),
             "volume": safe_float(row.get("成交量")),
             "amount": safe_float(row.get("成交额")),
-            "pct_chg": safe_float(row.get("涨跌幯")),
+            "pct_chg": safe_float(row.get("涨跌幅")),
         })
-    if limit and len(out) > int(limit):
+    if not out:
+        raise RuntimeError(f"AkShare 在指定日期区间无数据：{resolved.symbol}")
+    if not start and not end and limit and len(out) > int(limit):
         out = out[-int(limit):]
     return out
 
@@ -142,17 +157,27 @@ def fetch_history_akshare_cn(resolved: ResolvedSymbol, *, period: str = "day", l
 def get_history(resolved: ResolvedSymbol, *, period: str = "day", limit: int = 20,
                 start: str = None, end: str = None, adjust: str = "qfq"):
     errors = []
-    try:
-        rows = fetch_history_tencent(resolved, period=period, limit=limit,
-                                 start=start, end=end, adjust=adjust)
-        return rows, "tencent.ifzq.gtimg.cn", errors
-    except Exception as exc:
-        errors.append("tencent.ifzq.gtimg.cn: " + type(exc).__name__ + ": " + str(exc))
-    if resolved.market == "A股" or resolved.asset_type in ("etf", "index"):
-        try:
-            rows = fetch_history_akshare_cn(resolved, period=period, limit=limit,
-                                         start=start, end=end, adjust=adjust)
-            return rows, "akshare.stock_zh_a_hist", errors
-        except Exception as exc:
-            errors.append("akshare.stock_zh_a_hist: " + type(exc).__name__ + ": " + str(exc))
+    is_cn_asset = resolved.market == "A股" or resolved.asset_type in ("etf", "index")
+
+    # 腾讯接口只提供最近最多 320 根 K 线，不能可靠覆盖较旧的 start/end。
+    # 中国市场的明确日期区间优先走支持日期参数的 AkShare；近期 limit 查询仍
+    # 保持腾讯优先，以兼顾速度和稳定性。
+    source_order = ["akshare", "tencent"] if is_cn_asset and (start or end) else ["tencent", "akshare"]
+    for source in source_order:
+        if source == "tencent":
+            try:
+                rows = fetch_history_tencent(
+                    resolved, period=period, limit=limit, start=start, end=end, adjust=adjust,
+                )
+                return rows, "tencent.ifzq.gtimg.cn", errors
+            except Exception as exc:
+                errors.append("tencent.ifzq.gtimg.cn: " + type(exc).__name__ + ": " + str(exc))
+        elif is_cn_asset:
+            try:
+                rows = fetch_history_akshare_cn(
+                    resolved, period=period, limit=limit, start=start, end=end, adjust=adjust,
+                )
+                return rows, "akshare", errors
+            except Exception as exc:
+                errors.append("akshare: " + type(exc).__name__ + ": " + str(exc))
     raise RuntimeError("所有历史行情数据源均失败：" + "；".join(errors))

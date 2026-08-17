@@ -96,7 +96,10 @@ from .config import (
     ANON_MAP_FILE,
 )
 from .attachment_policy import (
+    is_downloadable_file_source,
+    is_outbound_or_self_event,
     looks_like_image_query,
+    normalise_file_item,
     select_recent_image_entries,
     should_fallback_to_recent_images,
     source_attachments_from_merged,
@@ -468,16 +471,29 @@ def _is_private_allowed(event: PrivateMessageEvent) -> bool:
     return str(getattr(event, "sub_type", "") or "").lower() == "friend"
 
 
-async def _allowed_group_rule(event: Event) -> bool:
+def _event_is_outbound_or_self(event: Event, bot: Bot | None = None) -> bool:
+    """过滤 Bot 自身回显及 message_sent 文件状态事件，避免形成回复回路。"""
+    self_ids = {
+        getattr(bot, "self_id", None),
+        getattr(event, "self_id", None),
+    }
+    return is_outbound_or_self_event(
+        post_type=getattr(event, "post_type", None),
+        user_id=getattr(event, "user_id", None),
+        self_ids=self_ids,
+    )
+
+
+async def _allowed_group_rule(bot: Bot, event: Event) -> bool:
     """把群类型和白名单放在规则层过滤，避免无关消息进入上下文缓存。"""
-    if not isinstance(event, GroupMessageEvent):
+    if not isinstance(event, GroupMessageEvent) or _event_is_outbound_or_self(event, bot):
         return False
     return _is_group_allowed(int(event.group_id))
 
 
 async def _agent_group_rule(bot: Bot, event: Event) -> bool:
     """匹配允许群里的 Agent 触发消息，兼容 @Bot / 前缀 / 全量触发。"""
-    if not isinstance(event, GroupMessageEvent):
+    if not isinstance(event, GroupMessageEvent) or _event_is_outbound_or_self(event, bot):
         return False
     if not _is_group_allowed(int(event.group_id)):
         return False
@@ -485,11 +501,11 @@ async def _agent_group_rule(bot: Bot, event: Event) -> bool:
     return _group_should_trigger(event, bot, text)
 
 
-async def _private_message_rule(event: Event) -> bool:
-    """只匹配 QQ 私聊消息，避免私聊请求被群聊白名单逻辑误拦截。"""
+async def _private_message_rule(bot: Bot, event: Event) -> bool:
+    """只匹配真实用户私聊，排除 Bot 回显和 message_sent 系统状态。"""
     # 2026-05-01 修改原因：私聊没有群号，也不需要 @Bot；这里单独识别
     # PrivateMessageEvent，使私聊入口和现有群聊入口互不影响。
-    return isinstance(event, PrivateMessageEvent)
+    return isinstance(event, PrivateMessageEvent) and not _event_is_outbound_or_self(event, bot)
 
 
 def _approval_summary(approval_id: str, operation: str, details: Dict[str, Any]) -> str:
@@ -1331,18 +1347,11 @@ def _iter_qq_file_sources(message: Any) -> List[Dict[str, Any]]:
         return sources
 
     def add_from_data(data: Dict[str, Any]) -> None:
-        src = str(data.get("url") or data.get("path") or data.get("file") or "").strip()
-        name = str(data.get("name") or data.get("file_name") or data.get("filename") or "").strip()
-        if not name and src:
-            name = Path(src.split("?", 1)[0].split("#", 1)[0]).name
-        if not src and not name:
+        item = normalise_file_item(data)
+        if item is None:
             return
-        size_raw = data.get("size") or data.get("file_size") or data.get("filesize")
-        try:
-            size = int(size_raw) if size_raw is not None and str(size_raw).strip() else 0
-        except Exception:
-            size = 0
-        sources.append({"source": src, "name": _safe_attachment_name(name, "file"), "size": size})
+        item["name"] = _safe_attachment_name(str(item.get("name") or "file"), "file")
+        sources.append(item)
 
     if isinstance(message, str):
         for match in _CQ_RE.finditer(message):
@@ -1371,21 +1380,91 @@ def _file_attachment_error_text(error: str) -> str:
     if error == "too_large":
         return f"文件太大，已超过当前限制 {FILE_MAX_BYTES // 1024 // 1024}MB。"
     if error == "no_source":
-        return "我收到了文件消息，但当前 OneBot 事件没有提供可下载链接。"
+        return "我收到了文件消息，但 OneBot 没有提供可下载地址，也无法通过文件 ID 获取。"
+    if error == "local_missing":
+        return "我收到了文件，但 OneBot 提供的本地文件路径在当前服务中不存在。"
+    if error == "source_expired":
+        return "我收到了文件，但 QQ 下载地址已失效或无权访问，请重新发送文件。"
+    if error == "network_failed":
+        return "我收到了文件，但下载时网络请求失败，请稍后重试。"
     if error == "download_failed":
-        return "我收到了文件，但下载失败了，可能是 QQ 临时链接已过期。"
+        return "我收到了文件，但下载或读取失败了。"
     return "我收到了文件，但处理文件时失败了。"
+
+
+def _file_source_from_api_result(value: Any) -> str:
+    """从不同 OneBot/NapCat API 返回结构中提取真实 URL 或绝对路径。"""
+    if isinstance(value, str):
+        return value if is_downloadable_file_source(value) else ""
+    if not isinstance(value, dict):
+        return ""
+    for key in ("url", "path", "file"):
+        source = str(value.get(key) or "").strip()
+        if is_downloadable_file_source(source):
+            return source
+    nested = value.get("data")
+    return _file_source_from_api_result(nested)
+
+
+async def _resolve_onebot_file_source(bot: Bot | None, event: Event | None, item: Dict[str, Any]) -> str:
+    """优先使用真实 source；否则通过 OneBot 文件 ID 换取临时下载地址。"""
+    source = str(item.get("source") or "").strip()
+    if is_downloadable_file_source(source):
+        return source
+    file_id = str(item.get("file_id") or "").strip()
+    if bot is None or not file_id:
+        return ""
+
+    attempts: list[tuple[str, dict[str, Any]]] = []
+    group_id = getattr(event, "group_id", None) if event is not None else None
+    user_id = getattr(event, "user_id", None) if event is not None else None
+    if group_id is not None:
+        base_params: dict[str, Any] = {"group_id": int(group_id), "file_id": file_id}
+        busid = item.get("busid")
+        if busid is not None:
+            attempts.append(("get_group_file_url", {**base_params, "busid": busid}))
+            attempts.append(("get_group_file_url", base_params))
+        else:
+            # OneBot/NapCat 版本对 busid 的要求不一致：有的可省略，有的要求
+            # 参数存在。先尝试标准精简参数，再以 0 兼容旧实现。
+            attempts.append(("get_group_file_url", base_params))
+            attempts.append(("get_group_file_url", {**base_params, "busid": 0}))
+    else:
+        params = {"file_id": file_id}
+        if user_id is not None:
+            params["user_id"] = int(user_id)
+        if item.get("file_hash"):
+            params["file_hash"] = item.get("file_hash")
+        attempts.append(("get_private_file_url", params))
+        attempts.append(("get_private_file_url", {"file_id": file_id}))
+
+    for api_name, params in attempts:
+        try:
+            result = await bot.call_api(api_name, **params)
+        except Exception:
+            logger.debug("OneBot file URL API failed: api=%s", api_name, exc_info=True)
+            continue
+        source = _file_source_from_api_result(result)
+        if source:
+            return source
+    return ""
 
 
 async def _read_file_source_bytes(client: httpx.AsyncClient, source: str) -> tuple[bytes, str]:
     """读取 QQ 文件来源；支持 URL、file:// 和本地路径，并限制最大字节数。"""
+    if not is_downloadable_file_source(source):
+        raise ValueError("no_source")
     if source.startswith("file://"):
         local = Path(source[7:])
+        if not local.is_file():
+            raise ValueError("local_missing")
         if local.stat().st_size > FILE_MAX_BYTES:
             raise ValueError("too_large")
         return local.read_bytes(), "application/octet-stream"
     if re.match(r"^[a-zA-Z]:[\\/]", source) or source.startswith("/"):
         local = Path(source)
+        if not local.is_file():
+            raise ValueError("local_missing")
         if local.stat().st_size > FILE_MAX_BYTES:
             raise ValueError("too_large")
         return local.read_bytes(), "application/octet-stream"
@@ -1404,8 +1483,14 @@ async def _read_file_source_bytes(client: httpx.AsyncClient, source: str) -> tup
     return bytes(content), content_type
 
 
-async def _file_sources_to_attachments(file_sources: List[Dict[str, Any]], conversation_key: str) -> tuple[list[dict], list[str]]:
-    """下载/复制 OneBot 普通文件，返回 Clonoth 附件描述。"""
+async def _file_sources_to_attachments(
+    file_sources: List[Dict[str, Any]],
+    conversation_key: str,
+    *,
+    bot: Bot | None = None,
+    event: Event | None = None,
+) -> tuple[list[dict], list[str]]:
+    """下载/复制 OneBot 普通文件，必要时先通过文件 ID 获取地址。"""
     result: list[dict] = []
     errors: list[str] = []
     if not ENABLE_FILE_INPUT or not file_sources:
@@ -1422,7 +1507,7 @@ async def _file_sources_to_attachments(file_sources: List[Dict[str, Any]], conve
 
     async with httpx.AsyncClient(timeout=IMAGE_DOWNLOAD_TIMEOUT, follow_redirects=True) as client:
         for item in file_sources[:MAX_FILES_PER_TURN]:
-            source = str(item.get("source") or "").strip()
+            source = await _resolve_onebot_file_source(bot, event, item)
             name = _safe_attachment_name(str(item.get("name") or "file"), "file")
             try:
                 size = int(item.get("size") or 0)
@@ -1455,8 +1540,16 @@ async def _file_sources_to_attachments(file_sources: List[Dict[str, Any]], conve
                 })
             except ValueError as exc:
                 errors.append(_file_attachment_error_text(str(exc) or "download_failed"))
+            except httpx.HTTPStatusError as exc:
+                status = exc.response.status_code
+                error_code = "source_expired" if status in {401, 403, 404, 410} else "download_failed"
+                logger.warning("collect QQ file attachment HTTP failure: status=%s", status)
+                errors.append(_file_attachment_error_text(error_code))
+            except httpx.RequestError as exc:
+                logger.warning("collect QQ file attachment network failure: %s", type(exc).__name__)
+                errors.append(_file_attachment_error_text("network_failed"))
             except Exception as exc:
-                logger.warning("collect QQ file attachment failed: source=%s error=%s", source, exc)
+                logger.warning("collect QQ file attachment failed: source_type=%s error=%s", "url" if source.startswith(("http://", "https://")) else "local", type(exc).__name__)
                 errors.append(_file_attachment_error_text("download_failed"))
     return result, errors
 
@@ -1526,7 +1619,7 @@ async def _image_sources_to_attachments(image_urls: List[str], conversation_key:
     return result, errors
 
 
-async def _collect_qq_attachments(event, conversation_key: str) -> tuple[list[dict], list[str]]:
+async def _collect_qq_attachments(bot: Bot, event: Event, conversation_key: str) -> tuple[list[dict], list[str]]:
     """下载 QQ 当前消息中的图片/普通文件，并返回 Clonoth 附件列表。引用消息由增强 reply 逻辑单独处理。"""
     message = event.get_message() if hasattr(event, "get_message") else None
     try:
@@ -1540,7 +1633,9 @@ async def _collect_qq_attachments(event, conversation_key: str) -> tuple[list[di
         logger.warning("collect QQ file attachments skipped current message: %s", exc)
         file_sources = []
     image_attachments, image_errors = await _image_sources_to_attachments(image_urls, conversation_key)
-    file_attachments, file_errors = await _file_sources_to_attachments(file_sources, conversation_key)
+    file_attachments, file_errors = await _file_sources_to_attachments(
+        file_sources, conversation_key, bot=bot, event=event,
+    )
     return image_attachments + file_attachments, image_errors + file_errors
 
 
@@ -6333,7 +6428,7 @@ async def _handle_history(bot: Bot, event: GroupMessageEvent) -> None:
         # 和图片提问能选到对应内容。
         real_conversation_key = f"qq_group:{int(event.group_id)}"
         stable_conversation_key = _stable_conversation_key(real_conversation_key)
-        attachments, _errors = await _collect_qq_attachments(event, stable_conversation_key)
+        attachments, _errors = await _collect_qq_attachments(bot, event, stable_conversation_key)
         _remember_recent_images(stable_conversation_key, event, attachments)
         _record_group_message(event, bot, override_text=expanded_text, attachments=attachments)
 
@@ -6354,12 +6449,12 @@ async def _handle_group_upload_notice(bot: Bot, event: Event) -> None:
     file_info = getattr(event, "file", None)
     if not isinstance(file_info, dict):
         file_info = {}
-    source = str(file_info.get("url") or file_info.get("path") or file_info.get("file") or "").strip()
-    name = _safe_attachment_name(str(file_info.get("name") or file_info.get("file_name") or file_info.get("filename") or "文件"), "file")
-    size = file_info.get("size") or file_info.get("file_size") or file_info.get("filesize") or 0
-    attachments, _errors = await _file_sources_to_attachments([
-        {"source": source, "name": name, "size": size},
-    ], stable_conversation_key)
+    file_item = normalise_file_item(file_info) or {"source": "", "name": "文件", "size": 0, "file_id": ""}
+    name = _safe_attachment_name(str(file_item.get("name") or "文件"), "file")
+    file_item["name"] = name
+    attachments, _errors = await _file_sources_to_attachments(
+        [file_item], stable_conversation_key, bot=bot, event=event,
+    )
     display_text = f"[文件:{name}]"
     sender_id = str(getattr(event, "user_id", "") or "")
     name_raw = _sender_display_name(getattr(event, "sender", None), sender_id)
@@ -6397,7 +6492,7 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     user_text = _strip_trigger_prefix(user_text)
     asyncio.create_task(_auto_like_user(bot, int(event.user_id)))
 
-    attachments, attachment_errors = await _collect_qq_attachments(event, stable_conversation_key)
+    attachments, attachment_errors = await _collect_qq_attachments(bot, event, stable_conversation_key)
     _remember_recent_images(stable_conversation_key, event, attachments)
     clear_mem_reply = await _maybe_handle_clear_group_memory_command(
         bot=bot,
@@ -6564,7 +6659,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
 
     real_conversation_key = f"qq_private:{user_id}"
     stable_conversation_key = _stable_conversation_key(real_conversation_key)
-    attachments, attachment_errors = await _collect_qq_attachments(event, stable_conversation_key)
+    attachments, attachment_errors = await _collect_qq_attachments(bot, event, stable_conversation_key)
     _remember_recent_images(stable_conversation_key, event, attachments)
     drawtools_reply = await _maybe_handle_drawtools_command(user_text)
     if drawtools_reply is not None:

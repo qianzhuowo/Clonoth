@@ -544,6 +544,14 @@ class EventRouter:
                             "ambiguous_ack": ambiguous_ack,
                         },
                     )
+                    # [2026-09-17] 死信即终态：立刻结束关联 trigger，并通知适配器。
+                    # Why: 以前死信后 trigger 一直挂到 600s 超时才被清理，期间 sweep
+                    # 每 3 秒调 update_progress，QQ 侧连续刷了 9 分钟“还在联网搜索中”，
+                    # 用户却没有收到任何失败提示。
+                    await self._finish_dead_letter_trigger(
+                        event, record, exc, route=route, delivery_key=delivery_key,
+                        ambiguous_ack=ambiguous_ack,
+                    )
                     return False
                 delay = self._outbound_store.mark_failed(
                     record, exc, owner=self._outbound_owner,
@@ -578,6 +586,69 @@ class EventRouter:
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
             self._outbound_inflight.discard(record.key)
+
+    async def _finish_dead_letter_trigger(
+        self,
+        event: Event,
+        record: OutboundRecord,
+        error: BaseException,
+        *,
+        route: str,
+        delivery_key: str,
+        ambiguous_ack: bool,
+    ) -> None:
+        """Dead-letter is terminal: retire the trigger now and let the adapter tell the user.
+
+        [2026-09-17] Why: a dead-lettered final reply used to leave its trigger and
+        MainTaskState alive until the 600s stale sweep. During that window the sweep
+        kept invoking ``update_progress`` (QQ spammed "still searching" notices) and
+        the user never learned that the reply was lost. How: for final replies, pop
+        the trigger/main state immediately (same objects ``_deliver_outbound_message``
+        would have consumed on success) and invoke the optional adapter callback
+        ``on_delivery_dead_letter``. Intermediate replies keep their trigger because
+        the task is still running and will still produce a final reply. Purpose:
+        make dead-letter a visible, immediate terminal state instead of a silent
+        10-minute limbo. Adapter failures here must never affect the router.
+        """
+        trigger = None
+        main_state = None
+        src_seq = 0
+        try:
+            src_seq = int(event.payload.get("source_inbound_seq") or 0)
+        except Exception:
+            src_seq = 0
+        is_final_reply = event.type != "intermediate_reply"
+        if src_seq and is_final_reply:
+            trigger = self._state.consume_trigger(src_seq)
+            main_state = self._state.remove_main_state(src_seq)
+            if trigger is not None and main_state is not None:
+                trigger.platform_data["_stale_main_state"] = main_state
+        elif src_seq:
+            trigger = self._state.get_trigger(src_seq)
+
+        callback = getattr(self._cb, "on_delivery_dead_letter", None)
+        if callback is None:
+            return
+        conversation_key = route or (trigger.conversation_key if trigger is not None else "")
+        try:
+            await callback(
+                trigger,
+                conversation_key,
+                error,
+                event_type=str(event.type or ""),
+                ambiguous_ack=ambiguous_ack,
+                idempotency_key=delivery_key,
+                task_id=record.task_id,
+            )
+        except Exception:
+            logger.warning(
+                "outbound_dead_letter_callback_failed", exc_info=True,
+                extra={
+                    "event_id": record.event_id, "event_seq": record.seq,
+                    "task_id": record.task_id, "idempotency_key": delivery_key,
+                    "conversation_key": conversation_key,
+                },
+            )
 
     def _maybe_prune_outbound_sent(self, *, force: bool = False) -> int:
         now = time.time()

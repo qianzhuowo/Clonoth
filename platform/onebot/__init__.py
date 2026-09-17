@@ -214,6 +214,14 @@ _REACT_CLEANUP_EMOJIS = tuple(_REACT_STAGE_EMOJIS.values())
 _SEARCH_PROGRESS_FIRST_NOTICE = "已收到联网搜索请求，正在检索网页资料，可能需要几秒钟……"
 _SEARCH_PROGRESS_STILL_RUNNING_NOTICE = "还在联网搜索中，我会拿到结果后马上整理回复。"
 _SEARCH_PROGRESS_STILL_RUNNING_INTERVAL_SEC = 20.0
+# [2026-09-17] “还在联网搜索中”最多发几条。日志证实投递失败后 trigger 挂到 10 分钟
+# 超时才被清理，期间每 20 秒刷一条共 27 条；这里硬限上限，避免刷屏。
+_SEARCH_PROGRESS_STILL_RUNNING_MAX_COUNT = int(
+    os.environ.get("ONEBOT_SEARCH_PROGRESS_MAX_STILL_NOTICES", "3") or "3"
+)
+# [2026-09-17] 最终回复进死信（QQ 侧未确认送达且不可重试）时给用户的一句提示。
+# 措辞兼顾“其实已送达”的歧义超时场景，不断言一定没发出去。
+_DELIVERY_DEAD_LETTER_NOTICE = "刚才的回复 QQ 侧没有确认送达，如果你没收到，请重新问我一次。"
 # [2026-07-22] 图片 sendMsg 超时后，延迟多久再用 base64:// 补发一次。
 # 给 NapCat/NTQQ 一点时间把“已提交但未 ack”的首发真正落地，降低补发双发概率。
 _IMAGE_TIMEOUT_RESEND_DELAY_SEC = float(os.environ.get("ONEBOT_IMAGE_TIMEOUT_RESEND_DELAY_SEC", "3") or "3")
@@ -4331,10 +4339,10 @@ async def _send_qq_message_once(bot: Bot, target: Dict[str, Any], message: Any, 
             # 原因：收藏表情/图片走 image(url) 时 NapCat 先落地到容器 temp/ 再上传，
             # temp 文件被并发清理时报 retcode=1200 ENOENT（真失败、未发出）。原私聊
             # 分支无补发保护，异常直接冒泡到 send_reply，导致整条回复被吞。
-            #   - sendMsg 超时：大概率已送达，raise 不重发（避免双发）。
+            #   - sendMsg 超时 / EventChecker 失败：大概率已送达，raise 不重发（避免双发）。
             #   - ENOENT：真失败，原样重发一次。
             #   - 其它失败：raise 交由上层记录。
-            if _is_napcat_sendmsg_timeout(exc):
+            if _is_napcat_ambiguous_ack(exc):
                 raise
             if _is_napcat_enoent(exc):
                 logger.warning(
@@ -4353,20 +4361,29 @@ async def _send_qq_message_once(bot: Bot, target: Dict[str, Any], message: Any, 
             result = await bot.send_group_msg(group_id=int(group_id), message=safe_message)
             return _extract_sent_message_id(result)
         except ActionFailed as exc:
-            # 兜底：若仍因 at/uid 问题失败（如成员列表不准确），把所有 at 降级为文本重发一次。
-            fallback = _strip_at_to_text(safe_message, group_id)
-            if str(fallback) != str(safe_message):
-                logger.warning("send_group_msg failed (%s); retry with at-as-text", exc)
-                result = await bot.send_group_msg(group_id=int(group_id), message=fallback)
-                return _extract_sent_message_id(result)
-            # [2026-07-22] 失败与 at 无关（fallback 与原消息相同）时的补发：
-            #   - sendMsg 超时：消息大概率已发出，不重发，直接 raise（避免重复）。
+            # [2026-09-17] 修复“连续 @ 同一人两次”：
+            #   原实现只要消息里含 at，任何 ActionFailed 都先走“at 转文本重发”，
+            #   超时判定放在后面永远轮不到。NapCat sendMsg 超时 / EventChecker 失败时
+            #   消息其实已提交给 NTQQ，结果就是群里出现两条 @。
+            #   现在的顺序：
+            #   1) ack 不明确（超时/EventChecker）：绝不重发，直接 raise 交由上层归类。
+            #   2) 仅当错误文本确实指向 at/uid 解析失败，才把 at 降级为文本重发一次。
+            #   3) ENOENT（容器 temp 文件缺失，真失败）：原样重发一次。
+            #   4) 其它：raise。
+            if _is_napcat_ambiguous_ack(exc):
+                raise
+            if _is_napcat_at_uid_error(exc):
+                # 兜底：若仍因 at/uid 问题失败（如成员列表不准确），把所有 at 降级为文本重发一次。
+                fallback = _strip_at_to_text(safe_message, group_id)
+                if str(fallback) != str(safe_message):
+                    logger.warning("send_group_msg failed (%s); retry with at-as-text", exc)
+                    result = await bot.send_group_msg(group_id=int(group_id), message=fallback)
+                    return _extract_sent_message_id(result)
+            # [2026-07-22] 失败与 at 无关时的补发：
             #   - ENOENT（NapCat 容器 temp 临时文件缺失，retcode=1200）：真失败、消息未发出，
             #     原样重发一次（dedupe=False）给一次补发机会，避免“漏回复”。
             #   图片类消息的 base64 重发已在 _send_attachment_path 处理，这里主要兼顾
             #   文本/引用回复等非图片消息因 ENOENT 整条失败的场景。
-            if _is_napcat_sendmsg_timeout(exc):
-                raise
             if _is_napcat_enoent(exc):
                 logger.warning(
                     "send_group_msg failed (ENOENT %s); retry once (dedupe off)", exc,
@@ -4490,7 +4507,18 @@ async def _send_split_text(
     source_attachments: List[Dict[str, Any]] | None = None,
     send_context: OutboundSendContext | None = None,
 ) -> bool:
-    """按 [SPLIT] 拆分文本，并把每段回复绑定到本轮来源图片。"""
+    """按 [SPLIT] 拆分文本，并把每段回复绑定到本轮来源图片。
+
+    [2026-09-17] 表情/图片与正文拆开发送：
+      Why: 正文与 [表情:xx] 原本合并在同一条消息里，NapCat 下载表情到容器 temp/
+      失败（ENOENT）时整条消息失败，文字答案跟着一起丢，再经 SDK 多轮重试/超时后
+      用户什么都收不到。
+      How: 每一段先发“文本 + at”（失败仍照旧冒泡，交由 SDK 重试），再把该段里的
+      表情/图片逐个单独发送；表情发送失败只记日志，不影响正文的成功结果。
+      表情段本身仍由 _message_from_processed_segments 生成（QQ 收藏表情专用
+      image 段：URL + sub_type=1 + summary），不改发送格式。
+      Purpose: 图片层面的不稳定不再阻塞文字回复。
+    """
     # 2026-05-01 修改原因：文本拆分逻辑对群聊和私聊相同，实际发送交给
     # _send_qq_message 处理，确保私聊也能复用表情替换和分段发送能力。
     sent_any = False
@@ -4510,33 +4538,90 @@ async def _send_split_text(
         )
         if not segments:
             continue
-        msg = _message_from_processed_segments(segments)
-        # 第一条消息带引用回复 + @发送者（与 ZhenXia 逻辑一致）
+        text_segments, image_segments = _split_text_and_image_segments(segments)
+        outgoing: List[tuple[str, Message]] = []
+        if text_segments:
+            outgoing.append(("text", _message_from_processed_segments(text_segments)))
+        for image_index, image_segment in enumerate(image_segments):
+            outgoing.append((f"emoji:{image_index}", _message_from_processed_segments([image_segment])))
+        if not outgoing:
+            continue
+        # 第一条消息带引用回复 + @发送者（与 ZhenXia 逻辑一致）；前缀挂在本段第一条
+        # 实际发出的消息上（有正文时是正文，纯表情段时是表情）。
         if not sent_any and target.get("reply_message_id"):
             prefix = MessageSegment.reply(target["reply_message_id"])
             if target.get("reply_sender_id"):
                 prefix = prefix + MessageSegment.at(target["reply_sender_id"]) + MessageSegment.text(" ")
-            msg = prefix + msg
-        segment_identity = f"text:{index}:{_message_dedup_text(msg).strip()}"
-        segment_context = send_context.child(segment_identity) if send_context else None
-        sent_message_id = await _send_qq_message(
-            bot,
-            target,
-            msg,
-            send_context=segment_context,
-            content_identity=segment_identity,
-        )
-        if sent_message_id and source_attachments:
-            _remember_reply_attachments(
-                sent_message_id,
-                str(target.get("conversation_key") or ""),
-                str(getattr(bot, "self_id", "") or ""),
-                source_attachments,
-            )
-        sent_any = True
+            kind, first_msg = outgoing[0]
+            outgoing[0] = (kind, prefix + first_msg)
+        text_only_part = bool(text_segments)
+        for kind, msg in outgoing:
+            segment_identity = f"{kind}:{index}:{_message_dedup_text(msg).strip()}"
+            segment_context = send_context.child(segment_identity) if send_context else None
+            is_primary = kind == "text" or not text_only_part
+            try:
+                sent_message_id = await _send_qq_message(
+                    bot,
+                    target,
+                    msg,
+                    send_context=segment_context,
+                    content_identity=segment_identity,
+                )
+            except Exception:
+                if is_primary:
+                    # 正文（或纯表情段）失败：维持旧语义冒泡，由 SDK 按合约重试/死信。
+                    raise
+                # 附带表情失败：正文已送达，只记日志，不阻塞、不重试整段。
+                logger.warning(
+                    "onebot_emoji_send_failed (text already delivered) identity=%s",
+                    segment_identity, exc_info=True,
+                )
+                continue
+            if is_primary and sent_message_id and source_attachments:
+                _remember_reply_attachments(
+                    sent_message_id,
+                    str(target.get("conversation_key") or ""),
+                    str(getattr(bot, "self_id", "") or ""),
+                    source_attachments,
+                )
+            sent_any = True
+            if len(outgoing) > 1:
+                await asyncio.sleep(0.3)
         if index < len(parts) - 1:
             await asyncio.sleep(0.5)
     return sent_any
+
+
+def _split_text_and_image_segments(
+    segments: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """把 emoji_handler 输出的段拆成（文本/at 段，图片/表情段）两组，各自保持原顺序。
+
+    文本组里去掉拆分后只剩空白的文本段，避免发出一条只有空格的消息。
+    """
+    text_segments: List[Dict[str, Any]] = []
+    image_segments: List[Dict[str, Any]] = []
+    for segment in segments:
+        seg_type = segment.get("type")
+        if seg_type == "image":
+            if segment.get("url"):
+                image_segments.append(segment)
+            continue
+        text_segments.append(segment)
+
+    def _visible_text(seg: Dict[str, Any]) -> str:
+        if seg.get("type") == "at":
+            return "@"
+        content = seg.get("content")
+        if content is None:
+            # 兼容 MessageSegment 形态（data.text），避免误判为空段。
+            data = seg.get("data")
+            content = data.get("text", "") if isinstance(data, dict) else ""
+        return str(content or "")
+
+    if not any(_visible_text(seg).strip() for seg in text_segments):
+        text_segments = []
+    return text_segments, image_segments
 
 
 def _to_workspace_rel_path(raw_path: Any) -> str:
@@ -4614,6 +4699,47 @@ def _is_napcat_enoent(exc: Exception) -> bool:
     """
     text = f"{getattr(exc, 'message', '') or ''} {getattr(exc, 'wording', '') or ''} {exc}".lower()
     return "enoent" in text or "no such file" in text
+
+
+def _is_napcat_eventchecker_failed(exc: Exception) -> bool:
+    """判断异常是否为 NapCat sendMsg 的 EventChecker 失败（ack 不明确，禁止重发）。
+
+    Why: [2026-09-17] NapCat 在 QQ 网络异常时回
+    "EventChecker Failed: NTEvent ... sendMsg ... errMsg: 网络连接异常! /
+    rich media transfer failed"。此时消息已经提交给 NTQQ，是否送达无法确认；
+    日志证实同一条 @ 消息因此被补发成两条。How: 匹配 message/wording 中的
+    eventchecker 关键字（配合 sendmsg）。Purpose: 与超时一样按“ack 不明确”
+    处理，交给 send_contract 归类为 ambiguous，绝不在本层重发。
+    """
+    text = f"{getattr(exc, 'message', '') or ''} {getattr(exc, 'wording', '') or ''} {exc}".lower()
+    return "eventchecker" in text and "sendmsg" in text
+
+
+def _is_napcat_ambiguous_ack(exc: Exception) -> bool:
+    """sendMsg 超时或 EventChecker 失败：消息可能已发出，本层一律不重发。"""
+    return _is_napcat_sendmsg_timeout(exc) or _is_napcat_eventchecker_failed(exc)
+
+
+_NAPCAT_AT_UID_ERROR_RE = re.compile(
+    r"(get\s*uid\s*error|\buid\b|\buin\b|\bat\b|@|艾特|not\s+(?:a\s+)?(?:group\s+)?member|群成员)",
+    re.IGNORECASE,
+)
+
+
+def _is_napcat_at_uid_error(exc: Exception) -> bool:
+    """判断异常是否与 at/uid 解析有关（只有这类失败才值得把 at 降级为文本重发）。
+
+    Why: [2026-09-17] 原实现只要消息里含 at、send_group_msg 抛任何 ActionFailed
+    就立刻把 at 转文本再发一次；NapCat 超时/EventChecker 失败（消息其实已发出）
+    也会触发，导致群里连续出现两条 @ 同一人的消息。How: 只看 NapCat 的
+    message/wording（不看异常 repr，避免 data=None 之类字段误命中），匹配
+    Get Uid Error / uid / uin / at / 群成员 等关键字。Purpose: 把 at-as-text
+    兜底收窄到“确实因 at 解析失败”的场景。
+    """
+    text = f"{getattr(exc, 'message', '') or ''} {getattr(exc, 'wording', '') or ''}"
+    if not text.strip():
+        text = f"{exc}"
+    return bool(_NAPCAT_AT_UID_ERROR_RE.search(text))
 
 
 def _is_api_call_timeout(exc: Exception) -> bool:
@@ -5270,12 +5396,38 @@ def _progress_mentions_search(record: str) -> bool:
     return any(keyword in text for keyword in _SEARCH_PROGRESS_KEYWORDS)
 
 
+def _progress_is_tool_start(record: str) -> bool:
+    """是否为“[node] 执行 N 个工具：...”这类工具开始执行的进度行。"""
+    text = str(record or "")
+    return "执行" in text and "个工具" in text
+
+
+def _search_in_progress(progress_records: List[str]) -> bool:
+    """仅当“最近一条搜索相关进度是开始执行、且尚未出现结果行”时返回 True。
+
+    [2026-09-17] Why: 原实现只要 progress_records 里出现过 web_search 字样就持续
+    发“还在联网搜索中”，搜索早就拿到结果（甚至答案已生成）也照刷不误。
+    How: 按顺序扫描进度行：“执行 N 个工具：web_search”视为搜索开始；之后任何
+    提到搜索工具的非开始行（“web_search: 已获得结果/失败/已自动转为异步…”）
+    视为搜索结束。Purpose: 只在搜索真正进行中才发可见进度提示。
+    """
+    running = False
+    for record in progress_records or []:
+        if not _progress_mentions_search(record):
+            continue
+        if _progress_is_tool_start(record):
+            running = True
+        else:
+            running = False
+    return running
+
+
 async def _maybe_send_search_progress_notice(
     bot: Bot,
     target: Dict[str, Any],
     platform_data: Dict[str, Any],
 ) -> None:
-    """在 QQ 侧为长搜索任务发送低频可见进度提示。"""
+    """在 QQ 侧为长搜索任务发送低频可见进度提示（调用方保证搜索确实在进行中）。"""
     now = time.time()
     request_identity = str(
         platform_data.setdefault("_qq_search_request_identity", uuid.uuid4().hex)
@@ -5299,11 +5451,16 @@ async def _maybe_send_search_progress_notice(
     last_at = float(platform_data.get("_qq_search_notice_last_at") or 0.0)
     if now - last_at < _SEARCH_PROGRESS_STILL_RUNNING_INTERVAL_SEC:
         return
+    # [2026-09-17] still-running 提示设上限，达到后不再发（也不再刷新时间）。
+    still_count = int(platform_data.get("_qq_search_notice_still_count") or 0)
+    if still_count >= max(0, _SEARCH_PROGRESS_STILL_RUNNING_MAX_COUNT):
+        return
     platform_data["_qq_search_notice_last_at"] = now
+    platform_data["_qq_search_notice_still_count"] = still_count + 1
     try:
         await _send_qq_message(
             bot, target, _SEARCH_PROGRESS_STILL_RUNNING_NOTICE,
-            send_context=context.child(f"still:{int(now // _SEARCH_PROGRESS_STILL_RUNNING_INTERVAL_SEC)}"),
+            send_context=context.child(f"still:{still_count + 1}"),
         )
     except Exception:
         logger.debug("send QQ search still-running notice failed", exc_info=True)
@@ -5498,11 +5655,77 @@ class TangQiuCallbacks:
         has_search_progress = any(_progress_mentions_search(record) for record in state.progress_records)
         if has_tool_progress or has_search_progress:
             await _switch_react_stage(bot, event, platform_data, "tool")
-            if has_search_progress and target:
+            # [2026-09-17] 只在搜索真正进行中（已开始执行、尚无结果行）才发可见提示；
+            # 搜索结束后即使任务仍在运行（生成回复/投递中）也不再刷“还在搜索中”。
+            if target and _search_in_progress(state.progress_records):
                 await _maybe_send_search_progress_notice(bot, target, platform_data)
             return
         if state.stream_parts:
             await _switch_react_stage(bot, event, platform_data, "thinking")
+
+    async def on_delivery_dead_letter(
+        self,
+        trigger: Optional[TriggerInfo],
+        conversation_key: str,
+        error: BaseException,
+        *,
+        event_type: str = "",
+        ambiguous_ack: bool = False,
+        idempotency_key: str = "",
+        task_id: str = "",
+    ) -> None:
+        """最终回复进死信：清理触发消息状态，并给用户一句简短提示。
+
+        [2026-09-17] Why: QQ 侧投递失败（NapCat 超时/EventChecker 失败→ambiguous）
+        以前完全静默，用户只看到一串“还在联网搜索中”然后没下文。How: SDK 已经
+        消费了 trigger，这里只做平台侧收尾：清 React、释放等待回复的事件、发一条
+        幂等的失败提示（同一次投递只提示一次）。中间回复死信不提示，因为任务
+        还在跑、最终回复会再来。Purpose: 把“静默丢回复”变成可见、可重试的终态。
+        """
+        if event_type == "intermediate_reply":
+            return
+        platform_data: Dict[str, Any] = trigger.platform_data if trigger is not None else {}
+        bot = platform_data.get("bot") or _conversation_bots.get(conversation_key) or _get_fallback_bot()
+        target = None
+        if platform_data:
+            target = _target_from_platform_data(platform_data)
+        if target is None and conversation_key:
+            target = _target_from_conversation_key(conversation_key)
+            if target is not None and not target.get("conversation_key"):
+                target["conversation_key"] = _real_conversation_key(conversation_key)
+        conv_key = str((target or {}).get("conversation_key") or conversation_key or "")
+        if conv_key:
+            _mark_qq_reply_finished(conv_key)
+        event = platform_data.get("event")
+        if bot and event is not None:
+            try:
+                await _clear_message_reacts(bot, event)
+            except Exception:
+                logger.debug("clear reacts after dead letter failed", exc_info=True)
+        if not bot or not target:
+            logger.warning(
+                "onebot_dead_letter_notice_skipped",
+                extra={"conversation_key": conversation_key, "task_id": task_id, "reason": "missing bot/target"},
+            )
+            return
+        notice_identity = idempotency_key or f"{conv_key}:{task_id}:{getattr(error, 'args', '')}"
+        context = _request_send_context("dead-letter-notice", str(notice_identity), conv_key)
+        try:
+            await _send_qq_message(
+                bot, target, _DELIVERY_DEAD_LETTER_NOTICE,
+                send_context=context,
+                content_identity=f"dead-letter:{notice_identity}",
+            )
+            logger.info(
+                "onebot_dead_letter_notice_sent",
+                extra={
+                    "conversation_key": conv_key, "task_id": task_id,
+                    "idempotency_key": idempotency_key, "ambiguous_ack": ambiguous_ack,
+                },
+            )
+        except Exception:
+            # 提示本身也发不出去（平台整体不可用）：只记日志，不再层层重试。
+            logger.warning("onebot_dead_letter_notice_failed", exc_info=True)
 
     async def create_child_progress(
         self,

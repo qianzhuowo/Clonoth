@@ -556,3 +556,43 @@ class AdapterCallbacks(Protocol):
                 orphans_cancelled, ts.
         """
         ...
+
+    async def on_delivery_dead_letter(
+        self,
+        trigger: TriggerInfo | None,
+        conversation_key: str,
+        error: BaseException,
+        *,
+        event_type: str = "",
+        ambiguous_ack: bool = False,
+        idempotency_key: str = "",
+        task_id: str = "",
+    ) -> None:
+        """一条 outbound 投递进入死信（不可重试），通知适配器做平台侧收尾。
+
+        [2026-09-17] 可选回调：EventRouter 通过 getattr 探测，未实现时跳过。
+
+        触发时机：适配器的 send_reply / send_to_channel / send_intermediate_reply
+                  抛出 ``retryable=False`` 的异常（如 ack 不明确的超时、永久性失败）。
+
+        SDK 已完成：
+          - 将 outbound 记录标记为 dead_letter（不会再自动重试）
+          - 若为最终回复（event_type != "intermediate_reply"）：已把关联 trigger 与
+            MainTaskState 从活跃集合中移除（MainTaskState 附在
+            trigger.platform_data["_stale_main_state"]），sweep 不会再对它调
+            update_progress / refresh_typing
+
+        适配器可以：
+          - 给用户发一句简短的失败提示（注意 ambiguous_ack=True 时消息可能其实已送达）
+          - 清理触发消息上的状态展示（React / status_msg 等）
+
+        Args:
+            trigger: 关联的触发信息；恢复模式下可能为 None（只有 conversation_key）。
+            conversation_key: 投递目标会话键。
+            error: 适配器抛出的原始异常。
+            event_type: 死信事件类型（outbound_message / intermediate_reply 等）。
+            ambiguous_ack: 平台 ack 是否不明确（True 时消息可能已送达）。
+            idempotency_key: 本次投递的幂等键，可用于提示消息去重。
+            task_id: 关联任务 ID。
+        """
+        ...

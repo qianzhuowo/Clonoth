@@ -121,12 +121,13 @@ All changes MUST be made in the local repo (`Clonoth/`) first:
 
 **Never edit production directories directly.**
 
-Sync scope (only these 5 directories):
+Sync scope (only these 6 directories):
 - `engine/`
 - `supervisor/`
 - `providers/`
 - `toolbox/`
 - `clonoth_sdk/`
+- `platform/onebot/`
 
 ## Adding New Components
 

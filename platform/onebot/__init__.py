@@ -4513,11 +4513,12 @@ async def _send_split_text(
       Why: 正文与 [表情:xx] 原本合并在同一条消息里，NapCat 下载表情到容器 temp/
       失败（ENOENT）时整条消息失败，文字答案跟着一起丢，再经 SDK 多轮重试/超时后
       用户什么都收不到。
-      How: 每一段先发“文本 + at”（失败仍照旧冒泡，交由 SDK 重试），再把该段里的
-      表情/图片逐个单独发送；表情发送失败只记日志，不影响正文的成功结果。
+      How: 每一段按原始顺序把连续“文本 + at”合并发送，并把表情/图片逐个单独
+      发送；表情发送失败只记日志，不影响前后正文继续发送。
       表情段本身仍由 _message_from_processed_segments 生成（QQ 收藏表情专用
       image 段：URL + sub_type=1 + summary），不改发送格式。
-      Purpose: 图片层面的不稳定不再阻塞文字回复。
+      Purpose: 图片层面的不稳定不再阻塞文字回复，同时保留“文本 → 表情 → 文本”
+      的原始语义顺序。
     """
     # 2026-05-01 修改原因：文本拆分逻辑对群聊和私聊相同，实际发送交给
     # _send_qq_message 处理，确保私聊也能复用表情替换和分段发送能力。
@@ -4538,12 +4539,11 @@ async def _send_split_text(
         )
         if not segments:
             continue
-        text_segments, image_segments = _split_text_and_image_segments(segments)
-        outgoing: List[tuple[str, Message]] = []
-        if text_segments:
-            outgoing.append(("text", _message_from_processed_segments(text_segments)))
-        for image_index, image_segment in enumerate(image_segments):
-            outgoing.append((f"emoji:{image_index}", _message_from_processed_segments([image_segment])))
+        ordered_groups = _ordered_text_and_image_segments(segments)
+        outgoing = [
+            (kind, _message_from_processed_segments(group))
+            for kind, group in ordered_groups
+        ]
         if not outgoing:
             continue
         # 第一条消息带引用回复 + @发送者（与 ZhenXia 逻辑一致）；前缀挂在本段第一条
@@ -4554,11 +4554,11 @@ async def _send_split_text(
                 prefix = prefix + MessageSegment.at(target["reply_sender_id"]) + MessageSegment.text(" ")
             kind, first_msg = outgoing[0]
             outgoing[0] = (kind, prefix + first_msg)
-        text_only_part = bool(text_segments)
+        has_text = any(kind.startswith("text:") for kind, _msg in outgoing)
         for kind, msg in outgoing:
             segment_identity = f"{kind}:{index}:{_message_dedup_text(msg).strip()}"
             segment_context = send_context.child(segment_identity) if send_context else None
-            is_primary = kind == "text" or not text_only_part
+            is_primary = kind.startswith("text:") or not has_text
             try:
                 sent_message_id = await _send_qq_message(
                     bot,
@@ -4592,36 +4592,49 @@ async def _send_split_text(
     return sent_any
 
 
-def _split_text_and_image_segments(
+def _ordered_text_and_image_segments(
     segments: List[Dict[str, Any]],
-) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """把 emoji_handler 输出的段拆成（文本/at 段，图片/表情段）两组，各自保持原顺序。
+) -> List[tuple[str, List[Dict[str, Any]]]]:
+    """按原顺序生成可独立发送的文本组和图片组。
 
-    文本组里去掉拆分后只剩空白的文本段，避免发出一条只有空格的消息。
+    相邻文本/at 合并为一条消息；每张有效图片独立成一条消息。空白文本组和缺少
+    URL 的图片会被忽略，避免产生空消息。返回的 kind 含同类型序号，可用于稳定的
+    幂等身份。
     """
-    text_segments: List[Dict[str, Any]] = []
-    image_segments: List[Dict[str, Any]] = []
-    for segment in segments:
-        seg_type = segment.get("type")
-        if seg_type == "image":
-            if segment.get("url"):
-                image_segments.append(segment)
-            continue
-        text_segments.append(segment)
+    outgoing: List[tuple[str, List[Dict[str, Any]]]] = []
+    text_group: List[Dict[str, Any]] = []
+    text_index = 0
+    image_index = 0
 
-    def _visible_text(seg: Dict[str, Any]) -> str:
-        if seg.get("type") == "at":
+    def _visible_text(segment: Dict[str, Any]) -> str:
+        if segment.get("type") == "at":
             return "@"
-        content = seg.get("content")
+        content = segment.get("content")
         if content is None:
             # 兼容 MessageSegment 形态（data.text），避免误判为空段。
-            data = seg.get("data")
+            data = segment.get("data")
             content = data.get("text", "") if isinstance(data, dict) else ""
         return str(content or "")
 
-    if not any(_visible_text(seg).strip() for seg in text_segments):
-        text_segments = []
-    return text_segments, image_segments
+    def _flush_text_group() -> None:
+        nonlocal text_group, text_index
+        if any(_visible_text(segment).strip() for segment in text_group):
+            outgoing.append((f"text:{text_index}", text_group))
+            text_index += 1
+        text_group = []
+
+    for segment in segments:
+        if segment.get("type") != "image":
+            text_group.append(segment)
+            continue
+        if not segment.get("url"):
+            continue
+        _flush_text_group()
+        outgoing.append((f"emoji:{image_index}", [segment]))
+        image_index += 1
+
+    _flush_text_group()
+    return outgoing
 
 
 def _to_workspace_rel_path(raw_path: Any) -> str:

@@ -952,3 +952,23 @@ def test_onebot_commit_cancel_fault_marks_message_id_ambiguous(tmp_path: Path) -
         assert row == ("ambiguous", "93")
 
     asyncio.run(exercise())
+
+
+def test_ordered_text_and_image_segments_preserve_interleaving(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    groups = runtime._ordered_text_and_image_segments([
+        {"type": "text", "content": "第一段"},
+        {"type": "image", "url": "u1", "emoji": True},
+        {"type": "text", "content": "第二段"},
+        {"type": "image", "url": "u2", "emoji": True},
+        {"type": "text", "content": "第三段"},
+    ])
+
+    assert [kind for kind, _segments in groups] == [
+        "text:0", "emoji:0", "text:1", "emoji:1", "text:2",
+    ]
+    assert [[segment["type"] for segment in segments] for _kind, segments in groups] == [
+        ["text"], ["image"], ["text"], ["image"], ["text"],
+    ]

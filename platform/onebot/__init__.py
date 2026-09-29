@@ -406,39 +406,47 @@ def _extract_approval_id_from_text(text: str) -> Optional[str]:
 
 
 async def _resolve_approval_id_by_reply_fallback(bot: Bot, event: Event, reply_message_id: Any) -> Optional[str]:
-    """引用快捷审批的兜底反查。
+    """仅从明确引用的本 bot 消息中恢复审批 ID；绝不猜测唯一待审批。"""
+    key = _normalize_msg_id(reply_message_id)
+    if not key or key == "0":
+        return None
+    try:
+        reply_obj = await _get_reply_message(bot, reply_message_id)
+    except Exception:
+        return None
+    if not isinstance(reply_obj, dict):
+        return None
+    sender = reply_obj.get("sender") or {}
+    bot_id = str(getattr(bot, "self_id", "") or "")
+    if not isinstance(sender, dict) or not bot_id or str(sender.get("user_id") or "") != bot_id:
+        return None
+    parts: List[str] = []
+    for field in ("raw_message", "message"):
+        value = reply_obj.get(field)
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, list):
+            for segment in value:
+                data = segment.get("data") if isinstance(segment, dict) else None
+                if isinstance(data, dict) and isinstance(data.get("text"), str):
+                    parts.append(data["text"])
+    return _extract_approval_id_from_text("\n".join(parts))
 
-    [2026-07-15] Why: 部分 NapCat 版本私聊 reply 段未带可用 id，直接映射反查
-    失败。How: 依次尝试（1）用 get_msg 拉被引用消息，从其文本中提取 approval_id；
-    （2）若仍失败且当前恰好只有一个待审批，直接回退到该唯一 id。Purpose: 在 reply
-    id 不可用时仍能让管理员“引用+同意/拒绝”生效。
-    """
-    # 1) get_msg 拉被引用消息文本
-    if reply_message_id is not None:
-        try:
-            reply_obj = await _get_reply_message(bot, reply_message_id)
-        except Exception:
-            reply_obj = None
-        if isinstance(reply_obj, dict):
-            parts: List[str] = []
-            for key in ("raw_message", "message"):
-                val = reply_obj.get(key)
-                if isinstance(val, str):
-                    parts.append(val)
-                elif isinstance(val, list):
-                    for seg in val:
-                        data = seg.get("data") if isinstance(seg, dict) else None
-                        if isinstance(data, dict):
-                            txt = data.get("text")
-                            if isinstance(txt, str):
-                                parts.append(txt)
-            aid = _extract_approval_id_from_text("\n".join(parts))
-            if aid:
-                return aid
-    # 2) 唯一待审批回退
-    if len(_pending_approvals) == 1:
-        return next(iter(_pending_approvals))
-    return None
+
+def _forget_pending_approval(approval_id: str) -> Dict[str, Any]:
+    """结束审批时同时清理缓存和引用映射，避免旧审批被再次选中。"""
+    info = _pending_approvals.pop(approval_id, {})
+    for message_id, mapped_id in list(_approval_message_ids.items()):
+        if mapped_id == approval_id:
+            _approval_message_ids.pop(message_id, None)
+    return info
+
+
+async def _handle_approval_raw_event(event: Any) -> None:
+    if event.type == "approval_decided":
+        approval_id = str((event.payload or {}).get("approval_id") or "")
+        if approval_id:
+            _forget_pending_approval(approval_id)
 
 
 # QQ 用户身份/称呼 Profile。只影响模型可见的称呼和身份说明，不授予任何权限。
@@ -540,47 +548,28 @@ def _approval_summary(approval_id: str, operation: str, details: Dict[str, Any])
 
 
 def _parse_approval_command(text: str) -> Optional[tuple[str, str]]:
-    """解析管理员私聊审批命令，返回 (decision, approval_id_or_prefix)。"""
-    normalized = re.sub(r"\s+", " ", (text or "").strip())
-    if not normalized:
+    """仅接受完整的审批命令及 ID（或至少 8 位的唯一 ID 前缀）。"""
+    parts = (text or "").strip().split()
+    if parts and parts[0].lower() in {"审批", "approval"}:
+        parts = parts[1:]
+    if len(parts) != 2 or not re.fullmatch(r"[0-9a-fA-F][0-9a-fA-F-]{7,35}", parts[1]):
         return None
-    parts = normalized.split(" ")
-    if len(parts) < 2:
-        return None
-    verbs_allow = {"同意", "批准", "通过", "允许", "allow", "approve", "yes", "y"}
-    verbs_deny = {"拒绝", "驳回", "deny", "reject", "no", "n"}
-    if parts[0] in {"审批", "approval"} and len(parts) >= 3:
-        verb = parts[1].lower()
-        token = parts[2]
-    else:
-        verb = parts[0].lower()
-        token = parts[1]
-    if verb in verbs_allow:
-        return "allow", token
-    if verb in verbs_deny:
-        return "deny", token
-    return None
+    decision = _parse_approval_reply_verb(parts[0])
+    return (decision, parts[1].lower()) if decision else None
 
 
 def _parse_approval_reply_verb(text: str) -> Optional[str]:
-    """从引用回复的文本中解析审批意图，返回 'allow' / 'deny' / None。
-
-    用于“引用审批消息 + 回复同意/拒绝”的快捷审批：无需携带 approval_id，
-    只要文本中出现同意/拒绝类关键词即可。容忍“审批同意”这种连写。
-    """
-    normalized = re.sub(r"\s+", "", (text or "").strip()).lower()
-    if not normalized:
-        return None
-    # 去掉可能的“审批”/“approval”前缀，便于“审批同意”也能识别。
-    for prefix in ("审批", "approval"):
-        if normalized.startswith(prefix):
-            normalized = normalized[len(prefix):]
-    allow_words = ("同意", "批准", "通过", "允许", "allow", "approve", "approved", "yes", "ok")
-    deny_words = ("拒绝", "驳回", "不同意", "deny", "reject", "rejected", "no")
-    # 先判断拒绝，避免“不同意”因包含“同意”而误判为 allow。
-    if any(w in normalized for w in deny_words):
+    """引用审批仅接受完整决策词；eyes、token 和问句不是审批指令。"""
+    normalized = (text or "").strip().lower()
+    if normalized.startswith("审批"):
+        normalized = normalized[len("审批"):].strip()
+    elif normalized.startswith("approval "):
+        normalized = normalized[len("approval "):].strip()
+    allow_words = {"同意", "批准", "通过", "允许", "allow", "approve", "approved", "yes", "y", "ok"}
+    deny_words = {"拒绝", "驳回", "不同意", "deny", "reject", "rejected", "no", "n"}
+    if normalized in deny_words:
         return "deny"
-    if any(w in normalized for w in allow_words):
+    if normalized in allow_words:
         return "allow"
     return None
 
@@ -4286,6 +4275,23 @@ async def _sanitize_group_at_segments(bot: Bot, group_id: Any, message: Any) -> 
     return Message(new_segments)
 
 
+def _dedupe_group_at_segments(message: Any) -> Any:
+    """同一条群消息每个真实 QQ 号只提及一次（在别名解析之后执行）。"""
+    if not isinstance(message, Message):
+        return message
+    seen: set[str] = set()
+    segments: List[MessageSegment] = []
+    for segment in message:
+        if getattr(segment, "type", "") == "at":
+            qq = str((getattr(segment, "data", {}) or {}).get("qq", "")).strip()
+            if qq:
+                if qq in seen:
+                    continue
+                seen.add(qq)
+        segments.append(segment)
+    return Message(segments)
+
+
 def _strip_at_to_text(message: Any, group_id: Any = None) -> Any:
     """把消息里所有 at 段降级为 @文本，用于发送失败后的兜底重发。
 
@@ -4357,6 +4363,7 @@ async def _send_qq_message_once(bot: Bot, target: Dict[str, Any], message: Any, 
             raise ValueError("group target missing group_id")
         # 发送前先把非本群/无法解析的 at 降级为文本，避免 Get Uid Error 整条失败。
         safe_message = await _sanitize_group_at_segments(bot, group_id, message)
+        safe_message = _dedupe_group_at_segments(safe_message)
         try:
             result = await bot.send_group_msg(group_id=int(group_id), message=safe_message)
             return _extract_sent_message_id(result)
@@ -4546,12 +4553,19 @@ async def _send_split_text(
         ]
         if not outgoing:
             continue
-        # 第一条消息带引用回复 + @发送者（与 ZhenXia 逻辑一致）；前缀挂在本段第一条
-        # 实际发出的消息上（有正文时是正文，纯表情段时是表情）。
+        # 首条消息保留引用；正文已有对发送者的显式 @ 时不再自动添加。
+        # 同段表情先发、正文后发时也检查整段，避免两条消息各 @ 一次。
         if not sent_any and target.get("reply_message_id"):
             prefix = MessageSegment.reply(target["reply_message_id"])
-            if target.get("reply_sender_id"):
-                prefix = prefix + MessageSegment.at(target["reply_sender_id"]) + MessageSegment.text(" ")
+            sender_id = str(target.get("reply_sender_id") or "").strip()
+            already_mentions_sender = any(
+                getattr(segment, "type", "") == "at"
+                and str((getattr(segment, "data", {}) or {}).get("qq", "")).strip() == sender_id
+                for _kind, message in outgoing
+                for segment in message
+            )
+            if target.get("type") == "group" and sender_id and not already_mentions_sender:
+                prefix = prefix + MessageSegment.at(sender_id) + MessageSegment.text(" ")
             kind, first_msg = outgoing[0]
             outgoing[0] = (kind, prefix + first_msg)
         has_text = any(kind.startswith("text:") for kind, _msg in outgoing)
@@ -6596,6 +6610,7 @@ async def _startup() -> None:
         entry_node_id=ENTRY_NODE_ID,
         poll_interval=1.0,
     )
+    _event_router.set_raw_event_hook(_handle_approval_raw_event)
     _router_task = asyncio.create_task(_event_router.run())
     if ENABLE_QQ_QUEUE and not any(not task.done() for task in _qq_queue_tasks):
         _qq_queue_tasks = [asyncio.create_task(_qq_queue_worker_forever()) for _ in range(QQ_QUEUE_WORKERS)]
@@ -6819,6 +6834,7 @@ async def _finish_approval_decision(user_id: int, approval_id: str, decision: st
 
     同时服务于“引用回复审批”和“手输审批命令”两个入口，避免重复代码。
     """
+    info = dict(_pending_approvals.get(approval_id, {}))
     try:
         ok = await _client.approve(
             approval_id,
@@ -6828,13 +6844,14 @@ async def _finish_approval_decision(user_id: int, approval_id: str, decision: st
     except Exception as exc:
         logger.exception("submit QQ approval decision failed")
         await _private_matcher.finish(f"提交审批失败：{exc}")
-    info = _pending_approvals.pop(approval_id, {}) if ok else _pending_approvals.get(approval_id, {})
+    if ok:
+        _forget_pending_approval(approval_id)
     operation = str(info.get("operation") or "unknown")
     if ok:
         await _private_matcher.finish(
             f"已{('同意' if decision == 'allow' else '拒绝')}审批：{approval_id}\n操作：{operation}"
         )
-    await _private_matcher.finish("审批提交被 Supervisor 拒绝，请检查日志。")
+    await _private_matcher.finish("审批未生效：请求可能已超时、已处理或被拒绝；未确认批准成功。")
 
 
 @_private_matcher.handle()
@@ -6853,13 +6870,14 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     # 快捷审批：管理员引用(回复)审批消息并发“同意/拒绝”即可，无需携带 approval_id。
     reply_mid = _extract_reply_message_id(event.get_message(), getattr(event, "raw_message", None))
     reply_approval_id = _resolve_approval_id_by_reply(reply_mid) if reply_mid is not None else None
-    # [2026-07-15] Why: 部分 NapCat 版本在私聊 reply 段里不带可用 id（上报为 0
-    # 或缺失），导致反查失败、快捷审批没命中而被当成普通聊天回复。How: 若直接
-    # 反查不到、但本条确实是引用回复且文本是同意/拒绝意图，则尝试用 get_msg 拉取
-    # 被引用消息内容，匹配其中的审批摘要/approval_id；仍失败且当前只有唯一待审批时
-    # 回退到该唯一 id。Purpose: 提高引用快捷审批的健壮性，避免因 reply id 缺失失效。
+    # 无有效引用时不得进入快捷审批；普通聊天绝不回退到某条待审批。
     reply_verb = _parse_approval_reply_verb(user_text)
-    if reply_approval_id is None and reply_verb is not None and _is_admin_user(user_id):
+    if (
+        reply_mid is not None
+        and reply_approval_id is None
+        and reply_verb is not None
+        and _is_admin_user(user_id)
+    ):
         reply_approval_id = await _resolve_approval_id_by_reply_fallback(bot, event, reply_mid)
     if reply_approval_id is not None:
         if reply_verb is not None:

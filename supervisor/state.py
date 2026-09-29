@@ -1495,10 +1495,17 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             )
         return approval
 
-    def decide_approval(self, *, approval_id: str, decision: str, comment: str | None = None) -> Approval | None:
+    def decide_approval(
+        self, *, approval_id: str, decision: str, comment: str | None = None,
+        require_pending: bool = False,
+    ) -> Approval | None:
         with self._lock:
             a = self.approvals.get(approval_id)
-            if a is None or a.status != ApprovalStatus.pending:
+            if a is None:
+                return None
+            if a.status != ApprovalStatus.pending:
+                if require_pending:
+                    raise ValueError("approval already decided or expired")
                 return a
             a.status = ApprovalStatus.allowed if decision == "allow" else ApprovalStatus.denied
             a.decision = decision

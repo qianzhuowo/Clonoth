@@ -1116,7 +1116,13 @@ def create_app(
     @app.post("/v1/approvals/{approval_id}", response_model=Approval)
     async def approval_decide(approval_id: str, body: ApprovalDecisionIn) -> Approval:
         st: SupervisorState = app.state.state
-        a = st.decide_approval(approval_id=approval_id, decision=body.decision, comment=body.comment)
+        try:
+            a = st.decide_approval(
+                approval_id=approval_id, decision=body.decision,
+                comment=body.comment, require_pending=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if a is None:
             raise HTTPException(status_code=404, detail="approval not found")
         return a

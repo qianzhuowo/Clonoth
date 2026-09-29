@@ -286,6 +286,14 @@ def _install_nonebot_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
         def at(cls, user_id: Any):
             return cls(type="at", data={"qq": user_id})
 
+        @property
+        def type(self) -> str:
+            return self["type"]
+
+        @property
+        def data(self) -> dict:
+            return self["data"]
+
         def __add__(self, other: Any):
             return Message([self]) + other
 

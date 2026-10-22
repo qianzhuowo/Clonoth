@@ -6,11 +6,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-# [AutoC 2026-06-01] Why: this standalone regression test is outside tests/
-# because this repository ignores most local test files under that directory.
-# How: add the workspace root to sys.path before importing the built-in handler.
-# Purpose: keep the Dream lock behavior covered by a commit-tracked test file.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Allow direct execution from the tests/ directory without installing the project.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from engine.builtin.dream import DreamHandler  # noqa: E402
 

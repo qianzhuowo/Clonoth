@@ -22,7 +22,17 @@ pip-wheel-metadata/
 
 # private skills
 secret_skills/
-tests/*
+# Local test files are opt-in; keep reviewed regression tests versioned.
+/tests/*
+!/tests/test_dream_lock.py
+!/tests/test_knowledge_inject_refactor.py
+!/tests/test_dispatch_context_mode_default.py
+!/tests/test_dispatch_result_attachments.py
+!/tests/test_finish_requires_tool.py
+!/tests/test_onebot_qq_delivery_fixes.py
+!/tests/test_policy_command_tiers.py
+!/tests/test_qq_command_authorization.py
+!tests/test_tls_dependency_floor.py
 !tests/test_approval_safety.py
 !tests/test_onebot_mentions.py
 
@@ -35,3 +45,53 @@ tests/*
 
 # user node configs / fragments that may be created from examples
 /config/nodes/_persona.md
+
+# Python environments, packaging and analysis caches
+venv/
+ENV/
+.tox/
+.nox/
+build/
+dist/
+*.egg-info/
+.eggs/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Frontend dependencies and generated output (at any depth)
+node_modules/
+.vite/
+.cache/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local operations and scratch files; never ship server recovery artifacts
+.tmp/
+.temp/
+/tmp/
+/temp/
+*.log
+
+# Test output, not test source or dependency lockfiles
+.coverage
+.coverage.*
+coverage/
+htmlcov/
+/coverage.xml
+/junit.xml
+/junit-*.xml
+test-results/
+test-reports/
+playwright-report/
+blob-report/
+.nyc_output/
+
+# New ad-hoc root tests belong in local scratch space, not the source suite.
+# Existing tracked files are unaffected; keep approved tests/ exceptions above.
+/test_*.py
+/tests/local/
+/tests/scratch/

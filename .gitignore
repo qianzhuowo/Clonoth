@@ -9,7 +9,10 @@ pip-wheel-metadata/
 
 # local secrets
 .env
-**/.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
 
 # all runtime data
 /data/
@@ -32,9 +35,30 @@ secret_skills/
 !/tests/test_onebot_qq_delivery_fixes.py
 !/tests/test_policy_command_tiers.py
 !/tests/test_qq_command_authorization.py
-!tests/test_tls_dependency_floor.py
-!tests/test_approval_safety.py
-!tests/test_onebot_mentions.py
+!/tests/test_tls_dependency_floor.py
+!/tests/test_approval_safety.py
+!/tests/test_onebot_mentions.py
+# Existing versioned regression tests must also survive a fresh checkout/add.
+!/tests/test_admin_active_tasks.py
+!/tests/test_approval_tool_identity.py
+!/tests/test_discord_send_contract.py
+!/tests/test_event_router_route_resolution.py
+!/tests/test_eventlog_rotation.py
+!/tests/test_mcp_runtime.py
+!/tests/test_onebot_send_contract.py
+!/tests/test_prompt.py
+!/tests/test_provider_options_config.py
+!/tests/test_session_entry_persistence.py
+!/tests/test_session_provider_override.py
+!/tests/test_session_registry_cleanup.py
+!/tests/test_signal_bridge.py
+!/tests/test_task_image_retention.py
+!/tests/test_task_route_recovery.py
+!/tests/test_tool_result_formatters.py
+!/tests/test_tool_result_truncation.py
+# Site-specific acceptance tests remain local under the default tests/* rule.
+/tests/test_onebot_image_probe.py
+/tests/test_onebot_napcat_temp.py
 
 # drawtools user runtime configs (keep *.example.* templates versioned)
 /tools/drawtools/settings.yaml
@@ -58,6 +82,13 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .hypothesis/
+.pyre/
+.pytype/
+__pypackages__/
+*.egg
+*.whl
+pip-log.txt
+pip-delete-this-directory.txt
 
 # Frontend dependencies and generated output (at any depth)
 node_modules/
@@ -68,6 +99,10 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+.npm/
+.pnpm-store/
+.eslintcache
+.stylelintcache
 
 # Local operations and scratch files; never ship server recovery artifacts
 .tmp/
@@ -84,6 +119,10 @@ htmlcov/
 /coverage.xml
 /junit.xml
 /junit-*.xml
+**/coverage.xml
+**/junit.xml
+**/junit-*.xml
+.pytest_cache-*/
 test-results/
 test-reports/
 playwright-report/
@@ -95,3 +134,43 @@ blob-report/
 /test_*.py
 /tests/local/
 /tests/scratch/
+
+# Private site-specific deployment, probes, accounts and incident evidence.
+# Keep these on disk only; public code must not depend on these modules.
+/platform/onebot/napcat-security/
+/platform/onebot/NAPCAT_TEMP_PREPARATION.md
+/platform/onebot/image_probe.py
+/platform/onebot/napcat_temp.py
+
+# Local deployment / TLS research output
+/security-backups/
+/security-builds/
+/platform/onebot/napcat-security/runtime-research/
+/platform/onebot/napcat-security/run[0-9]*/
+/platform/onebot/napcat-security/research.json
+# Machine-specific incident notes and acceptance reports, not reusable docs.
+/platform/onebot/napcat-security/RUNTIME-RESEARCH.md
+/platform/onebot/napcat-security/*-RESEARCH.md
+/platform/onebot/napcat-security/local-reports/
+/platform/onebot/napcat-security/*-result.json
+/platform/onebot/napcat-security/*-results.json
+/platform/onebot/napcat-security/*.stdout
+/platform/onebot/napcat-security/*.stderr
+/platform/onebot/napcat-security/*.zip
+/platform/onebot/napcat-security/*.tar
+/platform/onebot/napcat-security/*.tar.gz
+*.core
+core.[0-9]*
+platform/onebot/napcat-security/README.md
+
+# OS/editor-generated scratch files (do not blanket-ignore project settings)
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+
+# Ignore rules do not untrack files or sanitize Git history.
+# Keep dependency lockfiles and public regression tests; private site code stays excluded.
+# Do not use git add -f for local evidence or secrets.

@@ -133,7 +133,7 @@ def _load_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
 
 def _at_message(runtime, text: str = "老大，结论如下"):
     seg = runtime.MessageSegment
-    return runtime.Message([seg.at("2434632094"), seg.text(" "), seg.text(text)])
+    return runtime.Message([seg.at("10001"), seg.text(" "), seg.text(text)])
 
 
 def _has_at(message: Any) -> bool:
@@ -150,7 +150,7 @@ def _patch_group_helpers(monkeypatch: pytest.MonkeyPatch, runtime) -> None:
 
 
 class _GroupBot:
-    self_id = "2920784415"
+    self_id = "10002"
 
     def __init__(self, failures: list[Exception]):
         self.failures = list(failures)
@@ -445,7 +445,7 @@ def test_qq_dead_letter_callback_sends_single_notice_and_clears_reacts(
 
     class _Event:
         message_id = 42
-        user_id = 2434632094
+        user_id = 10001
 
     trigger = TriggerInfo(
         inbound_seq=1, conversation_key="qq_group:1049665226", session_id="s", is_dm=False,
@@ -505,7 +505,7 @@ def test_split_text_sends_text_first_then_emoji_and_emoji_failure_is_not_fatal(
     monkeypatch.setattr(runtime, "_send_qq_message", fake_send)
     monkeypatch.setattr(runtime.asyncio, "sleep", _no_sleep)
 
-    target = {"type": "group", "group_id": 1, "reply_message_id": 9, "reply_sender_id": 2434632094}
+    target = {"type": "group", "group_id": 1, "reply_message_id": 9, "reply_sender_id": 10001}
     ok = asyncio.run(runtime._send_split_text(
         object(), target, "任意文本", send_context=DeliveryContext(event_id="evt", idempotency_key="id"),
     ))

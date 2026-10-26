@@ -494,7 +494,7 @@ def test_split_text_sends_text_first_then_emoji_and_emoji_failure_is_not_fatal(
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
     _patch_process_emojis(monkeypatch, runtime, [
-        {"type": "text", "content": "老大，短期内不会解体 "},
+        {"type": "text", "content": "表情包测试呀 "},
         {"type": "image", "url": "https://gxh.vip.qq.com/club/item/parcel/item/abc.png", "emoji": True},
         {"type": "text", "content": "\n最新消息如下"},
     ])
@@ -520,7 +520,7 @@ def test_split_text_sends_text_first_then_emoji_and_emoji_failure_is_not_fatal(
     # 引用与 @ 只挂在第一条正文上，后续正文仍保持在表情之后。
     assert [seg["type"] for seg in first_text] == ["reply", "at", "text", "text"]
     assert "".join(seg["data"].get("text", "") for seg in first_text if seg["type"] == "text") \
-        == " 老大，短期内不会解体 "
+        == " 表情包测试呀 "
     assert [seg["type"] for seg in emoji_msg] == ["image"]
     assert emoji_msg[0]["data"]["file"] == "https://gxh.vip.qq.com/club/item/parcel/item/abc.png"
     assert emoji_msg[0]["data"]["cache"] == "false"

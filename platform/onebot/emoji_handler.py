@@ -7,12 +7,15 @@ Clonoth 后端可能输出 QQ 表情标记、Discord 表情标记、Reaction 标
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
 
 # 模型易写的收藏表情标记。兼容旧格式 [QQ_EMOJI:名称]，并新增：
 # [表情: 开心] / [emoji: 开心] / [收藏表情: 开心]
@@ -494,6 +497,33 @@ def _metadata_pick_url(entry: Any) -> str:
     return ""
 
 
+def _metadata_entry_live_url(entry: Any, live_faces: List[Any]) -> str:
+    """把元数据索引项解析为可发送 URL：优先按 md5/resId/emojiId 匹配实时详情。
+
+    同名候选组会随机打乱后逐个尝试，直到拿到 URL。实时详情未命中时才用
+    元数据里保存的旧 URL（可能已过期）兜底。
+    """
+    if isinstance(entry, dict) and "__group__" in entry:
+        items = [g for g in entry["__group__"] if isinstance(g, dict)]
+        random.shuffle(items)
+    elif isinstance(entry, dict):
+        items = [entry]
+    else:
+        return ""
+    for item in items:
+        for face in live_faces or []:
+            if _metadata_matches_face(item, face):
+                url = _custom_face_url(face)
+                if url:
+                    return url
+                break
+    for item in items:
+        url = str(item.get("url") or "").strip()
+        if url:
+            return url
+    return ""
+
+
 def build_metadata_face_index(metadata: List[Dict[str, Any]]) -> Dict[str, Any]:
     """构建“别名 -> 元数据项”的索引，可直接用元数据里的 URL 发送。
 
@@ -678,9 +708,22 @@ async def process_emojis(
     )
     segments: List[Dict[str, Any]] = []
     last_end = 0
-    # 优先用持久化元数据里的 URL 直接发送，避免每条消息都拉 NapCat 详情。
-    face_index: Dict[str, Any] | None = build_metadata_face_index(metadata) if metadata else None
-    live_loaded = False
+    # 元数据只负责“名称 -> md5/resId”定位；真正发送用的 URL 优先取 NapCat
+    # 实时详情（fetch_custom_face_details 自带短 TTL 缓存）。元数据里保存的
+    # URL 带 rkey，会过期，只在实时详情拉取失败或未命中时兜底使用。
+    meta_index: Dict[str, Any] = build_metadata_face_index(metadata) if metadata else {}
+    live_faces: List[Any] | None = None
+    live_index: Dict[str, Any] | None = None
+
+    async def _load_live_faces() -> List[Any]:
+        nonlocal live_faces
+        if live_faces is None:
+            try:
+                live_faces = await fetch_custom_face_details(bot)
+            except Exception as exc:
+                logger.warning("fetch_custom_face_detail failed, fallback to metadata url: %s", exc)
+                live_faces = []
+        return live_faces
 
     # 合并 QQ 收藏表情和 at 标记，按位置排序统一处理。
     emoji_matches = [(m.start(), m.end(), "emoji", m) for m in _QQ_EMOJI_RE.finditer(text)]
@@ -721,24 +764,16 @@ async def process_emojis(
         name = match.group(1).strip()
         if name:
             key = _normalize_name(name)
-            if face_index is None:
-                faces = await fetch_custom_face_details(bot)
-                face_index = build_custom_face_index(faces, bqbs, preferred_names, metadata)
-                live_loaded = True
-            entry = face_index.get(key)
-            # 元数据候选组：同名随机选一个 URL 直接发送。
-            url = _metadata_pick_url(entry) if isinstance(entry, dict) and "__group__" in entry else ""
-            face = None if (isinstance(entry, dict) and "__group__" in entry) else entry
-            if not url and face is None and not live_loaded:
-                # 元数据未命中时回退实时详情，兼容名称文件与收藏列表短暂不一致。
-                faces = await fetch_custom_face_details(bot)
-                live_index = build_custom_face_index(faces, bqbs, preferred_names, metadata)
-                face_index.update(live_index)
-                live_loaded = True
-                entry = face_index.get(key)
-                url = _metadata_pick_url(entry) if isinstance(entry, dict) and "__group__" in entry else ""
-                face = None if (isinstance(entry, dict) and "__group__" in entry) else entry
+            meta_entry = meta_index.get(key)
+            url = _metadata_entry_live_url(meta_entry, await _load_live_faces()) if meta_entry else ""
             if not url:
+                # 元数据未命中（或命中但实时/元数据都没有 URL）：按实时详情别名索引查找，
+                # 兼容名称文件与收藏列表短暂不一致、或直接用序号/md5 调用的情况。
+                if live_index is None:
+                    live_index = build_custom_face_index(
+                        await _load_live_faces(), bqbs, preferred_names, metadata,
+                    )
+                face = live_index.get(key)
                 url = _custom_face_url(face) if face is not None else ""
             if url:
                 # 标记 emoji=True：这是 QQ 收藏表情，发送时走 image 表情子类型

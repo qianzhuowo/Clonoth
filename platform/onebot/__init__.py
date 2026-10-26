@@ -4073,6 +4073,47 @@ def _truncate_qq_text(text: str) -> str:
     return text[: _QQ_MESSAGE_LIMIT - len(suffix)] + suffix
 
 
+async def _inline_emoji_segments(
+    segments: List[Dict[str, Any]],
+) -> tuple[List[Dict[str, Any]], bool]:
+    """把收藏表情的远程图片预先转成 base64，绕过 NapCat 临时目录。"""
+    candidates = [
+        segment for segment in segments
+        if segment.get("type") == "image"
+        and segment.get("emoji")
+        and str(segment.get("url") or "").strip()
+        and not str(segment.get("url") or "").startswith("base64://")
+    ]
+    if not candidates:
+        return segments, False
+
+    changed = False
+    async with httpx.AsyncClient(
+        timeout=IMAGE_DOWNLOAD_TIMEOUT,
+        follow_redirects=True,
+    ) as client:
+        for segment in candidates:
+            source = str(segment.get("url") or "").strip()
+            try:
+                if source.startswith("file://"):
+                    raw = Path(source[7:]).read_bytes()
+                elif re.match(r"^https?://", source, re.IGNORECASE):
+                    response = await client.get(source)
+                    response.raise_for_status()
+                    raw = response.content
+                else:
+                    continue
+                if not raw:
+                    raise ValueError("empty image response")
+                if len(raw) > IMAGE_MAX_BYTES:
+                    raise ValueError(f"image exceeds {IMAGE_MAX_BYTES} bytes")
+                segment["url"] = "base64://" + base64.b64encode(raw).decode("ascii")
+                changed = True
+            except Exception as exc:
+                logger.warning("inline QQ emoji image failed: source=%s error=%s", source, exc)
+    return segments, changed
+
+
 def _message_from_processed_segments(segments: List[Dict[str, Any]]) -> Message:
     """把 emoji_handler 的轻量段描述转换为 OneBot Message。"""
     message_segments: List[MessageSegment] = []
@@ -4089,6 +4130,12 @@ def _message_from_processed_segments(segments: List[Dict[str, Any]]) -> Message:
                     # 让 QQ 客户端按小图/贴纸渲染而不是普通大图；summary 提供
                     # "[表情]" 占位，兼容不支持 sub_type 的客户端摘要显示。
                     emoji_seg = MessageSegment.image(url)
+                    # NapCat 在 cache/proxy 默认开启时会把 QQ 表情 URL 落到
+                    # 容器内的临时目录；当前部署的 Bot 与 NapCat 不共享该目录，
+                    # 会导致 retcode=1200/ENOENT。关闭这两个选项，让 NapCat
+                    # 直接处理表情 URL，避免依赖不存在的容器临时文件。
+                    emoji_seg.data["cache"] = "false"
+                    emoji_seg.data["proxy"] = "false"
                     emoji_seg.data["sub_type"] = 1
                     emoji_seg.data.setdefault("summary", "[表情]")
                     message_segments.append(emoji_seg)
@@ -4351,6 +4398,7 @@ async def _send_qq_message_once(bot: Bot, target: Dict[str, Any], message: Any, 
             if _is_napcat_ambiguous_ack(exc):
                 raise
             if _is_napcat_enoent(exc):
+                _alert_napcat_temp_unwritable(exc, "send_private_msg")
                 logger.warning(
                     "send_private_msg failed (ENOENT %s); retry once", exc,
                 )
@@ -4392,6 +4440,7 @@ async def _send_qq_message_once(bot: Bot, target: Dict[str, Any], message: Any, 
             #   图片类消息的 base64 重发已在 _send_attachment_path 处理，这里主要兼顾
             #   文本/引用回复等非图片消息因 ENOENT 整条失败的场景。
             if _is_napcat_enoent(exc):
+                _alert_napcat_temp_unwritable(exc, "send_group_msg")
                 logger.warning(
                     "send_group_msg failed (ENOENT %s); retry once (dedupe off)", exc,
                 )
@@ -4506,6 +4555,50 @@ async def _send_qq_message(
             await heartbeat
 
 
+async def _send_emoji_base64_fallback(
+    bot: Bot,
+    target: Dict[str, Any],
+    group: List[Dict[str, Any]],
+    exc: BaseException,
+    *,
+    prefix: Any = None,
+    send_context: OutboundSendContext | None = None,
+    segment_identity: str = "",
+) -> Optional[str]:
+    """表情 URL 直发失败后，在 Bot 侧下载转 base64:// 重发一次。
+
+    返回发送成功的 message_id；不适合或重发失败时返回 None（由调用方决定冒泡还是忽略）。
+    - ack 不明确（可能已送达）：不重发，避免双发。
+    - NapCat temp 目录 ENOENT：base64 同样要落到 temp，重发无意义，只告警。
+    """
+    if getattr(exc, "ambiguous_ack", False):
+        logger.warning("onebot_emoji_send_ambiguous (no base64 retry) identity=%s", segment_identity[:200])
+        return None
+    if _alert_napcat_temp_unwritable(exc, "emoji_send"):
+        return None
+    fallback_group = [dict(segment) for segment in group]
+    fallback_group, changed = await _inline_emoji_segments(fallback_group)
+    if not changed:
+        return None
+    message = _message_from_processed_segments(fallback_group)
+    if prefix is not None:
+        message = prefix + message
+    identity = f"{segment_identity}:b64"
+    logger.warning("onebot_emoji_url_send_failed, retry base64 identity=%s error=%s", segment_identity[:200], exc)
+    try:
+        return await _send_qq_message(
+            bot,
+            target,
+            message,
+            send_context=send_context.child(identity) if send_context else None,
+            content_identity=identity,
+        )
+    except Exception as retry_exc:
+        _alert_napcat_temp_unwritable(retry_exc, "emoji_send_base64")
+        logger.warning("onebot_emoji_base64_send_failed identity=%s error=%s", segment_identity[:200], retry_exc)
+        return None
+
+
 async def _send_split_text(
     bot: Bot,
     target: Dict[str, Any],
@@ -4546,6 +4639,8 @@ async def _send_split_text(
         )
         if not segments:
             continue
+        # 表情先把实时 URL 直接交给 NapCat（由 NapCat 自己下载），失败后才在 Bot 侧
+        # 下载转 base64:// 重发；不再每次预下载，减少 Bot 侧下载超时。
         ordered_groups = _ordered_text_and_image_segments(segments)
         outgoing = [
             (kind, _message_from_processed_segments(group))
@@ -4555,6 +4650,7 @@ async def _send_split_text(
             continue
         # 首条消息保留引用；正文已有对发送者的显式 @ 时不再自动添加。
         # 同段表情先发、正文后发时也检查整段，避免两条消息各 @ 一次。
+        first_prefix = None
         if not sent_any and target.get("reply_message_id"):
             prefix = MessageSegment.reply(target["reply_message_id"])
             sender_id = str(target.get("reply_sender_id") or "").strip()
@@ -4568,8 +4664,9 @@ async def _send_split_text(
                 prefix = prefix + MessageSegment.at(sender_id) + MessageSegment.text(" ")
             kind, first_msg = outgoing[0]
             outgoing[0] = (kind, prefix + first_msg)
+            first_prefix = prefix
         has_text = any(kind.startswith("text:") for kind, _msg in outgoing)
-        for kind, msg in outgoing:
+        for out_index, (kind, msg) in enumerate(outgoing):
             segment_identity = f"{kind}:{index}:{_message_dedup_text(msg).strip()}"
             segment_context = send_context.child(segment_identity) if send_context else None
             is_primary = kind.startswith("text:") or not has_text
@@ -4581,16 +4678,28 @@ async def _send_split_text(
                     send_context=segment_context,
                     content_identity=segment_identity,
                 )
-            except Exception:
-                if is_primary:
-                    # 正文（或纯表情段）失败：维持旧语义冒泡，由 SDK 按合约重试/死信。
-                    raise
-                # 附带表情失败：正文已送达，只记日志，不阻塞、不重试整段。
-                logger.warning(
-                    "onebot_emoji_send_failed (text already delivered) identity=%s",
-                    segment_identity, exc_info=True,
-                )
-                continue
+            except Exception as exc:
+                sent_message_id = None
+                if kind.startswith("emoji:"):
+                    sent_message_id = await _send_emoji_base64_fallback(
+                        bot,
+                        target,
+                        ordered_groups[out_index][1],
+                        exc,
+                        prefix=first_prefix if out_index == 0 else None,
+                        send_context=send_context,
+                        segment_identity=segment_identity,
+                    )
+                if sent_message_id is None:
+                    if is_primary:
+                        # 正文（或纯表情段）失败：维持旧语义冒泡，由 SDK 按合约重试/死信。
+                        raise
+                    # 附带表情失败：正文已送达，只记日志，不阻塞、不重试整段。
+                    logger.warning(
+                        "onebot_emoji_send_failed (text already delivered) identity=%s error=%s",
+                        segment_identity[:200], exc,
+                    )
+                    continue
             if is_primary and sent_message_id and source_attachments:
                 _remember_reply_attachments(
                     sent_message_id,
@@ -4726,6 +4835,44 @@ def _is_napcat_enoent(exc: Exception) -> bool:
     """
     text = f"{getattr(exc, 'message', '') or ''} {getattr(exc, 'wording', '') or ''} {exc}".lower()
     return "enoent" in text or "no such file" in text
+
+
+_NAPCAT_TEMP_ENOENT_RE = re.compile(r"ENOENT[^'\"]*['\"]([^'\"]*/NapCat/temp/[^'\"]*)['\"]", re.IGNORECASE)
+
+
+def _napcat_temp_enoent_path(exc: BaseException | None) -> str:
+    """若异常（含 cause/__cause__ 链）是 NapCat temp 目录 ENOENT，返回报错路径，否则空串。"""
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        text = (
+            f"{getattr(current, 'message', '') or ''} "
+            f"{getattr(current, 'wording', '') or ''} {current}"
+        )
+        match = _NAPCAT_TEMP_ENOENT_RE.search(text)
+        if match:
+            return match.group(1)
+        current = getattr(current, "cause", None) or current.__cause__
+    return ""
+
+
+def _alert_napcat_temp_unwritable(exc: BaseException, action: str) -> bool:
+    """NapCat temp ENOENT 时打一条独立的 ERROR 告警；返回是否命中。
+
+    Why: NapCat 发送任何图片（URL / base64 都一样）都要先在
+    /app/.config/QQ/NapCat/temp 下落文件。该目录不可写（例如宿主机 bind 源目录
+    被删除）时所有图片/表情全部失败，而非单个表情的偶发问题，必须显式告警。
+    """
+    path = _napcat_temp_enoent_path(exc)
+    if not path:
+        return False
+    logger.error(
+        "NapCat 数据目录不可写 (napcat_temp_unwritable) action=%s path=%s："
+        "所有图片/表情发送都会失败，请检查 NapCat 容器 /app/.config/QQ 挂载源目录是否存在且可写",
+        action, path,
+    )
+    return True
 
 
 def _is_napcat_eventchecker_failed(exc: Exception) -> bool:

@@ -186,7 +186,7 @@ def test_group_send_ambiguous_ack_with_at_never_resends(
     runtime = _load_runtime(monkeypatch, tmp_path)
     _patch_group_helpers(monkeypatch, runtime)
     bot = _GroupBot([runtime.ActionFailed(error_text)])
-    target = {"type": "group", "group_id": 1049665226}
+    target = {"type": "group", "group_id": 100000001}
 
     with pytest.raises(runtime.ActionFailed):
         asyncio.run(runtime._send_qq_message_once(bot, target, _at_message(runtime)))
@@ -202,7 +202,7 @@ def test_group_send_uid_error_with_at_resends_as_text_once(
     runtime = _load_runtime(monkeypatch, tmp_path)
     _patch_group_helpers(monkeypatch, runtime)
     bot = _GroupBot([runtime.ActionFailed("Get Uid Error")])
-    target = {"type": "group", "group_id": 1049665226}
+    target = {"type": "group", "group_id": 100000001}
 
     message_id = asyncio.run(runtime._send_qq_message_once(bot, target, _at_message(runtime)))
 
@@ -221,7 +221,7 @@ def test_group_send_enoent_retries_once_unchanged(
     runtime = _load_runtime(monkeypatch, tmp_path)
     _patch_group_helpers(monkeypatch, runtime)
     bot = _GroupBot([runtime.ActionFailed(_ENOENT_TEXT)])
-    target = {"type": "group", "group_id": 1049665226}
+    target = {"type": "group", "group_id": 100000001}
 
     message_id = asyncio.run(runtime._send_qq_message_once(bot, target, _at_message(runtime)))
 
@@ -237,7 +237,7 @@ def test_group_send_unknown_error_with_at_raises_without_resend(
     runtime = _load_runtime(monkeypatch, tmp_path)
     _patch_group_helpers(monkeypatch, runtime)
     bot = _GroupBot([runtime.ActionFailed("rich media transfer failed")])
-    target = {"type": "group", "group_id": 1049665226}
+    target = {"type": "group", "group_id": 100000001}
 
     with pytest.raises(runtime.ActionFailed):
         asyncio.run(runtime._send_qq_message_once(bot, target, _at_message(runtime)))
@@ -448,25 +448,25 @@ def test_qq_dead_letter_callback_sends_single_notice_and_clears_reacts(
         user_id = 10001
 
     trigger = TriggerInfo(
-        inbound_seq=1, conversation_key="qq_group:1049665226", session_id="s", is_dm=False,
+        inbound_seq=1, conversation_key="qq_group:100000001", session_id="s", is_dm=False,
         platform_data={
-            "event": _Event(), "bot": object(), "type": "group", "group_id": 1049665226,
-            "conversation_key": "qq_group:1049665226",
+            "event": _Event(), "bot": object(), "type": "group", "group_id": 100000001,
+            "conversation_key": "qq_group:100000001",
         },
     )
     callbacks = runtime.TangQiuCallbacks()
     asyncio.run(callbacks.on_delivery_dead_letter(
-        trigger, "qq_group:1049665226", RuntimeError("ambiguous"),
+        trigger, "qq_group:100000001", RuntimeError("ambiguous"),
         event_type="outbound_message", ambiguous_ack=True, idempotency_key="k1", task_id="t",
     ))
     assert len(sent) == 1
-    assert sent[0][0]["group_id"] == 1049665226
+    assert sent[0][0]["group_id"] == 100000001
     assert sent[0][1] == runtime._DELIVERY_DEAD_LETTER_NOTICE
     assert cleared == [trigger.platform_data["event"]]
 
     # 中间回复死信：不提示。
     asyncio.run(callbacks.on_delivery_dead_letter(
-        trigger, "qq_group:1049665226", RuntimeError("x"),
+        trigger, "qq_group:100000001", RuntimeError("x"),
         event_type="intermediate_reply", ambiguous_ack=False, idempotency_key="k2", task_id="t",
     ))
     assert len(sent) == 1
@@ -480,7 +480,11 @@ def _patch_process_emojis(monkeypatch: pytest.MonkeyPatch, runtime, segments: li
     async def fake_process(text, bot, bqbs, names, metadata, **kwargs):
         return [dict(seg) for seg in segments]
 
+    async def fake_inline(items):
+        return items, False
+
     monkeypatch.setattr(runtime, "process_emojis", fake_process)
+    monkeypatch.setattr(runtime, "_inline_emoji_segments", fake_inline)
     monkeypatch.setattr(runtime, "_current_custom_face_names", lambda: [])
     monkeypatch.setattr(runtime, "_current_custom_face_metadata", lambda: {})
 
@@ -519,6 +523,8 @@ def test_split_text_sends_text_first_then_emoji_and_emoji_failure_is_not_fatal(
         == " 老大，短期内不会解体 "
     assert [seg["type"] for seg in emoji_msg] == ["image"]
     assert emoji_msg[0]["data"]["file"] == "https://gxh.vip.qq.com/club/item/parcel/item/abc.png"
+    assert emoji_msg[0]["data"]["cache"] == "false"
+    assert emoji_msg[0]["data"]["proxy"] == "false"
     assert emoji_msg[0]["data"]["sub_type"] == 1
     assert emoji_msg[0]["data"]["summary"] == "[表情]"
     assert "".join(seg["data"].get("text", "") for seg in second_text) == "\n最新消息如下"
@@ -580,5 +586,144 @@ def test_ordered_text_and_image_segments_helper(monkeypatch: pytest.MonkeyPatch,
     ]
 
 
+def test_inline_emoji_segments_uses_base64_for_local_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    source = tmp_path / "emoji.gif"
+    source.write_bytes(b"GIF89a test emoji")
+
+    segments, changed = asyncio.run(runtime._inline_emoji_segments([
+        {"type": "image", "url": f"file://{source}", "emoji": True},
+    ]))
+
+    assert changed is True
+    assert segments[0]["url"].startswith("base64://R0lGODlh")
+
+
 async def _no_sleep(*_args: Any, **_kwargs: Any) -> None:
     return None
+
+
+# ----------------------------------------------------------------------
+#  5. 表情 URL 直发 + base64 兜底 + NapCat temp 不可写告警
+# ----------------------------------------------------------------------
+
+def test_split_text_emoji_url_first_then_base64_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    _patch_process_emojis(monkeypatch, runtime, [
+        {"type": "text", "content": "正文"},
+        {"type": "image", "url": "https://example/x.png", "emoji": True},
+    ])
+    inline_calls: list[Any] = []
+
+    async def fake_inline(items):
+        inline_calls.append(items)
+        for item in items:
+            item["url"] = "base64://QUJD"
+        return items, True
+
+    monkeypatch.setattr(runtime, "_inline_emoji_segments", fake_inline)
+    sent: list[Any] = []
+
+    async def fake_send(bot, target, message, **kwargs):
+        sent.append(message)
+        files = [seg["data"].get("file") for seg in message if seg.get("type") == "image"]
+        if files and files[0].startswith("https://"):
+            raise runtime.ActionFailed("download failed: http 403")
+        return f"mid-{len(sent)}"
+
+    monkeypatch.setattr(runtime, "_send_qq_message", fake_send)
+    monkeypatch.setattr(runtime.asyncio, "sleep", _no_sleep)
+
+    ok = asyncio.run(runtime._send_split_text(object(), {"type": "group", "group_id": 1}, "x"))
+
+    assert ok is True
+    # 正文 -> URL 直发失败 -> base64 重发成功；只在失败后才下载。
+    assert len(sent) == 3
+    assert sent[1][0]["data"]["file"] == "https://example/x.png"
+    assert sent[2][0]["data"]["file"] == "base64://QUJD"
+    assert sent[2][0]["data"]["sub_type"] == 1
+    assert len(inline_calls) == 1
+
+
+def test_split_text_emoji_temp_enoent_alerts_and_skips_base64(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    _patch_process_emojis(monkeypatch, runtime, [
+        {"type": "text", "content": "正文"},
+        {"type": "image", "url": "https://example/x.png", "emoji": True},
+    ])
+    inline_calls: list[Any] = []
+
+    async def fake_inline(items):
+        inline_calls.append(items)
+        return items, True
+
+    monkeypatch.setattr(runtime, "_inline_emoji_segments", fake_inline)
+    sent: list[Any] = []
+
+    async def fake_send(bot, target, message, **kwargs):
+        sent.append(message)
+        if any(seg.get("type") == "image" for seg in message):
+            raise runtime.ActionFailed(_ENOENT_TEXT)
+        return "mid"
+
+    monkeypatch.setattr(runtime, "_send_qq_message", fake_send)
+    monkeypatch.setattr(runtime.asyncio, "sleep", _no_sleep)
+
+    with caplog.at_level("ERROR"):
+        ok = asyncio.run(runtime._send_split_text(object(), {"type": "group", "group_id": 1}, "x"))
+
+    assert ok is True
+    assert len(sent) == 2
+    assert inline_calls == []
+    assert any("NapCat 数据目录不可写" in rec.getMessage() for rec in caplog.records)
+
+
+def test_napcat_temp_enoent_path_walks_cause_chain(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    inner = runtime.ActionFailed(_ENOENT_TEXT)
+    outer = RuntimeError("OneBot send failed")
+    outer.__cause__ = inner
+    assert runtime._napcat_temp_enoent_path(outer) == "/app/.config/QQ/NapCat/temp/143d6a94"
+    assert runtime._napcat_temp_enoent_path(RuntimeError("ENOENT: open '/tmp/x'")) == ""
+
+
+def test_process_emojis_prefers_live_url_over_stale_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    calls: list[str] = []
+
+    class FakeBot:
+        async def call_api(self, api, **kwargs):
+            calls.append(api)
+            return [
+                {"desc": "开心", "md5": "aaa", "resId": "r1", "url": "https://live/new.png"},
+            ]
+
+    metadata = [{"name": "开心", "base_name": "开心", "md5": "aaa", "url": "https://stale/old.png"}]
+    segments = asyncio.run(runtime.process_emojis("哈[表情:开心]", FakeBot(), [], ["开心"], metadata))
+    images = [seg for seg in segments if seg["type"] == "image"]
+    assert images and images[0]["url"] == "https://live/new.png"
+    assert calls == ["fetch_custom_face_detail"]
+
+
+def test_process_emojis_falls_back_to_metadata_url_when_live_fails(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+
+    class FakeBot:
+        async def call_api(self, api, **kwargs):
+            raise RuntimeError("napcat down")
+
+    metadata = [{"name": "开心", "base_name": "开心", "md5": "aaa", "url": "https://stale/old.png"}]
+    segments = asyncio.run(runtime.process_emojis("[表情:开心]", FakeBot(), [], ["开心"], metadata))
+    assert segments == [{"type": "image", "url": "https://stale/old.png", "emoji": True}]

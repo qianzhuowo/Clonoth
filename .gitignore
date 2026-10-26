@@ -70,6 +70,12 @@ secret_skills/
 # user node configs / fragments that may be created from examples
 /config/nodes/_persona.md
 
+# QQ bot runtime data: collected emoji names/metadata and per-user profiles
+# (keep config/qq_user_profiles.example.yaml versioned)
+/config/qq_custom_faces.txt
+/config/qq_custom_faces.json
+/config/qq_user_profiles.yaml
+
 # Python environments, packaging and analysis caches
 venv/
 ENV/

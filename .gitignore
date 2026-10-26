@@ -56,6 +56,7 @@ secret_skills/
 !/tests/test_task_route_recovery.py
 !/tests/test_tool_result_formatters.py
 !/tests/test_tool_result_truncation.py
+!/tests/test_data_cleanup_qq_cache.py
 # Site-specific acceptance tests remain local under the default tests/* rule.
 /tests/test_onebot_image_probe.py
 /tests/test_onebot_napcat_temp.py

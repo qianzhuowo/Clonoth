@@ -61,6 +61,15 @@ QQ_CACHE_DIR_KEYWORDS = {
     # Explicitly cover NTQQ account media cache directories: <qq号>/Image and <qq号>/Video.
     "image", "images", "pic", "pics", "video", "videos", "emoji", "face", "record",
 }
+# Runtime working directories that must never be removed even when empty.
+# NapCat writes every outgoing image/emoji to NapCat/temp/<uuid> and empties the
+# directory again afterwards, so it is usually empty.  Removing it makes all
+# image sends fail with ENOENT, and removing it through /proc/<pid>/root also
+# silently detaches a bind mount living in the container's mount namespace.
+# Matched as consecutive lower-cased path parts relative to a cache root.
+QQ_CACHE_PROTECTED_DIR_PARTS = (
+    ("napcat", "temp"),
+)
 
 # Persistent memory entry cleanup. Entries with constant=true are protected.
 # For ordinary entries, use last_hit_at first, then updated_at, then created_at.
@@ -282,6 +291,44 @@ def _is_cache_like_relative_path(rel: Path) -> bool:
     return False
 
 
+def _is_protected_qq_dir(rel: Path) -> bool:
+    """Return True if *rel* is (or is inside) a protected runtime directory."""
+    parts = [part.lower() for part in rel.parts]
+    for protected in QQ_CACHE_PROTECTED_DIR_PARTS:
+        width = len(protected)
+        for i in range(len(parts) - width + 1):
+            if tuple(parts[i:i + width]) == protected:
+                return True
+    return False
+
+
+def _remove_stale_empty_qq_dir(dp: Path, root: Path, cutoff: float) -> bool:
+    """Remove an empty cache-like directory only when it is safe and stale.
+
+    Empty directories are kept unless they have not been modified since
+    *cutoff*: QQ/NapCat create many working directories once and expect them to
+    keep existing even while empty.
+    """
+    if dp == root:
+        return False
+    try:
+        rel = dp.relative_to(root)
+        if not _is_cache_like_relative_path(rel / "placeholder"):
+            return False
+        if _is_protected_qq_dir(rel):
+            return False
+        if os.path.ismount(dp):
+            return False
+        if dp.stat().st_mtime >= cutoff:
+            return False
+        if any(dp.iterdir()):
+            return False
+        dp.rmdir()
+        return True
+    except Exception:
+        return False
+
+
 def purge_qq_internal_cache():
     """Clean stale NTQQ/NapCat image/video/cache files.
 
@@ -324,23 +371,10 @@ def purge_qq_internal_cache():
                 except Exception:
                     continue
 
-            # Remove empty cache/media subdirectories, but never the root itself.
+            # Remove stale empty cache/media subdirectories, never the root itself
+            # and never protected runtime directories such as NapCat/temp.
             for dirpath, _, _ in os.walk(str(root), topdown=False):
-                dp = Path(dirpath)
-                if dp == root:
-                    continue
-                try:
-                    rel = dp.relative_to(root)
-                    if not _is_cache_like_relative_path(rel / "placeholder"):
-                        continue
-                    next(dp.iterdir())
-                except StopIteration:
-                    try:
-                        dp.rmdir()
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+                _remove_stale_empty_qq_dir(Path(dirpath), root, cutoff)
         except Exception as exc:
             logging.info("[qq_cache] skipped %s: %s", root, exc)
 

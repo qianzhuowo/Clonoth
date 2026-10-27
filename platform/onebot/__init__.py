@@ -4757,7 +4757,105 @@ def _ordered_text_and_image_segments(
         image_index += 1
 
     _flush_text_group()
-    return outgoing
+    return _tidy_split_text_groups(outgoing)
+
+
+# 表情后紧跟的“收尾标点”：属于前一段正文的句末/右括号，不应单独成为下一条气泡的开头。
+_EMOJI_TRAILING_PUNCT_RE = re.compile(
+    r"^\s*([，。！？、；：,.!?;:）)\]】」』》〉}”’\"'~～…—]+)"
+)
+
+
+def _segment_text_value(segment: Dict[str, Any]) -> Optional[str]:
+    """读取文本段内容；非文本段返回 None。"""
+    if segment.get("type") != "text":
+        return None
+    if "content" in segment:
+        return str(segment.get("content") or "")
+    data = segment.get("data")
+    if isinstance(data, dict):
+        return str(data.get("text", "") or "")
+    return ""
+
+
+def _with_segment_text(segment: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """返回替换文本后的段副本，不修改原段。"""
+    new_segment = dict(segment)
+    if "content" not in segment and isinstance(segment.get("data"), dict):
+        new_segment["data"] = {**segment["data"], "text": text}
+    else:
+        new_segment["content"] = text
+    return new_segment
+
+
+def _tidy_split_text_groups(
+    groups: List[tuple[str, List[Dict[str, Any]]]],
+) -> List[tuple[str, List[Dict[str, Any]]]]:
+    """清理被表情拆开后的文本组边界。
+
+    [2026-10-27] 表情单独成条后，原文里表情前后的换行/空格会落在下一条气泡
+    开头，出现“空行 + 正文”；表情后紧跟的句末标点（如“，”“！”“）”）也会
+    单独成为下一条气泡。这里：
+      1. 去掉每个文本组首尾的空白；
+      2. 表情后的文本组若以收尾标点开头，把标点挪回表情前最近的文本组末尾；
+         前面没有正文时直接丢弃该标点；
+      3. 清理后变空的文本组整体丢弃，并重新编号 kind。
+    """
+    tidied: List[tuple[str, List[Dict[str, Any]]]] = []
+    last_text_pos: Optional[int] = None
+    prev_is_emoji = False
+    for kind, group in groups:
+        if kind.startswith("emoji:"):
+            tidied.append((kind, group))
+            prev_is_emoji = True
+            continue
+        group = list(group)
+        # 1) 表情后的收尾标点挪回前一段正文。
+        if prev_is_emoji and group:
+            first_text = _segment_text_value(group[0])
+            if first_text is not None:
+                match = _EMOJI_TRAILING_PUNCT_RE.match(first_text)
+                if match:
+                    punct = match.group(1)
+                    group[0] = _with_segment_text(group[0], first_text[match.end():])
+                    if last_text_pos is not None:
+                        prev_kind, prev_group = tidied[last_text_pos]
+                        prev_group = list(prev_group)
+                        tail_text = _segment_text_value(prev_group[-1])
+                        if tail_text is not None:
+                            prev_group[-1] = _with_segment_text(prev_group[-1], tail_text.rstrip() + punct)
+                        else:
+                            prev_group.append({"type": "text", "content": punct})
+                        tidied[last_text_pos] = (prev_kind, prev_group)
+        # 2) 去掉文本组首尾空白（at 段不受影响）。
+        if group:
+            head_text = _segment_text_value(group[0])
+            if head_text is not None:
+                group[0] = _with_segment_text(group[0], head_text.lstrip())
+            tail_text = _segment_text_value(group[-1])
+            if tail_text is not None:
+                group[-1] = _with_segment_text(group[-1], tail_text.rstrip())
+        group = [seg for seg in group if _segment_text_value(seg) != ""]
+        prev_is_emoji = False
+        if not any(
+            seg.get("type") == "at" or (_segment_text_value(seg) or "").strip()
+            for seg in group
+        ):
+            continue
+        tidied.append((kind, group))
+        last_text_pos = len(tidied) - 1
+
+    result: List[tuple[str, List[Dict[str, Any]]]] = []
+    text_index = 0
+    image_index = 0
+    for kind, group in tidied:
+        if kind.startswith("emoji:"):
+            result.append((f"emoji:{image_index}", group))
+            image_index += 1
+        else:
+            result.append((f"text:{text_index}", group))
+            text_index += 1
+    return result
 
 
 def _to_workspace_rel_path(raw_path: Any) -> str:

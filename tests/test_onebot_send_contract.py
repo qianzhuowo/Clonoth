@@ -980,3 +980,45 @@ def test_ordered_text_and_image_segments_preserve_interleaving(
     assert [[segment["type"] for segment in segments] for _kind, segments in groups] == [
         ["text"], ["image"], ["text"], ["image"], ["text"],
     ]
+
+
+def test_ordered_groups_strip_newlines_around_emoji(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    groups = runtime._ordered_text_and_image_segments([
+        {"type": "text", "content": "第一段文本\n"},
+        {"type": "image", "url": "u1", "emoji": True},
+        {"type": "text", "content": "\n\n 第二段文本\n"},
+    ])
+    assert [kind for kind, _ in groups] == ["text:0", "emoji:0", "text:1"]
+    assert groups[0][1][0]["content"] == "第一段文本"
+    assert groups[2][1][0]["content"] == "第二段文本"
+
+
+def test_ordered_groups_move_trailing_punct_before_emoji(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    groups = runtime._ordered_text_and_image_segments([
+        {"type": "text", "content": "第一段文本"},
+        {"type": "image", "url": "u1", "emoji": True},
+        {"type": "text", "content": "！）\n"},
+    ])
+    assert [kind for kind, _ in groups] == ["text:0", "emoji:0"]
+    assert groups[0][1][0]["content"] == "第一段文本！）"
+
+    groups = runtime._ordered_text_and_image_segments([
+        {"type": "text", "content": "第一段"},
+        {"type": "image", "url": "u1", "emoji": True},
+        {"type": "text", "content": "\n，第二段"},
+    ])
+    assert [kind for kind, _ in groups] == ["text:0", "emoji:0", "text:1"]
+    assert groups[0][1][0]["content"] == "第一段，"
+    assert groups[2][1][0]["content"] == "第二段"
+
+    groups = runtime._ordered_text_and_image_segments([
+        {"type": "image", "url": "u1", "emoji": True},
+        {"type": "text", "content": "！"},
+    ])
+    assert [kind for kind, _ in groups] == ["emoji:0"]

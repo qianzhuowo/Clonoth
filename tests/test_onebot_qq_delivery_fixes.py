@@ -520,14 +520,14 @@ def test_split_text_sends_text_first_then_emoji_and_emoji_failure_is_not_fatal(
     # 引用与 @ 只挂在第一条正文上，后续正文仍保持在表情之后。
     assert [seg["type"] for seg in first_text] == ["reply", "at", "text", "text"]
     assert "".join(seg["data"].get("text", "") for seg in first_text if seg["type"] == "text") \
-        == " 表情包测试呀 "
+        == " 表情包测试呀"
     assert [seg["type"] for seg in emoji_msg] == ["image"]
     assert emoji_msg[0]["data"]["file"] == "https://gxh.vip.qq.com/club/item/parcel/item/abc.png"
     assert emoji_msg[0]["data"]["cache"] == "false"
     assert emoji_msg[0]["data"]["proxy"] == "false"
     assert emoji_msg[0]["data"]["sub_type"] == 1
     assert emoji_msg[0]["data"]["summary"] == "[表情]"
-    assert "".join(seg["data"].get("text", "") for seg in second_text) == "\n最新消息如下"
+    assert "".join(seg["data"].get("text", "") for seg in second_text) == "最新消息如下"
 
 
 def test_split_text_text_failure_still_propagates(

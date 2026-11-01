@@ -27,6 +27,34 @@ class TaskStoreMixin:
         cfg = load_runtime_config(self.workspace_root)
         return get_entry_node_id(cfg)
 
+    def _route_entry_node_for_capabilities(self, *, payload: dict[str, Any], selected_entry_node: str) -> str:
+        """Pick a vision-capable entry node for image inbounds (runtime.yaml routing.vision).
+
+        Lookup order: routing.vision.channels.<channel> -> channels.<platform> ->
+        routing.vision.entry_node_id. Disabled or unconfigured -> selected node.
+        """
+        attachments = payload.get("attachments") if isinstance(payload.get("attachments"), list) else []
+        hints = payload.get("route_hints") if isinstance(payload.get("route_hints"), dict) else {}
+        has_image = bool(hints.get("has_image")) or any(
+            isinstance(a, dict) and str(a.get("type") or "") == "image" for a in attachments
+        )
+        if not has_image:
+            return selected_entry_node
+        cfg = load_runtime_config(self.workspace_root)
+        routing = cfg.get("routing") if isinstance(cfg.get("routing"), dict) else {}
+        vision = routing.get("vision") if isinstance(routing.get("vision"), dict) else {}
+        if not bool(vision.get("enabled", False)):
+            return selected_entry_node
+        channel = str(payload.get("channel") or hints.get("channel") or "").strip()
+        platform = str(hints.get("platform") or channel.split("_", 1)[0] or "").strip()
+        channels = vision.get("channels") if isinstance(vision.get("channels"), dict) else {}
+        for key in (channel, platform):
+            entry = channels.get(key) if key else None
+            node_id = str(entry.get("entry_node_id") or "").strip() if isinstance(entry, dict) else ""
+            if node_id:
+                return node_id
+        return str(vision.get("entry_node_id") or "").strip() or selected_entry_node
+
     def _task_terminal(self, task: Task) -> bool:
         return task.status in {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
 
@@ -286,6 +314,13 @@ class TaskStoreMixin:
             # the same route even if the callback payload has no entry_node_id.
             session_info.entry_node_id = entry_node
             self._session_store.update_entry_node(session_id, entry_node)
+        # Capability routing applies to this inbound only: it runs after the
+        # session's entry node is persisted, so an image message never rebinds
+        # the session. AI switch overrides and dispatch targets are exact.
+        if not payload.get("dispatch_origin") and not session_override:
+            entry_node = self._route_entry_node_for_capabilities(
+                payload=payload, selected_entry_node=entry_node,
+            )
         # Record the actual entry node used for this session (for getActiveNode API)
         self.session_last_entry_node[session_id] = entry_node
         generation = self._current_session_generation_locked(session_id) or 1
@@ -448,6 +483,10 @@ class TaskStoreMixin:
                     "dispatch_context_mode": _dispatch_context_mode,
                     "parent_conversation_key": _dispatch_parent_conv_key,
                     "route_conversation_key": _dispatch_parent_conv_key,
+                    # Trusted adapter identity; supervisor permission checks read
+                    # it from here (never from tool-supplied parameters).
+                    "platform_auth": dict(payload["platform_auth"]) if isinstance(payload.get("platform_auth"), dict) else {},
+                    "route_hints": dict(payload["route_hints"]) if isinstance(payload.get("route_hints"), dict) else {},
                 },
                 "dispatch_context_mode": _dispatch_context_mode,
                 "_dispatch_origin": _dispatch_origin,

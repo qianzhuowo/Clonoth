@@ -80,6 +80,13 @@ class InboundMessageIn(BaseModel):
     # creation, before the entry task is dispatched. Purpose: the model chosen on
     # the welcome page takes effect on the very first response, with no race.
     provider_override: dict[str, Any] | None = None
+    # Platform identity produced by trusted adapters (OneBot/Discord), never
+    # parsed from user text: {"platform": "qq", "user_id": ..., "is_admin": bool}.
+    # Carried into task_context; supervisor permission checks read it from there.
+    platform_auth: dict[str, Any] = Field(default_factory=dict)
+    # Adapter routing hints, e.g. {"platform", "channel", "has_image",
+    # "target_type"}. Used only for capability routing (vision entry node).
+    route_hints: dict[str, Any] = Field(default_factory=dict)
 
 
 class InboundMessageOut(BaseModel):

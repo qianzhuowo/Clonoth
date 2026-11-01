@@ -756,6 +756,11 @@ async def _handle_pseudo_dispatch(ls: _LoopState, args: dict, pseudo_call) -> No
         "dispatch_origin": dispatch_origin,
         "dispatch_context_mode": ctx_mode,
     }
+    # Dispatch children act on behalf of the originating platform user, so
+    # supervisor permission checks (QQ admin / non-admin) still apply to them.
+    _parent_auth = task_ctx.get("platform_auth")
+    if isinstance(_parent_auth, dict) and _parent_auth:
+        inbound_payload["platform_auth"] = dict(_parent_auth)
     if ctx_mode == "fork":
         inbound_payload["dispatch_fork_from_session"] = getattr(ls.rctx, "session_id", "") or parent_session_id
 

@@ -1459,6 +1459,76 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             )
             return a
 
+    _QQ_PLATFORMS = frozenset({"qq", "onebot", "onebot11"})
+    _QQ_NON_ADMIN_SENSITIVE_READ_PREFIXES = ("config/", "engine/builtin/nodes/", "data/", ".env")
+
+    def _task_platform_auth(self, task_id: str | None) -> dict[str, Any]:
+        """platform_auth recorded in the task's task_context by the inbound adapter."""
+        task = self.tasks.get(task_id) if task_id else None
+        task_input = task.input if task is not None and isinstance(task.input, dict) else {}
+        ctx = task_input.get("task_context")
+        auth = ctx.get("platform_auth") if isinstance(ctx, dict) else None
+        return dict(auth) if isinstance(auth, dict) else {}
+
+    def _qq_request_identity(self, *, session_id: str, task_id: str | None) -> tuple[bool, bool]:
+        """Return (is_qq, is_admin). QQ = adapter-declared platform or a qq_* session.
+
+        Dispatch children inherit the originator's platform_auth, so they are
+        recognised even though their conversation_key starts with ``agent:``.
+        Missing identity on a QQ session means non-admin (fail closed).
+        """
+        auth = self._task_platform_auth(task_id)
+        session = self.sessions.get(session_id)
+        conv_key = str(getattr(session, "conversation_key", "") or "") if session else ""
+        platform = str(auth.get("platform") or "").strip().lower()
+        is_qq = platform in self._QQ_PLATFORMS or conv_key.startswith("qq_")
+        return is_qq, bool(auth.get("is_admin"))
+
+    def _root_relpath(self, path: Any, workspace: str | None) -> str | None:
+        """Path relative to workspace_root (posix), or None when outside/invalid."""
+        raw = str(path or "").strip()
+        if not raw:
+            return None
+        base = Path(workspace) if workspace else Path(self.workspace_root)
+        try:
+            candidate = Path(raw)
+            resolved = candidate.resolve() if candidate.is_absolute() else (base / candidate).resolve()
+            return resolved.relative_to(Path(self.workspace_root).resolve()).as_posix()
+        except (OSError, ValueError):
+            return None
+
+    def _qq_non_admin_override(
+        self, *, op: str, parameters: dict[str, Any], workspace: str | None,
+    ) -> OpRequestOut | None:
+        """Hard limits for QQ non-admin users, who have no approval channel."""
+        if op == "execute_command":
+            if self.policy.is_safe_public_curl(str(parameters.get("command") or "")):
+                return OpRequestOut(
+                    safety_level=SafetyLevel.auto,
+                    reason="auto-allowed: qq non-admin safe public curl read",
+                    approval_id=None,
+                )
+            return OpRequestOut(
+                safety_level=SafetyLevel.deny,
+                reason="qq non-admin users cannot execute commands",
+                approval_id=None,
+            )
+        if op in ("restart", "write_file"):
+            return OpRequestOut(
+                safety_level=SafetyLevel.deny,
+                reason=f"qq non-admin users cannot {op.replace('_', ' ')}",
+                approval_id=None,
+            )
+        if op == "read_file":
+            rel = self._root_relpath(parameters.get("path"), workspace)
+            if rel is not None and rel.startswith(self._QQ_NON_ADMIN_SENSITIVE_READ_PREFIXES):
+                return OpRequestOut(
+                    safety_level=SafetyLevel.deny,
+                    reason="qq non-admin users cannot read sensitive files",
+                    approval_id=None,
+                )
+        return None
+
     def request_operation(
         self,
         *,
@@ -1470,6 +1540,11 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         task_id: str | None = None,
         workspace: str | None = None,
     ) -> OpRequestOut:
+        is_qq, is_qq_admin = self._qq_request_identity(session_id=session_id, task_id=task_id)
+        if is_qq and not is_qq_admin:
+            override = self._qq_non_admin_override(op=op, parameters=parameters, workspace=workspace)
+            if override is not None:
+                return override
         _ws = Path(workspace) if workspace else None
         decision = self.policy.evaluate(op=op, parameters=parameters, workspace=_ws)
         _tl = decision.trust_level or ""
@@ -1481,6 +1556,19 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         # operations stay blocked even when they come from unattended jobs.
         if decision.safety_level == SafetyLevel.deny:
             return OpRequestOut(safety_level=SafetyLevel.deny, reason=decision.reason, approval_id=None, trust_level=_tl)
+
+        # QQ admins manage reminders as a normal chat action; a second
+        # schedules.yaml approval would otherwise block the chat task.
+        if (
+            is_qq and is_qq_admin and op == "write_file"
+            and self._root_relpath(parameters.get("path"), workspace) == "data/schedules.yaml"
+        ):
+            return OpRequestOut(
+                safety_level=SafetyLevel.auto,
+                reason="auto-approved: qq admin schedule change",
+                approval_id=None,
+                trust_level=_tl,
+            )
 
         # [AutoC 2026-06-04] Why: scheduler-triggered tasks have no source inbound
         # sequence, so their approval events cannot be routed to Discord and would

@@ -145,6 +145,19 @@ def _format_task_messages_for_turn_summary(messages: list[Any]) -> str:
     return f"=== COMPLETED TASK LOG (read-only, do NOT continue) ===\n\n{body}\n\n=== END OF LOG ==="
 
 
+def carry_platform_auth(payload: dict[str, Any], source_task: Task | None) -> None:
+    """Callback inbounds act for the user who started the source task.
+
+    Only platform_auth is inherited; route_hints (e.g. has_image) described
+    the original message and must not reroute the callback.
+    """
+    task_input = source_task.input if source_task is not None and isinstance(source_task.input, dict) else {}
+    ctx = task_input.get("task_context")
+    auth = ctx.get("platform_auth") if isinstance(ctx, dict) else None
+    if isinstance(auth, dict) and auth:
+        payload["platform_auth"] = dict(auth)
+
+
 class TaskRouterMixin:
     """提供 _route_completed_task_locked 及其子路由方法。
 
@@ -1348,6 +1361,7 @@ class TaskRouterMixin:
         }
         if result_atts:
             payload["attachments"] = result_atts
+        carry_platform_auth(payload, task)
 
         evt = self.eventlog.append(
             session_id=route_session_id,
@@ -1465,6 +1479,7 @@ class TaskRouterMixin:
             payload["_dispatch_owner_root_task_id"] = origin_task_id
         if result_atts:
             payload["attachments"] = result_atts
+        carry_platform_auth(payload, task)
 
         evt = self.eventlog.append(
             session_id=target_session_id,
@@ -1655,6 +1670,7 @@ class TaskRouterMixin:
                 payload["_dispatch_owner_root_task_id"] = source_task_id
             if result_atts:
                 payload["attachments"] = [{"path": p} for p in result_atts]
+            carry_platform_auth(payload, self.tasks.get(source_task_id) if source_task_id else None)
 
             evt = self.eventlog.append(
                 session_id=session_id,

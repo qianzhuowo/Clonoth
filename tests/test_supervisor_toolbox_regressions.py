@@ -108,6 +108,7 @@ def test_async_result_reuses_carrier_or_keeps_root_owner(has_carrier):
     carrier = SimpleNamespace(task_id="resumed-branch") if has_carrier else None
     router = SimpleNamespace(
         _lock=threading.Lock(),
+        tasks={},
         sessions={"s": SimpleNamespace(conversation_key="discord:42", channel="discord")},
         _find_dispatch_callback_carrier_locked=Mock(return_value=carrier),
         _is_branchless_running_task_locked=Mock(return_value=None),

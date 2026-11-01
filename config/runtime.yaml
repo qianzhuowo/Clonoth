@@ -118,6 +118,21 @@ memory:
     min_sessions: 0           # 距上次 dream 后至少有 N 个不同 session 活动过才触发（0 = 不检查）
     conversation_key: "system:dream"  # dream 会话标识
 
+routing:
+  # 识图入口路由：适配器 route_hints.has_image=true 或附件含图片时，本条消息改由
+  # 视觉入口节点处理（只影响本条，不改写会话绑定的入口节点）。
+  # 查找顺序：channels.<channel> → channels.<platform> → entry_node_id。
+  # AI 切换节点（session 覆盖）与 dispatch 子任务不参与路由。
+  vision:
+    enabled: false
+    entry_node_id: ""
+    channels: {}
+    # channels:
+    #   qq_group:
+    #     entry_node_id: "qq_vision"
+    #   qq_private:
+    #     entry_node_id: "qq_vision"
+
 shell:
   # 历史命名空间：仅保留默认入口节点配置。内置 CLI/TUI shell 已移除。
   entry_node_id: ""

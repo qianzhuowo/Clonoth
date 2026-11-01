@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import fnmatch
+import ipaddress
 import re
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -131,6 +134,30 @@ def _default_policy_dict() -> dict[str, Any]:
     }
 
 
+def _is_public_http_url(raw: str) -> bool:
+    """True only for http(s) URLs whose host is not loopback/private/link-local/reserved."""
+    raw = (raw or "").strip()
+    if "://" not in raw:
+        raw = "http://" + raw
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return False
+    if parsed.scheme.lower() not in ("http", "https"):
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if not host or host in ("localhost", "localhost.localdomain"):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+        return ip.is_global and not ip.is_multicast
+    except ValueError:
+        pass
+    if host.endswith((".localhost", ".local", ".internal")):
+        return False
+    return True
+
+
 def _to_safety_level(s: str) -> SafetyLevel:
     v = (s or "").strip()
     try:
@@ -159,12 +186,6 @@ class PolicyEngine:
 
         self._extra_roots: list[Path] = []
 
-    @property
-    def extra_roots(self) -> list[Path]:
-        """Public read access for attachment trust resolution."""
-        self._reload_if_needed()
-        return list(self._extra_roots)
-
         self._read_default: SafetyLevel = SafetyLevel.auto
         self._write_default: SafetyLevel = SafetyLevel.auto
         self._restart_default: SafetyLevel = SafetyLevel.approval_required
@@ -179,6 +200,12 @@ class PolicyEngine:
 
         self._ensure_policy_file_exists()
         self._reload_if_needed(force=True)
+
+    @property
+    def extra_roots(self) -> list[Path]:
+        """Public read access for attachment trust resolution."""
+        self._reload_if_needed()
+        return list(self._extra_roots)
 
     def _ensure_policy_file_exists(self) -> None:
         if self._policy_path.exists():
@@ -346,6 +373,52 @@ class PolicyEngine:
         if self._command_default == SafetyLevel.deny:
             return PolicyDecision(SafetyLevel.deny, "command denied by default")
         return PolicyDecision(SafetyLevel.approval_required, "command requires approval")
+
+    def is_safe_public_curl(self, command: str) -> bool:
+        """True only for a single plain-GET curl of one public http(s) URL.
+
+        Lets QQ non-admin users have the bot read web pages without an approval
+        channel. Rejects command chaining/injection/redirection, any deny or
+        approval pattern hit, write/upload/output flags, multiple URLs, and
+        non-public hosts (SSRF). Anything uncertain returns False.
+        """
+        self._reload_if_needed()
+        cmd = (command or "").strip()
+        if not cmd:
+            return False
+        if any(ch in cmd for ch in (";", "|", "&", "`", ">", "<", "\n")):
+            return False
+        if "$(" in cmd or "${" in cmd:
+            return False
+        for pat in (*self._deny_command_patterns, *self._approval_command_patterns):
+            if pat.search(cmd):
+                return False
+        try:
+            tokens = shlex.split(cmd)
+        except ValueError:
+            return False
+        if not tokens or tokens[0].lower() != "curl":
+            return False
+        # Compared lowercased, so uppercase variants (-O, -T, -X, -F) are covered.
+        forbidden_flags = {
+            "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
+            "-x", "--request", "-t", "--upload-file", "-f", "--form",
+            "-o", "--output", "--remote-name", "-k", "--config",
+        }
+        urls: list[str] = []
+        for tok in tokens[1:]:
+            low = tok.lower()
+            if low in forbidden_flags:
+                return False
+            if low.startswith(("--data", "--request", "--output")):
+                return False
+            if tok.startswith(("http://", "https://")):
+                urls.append(tok)
+            elif not tok.startswith("-") and ("://" in tok or "." in tok):
+                urls.append(tok)
+        if len(urls) != 1:
+            return False
+        return _is_public_http_url(urls[0])
 
     def evaluate_restart(self, *, target: str) -> PolicyDecision:
         self._reload_if_needed()

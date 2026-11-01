@@ -294,7 +294,10 @@ def static_router(directory: "str | PathLike[str]") -> Any:
     router = APIRouter()
 
     @router.api_route("/{file_path:path}", methods=["GET", "HEAD"], include_in_schema=False)
-    async def _serve_static(file_path: str) -> FileResponse:
+    async def _serve_static(file_path: str):
+        # No return annotation: this module uses postponed annotations and
+        # FileResponse is imported locally, so FastAPI's eval of the string
+        # annotation against module globals raises NameError at registration.
         cleaned = (file_path or "").strip("/")
         if not cleaned:
             cleaned = "index.html"

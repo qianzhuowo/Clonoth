@@ -22,6 +22,8 @@ from clonoth_runtime import (
     load_runtime_config,
     load_yaml_dict,
     normalize_llm_secret,
+    resolve_system_model,
+    SYSTEM_NODE_MODEL_SLOTS,
 )
 from providers import registry as provider_registry
 from toolbox.context import ToolContext
@@ -1159,6 +1161,18 @@ async def _run_node_task(
             provider_configs=_provider_configs,
             default_provider_type=_active_provider,
         )
+        # System nodes (compactor / turn summarizer) can be pointed at a separate
+        # model/base_url/api_key via config.yaml system_models.<slot> or
+        # CLONOTH_<SLOT>_* env; unset fields keep the node's resolved channel.
+        _sys_slot = SYSTEM_NODE_MODEL_SLOTS.get(node.id, "")
+        if _sys_slot:
+            _sm_model, _sm_base_url, _sm_api_key = resolve_system_model(ws_root, _sys_slot)
+            if _sm_model:
+                rp.model = _sm_model
+            if _sm_base_url:
+                rp.base_url = _sm_base_url
+            if _sm_api_key:
+                rp.api_key = _sm_api_key
         provider_cfg = (runtime_cfg.get("providers") or {}).get(rp.provider_type or "openai")
         global_provider_options = provider_cfg.get("options") if isinstance(provider_cfg, dict) else {}
         if not isinstance(global_provider_options, dict):

@@ -270,6 +270,63 @@ def resolve_env_ref(text: str) -> str:
     return s
 
 
+# ---------------------------------------------------------------------------
+#  System model slots (compact / summary / image / image_gpt)
+# ---------------------------------------------------------------------------
+# data/config.yaml:
+#   system_models:
+#     compact: { model: "...", base_url: "${...}", api_key: "${...}" }
+#     summary: { model: "..." }      # url/key follow the node's channel
+# Per field: config.yaml system_models.<slot> > CLONOTH_<SLOT>_<FIELD> env >
+# caller default. Empty result means "keep the node's own value".
+_SYSTEM_MODEL_ENV_PREFIX = {
+    "compact": "CLONOTH_COMPACT",
+    "summary": "CLONOTH_SUMMARY",
+    "image": "CLONOTH_IMAGE",
+    "image_gpt": "CLONOTH_IMAGE_GPT",
+}
+
+# System node id -> slot. Only nodes listed here are overlaid by the runner.
+SYSTEM_NODE_MODEL_SLOTS = {
+    "system.compactor": "compact",
+    "system.turn_summarizer": "summary",
+}
+
+
+def resolve_system_model(
+    workspace_root: Path,
+    slot: str,
+    *,
+    default_model: str = "",
+    default_base_url: str = "",
+    default_api_key: str = "",
+) -> tuple[str, str, str]:
+    """Resolve (model, base_url, api_key) for a system slot."""
+    slot = (slot or "").strip().lower()
+    prefix = _SYSTEM_MODEL_ENV_PREFIX.get(slot, "")
+    cfg = load_yaml_dict(workspace_root / "data" / "config.yaml") or {}
+    sm = cfg.get("system_models")
+    block = sm.get(slot) if isinstance(sm, dict) else None
+    if not isinstance(block, dict):
+        block = {}
+
+    def _pick(field: str, env_suffix: str, fallback: str) -> str:
+        v = resolve_env_ref(str(block.get(field) or "").strip())
+        if v:
+            return v
+        if prefix:
+            v = os.getenv(f"{prefix}_{env_suffix}", "").strip()
+            if v:
+                return v
+        return fallback
+
+    return (
+        _pick("model", "MODEL", default_model),
+        _pick("base_url", "BASE_URL", default_base_url),
+        _pick("api_key", "API_KEY", default_api_key),
+    )
+
+
 async def fetch_llm_secret(http: httpx.AsyncClient, supervisor_url: str) -> dict[str, Any]:
     """从 supervisor 获取全局 LLM provider 配置（api_key/base_url/model）。"""
     r = await http.get(f"{supervisor_url.rstrip('/')}/v1/config/openai/secret")

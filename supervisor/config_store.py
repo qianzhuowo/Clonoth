@@ -288,7 +288,9 @@ class ConfigStore:
     #  Multi-provider CRUD (operates on raw YAML dict)
     # ================================================================
 
-    _META_KEYS = frozenset({"version", "provider", "fallbacks", "mimo_audio"})
+    # system_models holds per-slot model/base_url/api_key blocks; it is not a
+    # provider even though its children look like provider blocks.
+    _META_KEYS = frozenset({"version", "provider", "fallbacks", "mimo_audio", "system_models"})
 
     def _load_raw(self) -> dict[str, Any]:
         """Load raw YAML dict from disk."""

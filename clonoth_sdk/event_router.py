@@ -1482,10 +1482,17 @@ class EventRouter:
             )
         else:
             try:
+                ui_kwargs: dict[str, Any] = {
+                    "conversation_key": conv_key, "session_id": ap_session,
+                }
+                # Adapters that declare ``origin`` get the triggering-window
+                # description; older (approval_id, operation, details) adapters
+                # keep working unchanged.
+                if self._callback_has_param("show_approval_ui", "origin"):
+                    origin = p.get("origin") if isinstance(p.get("origin"), dict) else {}
+                    ui_kwargs["origin"] = {**origin, "conversation_key": conv_key}
                 await self._cb.show_approval_ui(
-                    appr_id, operation, details,
-                    conversation_key=conv_key,
-                    session_id=ap_session,
+                    appr_id, operation, details, **ui_kwargs,
                 )
             except Exception as e:
                 logger.error("show_approval_ui failed: %s", e)

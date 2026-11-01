@@ -418,8 +418,13 @@ class AdapterCallbacks(Protocol):
         *,
         conversation_key: str = "",
         session_id: str = "",
+        origin: dict[str, Any] | None = None,
     ) -> None:
         """外部操作需要人工审批，通知适配器展示审批 UI。
+
+        origin：触发审批的窗口信息（conversation_key 已解析为用户可见的路由会话，
+        channel / platform / target_type=group|private / user_id）。适配器据此在
+        审批消息里标注来源，例如【群】xx群、【私聊】xx。
 
         触发时机：approval_requested 事件，经 is_external_operation 判定为
                   外部操作（操作目标在工作区外部）。

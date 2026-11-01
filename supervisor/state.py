@@ -1382,6 +1382,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         node_id: str | None = None,
         task_id: str | None = None,
         trust_level: str = "",
+        origin: dict[str, Any] | None = None,
     ) -> Approval:
         now = _now()
         # [AutoC 2026-05-31] Why: duplicate pending approval suppression must not
@@ -1413,6 +1414,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             node_id=node_id,
             task_id=task_id,
             trust_level=trust_level,
+            origin=dict(origin or {}),
         )
 
         with self._lock:
@@ -1469,6 +1471,36 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
         ctx = task_input.get("task_context")
         auth = ctx.get("platform_auth") if isinstance(ctx, dict) else None
         return dict(auth) if isinstance(auth, dict) else {}
+
+    def _approval_origin(self, *, session_id: str, task_id: str | None) -> dict[str, Any]:
+        """Describe the chat window that triggered an approval (see Approval.origin)."""
+        task = self.tasks.get(task_id) if task_id else None
+        task_input = task.input if task is not None and isinstance(task.input, dict) else {}
+        ctx = task_input.get("task_context") if isinstance(task_input.get("task_context"), dict) else {}
+        auth = ctx.get("platform_auth") if isinstance(ctx.get("platform_auth"), dict) else {}
+        hints = ctx.get("route_hints") if isinstance(ctx.get("route_hints"), dict) else {}
+        session = self.sessions.get(session_id)
+        conv_key = str(
+            ctx.get("route_conversation_key")
+            or ctx.get("conversation_key")
+            or getattr(session, "conversation_key", "")
+            or ""
+        ).strip()
+        channel = str(ctx.get("channel") or getattr(session, "channel", "") or "").strip()
+        target_type = str(hints.get("target_type") or "").strip()
+        if not target_type:
+            if conv_key.startswith("qq_group:"):
+                target_type = "group"
+            elif conv_key.startswith("qq_private:"):
+                target_type = "private"
+        origin = {
+            "conversation_key": conv_key,
+            "channel": channel,
+            "platform": str(auth.get("platform") or hints.get("platform") or "").strip(),
+            "target_type": target_type,
+            "user_id": str(auth.get("user_id") or "").strip(),
+        }
+        return {k: v for k, v in origin.items() if v}
 
     def _qq_request_identity(self, *, session_id: str, task_id: str | None) -> tuple[bool, bool]:
         """Return (is_qq, is_admin). QQ = adapter-declared platform or a qq_* session.
@@ -1570,6 +1602,18 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
                 trust_level=_tl,
             )
 
+        # QQ admins started this task themselves: ordinary commands and file
+        # operations need no second confirmation. Sensitive decisions (explicit
+        # path rules, external paths, sensitive command patterns, git push,
+        # restart) still go to manual approval; deny was handled above.
+        if is_qq and is_qq_admin and not decision.sensitive:
+            return OpRequestOut(
+                safety_level=SafetyLevel.auto,
+                reason=f"auto-approved: qq admin task ({decision.reason})",
+                approval_id=None,
+                trust_level=_tl,
+            )
+
         # [AutoC 2026-06-04] Why: scheduler-triggered tasks have no source inbound
         # sequence, so their approval events cannot be routed to Discord and would
         # leave the task suspended forever. How: when the active task belongs to a
@@ -1626,6 +1670,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             node_id=node_id,
             task_id=task_id,
             trust_level=_tl,
+            origin=self._approval_origin(session_id=session_id, task_id=task_id),
         )
         return OpRequestOut(safety_level=SafetyLevel.approval_required, reason=decision.reason, approval_id=approval.approval_id, trust_level=_tl)
 

@@ -228,6 +228,11 @@ class Approval(BaseModel):
     tool_call_id: str | None = None
     node_id: str | None = None
     task_id: str | None = None
+    # Where the approval was triggered, so the reviewer knows which chat asked:
+    # {"conversation_key": user-facing route key (dispatch children resolve to
+    # the parent chat), "channel", "platform", "target_type": "group"|"private",
+    # "user_id": requester}. Adapters map the key to a display name.
+    origin: dict[str, Any] = Field(default_factory=dict)
 
 
 class OpRequestIn(BaseModel):

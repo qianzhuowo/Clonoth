@@ -841,3 +841,36 @@ def test_sent_retention_max_rows_reclaims_oldest_processed_events(tmp_path: Path
         "SELECT seq FROM outbound WHERE status='sent' ORDER BY seq"
     ).fetchall()
     assert [row[0] for row in remaining] == [403, 404]
+
+
+
+def test_show_approval_ui_origin_only_for_adapters_that_declare_it(tmp_path: Path) -> None:
+    import asyncio as _asyncio
+    from clonoth_sdk.approval import ApprovalTracker
+
+    class _New:
+        def __init__(self): self.calls = []
+        async def show_approval_ui(self, approval_id, operation, details, *, conversation_key="", session_id="", origin=None):
+            self.calls.append(origin)
+
+    class _Old:
+        def __init__(self): self.calls = []
+        async def show_approval_ui(self, approval_id, operation, details, *, conversation_key="", session_id=""):
+            self.calls.append(conversation_key)
+
+    for cb, expect_origin in ((_New(), True), (_Old(), False)):
+        state = SessionState()
+        state.register_session("s1", "qq_group:abc")
+        cfg = BotConfig(base_url="http://x", conversation_key_prefix="qq_group",
+                        outbound_store_path=tmp_path / f"o{expect_origin}.sqlite3")
+        router = EventRouter(object(), state, cb, cfg, approval_tracker=ApprovalTracker())
+        router._resolve_owned_route_conversation_key = lambda *a, **k: "qq_group:abc"
+        ev = Event(seq=1, event_id="e1", ts="", run_id="r", session_id="s1", component="supervisor",
+                   type="approval_requested",
+                   payload={"approval_id": "a1", "operation": "execute_command", "details": {},
+                            "origin": {"target_type": "group", "user_id": "u1"}})
+        _asyncio.run(router._handle_approval_requested(ev))
+        if expect_origin:
+            assert cb.calls == [{"target_type": "group", "user_id": "u1", "conversation_key": "qq_group:abc"}]
+        else:
+            assert cb.calls == ["qq_group:abc"]

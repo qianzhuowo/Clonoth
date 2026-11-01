@@ -150,12 +150,43 @@ def test_dispatch_child_inherits_qq_identity_by_platform(state) -> None:
     assert _request(state, child, tid, "write_file", path="x.txt").safety_level == SafetyLevel.deny
 
 
-def test_qq_admin_follows_normal_policy_and_schedule_is_auto(state, qq_session) -> None:
+def test_qq_admin_non_sensitive_is_auto_and_schedule_is_auto(state, qq_session) -> None:
     tid = _task(state, qq_session, platform_auth={"platform": "qq", "is_admin": True})
     cmd = _request(state, qq_session, tid, "execute_command", command="ls")
-    assert cmd.safety_level == SafetyLevel.approval_required
+    assert cmd.safety_level == SafetyLevel.auto
+    assert cmd.approval_id is None
     sched = _request(state, qq_session, tid, "write_file", path="data/schedules.yaml")
     assert sched.safety_level == SafetyLevel.auto
+
+
+@pytest.mark.parametrize("op,params", [
+    ("execute_command", {"command": "pip install requests"}),
+    ("execute_command", {"command": "wget https://example.com/x"}),
+    ("execute_command", {"command": "chmod +x run.sh"}),
+    ("execute_command", {"command": "git push origin main"}),
+    ("write_file", {"path": "engine/runner.py"}),
+    ("write_file", {"path": "config/nodes/qq_assistant.yaml"}),
+    ("restart", {"target": "engine"}),
+])
+def test_qq_admin_sensitive_still_needs_approval(state, qq_session, op, params) -> None:
+    tid = _task(state, qq_session, platform_auth={"platform": "qq", "user_id": "u1", "is_admin": True})
+    out = _request(state, qq_session, tid, op, **params)
+    assert out.safety_level == SafetyLevel.approval_required
+    assert out.approval_id
+
+
+def test_qq_admin_deny_is_never_relaxed(state, qq_session) -> None:
+    tid = _task(state, qq_session, platform_auth={"platform": "qq", "is_admin": True})
+    out = _request(state, qq_session, tid, "execute_command", command="rm -rf /")
+    assert out.safety_level == SafetyLevel.deny
+
+
+def test_policy_sensitive_flags(policy: PolicyEngine) -> None:
+    assert policy.evaluate_execute_command(command="ls").sensitive is False
+    assert policy.evaluate_execute_command(command="pip install x").sensitive is True
+    assert policy.evaluate_write_file(path="notes/a.txt").sensitive is False
+    assert policy.evaluate_write_file(path="engine/x.py").sensitive is True
+    assert policy.evaluate_restart(target="engine").sensitive is True
 
 
 def test_qq_non_admin_cannot_write_schedules(state, qq_session) -> None:
@@ -234,3 +265,32 @@ def test_callback_inbound_inherits_platform_auth_only() -> None:
     empty: dict = {}
     carry_platform_auth(empty, None)
     assert empty == {}
+
+
+# --------------------------------------------------------------------------- #
+# Approval origin (triggering window)
+# --------------------------------------------------------------------------- #
+def test_approval_carries_group_origin(state, qq_session) -> None:
+    tid = _task(state, qq_session, platform_auth={"platform": "qq", "user_id": "u1", "is_admin": True})
+    state.tasks[tid].input["task_context"].update({
+        "conversation_key": "qq_group:abc", "channel": "qq_group",
+        "route_hints": {"platform": "qq", "target_type": "group"},
+    })
+    out = _request(state, qq_session, tid, "execute_command", command="pip install x")
+    origin = state.approvals[out.approval_id].origin
+    assert origin == {
+        "conversation_key": "qq_group:abc", "channel": "qq_group",
+        "platform": "qq", "target_type": "group", "user_id": "u1",
+    }
+
+
+def test_dispatch_child_approval_points_to_parent_private_chat(state) -> None:
+    child = state.get_or_create_session(channel="qq_private", conversation_key="agent:w:qq_private:p1")
+    tid = _task(state, child, platform_auth={"platform": "qq", "user_id": "u2", "is_admin": True})
+    state.tasks[tid].input["task_context"].update({
+        "conversation_key": "agent:w:qq_private:p1", "route_conversation_key": "qq_private:p1",
+    })
+    out = _request(state, child, tid, "restart", target="engine")
+    origin = state.approvals[out.approval_id].origin
+    assert origin["conversation_key"] == "qq_private:p1"
+    assert origin["target_type"] == "private"

@@ -150,6 +150,44 @@ def _extract_tool_spec(py: Path) -> tuple[dict[str, Any] | None, float | None]:
     return spec, timeout_sec
 
 
+_SCRIPT_IDENTITY_ENV_KEYS = (
+    "CLONOTH_SUPERVISOR_URL",
+    "CLONOTH_SESSION_ID",
+    "CLONOTH_PARENT_SESSION_ID",
+    "CLONOTH_TASK_ID",
+    "CLONOTH_NODE_ID",
+    "CLONOTH_CONVERSATION_KEY",
+    "CLONOTH_TOOL_CALL_ID",
+)
+
+
+def _script_tool_env(ctx: Any) -> dict[str, str]:
+    """External-tool environment carrying the calling task's identity.
+
+    Identity keys inherited from the Engine process are dropped first, so a
+    value missing on the current ToolContext never leaks a stale identity.
+    Tools such as qq_forward / drawtools use these to call back into the
+    supervisor for the right session and conversation.
+    """
+    env = _safe_subprocess_env()
+    for key in _SCRIPT_IDENTITY_ENV_KEYS:
+        env.pop(key, None)
+    values = {
+        "CLONOTH_SUPERVISOR_URL": getattr(ctx, "supervisor_url", ""),
+        "CLONOTH_SESSION_ID": getattr(ctx, "session_id", ""),
+        "CLONOTH_PARENT_SESSION_ID": getattr(ctx, "parent_session_id", ""),
+        "CLONOTH_TASK_ID": getattr(ctx, "task_id", ""),
+        "CLONOTH_NODE_ID": getattr(ctx, "node_id", ""),
+        "CLONOTH_CONVERSATION_KEY": getattr(ctx, "conversation_key", ""),
+        "CLONOTH_TOOL_CALL_ID": getattr(ctx, "tool_call_id", ""),
+    }
+    for key, value in values.items():
+        value = str(value or "").strip()
+        if value:
+            env[key] = value
+    return env
+
+
 def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFunc:
     """Create a tool function that runs a Python script as a subprocess.
 
@@ -182,15 +220,9 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
         input_json = json.dumps(args or {}, ensure_ascii=False)
 
         try:
-            sub_env = _safe_subprocess_env()
+            sub_env = _script_tool_env(ctx)
             if isinstance(root, Path):
                 sub_env["CLONOTH_WORKSPACE"] = str(root)
-            _ctx_sid = str(getattr(ctx, "session_id", "") or "").strip()
-            _ctx_tid = str(getattr(ctx, "task_id", "") or "").strip()
-            if _ctx_sid:
-                sub_env["CLONOTH_SESSION_ID"] = _ctx_sid
-            if _ctx_tid:
-                sub_env["CLONOTH_TASK_ID"] = _ctx_tid
             proc = await asyncio.create_subprocess_exec(
                 sys.executable, str(script_path),
                 stdin=asyncio.subprocess.PIPE,
@@ -629,8 +661,13 @@ class ToolRegistry:
 
         builtin_names = set(self._tool_specs.keys())
 
-        for py in sorted(self.tools_dir.glob("*.py")):
-            if py.name == "__init__.py":
+        # Tool packs (tools/drawtools/, tools/stocktool/) keep entrypoints in
+        # subdirectories. Only files declaring a top-level SPEC register; helper
+        # modules, private (_*) and *.disabled.py files are skipped.
+        for py in sorted(self.tools_dir.rglob("*.py")):
+            if py.name == "__init__.py" or py.name.startswith("_") or py.name.endswith(".disabled.py"):
+                continue
+            if "__pycache__" in py.parts:
                 continue
 
             spec, timeout_sec = _extract_tool_spec(py)

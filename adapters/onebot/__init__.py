@@ -1198,9 +1198,14 @@ class TangQiuCallbacks:
         if bot:
             await _send_attachment_path(bot, target, Path(path))
 
-    async def send_intermediate_reply(self, trigger: TriggerInfo, text: str) -> None:
-        """发送主节点中间回复，但不写入群历史。"""
-        if not text:
+    async def send_intermediate_reply(
+        self,
+        trigger: TriggerInfo,
+        text: str,
+        attachments: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """发送主节点中间回复（可带附件），但不写入群历史。"""
+        if not text and not attachments:
             return
         platform_data = trigger.platform_data
         bot = platform_data.get("bot") or _get_fallback_bot()
@@ -1217,12 +1222,12 @@ class TangQiuCallbacks:
         text, reactions = _extract_reactions(text)
         if reactions:
             await self.add_reactions(trigger, reactions)
-        if text:
+        if text or attachments:
             await _send_text_and_attachments(
                 bot,
                 target,
                 text,
-                [],
+                attachments or [],
                 conversation_key=trigger.conversation_key,
                 # 中间回复只解析显式 <tts> 段，不因语音输入自动 fallback 整段合成。
                 input_modality="text",

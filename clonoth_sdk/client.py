@@ -131,6 +131,8 @@ class ClonothClient:
         use_context: bool = True,
         entry_node_id: str | None = None,
         use_branch: bool | None = None,
+        platform_auth: dict[str, Any] | None = None,
+        route_hints: dict[str, Any] | None = None,
     ) -> InboundResult:
         """提交用户消息到 Supervisor。
 
@@ -166,6 +168,10 @@ class ClonothClient:
             payload["entry_node_id"] = entry_node_id
         if use_branch is not None:
             payload["use_branch"] = use_branch
+        if platform_auth:
+            payload["platform_auth"] = dict(platform_auth)
+        if route_hints:
+            payload["route_hints"] = dict(route_hints)
 
         resp = await self._http().post(f"{self._base_url}/v1/inbound", json=payload)
         resp.raise_for_status()
@@ -286,15 +292,29 @@ class ClonothClient:
             comment: 附加说明（可选）
 
         Returns:
-            True 表示提交成功（HTTP 状态码 < 400）
+            True 表示服务器确认了所请求的最终决策，而非仅 HTTP 请求成功。
         """
+        if decision not in {"allow", "deny"}:
+            raise ValueError("decision must be allow or deny")
         body: dict[str, Any] = {"decision": decision}
         if comment is not None:
             body["comment"] = comment
         resp = await self._http().post(
             f"{self._base_url}/v1/approvals/{approval_id}", json=body,
         )
-        return resp.status_code < 400
+        if not 200 <= resp.status_code < 300:
+            return False
+        try:
+            result = resp.json()
+        except ValueError:
+            return False
+        expected_status = "allowed" if decision == "allow" else "denied"
+        return (
+            isinstance(result, dict)
+            and result.get("approval_id") == approval_id
+            and result.get("status") == expected_status
+            and result.get("decision") == decision
+        )
 
     # ================================================================
     #  Cancel — 取消任务

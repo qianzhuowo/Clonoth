@@ -53,6 +53,7 @@ pnpm-debug.log*
 # Local-only tools, plans, and editor state
 .limcode/
 secret_skills/
+docs/migration/
 .idea/
 .vscode/
 *.swp
@@ -62,13 +63,28 @@ secret_skills/
 .DS_Store
 Thumbs.db
 
-# Test-only content is kept out of the cleaned original repository
-tests/
-test_*.py
-**/__tests__/
-*.test.*
-*.spec.*
-tools/
-
 /TEMP/
 *.local.yaml
+
+# Test results and reports
+.tox/
+.nox/
+.hypothesis/
+coverage.xml
+junit*.xml
+pytest-report*.*
+report.xml
+test-results/
+test-reports/
+
+# Local runtime databases outside /data
+*.sqlite3
+*.sqlite3-journal
+*.db-wal
+*.db-shm
+
+# Migration: site-specific artifacts that must stay local
+adapters/onebot/napcat-security/local-reports/
+tools/drawtools/settings.yaml
+tools/drawtools/character_tags.yaml
+config/qq_user_profiles.yaml

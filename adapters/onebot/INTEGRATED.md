@@ -26,7 +26,7 @@ ws://127.0.0.1:18080/onebot/v11/ws
 NoneBot 日志中已经确认连接：
 
 ```text
-OneBot V11 | Bot 3944289651 connected
+OneBot V11 | Bot <BOT_QQ> connected
 ```
 
 NapCat 日志中已经确认反向 WebSocket 已启动：
@@ -88,7 +88,7 @@ supervisor:
     onebot_host: "127.0.0.1"
     onebot_port: 18080
     onebot_entry_node: "qq_assistant"
-    napcat_quick_login: "3944289651"
+    napcat_quick_login: "<BOT_QQ>"
 ```
 
 Supervisor 启动后会自动拉起：
@@ -132,7 +132,7 @@ data/onebot/napcat/onekey/NapCat.44498.Shell/config/onebot11.json
 账号专用配置会写入：
 
 ```text
-data/onebot/napcat/onekey/NapCat.44498.Shell/versions/9.9.26-44498/resources/app/napcat/config/onebot11_3944289651.json
+data/onebot/napcat/onekey/NapCat.44498.Shell/versions/9.9.26-44498/resources/app/napcat/config/onebot11_<BOT_QQ>.json
 ```
 
 这个账号专用配置中必须包含：
@@ -185,7 +185,7 @@ python adapters/onebot/app.py
 管理 NapCat：
 
 ```bash
-python adapters/onebot/napcat_manager.py start --reverse-host 127.0.0.1 --reverse-port 18080 --reverse-suffix /onebot/v11/ws --quick-login 3944289651
+python adapters/onebot/napcat_manager.py start --reverse-host 127.0.0.1 --reverse-port 18080 --reverse-suffix /onebot/v11/ws --quick-login <BOT_QQ>
 python adapters/onebot/napcat_manager.py stop
 python adapters/onebot/napcat_manager.py status
 ```
@@ -251,7 +251,7 @@ onebot_tts_instruction: ""
 检查账号专用配置：
 
 ```text
-data/onebot/napcat/onekey/NapCat.44498.Shell/versions/9.9.26-44498/resources/app/napcat/config/onebot11_3944289651.json
+data/onebot/napcat/onekey/NapCat.44498.Shell/versions/9.9.26-44498/resources/app/napcat/config/onebot11_<BOT_QQ>.json
 ```
 
 确认里面存在 `websocketClients`，并且地址是：

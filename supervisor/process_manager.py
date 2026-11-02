@@ -96,9 +96,8 @@ class ProcessManager:
         self.spawn_napcat = get_bool(runtime_cfg, "supervisor.process_manager.spawn_napcat", False)
         self.onebot_host = get_str(runtime_cfg, "supervisor.process_manager.onebot_host", "127.0.0.1")
         self.onebot_port = get_int(runtime_cfg, "supervisor.process_manager.onebot_port", 18080, min_value=1, max_value=65535)
-        self.onebot_entry_node = get_str(runtime_cfg, "supervisor.process_manager.onebot_entry_node", "qq_assistant")
+        self.onebot_entry_node = get_str(runtime_cfg, "supervisor.process_manager.onebot_entry_node", "qq.orchestrator")
         self.napcat_quick_login = get_str(runtime_cfg, "supervisor.process_manager.napcat_quick_login", "")
-        self.onebot_superusers = get_str(runtime_cfg, "supervisor.process_manager.onebot_superusers", "")
         self.onebot_owner_id = get_str(runtime_cfg, "supervisor.process_manager.onebot_owner_id", "")
         self.onebot_owner_name = get_str(runtime_cfg, "supervisor.process_manager.onebot_owner_name", "")
         self.onebot_voice_input = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_input", True)
@@ -273,7 +272,6 @@ class ProcessManager:
                 "CLONOTH_URL": self.supervisor_url,
                 "CLONOTH_WORKSPACE": str(self.workspace_root),
                 "CLONOTH_ENTRY_NODE": self.onebot_entry_node,
-                "CLONOTH_QQ_SUPERUSERS": self.onebot_superusers,
                 "CLONOTH_QQ_OWNER_ID": self.onebot_owner_id,
                 "CLONOTH_QQ_OWNER_NAME": self.onebot_owner_name,
                 "CLONOTH_ONEBOT_VOICE_INPUT": str(self.onebot_voice_input).lower(),

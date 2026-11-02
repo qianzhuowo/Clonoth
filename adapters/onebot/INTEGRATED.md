@@ -87,7 +87,7 @@ supervisor:
     spawn_napcat: true
     onebot_host: "127.0.0.1"
     onebot_port: 18080
-    onebot_entry_node: "qq_assistant"
+    onebot_entry_node: "qq.orchestrator"
     napcat_quick_login: "<BOT_QQ>"
 ```
 

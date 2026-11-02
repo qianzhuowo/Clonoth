@@ -197,13 +197,13 @@ supervisor:
     spawn_napcat: false
     onebot_host: "127.0.0.1"
     onebot_port: 18080
-    onebot_entry_node: "qq_assistant"
+    onebot_entry_node: "qq.orchestrator"
     # 首次扫码登录后，可填机器人 QQ 号用于 NapCat 快速登录。
     # 留空时，项目会优先启动 NapCat 安装器或登录界面。
     napcat_quick_login: ""
 
-    # QQ 最高权限用户。多个 QQ 号用逗号分隔。
-    onebot_superusers: ""
+    # 群/私聊白名单与管理员 QQ 号写在 .env（CLONOTH_ALLOWED_GROUPS、
+    # CLONOTH_ALLOWED_PRIVATE_USERS、CLONOTH_ADMIN_QQ_USERS），不要写进本文件。
     onebot_owner_id: ""
     onebot_owner_name: ""
 

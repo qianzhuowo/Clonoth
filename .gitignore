@@ -88,3 +88,6 @@ adapters/onebot/napcat-security/local-reports/
 tools/drawtools/settings.yaml
 tools/drawtools/character_tags.yaml
 config/qq_user_profiles.yaml
+config/qq_custom_faces.txt
+config/qq_custom_faces.json
+config/nodes/_persona.md

@@ -16,8 +16,20 @@ CLONOTH_WORKSPACE = os.environ.get("CLONOTH_WORKSPACE", str(Path(__file__).resol
 # 入口节点 ID
 ENTRY_NODE_ID = os.environ.get("CLONOTH_ENTRY_NODE", "main")
 
-# QQ 自定义表情名称索引文件路径（可选）
-BQBS_PATH = os.environ.get("CLONOTH_BQBS_PATH", "")
+# 旧 bqbs.txt 顺序别名文件（可选）。生产环境用 ONEBOT_CUSTOM_EMOJI_INDEX_PATH，新部署用 CLONOTH_BQBS_PATH。
+BQBS_PATH = (
+    os.environ.get("ONEBOT_CUSTOM_EMOJI_INDEX_PATH", "").strip()
+    or os.environ.get("CLONOTH_BQBS_PATH", "").strip()
+)
+
+# QQ 收藏表情：AI 可见名称文件（只含基础名）与内部元数据（md5/resId/emojiId）。均不入库。
+CUSTOM_FACE_NAMES_PATH = os.environ.get(
+    "ONEBOT_CUSTOM_FACE_NAMES_PATH", os.path.join(CLONOTH_WORKSPACE, "config", "qq_custom_faces.txt")
+)
+CUSTOM_FACE_METADATA_PATH = os.environ.get(
+    "ONEBOT_CUSTOM_FACE_METADATA_PATH", os.path.join(CLONOTH_WORKSPACE, "config", "qq_custom_faces.json")
+)
+CUSTOM_FACE_PROMPT_LIMIT = max(0, min(200, int(os.environ.get("ONEBOT_CUSTOM_FACE_PROMPT_LIMIT", "50") or "50")))
 
 def _parse_qq_id_list(raw: str) -> list[int]:
     """Parse a comma separated QQ/group id list; non-numeric items are ignored."""

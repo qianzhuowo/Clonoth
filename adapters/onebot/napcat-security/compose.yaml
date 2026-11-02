@@ -1,0 +1,28 @@
+# Template only: do not start until verify_image.py reports all stacks passed.
+# Export an immutable local image ID (sha256:...) from the verification report.
+services:
+  napcat:
+    image: ${NAPCAT_VERIFIED_IMAGE:?Set the verified immutable image ID}
+    pull_policy: never
+    container_name: napcat
+    restart: unless-stopped
+    network_mode: bridge
+    # Deliberately no ports: reverse WS connects to the host adapter.
+    environment:
+      ACCOUNT: ${NAPCAT_ACCOUNT:?Set the existing QQ account locally}
+      NAPCAT_UID: "0"
+      NAPCAT_GID: "0"
+      TZ: Asia/Shanghai
+    ulimits:
+      core: 0
+    volumes:
+      - ${NAPCAT_DATA_DIR:?Set the NapCat data dir}/config:/app/napcat/config
+      - ${NAPCAT_DATA_DIR}/qq:/app/.config/QQ
+      - ${NAPCAT_DATA_DIR}/qq/NapCat/temp:/app/.config/QQ/NapCat/temp
+      # Clonoth attachments: mount at the same absolute path so file:// paths resolve.
+      - ${CLONOTH_ATTACHMENTS_DIR:?Set Clonoth data/attachments}:${CLONOTH_ATTACHMENTS_DIR}:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

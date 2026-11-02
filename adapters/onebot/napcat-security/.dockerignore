@@ -1,0 +1,11 @@
+*
+!Dockerfile
+!.dockerignore
+!Dockerfile.experimental
+!Dockerfile.worker
+!bootstrap.mjs
+!runtime-policy.cjs
+!node-preload.cjs
+!worker-guard.cjs
+!ca-evidence.json
+!probe.cjs

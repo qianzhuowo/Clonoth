@@ -1,0 +1,17 @@
+# Opt-in worker-guard experiment, NOT a verified security release.
+# BASE_IMAGE must be the locally built CA candidate, verified by immutable ID
+# before building. Keep the normal Dockerfile/compose verification gate intact.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+COPY runtime-policy.cjs ca-evidence.json bootstrap.mjs probe.cjs node-preload.cjs worker-guard.cjs /opt/clonoth-security/
+RUN set -eu; \
+    echo '6801f93e533846cea05f4f531874a0e84371ab2331c5585b57cd7e3b869cf96b  /app/NapCat.Shell.zip' | sha256sum -c -; \
+    mkdir -p /app/napcat; \
+    unzip -qo /app/NapCat.Shell.zip -d /app/napcat; \
+    test -f /app/napcat/napcat.mjs; \
+    test -f /app/napcat/worker/conoutSocketWorker.mjs; \
+    sed -i "1i import '/opt/clonoth-security/bootstrap.mjs';" /app/napcat/napcat.mjs; \
+    sed -i "1i import '/opt/clonoth-security/bootstrap.mjs';" /app/napcat/worker/conoutSocketWorker.mjs
+# Upstream entrypoint preserves the pre-extracted business module. Main process,
+# utilityProcess child, and guarded Worker threads each initialize Node TLS policy.
+LABEL org.clonoth.security.status="experimental-worker-guarded-runtime-hardening"

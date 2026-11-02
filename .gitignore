@@ -85,8 +85,6 @@ test-reports/
 
 # Migration: site-specific artifacts that must stay local
 adapters/onebot/napcat-security/local-reports/
-tools/drawtools/settings.yaml
-tools/drawtools/character_tags.yaml
 config/qq_user_profiles.yaml
 config/qq_custom_faces.txt
 config/qq_custom_faces.json
@@ -98,3 +96,21 @@ config/nodes/_persona.md
 /tools/drawtools/prompts/novelai/top-system.md
 /tools/drawtools/prompts/novelai/output-format.md
 /tools/drawtools/prompts/novelai/tag-guide.md
+
+# Editor / merge leftovers and scratch files
+*.bak
+*.orig
+*.rej
+*.tmp
+*~
+/scratch*/
+/scratch*.py
+
+# Ad-hoc test scripts and outputs outside tests/ (real tests live in tests/)
+/test_*.py
+/*_test.py
+/debug_*.py
+.benchmarks/
+*.prof
+*.lprof
+profile*.out

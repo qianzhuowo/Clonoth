@@ -57,6 +57,31 @@ ANON_MAP_SAVE_MIN_INTERVAL = max(0.0, float(os.environ.get("ONEBOT_ANON_MAP_SAVE
 # 单条 QQ 消息长度上限。
 QQ_MESSAGE_LIMIT = max(500, int(os.environ.get("ONEBOT_QQ_MESSAGE_LIMIT", "4300") or "4300"))
 
+
+def _env_int_range(name: str, default: int, min_value: int, max_value: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, "") or default)
+    except ValueError:
+        value = default
+    value = max(min_value, value)
+    return min(max_value, value) if max_value is not None else value
+
+
+# QQ 用户称呼 Profile（只影响称呼与身份说明，不授予权限）；含真实 QQ 号，不入库。
+USER_PROFILES_PATH = os.environ.get(
+    "CLONOTH_QQ_USER_PROFILES_PATH", os.path.join(CLONOTH_WORKSPACE, "config", "qq_user_profiles.yaml")
+)
+
+# 群聊上下文：保留最近 N 条，每条压缩到 HISTORY_TEXT_LIMIT 字符。
+GROUP_HISTORY_MAX = _env_int_range("ONEBOT_GROUP_HISTORY_MAX", 20, 0)
+HISTORY_TEXT_LIMIT = _env_int_range("ONEBOT_HISTORY_TEXT_LIMIT", 400, 50)
+
+# 合并转发展开：递归深度、总条数与总字数上限。
+ENABLE_FORWARD_MSG_INPUT = os.environ.get("ONEBOT_ENABLE_FORWARD_MSG_INPUT", "true").strip().lower() not in {"0", "false", "no", "off"}
+FORWARD_MSG_MAX_DEPTH = _env_int_range("ONEBOT_FORWARD_MSG_MAX_DEPTH", 3, 0, 8)
+FORWARD_MSG_MAX_MESSAGES = _env_int_range("ONEBOT_FORWARD_MSG_MAX_MESSAGES", 80, 1, 500)
+FORWARD_MSG_TEXT_LIMIT = _env_int_range("ONEBOT_FORWARD_MSG_TEXT_LIMIT", 12000, 500, 100000)
+
 # QQ 最高权限用户列表（逗号分隔）。这些用户会在 inbound 文本中标记为最高权限管理员。
 _raw_superusers = os.environ.get("CLONOTH_QQ_SUPERUSERS", "")
 QQ_SUPERUSERS: set[int] = {int(u) for u in _raw_superusers.split(",") if u.strip().isdigit()}

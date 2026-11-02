@@ -19,9 +19,43 @@ ENTRY_NODE_ID = os.environ.get("CLONOTH_ENTRY_NODE", "main")
 # QQ 自定义表情名称索引文件路径（可选）
 BQBS_PATH = os.environ.get("CLONOTH_BQBS_PATH", "")
 
-# 允许接入的群号列表（逗号分隔）；空值表示全部群均可接入
+def _parse_qq_id_list(raw: str) -> list[int]:
+    """Parse a comma separated QQ/group id list; non-numeric items are ignored."""
+    result: list[int] = []
+    for item in (raw or "").split(","):
+        token = item.strip()
+        if token.isdigit():
+            result.append(int(token))
+    return result
+
+
+# 允许接入的群号列表（逗号分隔）。空值表示不允许任何群（白名单制）。
 _raw_groups = os.environ.get("CLONOTH_ALLOWED_GROUPS", "")
-ALLOWED_GROUPS: list[int] = [int(g) for g in _raw_groups.split(",") if g.strip()]
+ALLOWED_GROUPS: list[int] = _parse_qq_id_list(_raw_groups)
+
+# QQ 审批管理员：只有这些用户能批准/拒绝审批；为空时所有审批直接拒绝。
+ADMIN_QQ_USERS: list[int] = _parse_qq_id_list(os.environ.get("CLONOTH_ADMIN_QQ_USERS", ""))
+
+# 私聊白名单。为空、或写了“好友/friend”时，已通过好友请求的用户也可私聊。
+_raw_private_users = os.environ.get("CLONOTH_ALLOWED_PRIVATE_USERS", "")
+ALLOWED_PRIVATE_USERS: list[int] = _parse_qq_id_list(_raw_private_users)
+ALLOW_PRIVATE_FRIENDS: bool = (
+    not ALLOWED_PRIVATE_USERS
+    or "好友" in _raw_private_users
+    or "friend" in _raw_private_users.lower()
+)
+
+# 提交给 Supervisor 的会话键用 HMAC 稳定哈希，真实群号/QQ 号只留在适配器本地。
+CONVERSATION_HASH_SECRET = os.environ.get("ONEBOT_CONVERSATION_HASH_SECRET", "").strip()
+
+# 匿名映射（真实号 <-> UserX/GroupX）是去匿名化字典，属于敏感文件，不得入库。
+ANON_MAP_FILE = os.environ.get(
+    "ONEBOT_ANON_MAP_FILE", os.path.join(CLONOTH_WORKSPACE, "data", "onebot_anon_map.json")
+)
+ANON_MAP_SAVE_MIN_INTERVAL = max(0.0, float(os.environ.get("ONEBOT_ANON_MAP_SAVE_MIN_INTERVAL", "5.0") or "5.0"))
+
+# 单条 QQ 消息长度上限。
+QQ_MESSAGE_LIMIT = max(500, int(os.environ.get("ONEBOT_QQ_MESSAGE_LIMIT", "4300") or "4300"))
 
 # QQ 最高权限用户列表（逗号分隔）。这些用户会在 inbound 文本中标记为最高权限管理员。
 _raw_superusers = os.environ.get("CLONOTH_QQ_SUPERUSERS", "")

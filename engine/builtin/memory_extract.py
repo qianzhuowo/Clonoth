@@ -107,6 +107,10 @@ class MemoryExtractHandler:
         if task_input.get("_system_task"):
             log.debug("memory_extract gate: blocked by _system_task")
             return
+        inbound_mtype = str(task_input.get("inbound_message_type") or "").strip()
+        if inbound_mtype in ("dispatch_result", "async_tool_result"):
+            log.debug("memory_extract gate: blocked by inbound_message_type=%s", inbound_mtype)
+            return
         # [2026-06-04] Why: fresh child tasks are short-lived and disposable (session
         # cleaned within 24h), so extracting memory from them wastes CPU. However,
         # accumulate/persistent child nodes (like Smith) maintain long-lived sessions
@@ -154,9 +158,9 @@ class MemoryExtractHandler:
         # Why: a task that explicitly saved memory has already handled the turn.
         # How: preserve the old save_memory tool-name mutual exclusion. Purpose:
         # avoid duplicate memory entries from automatic extraction.
-        tool_names = (getattr(task, "result", None) or {}).get("_tool_names") or []
-        if "save_memory" in tool_names:
-            log.debug("memory_extract TRACE: BLOCKED by save_memory in tool_names")
+        tool_names = set((getattr(task, "result", None) or {}).get("_tool_names") or [])
+        if tool_names & {"save_memory", "delete_memory", "manage_memory:upsert", "manage_memory:delete"}:
+            log.debug("memory_extract TRACE: BLOCKED by memory write in tool_names")
             return
 
         # [Fork/Merge 2026-05-17] Why: completed entry tasks run on temporary
@@ -419,17 +423,23 @@ class MemoryExtractHandler:
             # and fall back to pending payloads, then prefix the transcript with
             # the sorted data/memory/*.yaml stems. Purpose: prefer existing books
             # while still allowing the extractor to create a new semantic book.
+            _source_nid = str(pending_extract.get("_source_node_id") or "").strip()
             workspace_value = ctx.get("workspace_root") or pending_extract.get("workspace_root")
             workspace_root = Path(workspace_value) if workspace_value is not None else None
-            _route_ns = str(
-                pending_extract.get("_memory_ns") or pending_extract.get("_source_node_id") or ""
-            ).strip()
-            mem_dir = workspace_root / "data" / "memory" if workspace_root is not None else None
-            if mem_dir is not None and _route_ns:
-                mem_dir = mem_dir / _route_ns
-            book_names = sorted(
-                p.stem for p in mem_dir.glob("*.yaml")
-            ) if mem_dir is not None and mem_dir.exists() else []
+            _route_ns = str(pending_extract.get("_memory_ns") or _source_nid or "").strip()
+            from engine.builtin.knowledge_inject import is_isolated_memory_namespace
+
+            mem_root = workspace_root / "data" / "memory" if workspace_root is not None else None
+            book_stems: set[str] = set()
+            if mem_root is not None and mem_root.exists():
+                scan_dirs = [mem_root / _route_ns] if _route_ns else []
+                # Isolated chats (conv_*) never see shared root books.
+                if not is_isolated_memory_namespace(_route_ns):
+                    scan_dirs.append(mem_root)
+                for scan_dir in scan_dirs:
+                    if scan_dir.is_dir():
+                        book_stems.update(p.stem for p in scan_dir.glob("*.yaml"))
+            book_names = sorted(book_stems)
             book_list_header = ""
             if book_names:
                 book_list_header = f"当前已有的 memory book 列表：{', '.join(book_names)}\n保存时优先使用已有 book，也可以创建新 book。\n\n"

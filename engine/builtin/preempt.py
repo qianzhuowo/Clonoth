@@ -209,7 +209,15 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
         workspace_name=getattr(ls.rctx, "workspace_name", "") or "",
     )
 
+    _in_mem_meta: dict[str, Any] = {
+        "preempt": True,
+        "message_type": "user_input",
+    }
+    _cur_tid = str(ls.rctx.task_id or "").strip()
+    if _cur_tid:
+        _in_mem_meta["source_task_id"] = _cur_tid
     if new_attachments:
+        _in_mem_meta["attachments"] = list(new_attachments)
         ls.messages.append({
             "role": "user",
             "content": build_multimodal_content(
@@ -217,9 +225,16 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
                 new_attachments,
                 workspace_root=ls.rctx.workspace_root,
             ),
+            "message_type": "user_input",
+            "_meta": _in_mem_meta,
         })
     else:
-        ls.messages.append({"role": "user", "content": new_instruction})
+        ls.messages.append({
+            "role": "user",
+            "content": new_instruction,
+            "message_type": "user_input",
+            "_meta": _in_mem_meta,
+        })
 
     # [Fork/Merge 2026-05-12] Persist the injected preempt user message to ConversationStore.
     # Why: before this hook was extracted, preempt injection only mutated the in-memory prompt,

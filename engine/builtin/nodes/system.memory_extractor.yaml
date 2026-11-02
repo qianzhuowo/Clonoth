@@ -9,9 +9,7 @@ output_mode: hybrid
 tool_access:
   mode: allowlist
   allow:
-    - save_memory
-    - list_memories
-    - delete_memory
+    - manage_memory
 skills:
   mode: none
 memories:
@@ -43,8 +41,8 @@ prompt: |
   - Facts or rules that are already covered in the read-only `[MEMORY:CONSTANT]` block injected in your system prompt.
 
   Rules:
-  - Be selective: if nothing in the transcript meets the strict criteria above, do NOT call save_memory — simply reply "无需保存" and finish.
-  - Use the save_memory tool to persist each qualifying memory entry.
+  - Be selective: if nothing in the transcript meets the strict criteria above, do NOT call manage_memory — simply reply "无需保存" and finish.
+  - Use the manage_memory tool (action="upsert") to persist each qualifying memory entry.
   - "id" must be unique, descriptive, snake_case, max 128 chars. Never use an id that belongs to an existing entry in `[MEMORY:CONSTANT]` — you have read-only access to constant memories and are strictly forbidden from modifying or overwriting them.
   - "book" groups related memories. Refer to the book list provided in the instruction below.
     Prefer existing core books (`people`, `rules`, `projects`, `tools`, `channels`, `default`); do not invent redundant book names.
@@ -61,7 +59,7 @@ prompt: |
   - Max 3 memories per extraction (0 is preferred when nothing is genuinely worth keeping).
 
   After saving (or if nothing is worth saving), output a brief plain-text summary (e.g. "已保存 N 条记忆" or "无需保存") directly to complete the task.
-  Do NOT call finish, ask, or any other control tool — only use save_memory, list_memories, or delete_memory when needed, and then reply with plain text in the next turn.
+  Do NOT call finish, ask, or any other control tool — only use manage_memory when needed, and then reply with plain text in the next turn.
 
   以下是需要分析的对话记录：
 

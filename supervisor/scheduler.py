@@ -125,6 +125,7 @@ class SchedulerThread:
         self._state = state
         self._workspace_root = workspace_root
         self._last_fired: dict[str, str] = {}  # schedule_id -> "YYYY-MM-DD HH:MM"
+        self._last_tick_minute: datetime | None = None
         self._thread: threading.Thread | None = None
         self._running_scripts: set[str] = set()  # 防重入
         self._scripts_lock = threading.Lock()
@@ -145,49 +146,70 @@ class SchedulerThread:
             # 每 30 分钟清理一次旧上下文快照（30 ticks × 60s = 30min）
             if tick_count % 30 == 0:
                 self._cleanup()
-            time.sleep(60)
+            # Align sleep to the next minute boundary (+0.2s) to prevent cumulative drift
+            sleep_sec = max(1.0, 60.0 - (time.time() % 60.0) + 0.2)
+            time.sleep(sleep_sec)
 
     def _tick(self) -> None:
         now = datetime.now(timezone.utc)
-        now_key = now.strftime("%Y-%m-%d %H:%M")
+        cur_min = now.replace(second=0, microsecond=0)
+        last_min = self._last_tick_minute
+        if last_min is not None:
+            gap_sec = (cur_min - last_min).total_seconds()
+            if 0 < gap_sec <= 300:
+                steps = int(gap_sec // 60)
+                minutes_to_check = [last_min + timedelta(minutes=i) for i in range(1, steps + 1)]
+            elif gap_sec <= 0:
+                minutes_to_check = [cur_min]
+            else:
+                minutes_to_check = [cur_min]
+        else:
+            minutes_to_check = [cur_min]
+        self._last_tick_minute = cur_min
 
         schedules = load_schedules(self._workspace_root)
 
-        for s in schedules:
-            sid = str(s.get("id") or "").strip()
-            if not sid:
-                continue
-            if not s.get("enabled", True):
-                continue
+        fired_once: set[str] = set()
+        for check_dt in minutes_to_check:
+            dt_key = check_dt.strftime("%Y-%m-%d %H:%M")
+            for s in schedules:
+                sid = str(s.get("id") or "").strip()
+                if not sid or sid in fired_once:
+                    continue
+                if not s.get("enabled", True):
+                    continue
 
-            cron_expr = str(s.get("cron") or "").strip()
-            if not cron_expr:
-                continue
+                cron_expr = str(s.get("cron") or "").strip()
+                if not cron_expr:
+                    continue
 
-            # 防止同一分钟重复触发
-            if self._last_fired.get(sid) == now_key:
-                continue
+                # 防止同一分钟重复触发
+                if self._last_fired.get(sid) == dt_key:
+                    continue
 
-            if not cron_match(cron_expr, now):
-                continue
+                if not cron_match(cron_expr, check_dt):
+                    continue
 
-            # 匹配成功
-            self._last_fired[sid] = now_key
-            once = bool(s.get("once", False))
-            stype = str(s.get("type") or "message").strip()
+                # 匹配成功
+                self._last_fired[sid] = dt_key
+                once = bool(s.get("once", False))
+                stype = str(s.get("type") or "message").strip()
 
-            if stype == "script":
-                threading.Thread(
-                    target=self._fire_script,
-                    args=(dict(s), sid),
-                    daemon=True,
-                    name=f"sched-script-{sid}",
-                ).start()
-            else:
-                self._fire_message(s, sid)
+                if stype == "script":
+                    threading.Thread(
+                        target=self._fire_script,
+                        args=(dict(s), sid),
+                        daemon=True,
+                        name=f"sched-script-{sid}",
+                    ).start()
+                else:
+                    self._fire_message(s, sid)
 
-            if once:
-                self._remove_schedule(sid)
+                if once:
+                    fired_once.add(sid)
+                    self._remove_schedule(sid)
+
+        now_key = cur_min.strftime("%Y-%m-%d %H:%M")
 
         # Why: system-level scheduled features now live in engine.builtin
         # supervisor hook handlers. How: emit a dream schedule tick with a
@@ -367,21 +389,48 @@ class SchedulerThread:
             if count > 0:
                 log.info(f"[scheduler] cleaned up {count} old context snapshots")
 
-            # 在锁内清理内存中已终结的旧 task（保留最近 200 个）
+            # 在锁内清理内存中已终结的旧 task（保留最近 80 个）
             with self._state._lock:
                 terminal = {TaskStatus.completed, TaskStatus.failed, TaskStatus.cancelled}
+                for task in self._state.tasks.values():
+                    if task.status in terminal and isinstance(task.result, dict):
+                        task.result.pop("_runtime_state", None)
                 finished_ids = [
                     tid for tid in self._state._task_order
                     if tid in self._state.tasks and self._state.tasks[tid].status in terminal
                 ]
-                if len(finished_ids) > 200:
-                    to_remove = finished_ids[:-200]
+                if len(finished_ids) > 80:
+                    to_remove = finished_ids[:-80]
                     for tid in to_remove:
                         self._state.tasks.pop(tid, None)
                     self._state._task_order = [
                         tid for tid in self._state._task_order if tid in self._state.tasks
                     ]
                     log.info(f"[scheduler] pruned {len(to_remove)} old tasks from memory")
+
+                # Keep recent inbound events and events referenced by active tasks.
+                active_seqs = {
+                    task.source_inbound_seq for task in self._state.tasks.values()
+                    if task.status not in terminal and task.source_inbound_seq is not None
+                }
+                for seq, event in list(self._state._inbound_events.items()):
+                    if (seq in self._state._inbound_processed or seq in self._state._inbound_routed) and isinstance(event, dict) and "payload" in event:
+                        self._state._inbound_events[seq] = {"session_id": str(event.get("session_id") or "")}
+                if self._state._inbound_cursor > 500:
+                    cut = self._state._inbound_cursor - 500
+                    evict_seqs = {
+                        seq for seq in self._state._inbound_order[:cut]
+                        if seq not in active_seqs
+                    }
+                    for seq in evict_seqs:
+                        self._state._inbound_events.pop(seq, None)
+                        self._state._inbound_processed.discard(seq)
+                        self._state._inbound_routed.pop(seq, None)
+                        self._state._inbound_leases.pop(seq, None)
+                    self._state._inbound_order = [
+                        seq for seq in self._state._inbound_order if seq not in evict_seqs
+                    ]
+                    self._state._inbound_cursor = max(0, self._state._inbound_cursor - len(evict_seqs))
 
                 # 回收超时的 running 状态 task（安全网，防止 worker 崩溃后 task 永久孤立）
                 _now_ts = datetime.now(timezone.utc)

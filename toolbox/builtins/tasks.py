@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..context import ToolContext
+from clonoth_runtime import load_runtime_config
 
 
 def _ok(result_text: str, **fields: Any) -> dict[str, Any]:
@@ -67,13 +68,36 @@ async def get_context_window(args: dict[str, Any], ctx: ToolContext) -> dict[str
         # empty branch estimate while the parent has the real usage record.
         route_session_id = ctx.route_session_id()
         r = await ctx.http.get(
-            f"{ctx.supervisor_url}/v1/sessions/{route_session_id}/context_window",
+            f"{ctx.supervisor_url}/v1/sessions/{route_session_id}/context_usage",
         )
         if r.status_code >= 400:
             return _err(r.text)
         payload = r.json()
         if isinstance(payload, dict):
-            return _ok("Context window retrieved", **payload)
+            prompt_tokens = int(payload.get("prompt_tokens") or 0)
+            estimated_tokens = int(payload.get("estimated_tokens") or 0)
+            message_count = int(payload.get("message_count") or 0)
+            runtime_cfg = load_runtime_config(ctx.workspace_root)
+            engine_cfg = runtime_cfg.get("engine") or {}
+            compact_cfg = engine_cfg.get("compact") or {}
+            threshold = int(compact_cfg.get("threshold_tokens", 160000))
+            eff_tokens = prompt_tokens if prompt_tokens > 0 else estimated_tokens
+            source = "provider_reported" if prompt_tokens > 0 else "char_estimate"
+            utilization = eff_tokens / threshold if threshold > 0 else 0.0
+            remaining = max(0, threshold - eff_tokens)
+            result_text = (
+                f"Context window usage: {eff_tokens:,} / {threshold:,} tokens "
+                f"({utilization * 100:.1f}%, remaining: {remaining:,} tokens), "
+                f"source={source}, messages={message_count}. "
+                f"prompt_tokens={prompt_tokens}, estimated_tokens={estimated_tokens}."
+            )
+            return _ok(result_text, **{
+                **payload, "prompt_tokens": prompt_tokens, "estimated_tokens": estimated_tokens,
+                "message_count": message_count, "effective_tokens": eff_tokens,
+                "source": source, "compact_threshold": threshold,
+                "utilization": utilization, "utilization_percent": utilization * 100,
+                "remaining_tokens": remaining,
+            })
         return _ok("Context window retrieved", value=payload)
     except Exception as e:
         return _err(e)

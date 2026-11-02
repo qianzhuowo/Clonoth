@@ -10,7 +10,7 @@ from typing import Any, TYPE_CHECKING
 
 from toolbox.registry import ToolRegistry
 
-from .pseudo_tools import _is_pseudo_tool_name, build_node_tool_specs, allowed_pseudo_names, refresh_dispatch_to_spec
+from .pseudo_tools import _is_pseudo_tool_name, build_node_tool_specs, allowed_pseudo_names, refresh_dispatch_to_spec, resolve_effective_action, is_tool_action_allowed
 from .resume_builder import apply_resume_messages, collect_resume_attachments
 from .loop_state import _LoopState, _build_loop_state, _persist_ctx as _persist_ctx_base, _short
 from .llm_call import (
@@ -260,10 +260,13 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
             if ls.allowed_pseudo_tools is not None and tc.name not in ls.allowed_pseudo_tools:
                 _reject_unauthorized(tc)
                 continue
+            if not is_tool_action_allowed(ls.node, tc.name, tc.arguments or {}):
+                _reject_unauthorized(tc)
+                continue
             pseudo_calls.append(tc)
         else:
             # 【Fix】真工具权限校验：工具必须在节点的授权列表内才能执行
-            if tc.name not in ls.allowed_real_tools:
+            if tc.name not in ls.allowed_real_tools or not is_tool_action_allowed(ls.node, tc.name, tc.arguments or {}):
                 _reject_unauthorized(tc)
                 continue
 
@@ -274,7 +277,12 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
             })
             # P0 Task 内核化：记录工具调用摘要
             _args_str = str(tc.arguments or {})[:200]
-            ls.rctx.tool_call_log.append({"name": tc.name, "args_summary": _args_str})
+            _cons_name, _eff_act = resolve_effective_action(tc.name, tc.arguments or {})
+            ls.rctx.tool_call_log.append({
+                "name": tc.name,
+                "action": f"{_cons_name}:{_eff_act}" if _eff_act else _cons_name,
+                "args_summary": _args_str,
+            })
 
     # 将 LLM 的工具调用决策追加到对话历史
     _assistant_msg = ls.formatter.build_assistant_message(resp, resp.text or "", resp.tool_calls)
@@ -512,14 +520,16 @@ def _align_step_tool_results_order(
     ]
 
 
+_PURE_LIST_MANAGERS = frozenset({"manage_skill", "manage_schedule", "manage_mcp_client", "manage_memory"})
+
+
 def _is_pure_tool_call(name: str, args: dict[str, Any], spec: dict[str, Any] | None) -> bool:
     """判断单个真实工具调用是否无副作用（pure）或声明式后台（async_mode），可安全并发执行。"""
     if spec and (spec.get("pure") or spec.get("async_mode")):
         return True
-    if name in ("manage_skill", "manage_schedule", "manage_mcp_client"):
-        act = str((args or {}).get("action") or "").strip().lower()
-        if act == "list" or (not act and not (args or {}).get("name") and not (args or {}).get("id")):
-            return True
+    if name in _PURE_LIST_MANAGERS:
+        _, eff_act = resolve_effective_action(name, args)
+        return eff_act == "list"
     if name in ("grep", "search_in_files"):
         return str((args or {}).get("mode") or "search").lower() != "replace"
     return name in ("list_skills", "list_memories", "list_mcp_clients", "list_dir", "read_file", "list_schedules", "get_context_window")

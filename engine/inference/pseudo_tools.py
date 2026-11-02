@@ -675,44 +675,267 @@ def _to_openai_tools(specs: list[dict]) -> list[dict]:
     return result
 
 
+_LEGACY_TO_CONSOLIDATED_ACTION: dict[str, tuple[str, str]] = {
+    "list_schedules": ("manage_schedule", "list"),
+    "create_schedule": ("manage_schedule", "upsert"),
+    "delete_schedule": ("manage_schedule", "delete"),
+    "list_mcp_clients": ("manage_mcp_client", "list"),
+    "create_or_update_mcp_client": ("manage_mcp_client", "upsert"),
+    "delete_mcp_client": ("manage_mcp_client", "delete"),
+    "list_skills": ("manage_skill", "list"),
+    "create_or_update_skill": ("manage_skill", "upsert"),
+    "delete_skill": ("manage_skill", "delete"),
+    "list_memories": ("manage_memory", "list"),
+    "save_memory": ("manage_memory", "upsert"),
+    "delete_memory": ("manage_memory", "delete"),
+    "create_or_update_tool": ("manage_tool", "upsert"),
+    "reload_tools": ("manage_tool", "reload"),
+}
+
 _LEGACY_TO_CONSOLIDATED: dict[str, str] = {
     "read_image": "read_media",
     "read_video": "read_media",
-    "list_schedules": "manage_schedule",
-    "create_schedule": "manage_schedule",
-    "delete_schedule": "manage_schedule",
-    "list_mcp_clients": "manage_mcp_client",
-    "create_or_update_mcp_client": "manage_mcp_client",
-    "delete_mcp_client": "manage_mcp_client",
-    "list_skills": "manage_skill",
-    "create_or_update_skill": "manage_skill",
-    "delete_skill": "manage_skill",
-    "create_or_update_tool": "manage_tool",
-    "reload_tools": "manage_tool",
+    **{k: v[0] for k, v in _LEGACY_TO_CONSOLIDATED_ACTION.items()},
 }
+
+
+def resolve_effective_action(tool_name: str, args: dict[str, Any] | None = None) -> tuple[str, str | None]:
+    """Resolve (canonical_tool_name, effective_action) for a tool call, handling defaults and synonyms."""
+    if tool_name in _LEGACY_TO_CONSOLIDATED_ACTION:
+        canonical, default_action = _LEGACY_TO_CONSOLIDATED_ACTION[tool_name]
+        # Registry memory aliases force their action; older aliases preserve an
+        # explicit action, which must therefore be checked instead of the default.
+        if canonical == "manage_memory" or not isinstance(args, dict) or "action" not in args:
+            return canonical, default_action
+    cons_name = _LEGACY_TO_CONSOLIDATED.get(tool_name, tool_name)
+    a = args if isinstance(args, dict) else {}
+    if cons_name in ("grep", "search_in_files"):
+        return "grep", str(a.get("mode") or "search").strip().lower()
+    act = str(a.get("action") or "").strip().lower()
+    if cons_name == "manage_memory":
+        if not act:
+            act = "upsert" if a.get("content") is not None else "list"
+        elif act in ("save", "create", "update"):
+            act = "upsert"
+        elif act in ("get", "read"):
+            act = "list"
+        elif act == "remove":
+            act = "delete"
+        return cons_name, act
+    if cons_name == "manage_skill":
+        if not act:
+            act = "upsert" if (a.get("name") and any(a.get(k) is not None for k in ("content", "description", "keywords", "strategy", "enabled", "priority", "order", "scan_depth", "visibility"))) else "list"
+        elif act in ("create", "update"):
+            act = "upsert"
+        elif act == "remove":
+            act = "delete"
+        return cons_name, act
+    if cons_name == "manage_schedule":
+        if not act:
+            act = "upsert" if (a.get("id") and any(a.get(k) is not None for k in ("cron", "text", "command", "type", "enabled", "once"))) else "list"
+        elif act in ("create", "update"):
+            act = "upsert"
+        elif act == "remove":
+            act = "delete"
+        return cons_name, act
+    if cons_name == "manage_mcp_client":
+        if not act:
+            act = "upsert" if (a.get("id") and any(a.get(k) is not None for k in ("transport", "command", "url", "args", "env", "headers", "enabled", "stateful"))) else "list"
+        elif act in ("create", "update"):
+            act = "upsert"
+        elif act == "remove":
+            act = "delete"
+        return cons_name, act
+    if cons_name == "manage_tool":
+        if not act:
+            act = "upsert" if (a.get("name") or a.get("script")) else "reload"
+        elif act in ("create", "update"):
+            act = "upsert"
+        return cons_name, act
+    if cons_name == "search_web":
+        if not act:
+            act = "fetch" if (a.get("urls") and not a.get("query")) else "search"
+        return cons_name, act
+    if act:
+        return cons_name, act
+    return cons_name, None
+
+
+def _parse_node_action_rules(node: "Node") -> tuple[set[str], dict[str, set[str]], dict[str, set[str]]]:
+    """Parse node.tool_access into (whole_denied_tools, denied_actions_by_tool, allowed_only_actions_by_tool).
+
+    Supports:
+    - 'tool_name': whole tool denied
+    - 'tool_name:act1,act2': specific actions denied
+    - 'tool_name:!act1,act2' or 'tool_name:!act1,!act2': all actions EXCEPT {act1, act2} denied
+    - legacy alias names in deny (e.g. 'delete_skill' -> deny 'manage_skill:delete'; if all aliases of a tool are in deny -> whole tool denied)
+    - partial legacy aliases or 'tool:act' in allow (when mode == 'allowlist' and the whole tool is not in allow)
+    """
+    whole_denied: set[str] = set()
+    denied_actions: dict[str, set[str]] = {}
+    allowed_only: dict[str, set[str]] = {}
+
+    def _add_allowed_only(tname: str, keep_set: set[str]) -> None:
+        if tname in allowed_only:
+            allowed_only[tname] &= keep_set
+        else:
+            allowed_only[tname] = set(keep_set)
+
+    raw_deny = [str(x).strip() for x in (node.tool_access.deny or []) if str(x).strip()]
+    legacy_deny_seen: dict[str, set[str]] = {}
+
+    for entry in raw_deny:
+        if ":" in entry:
+            tname, act_spec = entry.split(":", 1)
+            tname = _LEGACY_TO_CONSOLIDATED.get(tname.strip(), tname.strip())
+            act_spec = act_spec.strip()
+            if not tname or not act_spec:
+                continue
+            if act_spec.startswith("!"):
+                keep = {tok.lstrip("!").strip().lower() for tok in act_spec.split(",") if tok.lstrip("!").strip()}
+                if keep:
+                    _add_allowed_only(tname, keep)
+            else:
+                acts = {tok.strip().lower() for tok in act_spec.split(",") if tok.strip()}
+                if acts:
+                    denied_actions.setdefault(tname, set()).update(acts)
+        elif entry in _LEGACY_TO_CONSOLIDATED_ACTION:
+            cons, act = _LEGACY_TO_CONSOLIDATED_ACTION[entry]
+            denied_actions.setdefault(cons, set()).update({act})
+            legacy_deny_seen.setdefault(cons, set()).add(entry)
+        else:
+            whole_denied.add(entry)
+            if entry in _LEGACY_TO_CONSOLIDATED and entry not in _LEGACY_TO_CONSOLIDATED_ACTION:
+                legacy_deny_seen.setdefault(_LEGACY_TO_CONSOLIDATED[entry], set()).add(entry)
+
+    legacy_groups: dict[str, set[str]] = {}
+    for leg, cons in _LEGACY_TO_CONSOLIDATED.items():
+        legacy_groups.setdefault(cons, set()).add(leg)
+    for cons, aliases in legacy_groups.items():
+        if aliases <= legacy_deny_seen.get(cons, set()):
+            whole_denied.add(cons)
+
+    mode = (node.tool_access.mode or "none").lower()
+    if mode == "allowlist":
+        raw_allow = [str(x).strip() for x in (node.tool_access.allow or []) if str(x).strip()]
+        direct_whole_allow: set[str] = set()
+        allow_actions_by_tool: dict[str, set[str]] = {}
+        for entry in raw_allow:
+            if ":" in entry:
+                tname, act_spec = entry.split(":", 1)
+                tname = _LEGACY_TO_CONSOLIDATED.get(tname.strip(), tname.strip())
+                act_spec = act_spec.strip()
+                if tname and act_spec:
+                    if act_spec.startswith("!"):
+                        excluded = {tok.lstrip("!").strip().lower() for tok in act_spec.split(",") if tok.lstrip("!").strip()}
+                        direct_whole_allow.add(tname)
+                        denied_actions.setdefault(tname, set()).update(excluded)
+                    else:
+                        acts = {tok.strip().lower() for tok in act_spec.split(",") if tok.strip()}
+                        if acts:
+                            allow_actions_by_tool.setdefault(tname, set()).update(acts)
+            elif entry in _LEGACY_TO_CONSOLIDATED_ACTION:
+                cons, act = _LEGACY_TO_CONSOLIDATED_ACTION[entry]
+                allow_actions_by_tool.setdefault(cons, set()).update({act})
+            else:
+                direct_whole_allow.add(entry)
+                if entry in _LEGACY_TO_CONSOLIDATED:
+                    direct_whole_allow.add(_LEGACY_TO_CONSOLIDATED[entry])
+        for tname, acts in allow_actions_by_tool.items():
+            if tname not in direct_whole_allow:
+                _add_allowed_only(tname, acts)
+
+    for tname in list(allowed_only.keys()):
+        if tname in denied_actions:
+            allowed_only[tname] -= denied_actions[tname]
+        if not allowed_only[tname]:
+            whole_denied.add(tname)
+
+    return whole_denied, denied_actions, allowed_only
+
+
+def is_tool_action_allowed(node: "Node", tool_name: str, args: dict[str, Any] | None = None) -> bool:
+    """Return True if the specific action on tool_name is permitted by node.tool_access."""
+    whole_denied, denied_actions, allowed_only = _parse_node_action_rules(node)
+    cons_name, act = resolve_effective_action(tool_name, args)
+    if tool_name in whole_denied or cons_name in whole_denied:
+        return False
+    if act is not None:
+        if cons_name in denied_actions and act in denied_actions[cons_name]:
+            return False
+        if cons_name in allowed_only and act not in allowed_only[cons_name]:
+            return False
+    return True
+
+
+def _prune_spec_actions(
+    spec: dict[str, Any],
+    denied_acts: set[str] | None,
+    allowed_only_acts: set[str] | None,
+) -> dict[str, Any] | None:
+    """Prune denied actions from a tool spec's input_schema enum. Returns None if all enum actions are denied."""
+    import copy
+    if not denied_acts and allowed_only_acts is None:
+        return spec
+    schema = spec.get("input_schema")
+    if not isinstance(schema, dict):
+        return None if (allowed_only_acts is not None and len(allowed_only_acts) == 0) else spec
+    props = schema.get("properties")
+    if not isinstance(props, dict):
+        return spec
+    act_key = "action" if "action" in props else ("mode" if "mode" in props and spec.get("name") in ("grep", "search_in_files") else None)
+    if not act_key or not isinstance(props.get(act_key), dict):
+        return spec
+    enum_vals = props[act_key].get("enum")
+    if not isinstance(enum_vals, list) or not enum_vals:
+        return spec
+
+    def _ok(val: Any) -> bool:
+        v = str(val).strip().lower()
+        if denied_acts and v in denied_acts:
+            return False
+        if allowed_only_acts is not None and v not in allowed_only_acts:
+            return False
+        return True
+
+    kept = [v for v in enum_vals if _ok(v)]
+    if not kept:
+        return None
+    if len(kept) == len(enum_vals):
+        return spec
+    cloned = copy.deepcopy(spec)
+    cloned["input_schema"]["properties"][act_key]["enum"] = kept
+    return cloned
 
 
 def _filter_tool_specs(node: "Node", all_specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     mode = (node.tool_access.mode or "none").lower()
-    if mode == "all":
-        denied = set(node.tool_access.deny)
-        if denied:
-            legacy_groups: dict[str, set[str]] = {}
-            for legacy, consolidated in _LEGACY_TO_CONSOLIDATED.items():
-                legacy_groups.setdefault(consolidated, set()).add(legacy)
-            expanded_denied = denied | {
-                consolidated for consolidated, aliases in legacy_groups.items()
-                if aliases <= denied
-            }
-            return [s for s in all_specs if s.get("name") not in expanded_denied]
-        return list(all_specs)
+    if mode not in ("all", "allowlist"):
+        return []
+    whole_denied, denied_actions, allowed_only = _parse_node_action_rules(node)
     if mode == "allowlist":
-        allowed = set(node.tool_access.allow)
-        for k, v in _LEGACY_TO_CONSOLIDATED.items():
-            if k in allowed:
-                allowed.add(v)
-        return [s for s in all_specs if s.get("name") in allowed]
-    return []
+        allowed: set[str] = set()
+        for raw_entry in (node.tool_access.allow or []):
+            entry = str(raw_entry).strip()
+            if not entry:
+                continue
+            base = entry.split(":", 1)[0].strip()
+            allowed.add(base)
+            if base in _LEGACY_TO_CONSOLIDATED:
+                allowed.add(_LEGACY_TO_CONSOLIDATED[base])
+        candidates = [s for s in all_specs if s.get("name") in allowed]
+    else:
+        candidates = list(all_specs)
+
+    filtered: list[dict[str, Any]] = []
+    for s in candidates:
+        tname = str(s.get("name") or "")
+        if not tname or tname in whole_denied:
+            continue
+        pruned = _prune_spec_actions(s, denied_actions.get(tname), allowed_only.get(tname))
+        if pruned is not None:
+            filtered.append(pruned)
+    return filtered
 
 
 def build_node_tool_specs(

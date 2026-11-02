@@ -83,6 +83,8 @@ python -m pip install -U pip
 python -m pip install -r requirements.txt
 ```
 
+图片输入依赖 Pillow（已包含在 `requirements.txt`），用于提交模型前的图片解码和缩放。已有部署升级后，请在运行 Engine 的同一 Python 环境中重新执行 `python -m pip install -r requirements.txt` 并重启服务，避免缺少依赖时图片被替换为 `[Image unavailable]`。
+
 ### 2. 配置环境变量
 
 复制 `.env.example` 为 `.env`，填入 LLM Provider 的 API Key 和端点：

@@ -159,6 +159,11 @@ class SessionMixin:
         # 不再作为可恢复会话被误用。
         store = ConversationStore(self.workspace_root / "data" / "conversations")
         store.delete(session_id)
+        transcript = self.workspace_root / "data" / "transcripts" / f"{session_id}.jsonl"
+        try:
+            transcript.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def _create_entry_branch_locked(self, parent_session_id: str, inbound_seq: int) -> tuple[str, dict[str, Any]]:
         """Create a branch session for one inbound and fork parent history into it."""

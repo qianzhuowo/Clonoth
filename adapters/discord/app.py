@@ -14,6 +14,7 @@ import re
 import sys
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -138,6 +139,7 @@ class DiscordRuntime:
     router_task: asyncio.Task[Any] | None = None
     channel_history: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
     history_seq_counter: int = 0
+    transient_msg_ids: deque[int] = field(default_factory=lambda: deque(maxlen=1000))
     # [2026-05-14 refactor note] callbacks.py uses this factory so ApprovalView
     # can stay in agent.py without creating a callbacks -> agent import cycle.
     approval_view_factory: Callable[[str], discord.ui.View] | None = None

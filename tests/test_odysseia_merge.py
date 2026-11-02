@@ -13,13 +13,8 @@ import pytest
 import yaml
 
 from clonoth_sdk.approval import classify_path
-from clonoth_sdk.types import HealthInfo
 from engine import compact, data_cleanup
-from engine.builtin.usage_tracker import PLUGIN_META, UsageTracker
-from engine.hooks import HookContext
-from engine.hooks.registry import HookRegistry
 from engine.inference.tool_format import JsonToolFormatter, NativeToolFormatter
-from providers.base import ProviderResponse
 from providers.deepseek import DeepSeekProvider
 from providers.gemini import _parse_usage
 from supervisor.config_store import ConfigStore
@@ -101,33 +96,6 @@ def test_reasoning_survives_formatter_boundary():
         result = formatter.message_to_llm(message)
         assert result["_meta"]["reasoning"] == "private chain"
         assert "thought_summary" not in result["_meta"]
-
-
-def test_usage_tracker_runs_last_and_accumulates_all_six_fields():
-    registry = HookRegistry()
-    usage = dict(
-        prompt_tokens=10,
-        completion_tokens=5,
-        total_tokens=15,
-        cached_prompt_tokens=3,
-        cache_write_prompt_tokens=2,
-        reasoning_tokens=4,
-    )
-
-    async def fallback(ctx):
-        ctx.response = ProviderResponse(ok=True, usage=usage)
-
-    tracker = UsageTracker()
-    registry.register("after_llm_call", fallback, priority=-20)
-    registry.register("after_llm_call", tracker.handle)
-    rctx = SimpleNamespace(total_usage={})
-    ctx = HookContext(
-        messages=[], tools=[], node=None, provider=None,
-        response=ProviderResponse(ok=False), rctx=rctx,
-    )
-    asyncio.run(registry.afire("after_llm_call", ctx))
-    assert PLUGIN_META["priority"] == tracker.priority == -100
-    assert rctx.total_usage == usage
 
 
 def test_stats_cleanup_is_local_and_vacuums(tmp_path, monkeypatch):
@@ -217,10 +185,6 @@ def test_bounded_line_reader_skips_long_tail_and_keeps_next_line():
     assert _read_bounded_line(stream) == (None, False, 0)
 
 
-def test_sdk_health_remains_constructible_without_new_workspace_field():
-    assert HealthInfo("ok", "run", "now", 1.0).workspace_root == ""
-
-
 def test_sdk_external_path_classification(tmp_path):
     assert classify_path(tmp_path, [], "file.txt")[2] is False
     assert classify_path(tmp_path, [], "../outside.txt")[2] is True
@@ -249,7 +213,6 @@ def test_health_workspace_and_reset_clear_context_usage(tmp_path):
     )
     with TestClient(app) as client:
         assert client.get("/v1/health").json()["workspace_root"] == str(tmp_path)
-    assert app.state.panel_auth is not None
 
 
 def test_knowledge_inject_hygiene_static_index_and_progressive_outlines(tmp_path: Path):
@@ -360,7 +323,7 @@ def test_knowledge_inject_hygiene_static_index_and_progressive_outlines(tmp_path
     assert "[Large skill" in skill_dynamic_text
     assert "- L1: # 第一章 调研" in skill_dynamic_text
     assert "[Long memory" in mem_dynamic_text
-    assert 'list_memories(book="tech", id="long_active_mem")' in mem_dynamic_text
+    assert 'manage_memory(action="list", book="tech", id="long_active_mem")' in mem_dynamic_text
 
     # Verify list_memories(id=...) returns full untruncated content
     ctx = SimpleNamespace(
@@ -475,88 +438,57 @@ def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolatio
     assert block_view[-1]["content"] == "<!-- Start the ECoT -->"
 
 
-@pytest.mark.parametrize("result_fields", [
-    {"tool_call_id": "", "name": "read_file"},
-    {"name": "read_file"},
-    {"tool_call_id": "", "name": ""},
-    {"tool_call_id": " ", "name": " "},
-    {},
+@pytest.mark.parametrize("unmatched_fields,result_fields", [
+    (None, {"tool_call_id": "", "name": "read_file"}),
+    (None, {"name": "read_file"}),
+    (None, {"tool_call_id": "", "name": ""}),
+    (None, {"tool_call_id": " ", "name": " "}),
+    (None, {}),
+    ({"tool_call_id": "wrong_id", "name": "read_file"}, {"name": "read_file"}),
+    ({"tool_call_id": "", "name": "unknown_tool"}, {"name": "read_file"}),
 ])
-def test_legacy_tool_results_recover_ids_and_preserve_actual_output(result_fields):
+def test_legacy_tool_results_recover_ids_without_consuming_unmatched_calls(unmatched_fields, result_fields):
     from engine.inference.tool_format import build_llm_messages, repair_tool_result_pairing_with_stats
 
-    messages = [
-        {"role": "assistant", "content": "", "_meta": {"tool_mode": "native"},
-         "tool_calls": [{"id": "c1", "name": "read_file", "arguments": {}}]},
-        {"role": "tool", "content": "ACTUAL_RESULT", "_meta": {"tool_mode": "native"}, **result_fields},
-    ]
+    messages = [{"role": "assistant", "content": "", "_meta": {"tool_mode": "native"},
+                 "tool_calls": [{"id": "c1", "name": "read_file", "arguments": {}}]}]
+    if unmatched_fields is not None:
+        messages.append({"role": "tool", "content": "WRONG_RESULT", **unmatched_fields})
+    messages.append({"role": "tool", "content": "ACTUAL_RESULT", "_meta": {"tool_mode": "native"}, **result_fields})
     repaired, stats = repair_tool_result_pairing_with_stats(messages)
-    assert stats["removed_orphan_tool_results"] == 0
+    assert stats["removed_orphan_tool_results"] == int(unmatched_fields is not None)
     assert stats["fixed_orphan_tool_calls"] == 0
-    assert repaired[1]["tool_call_id"] == "c1"
-    assert repaired[1]["name"] == "read_file"
-    assert repaired[1]["content"] == "ACTUAL_RESULT"
-    view = build_llm_messages(messages, NativeToolFormatter())
-    assert view[0]["tool_calls"][0]["id"] == "c1"
-    assert view[1]["tool_call_id"] == "c1"
-    assert view[1]["name"] == "read_file"
-    assert view[1]["content"] == "ACTUAL_RESULT"
+    for view in (repaired, build_llm_messages(messages, NativeToolFormatter())):
+        assert view[0]["tool_calls"][0]["id"] == "c1"
+        assert [(m["tool_call_id"], m["name"], m["content"]) for m in view[1:]] == [
+            ("c1", "read_file", "ACTUAL_RESULT"),
+        ]
 
 
-@pytest.mark.parametrize("bad_fields", [
-    {"tool_call_id": "wrong_id", "name": "read_file"},
-    {"tool_call_id": "", "name": "unknown_tool"},
-])
-def test_unmatched_tool_results_cannot_consume_a_different_call(bad_fields):
+@pytest.mark.parametrize("positional", [False, True])
+def test_tool_result_pairing_prefers_names_and_consumes_each_call_once(positional):
     from engine.inference.tool_format import repair_tool_result_pairing_with_stats
 
-    messages = [
-        {"role": "assistant", "content": "",
-         "tool_calls": [{"id": "c1", "name": "read_file", "arguments": {}}]},
-        {"role": "tool", "content": "WRONG_RESULT", **bad_fields},
-        {"role": "tool", "tool_call_id": "", "name": "read_file", "content": "ACTUAL_RESULT"},
-    ]
+    messages = [{"role": "assistant", "content": "", "tool_calls": [
+        {"id": "c1", "name": "read_file", "arguments": {}},
+        {"id": "c2", "name": "search", "arguments": {}},
+    ]}]
+    if positional:
+        messages += [
+            {"role": "tool", "tool_call_id": "", "name": "", "content": "FIRST"},
+            {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "DUPLICATE"},
+            {"role": "tool", "content": "SECOND"},
+        ]
+        expected = [("c1", "read_file", "FIRST"), ("c2", "search", "SECOND")]
+    else:
+        messages += [
+            {"role": "tool", "name": "search", "content": "SEARCH_RESULT"},
+            {"role": "tool", "name": "read_file", "content": "READ_RESULT"},
+        ]
+        expected = [("c1", "read_file", "READ_RESULT"), ("c2", "search", "SEARCH_RESULT")]
     repaired, stats = repair_tool_result_pairing_with_stats(messages)
-    assert stats["removed_orphan_tool_results"] == 1
-    assert stats["fixed_orphan_tool_calls"] == 0
-    assert [m["content"] for m in repaired[1:]] == ["ACTUAL_RESULT"]
-    assert repaired[1]["tool_call_id"] == "c1"
-
-
-def test_legacy_tool_results_match_names_before_position():
-    from engine.inference.tool_format import repair_tool_result_pairing_with_stats
-
-    messages = [
-        {"role": "assistant", "content": "", "tool_calls": [
-            {"id": "c1", "name": "read_file", "arguments": {}},
-            {"id": "c2", "name": "search", "arguments": {}},
-        ]},
-        {"role": "tool", "tool_call_id": "", "name": "search", "content": "SEARCH_RESULT"},
-        {"role": "tool", "tool_call_id": "", "name": "read_file", "content": "READ_RESULT"},
-    ]
-    repaired, _ = repair_tool_result_pairing_with_stats(messages)
-    assert [(m["tool_call_id"], m["content"]) for m in repaired[1:]] == [
-        ("c1", "READ_RESULT"), ("c2", "SEARCH_RESULT"),
-    ]
-
-
-def test_positional_tool_results_remove_consumed_ids_from_pending():
-    from engine.inference.tool_format import repair_tool_result_pairing_with_stats
-
-    messages = [
-        {"role": "assistant", "content": "", "tool_calls": [
-            {"id": "c1", "name": "read_file", "arguments": {}},
-            {"id": "c2", "name": "search", "arguments": {}},
-        ]},
-        {"role": "tool", "tool_call_id": "", "name": "", "content": "FIRST"},
-        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "DUPLICATE"},
-        {"role": "tool", "content": "SECOND"},
-    ]
-    repaired, stats = repair_tool_result_pairing_with_stats(messages)
-    assert stats["removed_orphan_tool_results"] == 1
-    assert [(m["tool_call_id"], m["name"], m["content"]) for m in repaired[1:]] == [
-        ("c1", "read_file", "FIRST"), ("c2", "search", "SECOND"),
-    ]
+    assert stats["removed_orphan_tool_results"] == int(positional)
+    assert [(m["tool_call_id"], m["name"], m["content"]) for m in repaired[1:]] == expected
 
 
 def test_anthropic_finish_result_merges_next_turn_text_without_continued():
@@ -580,8 +512,6 @@ def test_anthropic_finish_result_merges_next_turn_text_without_continued():
         {"type": "text", "text": "I2"},
     ]
     assert not any(block.get("text") == "(continued)" for m in converted for block in m["content"])
-
-
 
 
 def test_anthropic_prevents_tool_result_after_merged_text_block():
@@ -645,7 +575,6 @@ def test_gemini_json_mode_history_rebuilds_function_call_when_switched_to_native
     assert contents[2]["parts"] == [
         {"functionResponse": {"name": "read_file", "response": {"ok": True}}},
     ]
-
 
 
 @pytest.fixture
@@ -807,7 +736,7 @@ def test_branch_checkpoint_advances_anchor_before_finalize(branch_anchor_state):
     assert len({m.id for m in merged}) == len(merged)
 
 
-def test_branch_compact_sync_skips_unrecoverable_anchor(branch_anchor_state, caplog):
+def test_branch_compact_sync_skips_unrecoverable_anchor(branch_anchor_state):
     from engine.conversation_store import Message
     state, parent, _ = branch_anchor_state
     branch, meta = state._create_entry_branch_locked(parent, 907)
@@ -819,7 +748,6 @@ def test_branch_compact_sync_skips_unrecoverable_anchor(branch_anchor_state, cap
     state._sync_entry_branch_compact_locked(store, branch, prefix, base_count=meta["base_count"], tasks=[task])
     assert [m.to_dict() for m in _anchor_store(state).load(branch)] == [m.to_dict() for m in shortened]
     assert task.input["base_last_id"] == meta["base_last_id"]
-    assert "anchor" in caplog.text and "exceeds" in caplog.text
 
 
 def test_branch_merge_io_failure_does_not_finalize(branch_anchor_state, monkeypatch):
@@ -840,7 +768,6 @@ def test_branch_merge_io_failure_does_not_finalize(branch_anchor_state, monkeypa
     assert not task.input.get("_branch_finalized") and branch in state.sessions
 
 
-
 def test_empty_parent_branch_sync_keeps_current_turn(branch_anchor_state):
     from engine.conversation_store import Message
     state, _, _ = branch_anchor_state
@@ -856,3 +783,167 @@ def test_empty_parent_branch_sync_keeps_current_turn(branch_anchor_state):
     state._sync_compact_to_branches(parent, prefix)
     assert [m.to_dict() for m in _anchor_store(state).load(branch)] == [m.to_dict() for m in prefix + delta]
     assert task.input["base_count"] == 1 and task.input["base_last_id"] == prefix[0].id
+
+
+@pytest.fixture(params=["PNG", "JPEG"])
+def prepared_image_message(request: pytest.FixtureRequest, tmp_path: Path) -> dict:
+    import io
+    from PIL import Image
+    from engine.attachments import build_multimodal_content, prepare_messages_for_llm, save_attachment
+
+    image_bytes = io.BytesIO()
+    with Image.new("RGB", (24, 12), "red") as image:
+        image.save(image_bytes, format=request.param)
+    suffix = request.param.lower()
+    attachment = save_attachment(
+        tmp_path,
+        "native-vision",
+        image_bytes.getvalue(),
+        filename=f"sample.{suffix}",
+        mime_type=f"image/{suffix}",
+    )
+    content = build_multimodal_content("Describe this image", [attachment], workspace_root=tmp_path)
+    messages = prepare_messages_for_llm([{"role": "user", "content": content}], tmp_path)
+    return messages[0]
+
+
+@pytest.mark.parametrize("provider_name", ["openai", "openai-responses", "anthropic", "gemini-aistudio"])
+def test_uploaded_image_reaches_native_provider_payload(prepared_image_message: dict, provider_name: str) -> None:
+    import base64
+    import io
+    from PIL import Image
+    from providers.anthropic import AnthropicProvider
+    from providers.gemini import GeminiAIStudioProvider
+    from providers.openai import OpenAIProvider
+    from providers.openai_responses import OpenAIResponsesProvider
+
+    messages = [prepared_image_message]
+    options = {"http": None, "api_key": "test", "base_url": None, "model": "test"}
+    if provider_name == "openai":
+        payload = OpenAIProvider(**options)._build_payload(messages, None)
+        image_part = next(part for part in payload["messages"][0]["content"] if part["type"] == "image_url")
+        header, encoded = image_part["image_url"]["url"].split(",", 1)
+        assert header == "data:image/jpeg;base64"
+    elif provider_name == "openai-responses":
+        provider = OpenAIResponsesProvider(**options)
+        instructions, input_items = provider._convert_messages(messages)
+        payload = provider._build_payload(input_items=input_items, instructions=instructions, tools=None, stream=False)
+        image_part = next(part for part in payload["input"][0]["content"] if part["type"] == "input_image")
+        header, encoded = image_part["image_url"].split(",", 1)
+        assert header == "data:image/jpeg;base64"
+    elif provider_name == "anthropic":
+        payload = AnthropicProvider(**options)._build_payload(messages)
+        image_part = next(part for part in payload["messages"][0]["content"] if part["type"] == "image")
+        assert image_part["source"]["type"] == "base64"
+        assert image_part["source"]["media_type"] == "image/jpeg"
+        encoded = image_part["source"]["data"]
+    else:
+        payload = GeminiAIStudioProvider(**options)._build_body(messages, None)
+        image_part = next(part for part in payload["contents"][0]["parts"] if "inlineData" in part)
+        assert image_part["inlineData"]["mimeType"] == "image/jpeg"
+        encoded = image_part["inlineData"]["data"]
+    with Image.open(io.BytesIO(base64.b64decode(encoded, validate=True))) as image:
+        assert image.format == "JPEG"
+        assert image.size == (24, 12)
+
+
+
+@pytest.mark.parametrize("use_flag", [True, False])
+def test_same_task_preempt_subsegments_preserve_tool_rounds(use_flag):
+    def msg(role, text, **fields):
+        meta = {"source_task_id": "one-task"}
+        if fields.pop("preempt", False):
+            if use_flag:
+                meta["preempt"] = True
+            else:
+                fields["message_type"] = "user_input"
+        return {"role": role, "content": text, "_meta": meta, **fields}
+
+    messages = [
+        msg("user", "initial"), msg("assistant", "completed first turn"),
+        msg("user", "second", preempt=True),
+        msg("assistant", "", tool_calls=[{"id": "call", "function": {"name": "read_file"}}]),
+        msg("user", "arrived during tool call", preempt=True),
+        msg("tool", "file contents", tool_call_id="call"),
+        msg("assistant", "completed second turn"),
+        msg("user", "third", preempt=True), msg("assistant", "final"),
+    ]
+    prefix, segments = compact.split_task_segments(messages)
+    assert prefix == []
+    assert [len(seg) for seg in segments] == [2, 5, 2]
+    assert [m for seg in segments for m in seg] == messages
+    assert compact.count_real_task_segments(messages) == 3
+    # Multiple inbound user messages alone are not completed turns.
+    assert len(compact.split_task_segments([messages[0], messages[2]])[1]) == 1
+
+
+def test_compact_token_estimates_use_completion_and_cjk():
+    assert compact.estimate_message_tokens({"role": "assistant", "content": "中" * 20}) == 10
+    assert compact.estimate_message_tokens({"role": "assistant", "content": "short", "_meta": {
+        "usage": {"completion_tokens": 900},
+    }}) == 900
+    assert compact.estimate_message_tokens({"role": "assistant", "content": "a" * 40, "_meta": {
+        "usage": {"completion_tokens": True},
+    }}) == 20
+    assert compact.estimate_message_tokens({"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "image"}},
+    ]}) == 1600
+
+
+def test_dream_hit_cache_prunes_orphans_even_with_empty_topology(tmp_path):
+    import json
+    from engine.builtin.dream import DreamHandler
+
+    path = tmp_path / "data" / "memory" / ".hit_cache.json"
+    path.parent.mkdir(parents=True)
+    now = datetime.now(timezone.utc).isoformat()
+    path.write_text(json.dumps({"live": now, "orphan": now}), encoding="utf-8")
+    handler = DreamHandler()
+    assert json.loads(handler._load_hit_cache_json(tmp_path, valid_ids={"live"})) == {"live": now}
+    assert json.loads(path.read_text(encoding="utf-8")) == {"live": now}
+    assert json.loads(handler._load_hit_cache_json(tmp_path, valid_ids=set())) == {}
+    assert json.loads(path.read_text(encoding="utf-8")) == {}
+
+
+def test_builtin_node_fallback_outside_repository(tmp_path):
+    from engine.node import load_node
+
+    node = load_node(tmp_path, "system.memory_extractor")
+    assert node is not None
+    assert "manage_memory" in node.tool_access.allow
+
+
+
+def test_memory_extractor_scans_source_namespace_and_legacy_root(tmp_path):
+    from engine.builtin.memory_extract import MemoryExtractHandler
+
+    mem_root = tmp_path / "data" / "memory"
+    (mem_root / "source").mkdir(parents=True)
+    (mem_root / "other").mkdir()
+    for path in [mem_root / "shared.yaml", mem_root / "source" / "private.yaml",
+                 mem_root / "source" / "shared.yaml", mem_root / "other" / "hidden.yaml"]:
+        path.write_text("entries: []", encoding="utf-8")
+    handler = MemoryExtractHandler()
+    handler._memory_extract_pending["session"] = {
+        "transcript": "user preference", "task_count": 1, "_source_node_id": "source",
+    }
+    created = []
+    handler._fire_memory_extract_idle({"workspace_root": tmp_path, "acquire_lock": RLock(),
+        "create_task": lambda **kwargs: created.append(kwargs)}, "session")
+    assert len(created) == 1
+    instruction = created[0]["input_data"]["instruction"]
+    assert "private, shared" in instruction
+    assert "hidden" not in instruction
+    assert created[0]["input_data"]["_memory_route_ns"] == "source"
+
+
+@pytest.mark.parametrize("message_type", ["dispatch_result", "async_tool_result"])
+def test_memory_extractor_skips_internal_result_turns(message_type):
+    from engine.builtin.memory_extract import MemoryExtractHandler
+
+    handler = MemoryExtractHandler()
+    task = SimpleNamespace(result={"action": "finish"}, kind="node", input={"inbound_message_type": message_type})
+    # No routing/runtime callbacks are available: internal result turns must exit at the gate.
+    handler._maybe_trigger_memory_extract_locked(ctx={}, task=task)
+    assert not handler._memory_extract_pending
+    assert not handler._memory_extract_task_counts

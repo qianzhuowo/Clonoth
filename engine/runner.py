@@ -1485,7 +1485,10 @@ async def _run_node_task(
     _result["_total_tokens"] = _total_tokens
     # P3 记忆提取互斥：传递本轮使用的工具名列表，供 supervisor 判断是否跳过提取
     if rctx.tool_call_log:
-        _result["_tool_names"] = list(set(tc["name"] for tc in rctx.tool_call_log))
+        _result["_tool_names"] = list(
+            {tc["name"] for tc in rctx.tool_call_log if tc.get("name")}
+            | {tc["action"] for tc in rctx.tool_call_log if tc.get("action")}
+        )
     return _result
 
 

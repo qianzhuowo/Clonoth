@@ -1324,7 +1324,7 @@ def _build_memory_outline(entry: dict[str, Any], max_preview_chars: int = 500) -
     return (
         content[:max_preview_chars] + outline
         + f'\n[Long memory (共 {len(content)} 字符) — 如需完整内容请调用 '
-        f'list_memories(book="{entry.get("book") or "default"}", id="{entry["id"]}")]'
+        f'manage_memory(action="list", book="{entry.get("book") or "default"}", id="{entry["id"]}")]'
     )
 
 
@@ -1395,7 +1395,7 @@ def _render_memory_messages(
 
     if index_entries:
         parts = ["[MEMORY:INDEX]",
-                 'Unindexed memories (use list_memories(book="<book>", id="<id>") to read full content when relevant):']
+                 'Unindexed memories (use manage_memory(action="list", book="<book>", id="<id>") to read full content when relevant):']
         for entry in index_entries:
             desc = _compact_index_desc(str(entry.get("content") or ""))
             parts.append(f"- {entry.get('book') or 'default'}/{entry['id']}: {desc}")
@@ -2191,7 +2191,26 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
 
     # [2026-05-28] invalidate 时传 memory_book，精确清除对应 namespace 的缓存
     _invalidate_cache(ctx.workspace_root, memory_book=_ns_memory_book)
+    with _hit_cache_lock:
+        if mid in _hit_cache:
+            _hit_cache.pop(mid, None)
+            global _hit_cache_dirty
+            _hit_cache_dirty = True
     return _tool_ok(f"Memory deleted: {book}/{mid}", book=book, id=mid, deleted=True)
+
+
+async def manage_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
+    """Unified memory management tool: list, upsert (save/update), or delete memory entries."""
+    action = str(args.get("action") or "").strip().lower()
+    if not action:
+        action = "upsert" if args.get("content") is not None else "list"
+    if action in ("list", "get", "read"):
+        return await list_memories(args, ctx)
+    if action in ("upsert", "save", "create", "update"):
+        return await save_memory(args, ctx)
+    if action in ("delete", "remove"):
+        return await delete_memory(args, ctx)
+    return _tool_err(f"invalid action: {action!r}, must be 'list', 'upsert', or 'delete'")
 
 
 # ---------------------------------------------------------------------------
@@ -2230,64 +2249,39 @@ PLUGIN_META["tools"] = [
         "func": manage_skill,
     },
     {
-        "name": "save_memory",
-        "description": "Save or update a memory entry in a book. "
-        "Use this when you learn something worth remembering across conversations: "
-        "user preferences, corrections, project context, external resource pointers, "
-        "or character profiles in group chat. "
-        "Memory content MUST be concise, high-density, and to the point (写记忆文字需简明扼要，不啰嗦不水字数).",
+        "name": "manage_memory",
+        "description": (
+            "Manage persistent memory entries in books: "
+            "action='list' lists memory entries (or returns full untruncated content when id is specified); "
+            "action='upsert' saves or updates a memory entry (memory content MUST be concise, high-density, and to the point / 写记忆文字需简明扼要，不啰嗦不水字数); "
+            "action='delete' deletes a memory entry by id."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "id": {"type": "string", "description": "Unique entry id (e.g. user_zhangsan, rule_no_mock)."},
-                "book": {"type": "string", "description": "Book name (file grouping). Default 'default'. Use e.g. 'people' for character profiles, 'rules' for behavioral rules."},
-                "content": {"type": "string", "description": "Memory content text. Must be concise, high-density, and free of filler/padding (文字需简明扼要，不啰嗦不水字数)."},
+                "action": {"type": "string", "enum": ["list", "upsert", "delete"], "description": "Operation: 'list' (default when content omitted), 'upsert' (create/update), or 'delete'."},
+                "id": {"type": "string", "description": "[upsert/delete/list] Unique entry id (e.g. user_zhangsan, rule_no_mock). In 'list' mode, specifying id returns full untruncated content."},
+                "book": {"type": "string", "description": "Book name (file grouping). Default 'default' (or all books in 'list' mode when omitted). Use e.g. 'people', 'rules'."},
+                "content": {"type": "string", "description": "[upsert] Memory content text. Must be concise, high-density, and free of filler/padding (文字需简明扼要，不啰嗦不水字数)."},
                 "keywords": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Activation keywords. Supports /regex/flags. When any keyword matches user input, this memory is injected into context.",
+                    "description": "[upsert] Activation keywords. Supports /regex/flags. When any keyword matches user input, this memory is injected into context.",
                 },
-                "constant": {"type": "boolean", "description": "If true, always injected regardless of keywords. Default false."},
-                "enabled": {"type": "boolean", "description": "Whether this entry is active. Default true."},
-                "priority": {"type": "integer", "description": "Budget priority; higher = kept first when budget exceeded."},
-                "scan_depth": {"type": "integer", "description": "Number of recent conversation rounds to scan for keywords. 0 = current message only."},
-                "scope": {"type": "string", "enum": ["workspace", "node"], "description": "Storage scope. 'workspace' (default): saved under the active workspace, isolated per-project. 'node': saved at node level, shared across all workspaces."},
+                "constant": {"type": "boolean", "description": "[upsert] If true, always injected regardless of keywords. Default false."},
+                "enabled": {"type": "boolean", "description": "[upsert] Whether this entry is active. Default true."},
+                "priority": {"type": "integer", "description": "[upsert] Budget priority; higher = kept first when budget exceeded."},
+                "scan_depth": {"type": "integer", "description": "[upsert] Number of recent conversation rounds to scan for keywords. 0 = current message only."},
+                "scope": {"type": "string", "enum": ["workspace", "node"], "description": "[upsert] Storage scope. 'workspace' (default): saved under the active workspace. 'node': shared across all workspaces."},
                 "node_ids": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "Optional list of node IDs allowed to see this memory entry (omit for all nodes in the namespace).",
+                    "description": "[upsert] Optional list of node IDs allowed to see this memory entry (omit for all nodes in the namespace).",
                 },
             },
-            "required": ["id", "content"],
+            "required": ["action"],
         },
-        "func": save_memory,
-    },
-    {
-        "name": "list_memories",
-        "pure": True,
-        "description": "List memory entries (node-level and workspace-scoped), optionally filtered by book name. Each entry carries scope/workspace fields indicating where it is stored.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "book": {"type": "string", "description": "Filter by book name. Omit to list all."},
-                "id": {"type": "string", "description": "Optional memory entry id. When specified, returns the full untruncated content of matching entry/entries."},
-            },
-            "required": [],
-        },
-        "func": list_memories,
-    },
-    {
-        "name": "delete_memory",
-        "description": "Delete a memory entry from a book. Lookup order mirrors save_memory's default landing spot: current workspace first, then node level, then root.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "description": "Memory entry id to delete."},
-                "book": {"type": "string", "description": "Book name. Default 'default'."},
-            },
-            "required": ["id"],
-        },
-        "func": delete_memory,
+        "func": manage_memory,
     },
 ]
 

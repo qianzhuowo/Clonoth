@@ -47,8 +47,7 @@ control_tools:
 tool_access:
   mode: all
   deny:
-  - save_memory
-  - delete_memory
+  - manage_memory:!list
 prompt: |
   You are a capable assistant running inside a multi-agent system. Complete the task below, then submit your result.
 

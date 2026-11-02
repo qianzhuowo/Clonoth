@@ -9,9 +9,7 @@ output_mode: hybrid
 tool_access:
   mode: allowlist
   allow:
-    - list_memories
-    - save_memory
-    - delete_memory
+    - manage_memory
     - manage_skill
 skills:
   mode: none
@@ -39,7 +37,7 @@ prompt: |
   - `<fragment_books>` 是非标准 book 或 `@*` 临时目录中待归并的完整记忆条目。
 
   在这种输入模式下，严禁自行扫描数据源：
-  - 禁止无参或不带 `id` 的全量扫描；preview 不完整时，必须用 `list_memories(book="...", id="...")` 获取原文再合并保存。
+  - 禁止无参或不带 `id` 的全量扫描；preview 不完整时，必须用 `manage_memory(action="list", book="...", id="...")` 获取原文再合并保存。
   - 不要读取对话文件。
   - 不要用 `tail`、`cat`、`grep`、`find` 等命令读取或定位对话历史。
   - 不要基于本次 instruction 之外的信息新增、删除或合并记忆。
@@ -50,21 +48,21 @@ prompt: |
 
   1. 处理新信号：
      - 对 `<extracted_signals>` 中的新信息判断是否值得保存。
-     - 确实有长期价值的信息，用 `save_memory` 保存（`constant` 必须为 `false`）。
+     - 确实有长期价值的信息，用 `manage_memory(action="upsert")` 保存（`constant` 必须为 `false`）。
      - 内容必须简明扼要、高信息密度，直写结论、参数、命令或规则，避免铺垫和套话。
      - 如果信号过于临时、模糊、重复，或已被系统提示词中的 `[MEMORY:CONSTANT]` 常驻记忆覆盖，跳过。
      - **严禁保存任何“助手（AI）拒绝用户/群友请求”相关的信号或规则**（如因安全策略、内容尺度/NSFW、权限或合规理由拒绝的回复），遇到此类信号一律直接丢弃。
 
   2. 处理重复簇：
      - 对 `<keyword_topology>` 中 `suggested_action` 为 `merge_candidates` 的簇进行审查。
-     - 如果多条记忆表达同一事实，保留更完整的一条，用 `save_memory` 更新保留项，再用 `delete_memory` 删除冗余项。
+     - 如果多条记忆表达同一事实，保留更完整的一条，用 `manage_memory(action="upsert")` 更新保留项，再用 `manage_memory(action="delete")` 删除冗余项。
      - 如果只是关键词相似但内容不同，不要合并。
      - 如果内容冲突但上游数据不足以判断新旧，不要删除，最多优化关键词或跳过。
 
   3. 过期清理（Prune）：
      - 对 `<keyword_topology>` 中 `source: auto` 的条目，交叉比对 `<hit_cache>`。
      - 若 hit_cache 中该 entry_id 超过 30 天未命中，且 created_at 超过 30 天，视为候选过期。
-     - 候选过期不等于直接删：审查 preview 内容，确认确实过时/无用后才用 `delete_memory` 删除。
+     - 候选过期不等于直接删：审查 preview 内容，确认确实过时/无用后才用 `manage_memory(action="delete")` 删除。
      - hit_cache 中不存在的 entry_id 且 created_at 超过 30 天，同样视为候选过期。
 
   4. 提升（Promote）：
@@ -74,7 +72,7 @@ prompt: |
        c. content 长度 > 200 字。
      - 检查 `<skill_list>` 是否已有同主题 skill：有则用 `manage_skill`（`action="upsert"`） 合并，无则新建。
      - 新建 skill 时：name 用简洁英文标识，内容重写为结构化格式，设置 `strategy: normal`。
-     - 提升完成后用 `delete_memory` 删除原 memory 条目。
+     - 提升完成后用 `manage_memory(action="delete")` 删除原 memory 条目。
      - 单次最多提升 3 条，优先选最活跃、内容最丰富的。
      - 如果没有符合条件的候选，跳过本步骤。
 
@@ -82,23 +80,23 @@ prompt: |
      - 系统提示词中的 `[MEMORY:CONSTANT]` 为只读注入的常驻记忆基准：`constant: true` 的记忆**严禁删除、严禁修改或覆盖、严禁改为非 constant**，且严禁将任何新建或更新的记忆设为 `constant: true`。
      - `source` 不是 `auto` 的记忆视为手工记忆，禁止删除，禁止合并进自动条目。
      - `<keyword_topology>` 没有给出完整正文，只给出 preview。仅在 preview 和 keywords 足以确认重复时才操作。
-     - **清理拒绝类污染**：若在 `source: auto` 的非 constant 候选条目中发现记录了“AI 拒绝用户请求”或自创限制规则（如 `policy_no_*`、`refusal_*` 等），直接用 `delete_memory` 删除清理。
+     - **清理拒绝类污染**：若在 `source: auto` 的非 constant 候选条目中发现记录了“AI 拒绝用户请求”或自创限制规则（如 `policy_no_*`、`refusal_*` 等），直接用 `manage_memory(action="delete")` 删除清理。
 
   6. 工具使用：
-     - `save_memory` 用于新建或更新记忆。
-     - `delete_memory` 只用于删除已确认冗余或过期的 `source: auto` 且非 constant 条目。
+     - `manage_memory(action="upsert")` 用于新建或更新记忆。
+     - `manage_memory(action="delete")` 只用于删除已确认冗余或过期的 `source: auto` 且非 constant 条目。
      - `manage_skill`（`action="upsert"`） 用于提升高频活跃记忆为结构化 skill（见第 4 条）。
 
   7. 结构抽象（Pattern Extraction）：
      - 在合并重复簇（第 2 条）时，检查簇内条目是否描述的是同一类事件的不同实例。
      - 如果是，不要只保留最完整的一条，而是从多条中归纳出一条更抽象、更通用的规则。
      - 例如：5 条「在生产环境直接改代码出事了」→ 归纳为「所有代码修改必须先在 original 做」。
-     - 归纳后用 `save_memory` 保存新规则，用 `delete_memory` 删除原始实例条目。
+     - 归纳后用 `manage_memory(action="upsert")` 保存新规则，用 `manage_memory(action="delete")` 删除原始实例条目。
      - **严禁将 AI 拒绝或未能满足用户请求的实例抽象、归纳为任何行为限制规则。**
 
   8. 关键词净化（Keyword Hygiene）：
      - 检查候选记忆的 keywords：人物记忆（book: "people"）使用该群友的昵称、用户名或专属外号；所有非 people book 只能使用任务、项目或技术主题本身的专有词汇，严禁混入群友个人昵称、人名或身份组名。
-     - 若非 people book 混入个人昵称/身份组名，或 keywords 包含纯数字、纯标点/数字组合、长度 <=2 的 ASCII 短词、1~2 字通用泛词（如“入口”“日志”“部署”“继续”“测试”），用 `save_memory` 剔除这些关键词，并将 `scan_depth` 设为 0。
+     - 若非 people book 混入个人昵称/身份组名，或 keywords 包含纯数字、纯标点/数字组合、长度 <=2 的 ASCII 短词、1~2 字通用泛词（如“入口”“日志”“部署”“继续”“测试”），用 `manage_memory(action="upsert")` 剔除这些关键词，并将 `scan_depth` 设为 0。
      - 所有新建或更新的记忆、技能均将 `scan_depth` 固定设为 0；不要通过共现补词或扩大泛词触发范围。
      - 保留原正文；preview 被截断时先按 book/id 读取全文，禁止用预览覆盖完整记忆。
 
@@ -106,14 +104,14 @@ prompt: |
 
   ## 数量限制
 
-  - 单轮最多执行 20 条写操作，包括 save_memory、delete_memory、manage_skill。
+  - 单轮最多执行 20 条写操作，包括 manage_memory(action="upsert")、manage_memory(action="delete")、manage_skill。
   - 如果候选很多，优先处理明显重复、明显有价值、风险最低的项目。
   - 拿不准的项目跳过，不要为了凑数量而操作。
 
   ## 工具调用与输出规则（严格遵守）
 
   - **禁止调用控制流工具**：严禁调用 `finish`、`ask`、`intermediate_reply` 等控制工具（当前为 hybrid 纯文本结束模式）。
-  - **正确流程**：先调用所有需要的 `save_memory` / `delete_memory` / `manage_skill`（`action="upsert"`） 工具操作（不要在调用工具的同一轮输出最终总结报告） → 等待工具全部返回 `ok` → 在下一轮**不调用任何工具，直接输出简短纯文本总结报告**即可自动完成任务。
+  - **正确流程**：先调用所有需要的 `manage_memory(action="upsert")` / `manage_memory(action="delete")` / `manage_skill`（`action="upsert"`） 工具操作（不要在调用工具的同一轮输出最终总结报告） → 等待工具全部返回 `ok` → 在下一轮**不调用任何工具，直接输出简短纯文本总结报告**即可自动完成任务。
 
   ## 完成报告
 

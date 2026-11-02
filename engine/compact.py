@@ -305,16 +305,22 @@ def estimate_message_tokens(message: Any) -> int:
                 if isinstance(t, str):
                     chars += len(t)
                 elif part.get("type") in ("image_url", "image") or "inlineData" in part:
-                    chars += 4800  # ~1600 tokens per image
+                    chars += 3200  # ~1600 tokens per image
     tool_calls = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
     if tool_calls:
         chars += len(json.dumps(tool_calls, ensure_ascii=False, default=str))
     meta = (message.get("_meta") or message.get("meta")) if isinstance(message, dict) else getattr(message, "meta", None)
+    completion_toks = 0
     if isinstance(meta, dict):
+        usage = meta.get("usage")
+        if isinstance(usage, dict):
+            ct = usage.get("completion_tokens")
+            if not isinstance(ct, bool) and isinstance(ct, (int, float)) and ct > 0:
+                completion_toks = int(ct)
         md = meta.get("metadata")
-        if isinstance(md, dict) and md and not chars:
+        if isinstance(md, dict) and md and not chars and not completion_toks:
             chars += len(json.dumps(md, ensure_ascii=False, default=str))
-    return max(chars // 3, 1)
+    return max(completion_toks, chars // 2, 1)
 
 
 def invalidate_stale_usage(messages: list[Any]) -> None:
@@ -361,6 +367,23 @@ def split_task_segments(messages: list[Any]) -> tuple[list[Any], list[list[Any]]
             if prev_tid and prev_tid != "compact_summary" and (prev_tid == next_tid or is_mid_task):
                 tids[i] = prev_tid
 
+    def _is_preempt_turn_boundary(item: Any, cur_seg: list[Any]) -> bool:
+        def role(msg: Any) -> str:
+            return str(msg.get("role") or "") if isinstance(msg, dict) else str(getattr(msg, "role", "") or "")
+
+        if role(item) != "user" or not cur_seg:
+            return False
+        if not any(role(msg) == "assistant" for msg in cur_seg):
+            return False
+        last = cur_seg[-1]
+        calls = last.get("tool_calls") if isinstance(last, dict) else getattr(last, "tool_calls", None)
+        if role(last) == "assistant" and calls:
+            return False
+        meta = (item.get("_meta") or item.get("meta")) if isinstance(item, dict) else getattr(item, "meta", None)
+        meta = meta if isinstance(meta, dict) else {}
+        mtype = (item.get("message_type") if isinstance(item, dict) else getattr(item, "message_type", "")) or meta.get("message_type")
+        return bool(meta.get("preempt") or mtype == "user_input")
+
     prefix_msgs: list[Any] = []
     segments: list[list[Any]] = []
     cur_seg: list[Any] = []
@@ -374,7 +397,7 @@ def split_task_segments(messages: list[Any]) -> tuple[list[Any], list[list[Any]]
                 cur_tid = None
             prefix_msgs.append(m)
             continue
-        if cur_tid is None or tid != cur_tid:
+        if cur_tid is None or tid != cur_tid or _is_preempt_turn_boundary(m, cur_seg):
             if cur_seg:
                 segments.append(cur_seg)
             cur_seg = [m]

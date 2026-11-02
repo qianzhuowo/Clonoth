@@ -90,17 +90,16 @@ class TaskStoreMixin:
         """Build a task snapshot payload safe for long-term event storage."""
         payload = task.model_dump(mode="json")
         result = payload.get("result")
-        if isinstance(result, dict) and "dispatch_input" in result:
-            # Why: dispatch_input can contain a full child prompt or compacted
-            # conversation text, and the same stale result used to be repeated in
-            # task_started/task_suspended snapshots. How: copy the serialized
-            # result and remove only dispatch_input from the event payload while
-            # leaving the live Task object untouched. Purpose: reduce future
-            # events.jsonl growth and replay memory without changing routing,
-            # which reads task.result before or outside event serialization.
+        if isinstance(result, dict) and ("dispatch_input" in result or "_runtime_state" in result):
+            # Why: dispatch_input and _runtime_state (tool_call_log) can contain large
+            # prompts or multi-step logs, and repeating them in every task_* snapshot
+            # bloats EventLog memory and events.jsonl. How: strip them from the event
+            # copy while leaving the live Task object untouched.
             slim_result = dict(result)
-            slim_result.pop("dispatch_input", None)
-            slim_result["dispatch_input_omitted"] = True
+            if "dispatch_input" in slim_result:
+                slim_result.pop("dispatch_input", None)
+                slim_result["dispatch_input_omitted"] = True
+            slim_result.pop("_runtime_state", None)
             payload["result"] = slim_result
         return payload
 
@@ -875,6 +874,8 @@ class TaskStoreMixin:
                     task.status = TaskStatus.cancelled
                     task.updated_at = now
                     task.lease_expires_at = None
+                    self._finalize_branch_task_locked(task, merge=True)
+                    self._cleanup_tool_result_artifacts_for_task(task.task_id)
                     self._event_task_snapshot("task_cancelled", task)
                     continue
 

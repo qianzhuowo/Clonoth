@@ -329,18 +329,18 @@ class DreamHandler:
                     signals.append(item)
 
         runtime_cfg = load_runtime_config(workspace_root)
+        # [AutoC 2026-08-28] Build memory route table from topology entries first
+        # so we can also filter hit_cache to existing memory IDs only.
+        topology_entries = self._load_memory_topology_entries(workspace_root)
+        valid_ids = {str(e.get("id") or "").strip() for e in topology_entries if str(e.get("id") or "").strip()}
         # [AutoC 2026-05-31] Load hit_cache and skill list for Prune/Promote phases
-        hit_cache_json = self._load_hit_cache_json(workspace_root)
+        hit_cache_json = self._load_hit_cache_json(workspace_root, valid_ids=valid_ids)
         skill_list = self._load_skill_list(workspace_root)
         # [AutoC 2026-05-31] Why: the final organizer also needs to know the
         # current book landscape. How: rebuild the list at final task creation
         # time so files created during preprocessing are visible. Purpose: guide
         # save/delete decisions with live book names.
         book_list = self._build_book_list(workspace_root)
-        # [AutoC 2026-08-28] Build memory route table from topology entries.
-        # Maps book name to (source_ns, source_ws) so the dream_router hook
-        # can redirect save_memory/delete_memory writes to the correct target.
-        topology_entries = self._load_memory_topology_entries(workspace_root)
         memory_route = self._build_memory_route(topology_entries)
         fragment_entries = [
             {
@@ -734,7 +734,7 @@ class DreamHandler:
 </book_list>
 保存时优先使用已有 book，也可以创建新 book。
 
-禁止调用 save_memory、delete_memory、list_memories 或 finish 等任何工具。
+禁止调用 manage_memory 或 finish 等任何工具。
 只分析下方 transcript，直接输出纯 JSON 数组文本（不要加 ```json 代码块围栏，也不要输出任何解释文字）：
 [{{"id": "...", "book": "...", "content": "...", "keywords": ["..."]}}]
 注意：提取的 content 文字必须简明扼要、高信息密度，直奔结论与核心参数/规则，不啰嗦不水字数；book 优先选用标准书目（technical_notes, models, channels, rules, people, tools, projects, prompts, research, resources, user_preferences, default）。
@@ -944,13 +944,14 @@ class DreamHandler:
             return False
         return now - started > timedelta(minutes=_DREAM_PENDING_TIMEOUT_MINUTES)
 
-    def _load_hit_cache_json(self, workspace_root: Path) -> str:
+    def _load_hit_cache_json(self, workspace_root: Path, valid_ids: set[str] | None = None) -> str:
         """Load hit_cache.json and return as compact JSON string.
 
         [AutoC 2026-05-31] Why: Dream Prune phase needs hit timestamps to
         determine which auto-source entries are expired (30d no hit).
-        How: read the JSON file, truncate to entries with hits in last 60d
-        to keep instruction bounded. Purpose: enable lifecycle management.
+        How: read the JSON file, truncate to existing memory entries with hits
+        in last 60d to keep instruction bounded, and prune orphan IDs on disk.
+        Purpose: enable lifecycle management without bloating Dream prompt.
         """
         hit_path = workspace_root / "data" / "memory" / ".hit_cache.json"
         if not hit_path.exists():
@@ -959,17 +960,30 @@ class DreamHandler:
             data = json.loads(hit_path.read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 return "{}"
-            # Only include entries with hits in last 60 days to bound size
+            if valid_ids is None:
+                valid_ids = {
+                    str(e.get("id") or "").strip()
+                    for e in self._load_memory_topology_entries(workspace_root)
+                    if str(e.get("id") or "").strip()
+                }
+            # Only include existing entries with hits in last 60 days to bound size
             from datetime import timedelta as _td
             cutoff = datetime.now(timezone.utc) - _td(days=60)
             filtered: dict[str, str] = {}
             for eid, ts_str in data.items():
+                if eid not in valid_ids:
+                    continue
                 try:
                     ts = datetime.fromisoformat(str(ts_str))
                     if ts.tzinfo is None:
                         ts = ts.replace(tzinfo=timezone.utc)
                     if ts >= cutoff:
                         filtered[eid] = str(ts_str)
+                except Exception:
+                    pass
+            if len(filtered) < len(data):
+                try:
+                    hit_path.write_text(json.dumps(filtered, ensure_ascii=False), encoding="utf-8")
                 except Exception:
                     pass
             return json.dumps(filtered, ensure_ascii=False)
@@ -1061,20 +1075,20 @@ time: {now.strftime('%Y-%m-%d %H:%M UTC')}
 </fragment_books>
 
 约束：
-1. 严禁无参调用 list_memories 全量扫描；但当需要合并重复簇或更新已有记忆、而 preview 被截断时，必须调用 list_memories(book="...", id="...") 按精确 book 和 id 读取完整原文后再合并保存。
+1. 严禁不带 id 调用 manage_memory(action="list") 全量扫描；但当需要合并重复簇或更新已有记忆、而 preview 被截断时，必须调用 manage_memory(action="list", book="...", id="...") 按精确 book 和 id 读取完整原文后再合并保存。
 2. 不要读取对话文件（tail/cat/read_file）。
 3. 只基于上面的 signals、topology、hit_cache 和 skill_list 做操作。
-4. 对 signals 中的新信息：判断是否值得保存，调用 save_memory。
-5. 对 topology 中的重复簇：判断是否需要合并/删除/更新，调用 save_memory/delete_memory。
-6. 过期清理（Prune）：对 topology 中 source=auto 的条目，若 hit_cache 中超过 30 天未命中且 created_at 超过 30 天，审查后可用 delete_memory 清理。
-7. 提升（Promote）：对 source=auto、created_at 超过 7 天、hit_cache 中最近 7 天内仍被命中、content 长度 > 200 字的条目，检查 skill_list 是否已有同主题 skill，如有则合并，如无则用 manage_skill(action="upsert") 提升为 skill，之后 delete_memory 删除原条目。单次最多提升 3 条。
-8. 单轮最多操作 35 条（含 save_memory/delete_memory/manage_skill）。
+4. 对 signals 中的新信息：判断是否值得保存，调用 manage_memory(action="upsert")。
+5. 对 topology 中的重复簇：判断是否需要合并/删除/更新，调用 manage_memory(action="upsert"|"delete")。
+6. 过期清理（Prune）：对 topology 中 source=auto 的条目，若 hit_cache 中超过 30 天未命中且 created_at 超过 30 天，审查后可用 manage_memory(action="delete") 清理。
+7. 提升（Promote）：对 source=auto、created_at 超过 7 天、hit_cache 中最近 7 天内仍被命中、content 长度 > 200 字的条目，检查 skill_list 是否已有同主题 skill，如有则合并，如无则用 manage_skill(action="upsert") 提升为 skill，之后用 manage_memory(action="delete") 删除原条目。单次最多提升 3 条。
+8. 单轮最多操作 35 条（含 manage_memory/manage_skill）。
 8b. 文字简明扼要：所有新建或合并更新的记忆文字必须简明扼要、高信息密度，直奔核心结论、参数与规则，不啰嗦不水字数。
-8c. 散装书与临时子目录归并：对 <fragment_books> 中的条目，若有长期价值则用 save_memory 归并到标准 16 本书（technical_notes, models, channels, rules, people, tools, projects, prompts, research, resources, user_preferences, default, changelog, jokes, slang, worldbook），再用 delete_memory 删除原 book/id；若属无价值临时琐事则直接 delete_memory 删除。
+8c. 散装书与临时子目录归并：对 <fragment_books> 中的条目，若有长期价值则用 manage_memory(action="upsert") 归并到标准 16 本书（technical_notes, models, channels, rules, people, tools, projects, prompts, research, resources, user_preferences, default, changelog, jokes, slang, worldbook），再用 manage_memory(action="delete") 删除原 book/id；若属无价值临时琐事则直接用 manage_memory(action="delete") 删除。
 9. constant=true 的记忆和 source 不是 auto 的手工记忆，保持保护不删、不改。
 10. 所有工具调用执行完毕并收到结果后，在最后一轮直接输出纯文本操作摘要（严禁调用 finish 等控制工具）。
-11. Book 整理：检查 <book_list> 中条目数 ≤ 5 的碎片 book，将其条目用 save_memory 迁移到语义最近的大 book，然后 delete_memory 删除原条目。
+11. Book 整理：检查 <book_list> 中条目数 ≤ 5 的碎片 book，将其条目用 manage_memory(action="upsert") 迁移到语义最近的大 book，然后用 manage_memory(action="delete") 删除原条目。
 12. 结构抽象（Pattern Extraction）：合并重复簇（约束5）时，不要只保留最完整的一条——如果簇内多条记忆描述的是同一类事件的不同实例（如 5 条都是「在生产环境直接改代码出事」的记录），应从中归纳出一条更抽象的规则（如「所有代码修改必须先在 original 做」），而非简单保留其中一条。严禁将 AI 拒绝或未能满足用户请求的实例抽象、归纳为任何行为限制规则。
-13. 关联链强化（Association Discovery）：处理 topology 簇时，交叉比对 <hit_cache>。如果簇内多条记忆在 48h 内被同一类 session 命中（共现），说明它们在实际使用中经常一起被需要。用 save_memory 给它们互相补充 keywords，使它们更容易一起被激活。
-14. 重激活（Reactivation）：对 priority > 0 且 <hit_cache> 中超过 20 天未命中（快过期但还没到 30 天删除线）的条目，审查其 keywords 是否过窄导致命中率低。如果内容仍有价值，用 save_memory 拆分或优化 keywords 使其更容易被触发，而非坐等过期删除。
-15. 严禁保存、保留或从实例中归纳任何“AI 拒绝用户请求”相关的记忆或限制规则；若在 source=auto 的非 constant 候选中发现拒绝类污染条目，用 delete_memory 清理。"""
+13. 关联链强化（Association Discovery）：处理 topology 簇时，交叉比对 <hit_cache>。如果簇内多条记忆在 48h 内被同一类 session 命中（共现），说明它们在实际使用中经常一起被需要。用 manage_memory(action="upsert") 给它们互相补充 keywords，使它们更容易一起被激活。
+14. 重激活（Reactivation）：对 priority > 0 且 <hit_cache> 中超过 20 天未命中（快过期但还没到 30 天删除线）的条目，审查其 keywords 是否过窄导致命中率低。如果内容仍有价值，用 manage_memory(action="upsert") 拆分或优化 keywords 使其更容易被触发，而非坐等过期删除。
+15. 严禁保存、保留或从实例中归纳任何“AI 拒绝用户请求”相关的记忆或限制规则；若在 source=auto 的非 constant 候选中发现拒绝类污染条目，用 manage_memory(action="delete") 清理。"""

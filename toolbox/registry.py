@@ -721,6 +721,9 @@ class ToolRegistry:
         "list_skills": ("manage_skill", "list"),
         "create_or_update_skill": ("manage_skill", "upsert"),
         "delete_skill": ("manage_skill", "delete"),
+        "list_memories": ("manage_memory", "list"),
+        "save_memory": ("manage_memory", "upsert"),
+        "delete_memory": ("manage_memory", "delete"),
         "create_or_update_tool": ("manage_tool", "upsert"),
         "reload_tools": ("manage_tool", "reload"),
     }
@@ -732,7 +735,9 @@ class ToolRegistry:
         alias = self._LEGACY_ALIAS_MAP.get(name)
         if alias is not None:
             target_name, default_action = alias
-            if default_action and "action" not in args:
+            # Memory aliases represent fixed actions, matching engine authorization.
+            # Preserve the existing override contract for older consolidated tools.
+            if default_action and (target_name == "manage_memory" or "action" not in args):
                 args["action"] = default_action
             return target_name, args
         return name, args

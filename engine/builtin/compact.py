@@ -80,8 +80,8 @@ def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
                     pmeta = prev.get("_meta") or {}
                     if isinstance(pmeta, dict) and str(pmeta.get("source_task_id") or "") == asst_tid:
                         stripped_imgs += int(pmeta.get("_stripped_images_count") or 0)
-        seeded = int(pt) + int(ct) + tail_chars // 3 - stripped_imgs * 1600
-        return max(seeded, tail_chars // 3)
+        seeded = int(pt) + int(ct) + tail_chars // 2 - stripped_imgs * 1600
+        return max(seeded, tail_chars // 2)
     return None
 
 
@@ -187,10 +187,15 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
             _stored_msgs = _conv_store.load(compact_sid)
             _seg_count = count_real_task_segments(_stored_msgs)
             _snipped_stubs = sum(1 for m in _stored_msgs if is_snipped_message(m))
-            if _seg_count <= 1 and _snipped_stubs == 0:
+            _is_entry_branch = bool(
+                ls.rctx.parent_session_id
+                and not ls.rctx.child_session_id
+            )
+            _min_segs = 1 if _is_entry_branch else 2
+            if _seg_count < _min_segs and _snipped_stubs == 0:
                 logger.info(
-                    "skip compact: only %d real task segments (snipped=%d), not enough to compress",
-                    _seg_count, _snipped_stubs,
+                    "skip compact: only %d real task segments (min=%d, snipped=%d), not enough to compress",
+                    _seg_count, _min_segs, _snipped_stubs,
                 )
                 ls.compacted = True
                 return None
@@ -199,7 +204,6 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
 
     ls.compacted = True
     try:
-        await ls.rctx.emit_event("compact_start", {"node_id": ls.node.id, "step": ctx.step})
         # [2026-06-06] Why: automatic compact should keep its threshold, breaker,
         # segment, and snip checks, but must not maintain a separate summary prompt
         # builder. How: call the shared planner after all automatic pre-checks pass.
@@ -223,6 +227,7 @@ async def _check_and_compact(ctx: Any, ls: Any) -> TaskAction | None:
                 "original_chars": original_chars,
             })
         if plan.status == "dispatch":
+            await ls.rctx.emit_event("compact_start", {"node_id": ls.node.id, "step": ctx.step})
             ctx_ref = _persist_ctx(ls, ctx.step)
             return TaskAction(
                 action=ACTION_DISPATCH,

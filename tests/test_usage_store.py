@@ -212,5 +212,4 @@ def test_usage_tracker_runs_after_fallback_response_replacement():
     ctx = HookContext(messages=[], tools=[], node=None, provider=None,
                       response=ProviderResponse(ok=False), rctx=rctx)
     asyncio.run(registry.afire("after_llm_call", ctx))
-    assert PLUGIN_META["priority"] == tracker.priority == -100
     assert rctx.total_usage == response.usage

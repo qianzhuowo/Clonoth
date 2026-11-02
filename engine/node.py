@@ -103,8 +103,9 @@ def load_node(workspace_root: Path, node_id: str) -> Node | None:
         )
     _usr_path = workspace_root / "config" / "nodes" / f"{nid}.yaml"
     _local_path = _usr_path.with_name(f"{nid}.local.yaml")
+    _builtin_path = workspace_root / "engine" / "builtin" / "nodes" / f"{nid}.yaml"
     _sys_path = workspace_root / "engine" / "system_nodes" / f"{nid}.yaml"
-    _node_path = next((p for p in (_local_path, _usr_path, _sys_path) if p.is_file()), _usr_path)
+    _node_path = next((p for p in (_local_path, _usr_path, _builtin_path, _sys_path, Path(__file__).resolve().parent / "builtin" / "nodes" / f"{nid}.yaml") if p.is_file()), _usr_path)
     data = load_yaml_dict(_node_path)
     if not isinstance(data, dict):
         return None
@@ -162,16 +163,8 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
     elif isinstance(ta_raw, dict):
         _raw_m = str(ta_raw.get("mode") or "none").strip().lower()
         m = {"allow": "allowlist"}.get(_raw_m, _raw_m)
-        allow = [
-            str(x).strip()
-            for x in (ta_raw.get("allow") or [])
-            if isinstance(x, str) and x.strip()
-        ]
-        deny = [
-            str(x).strip()
-            for x in (ta_raw.get("deny") or [])
-            if isinstance(x, str) and x.strip()
-        ]
+        allow = [str(x).strip() for x in (ta_raw.get("allow") or []) if isinstance(x, str) and x.strip()]
+        deny = [str(x).strip() for x in (ta_raw.get("deny") or []) if isinstance(x, str) and x.strip()]
         if m not in {"none", "all", "allowlist"}:
             # [AutoC 2026-08-31] 非法 mode 静默回退 none 会把 allow 列表一起
             # 吞掉（实测：mode="allow" 的 mini 节点 execute_command 未注入，

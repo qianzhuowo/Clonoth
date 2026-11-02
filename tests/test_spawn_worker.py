@@ -8,15 +8,19 @@ silently remove anonymous worker spawning or change its fresh/fork defaults.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import yaml
+
+from engine.context import RunContext
 
 from engine.inference import pseudo_handlers
 from engine.inference.pseudo_handlers import _handle_pseudo_tool
-from engine.inference.pseudo_tools import _is_pseudo_tool_name, build_node_tool_specs
+from engine.inference.pseudo_tools import build_node_tool_specs
 from engine.node import Node, load_node
 
 
@@ -36,62 +40,27 @@ def _tool_names(specs: list[dict[str, Any]]) -> set[str]:
     }
 
 
-def test_spawn_worker_is_a_pseudo_tool_injected_without_delegate_targets() -> None:
-    """Ordinary nodes should receive spawn_worker without predefined targets."""
+@pytest.mark.parametrize("has_active_children", [False, True])
+def test_manage_workers_is_permanently_injected_and_replaces_preempt_and_ask(has_active_children):
     node = Node(id="parent", type="ai", delegate_targets=[])
-
-    _allowed, specs = build_node_tool_specs(registry=_EmptyRegistry(), node=node)
-
-    assert _is_pseudo_tool_name("spawn_worker") is True
-    assert "spawn_worker" in _tool_names(specs)
-    spec = next(item["function"] for item in specs if item["function"]["name"] == "spawn_worker")
-    assert spec["parameters"]["required"] == ["instruction"]
-    assert spec["parameters"]["properties"]["context_mode"]["default"] == "fork"
-
-
-def test_spawn_worker_respects_explicit_control_tool_allowlist() -> None:
-    """The existing control_tools gate should be able to include or exclude it."""
-    excluded = Node(id="excluded", type="ai", control_tools=["ask"])
-    included = Node(id="included", type="ai", control_tools=["spawn_worker"])
-
-    assert "spawn_worker" not in _tool_names(build_node_tool_specs(registry=_EmptyRegistry(), node=excluded)[1])
-    assert "spawn_worker" in _tool_names(build_node_tool_specs(registry=_EmptyRegistry(), node=included)[1])
+    _, specs = build_node_tool_specs(registry=_EmptyRegistry(), node=node, has_active_children=has_active_children)
+    names = _tool_names(specs)
+    assert {"spawn_worker", "manage_workers"} <= names
+    assert names.isdisjoint({"ask", "preempt_task"})
+    spawn = next(s["function"] for s in specs if s["function"]["name"] == "spawn_worker")
+    assert spawn["parameters"]["required"] == ["instruction"]
+    assert spawn["parameters"]["properties"]["context_mode"]["default"] == "fork"
 
 
-def test_spawn_worker_routes_to_builtin_worker_template(monkeypatch) -> None:
-    """The handler should reuse dispatch with resolved anonymous-worker arguments."""
-    captured: dict[str, Any] = {}
-
-    async def fake_dispatch(ls: Any, args: dict[str, Any], pseudo_call: Any) -> None:
-        captured.update(args)
-        captured["call_name"] = pseudo_call.name
-        return None
-
-    # [AutoC 2026-09-12] Replace the shared dispatch boundary rather than mocking
-    # HTTP internals. Why: this test owns spawn_worker argument normalization only.
-    # How: capture the exact dispatch payload. Purpose: existing dispatch tests remain
-    # responsible for Supervisor request construction and event emission.
-    monkeypatch.setattr(pseudo_handlers, "_handle_pseudo_dispatch", fake_dispatch)
-    pseudo_call = SimpleNamespace(
-        id="spawn-1",
-        name="spawn_worker",
-        arguments={
-            "instruction": "检查三个文件",
-            "context_mode": "invalid",
-            "attachment_paths": ["data/temp/input.txt"],
-        },
-    )
-
-    result = asyncio.run(_handle_pseudo_tool(SimpleNamespace(), pseudo_call, step=0))
-
-    assert result is None
-    assert captured == {
-        "target": "_worker",
-        "instruction": "检查三个文件",
-        "context_mode": "fork",
-        "attachment_paths": ["data/temp/input.txt"],
-        "call_name": "spawn_worker",
-    }
+@pytest.mark.parametrize("allowed,expected", [
+    (["ask"], set()),
+    (["spawn_worker"], {"spawn_worker"}),
+    (["manage_workers"], {"manage_workers"}),
+])
+def test_worker_controls_respect_explicit_allowlist(allowed, expected):
+    node = Node(id="parent", type="ai", control_tools=allowed)
+    names = _tool_names(build_node_tool_specs(registry=_EmptyRegistry(), node=node, has_active_children=True)[1])
+    assert names & {"spawn_worker", "manage_workers"} == expected
 
 
 def test_spawn_worker_rejects_empty_instruction(monkeypatch) -> None:
@@ -329,3 +298,131 @@ def test_run_ai_node_consumes_cache_warm_fork_snapshot(tmp_path: Path) -> None:
     assert prov.seen_messages[:2] == parent_prefix
     assert "Inspect module X" in prov.seen_messages[2]["content"]
     assert prov.seen_tools == parent_tools
+
+
+class _Response:
+    """Small HTTP response compatible with RunContext and pseudo handlers."""
+
+    def __init__(self, payload: Any, status_code: int = 200, text: str = "OK") -> None:
+        self._payload = payload
+        self.status_code = status_code
+        self.text = text
+
+    def json(self) -> Any:
+        return self._payload
+
+
+class _ActionHttp:
+    """Record manage_workers mutation requests."""
+
+    def __init__(self) -> None:
+        self.posts: list[dict[str, Any]] = []
+
+    async def post(self, url: str, **kwargs: Any) -> _Response:
+        self.posts.append({"url": url, **kwargs})
+        return _Response({"ok": True})
+
+
+def _run_context(http: Any) -> RunContext:
+    """Build a RunContext using one HTTP stub for both client fields."""
+    return RunContext(
+        workspace_root=Path("."),
+        supervisor_url="http://supervisor.test",
+        session_id="branch-current",
+        parent_session_id="parent-session",
+        worker_id="engine-worker",
+        http=http,
+        llm_http=http,
+        task_id="parent-task",
+    )
+
+
+def _handler_state(http: Any, tasks: list[dict[str, Any]]) -> SimpleNamespace:
+    """Build the minimal loop state consumed by manage_workers."""
+    async def list_active_child_tasks() -> list[dict[str, Any]]:
+        return list(tasks)
+
+    rctx = SimpleNamespace(
+        supervisor_url="http://supervisor.test",
+        session_id="branch-current",
+        parent_session_id="parent-session",
+        task_id="parent-task",
+        http=http,
+        list_active_child_tasks=list_active_child_tasks,
+    )
+    return SimpleNamespace(rctx=rctx)
+
+
+def _run_handler(monkeypatch: Any, args: dict[str, Any], *, tasks: list[dict[str, Any]], http: Any) -> dict[str, Any]:
+    """Execute one manage_workers call and decode its emitted result."""
+    emitted: list[str] = []
+
+    def fake_emit(ls: Any, pseudo_call: Any, content: str, **kwargs: Any) -> None:
+        emitted.append(content)
+
+    monkeypatch.setattr(pseudo_handlers, "_emit_pseudo_tool_result", fake_emit)
+    call = SimpleNamespace(id="manage-1", name="manage_workers", arguments=args)
+    result = asyncio.run(_handle_pseudo_tool(_handler_state(http, tasks), call, step=0))
+
+    assert result is None
+    assert len(emitted) == 1
+    return json.loads(emitted[0])
+
+
+def test_run_context_lists_only_active_child_tasks_and_deduplicates() -> None:
+    """Discovery should combine legacy and child-session tasks without user entries."""
+    tasks = asyncio.run(_run_context(_DiscoveryHttp()).list_active_child_tasks())
+
+    assert [task["task_id"] for task in tasks] == [
+        "legacy-child-task-abcdef",
+        "spawned-child-task-123456",
+    ]
+    assert tasks[1]["node_id"] == "_worker"
+    assert tasks[1]["status"] == "awaiting_approval"
+
+
+class _DiscoveryHttp:
+    async def get(self, url, **kwargs):
+        if url.endswith("/running_tasks"):
+            return _Response({"tasks": [
+                {"task_id": "parent-task", "node_id": "parent", "status": "running", "is_user_entry": True},
+                {"task_id": "sibling-user-task", "node_id": "parent", "status": "running", "is_user_entry": True},
+                {"task_id": "legacy-child-task-abcdef", "node_id": "scout", "status": "running", "is_user_entry": False},
+            ]})
+        if url.endswith("/children"):
+            return _Response([
+                {"task_id": "legacy-child-task-abcdef", "node_id": "scout", "status": "running", "session_id": "child-legacy"},
+                {"task_id": "spawned-child-task-123456", "node_id": "_worker", "status": "awaiting_approval", "session_id": "child-spawned"},
+                {"task_id": "completed-child-task", "node_id": "_worker", "status": "completed", "session_id": "child-completed"},
+            ])
+        raise AssertionError(f"unexpected GET {url}")
+
+
+def test_manage_workers_list_formats_active_children(monkeypatch):
+    tasks = [{"task_id": "abcdef123456-full", "node_id": "scout", "status": "running",
+              "created_at": "2026-09-12T15:00:00+00:00"}]
+    http = _ActionHttp()
+    payload = _run_handler(monkeypatch, {"action": "list"}, tasks=tasks, http=http)
+    assert payload["active_children"] == 1
+    assert payload["tasks"][0]["task_id"] == "abcdef123456"
+    assert payload["tasks"][0]["node_id"] == "scout"
+    assert isinstance(payload["tasks"][0]["elapsed_sec"], int)
+    assert not http.posts
+
+
+@pytest.mark.parametrize("args,path,json_body,params", [
+    ({"action": "message", "task_id": "abcdef123456", "message": "请补充验证"},
+     "/tasks/abcdef123456-full/preempt", {"message": "请补充验证"}, None),
+    ({"action": "preempt", "target": "scout"}, "/tasks/abcdef123456-full/preempt", None, None),
+    ({"action": "cancel"}, "/sessions/parent-session/cancel_active_tasks", None, {"exclude_task_id": "parent-task"}),
+    ({"action": "cancel", "node_id": "smith"}, "/sessions/parent-session/cancel_active_tasks", None,
+     {"exclude_task_id": "parent-task", "node_id": "smith"}),
+])
+def test_manage_workers_routes_child_controls(monkeypatch, args, path, json_body, params):
+    tasks = [{"task_id": "abcdef123456-full", "node_id": "scout", "status": "running"}]
+    http = _ActionHttp()
+    payload = _run_handler(monkeypatch, args, tasks=tasks, http=http)
+    assert payload["success"] is True
+    assert [(p["url"], p.get("json"), p.get("params")) for p in http.posts] == [
+        ("http://supervisor.test/v1" + path, json_body, params),
+    ]

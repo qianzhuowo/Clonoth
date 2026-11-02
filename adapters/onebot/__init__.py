@@ -42,7 +42,7 @@ import logging
 import os
 import time
 
-from . import access, approval, attachment_policy, callbacks, commands, forward_bridge, history, inbound_attachments, message_parse, routing, send, state
+from . import access, approval, attachment_policy, callbacks, commands, forward_bridge, history, inbound_attachments, message_parse, routing, send, state, voice
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -263,11 +263,14 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     )
     if proactive_reply is not None:
         await _agent_matcher.finish(proactive_reply)
+    transcripts, had_voice = await voice.transcribe_message(bot, event.get_message())
+    user_text, history_text, input_modality = voice.compose_user_text(user_text, transcripts, had_voice)
     await state.RECENT.merge_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
-    history._record_group_message(event, bot, override_text=user_text, attachments=attachments)
+    history._record_group_message(event, bot, override_text=history_text, attachments=attachments)
     draw_direct_prompt = routing._parse_direct_draw_command(user_text)
     entry_node_id = state.DRAW_NODE_ID if draw_direct_prompt is not None else ""
     inbound_text = await routing._build_draw_direct_inbound_text(event, draw_direct_prompt, False) if draw_direct_prompt is not None else await routing._build_inbound_text(event, bot, user_text, stable_conversation_key, attachments)
+    inbound_text = voice.append_reply_modality_hint(inbound_text, input_modality, is_dm=False)
     if attachment_policy.looks_like_image_query(user_text) and not attachments:
         attachment_errors.append(
             "当前消息或引用链未能绑定到可确认的图片；不得从聊天历史猜测图片内容，请让用户重新发送或直接引用原图。"
@@ -285,6 +288,7 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
         "group_id": group_id,
         "conversation_key": stable_conversation_key,
         "_source_attachments": [dict(att) for att in attachments if isinstance(att, dict)],
+        "_qq_input_modality": input_modality,
     }
     try:
         ok = await routing._enqueue_or_submit_inbound(state.QueuedInbound(
@@ -424,10 +428,13 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
     )
     if proactive_reply is not None:
         await _private_matcher.finish(proactive_reply)
+    transcripts, had_voice = await voice.transcribe_message(bot, event.get_message())
+    user_text, _history_text, input_modality = voice.compose_user_text(user_text, transcripts, had_voice)
     await state.RECENT.merge_after_text(event=event, conversation_key=stable_conversation_key, user_text=user_text, attachments=attachments)
     draw_direct_prompt = routing._parse_direct_draw_command(user_text)
     entry_node_id = state.DRAW_NODE_ID if draw_direct_prompt is not None else ""
     inbound_text = await routing._build_draw_direct_inbound_text(event, draw_direct_prompt, True) if draw_direct_prompt is not None else await routing._build_private_inbound_text(event, bot, user_text, stable_conversation_key, attachments)
+    inbound_text = voice.append_reply_modality_hint(inbound_text, input_modality, is_dm=True)
     if attachment_policy.looks_like_image_query(user_text) and not attachments:
         attachment_errors.append(
             "当前消息或引用链未能绑定到可确认的图片；不得从聊天历史猜测图片内容，请让用户重新发送或直接引用原图。"
@@ -445,6 +452,7 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
         "user_id": user_id,
         "conversation_key": stable_conversation_key,
         "_source_attachments": [dict(att) for att in attachments if isinstance(att, dict)],
+        "_qq_input_modality": input_modality,
     }
     try:
         ok = await routing._enqueue_or_submit_inbound(state.QueuedInbound(

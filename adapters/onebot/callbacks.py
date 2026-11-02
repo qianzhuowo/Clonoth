@@ -18,7 +18,7 @@ from typing import List
 from typing import Optional
 import time
 
-from . import approval, commands, message_parse, send, state
+from . import approval, commands, message_parse, send, state, voice
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -135,6 +135,8 @@ class TangQiuCallbacks:
             attachments or [],
             source_attachments=source_attachments,
             send_context=send_context,
+            input_modality=str(platform_data.get("_qq_input_modality") or "text"),
+            conversation_key=trigger.conversation_key,
         )
         # 2026-05-03 修改原因：最终回复到达时，触发消息上可能仍残留生命周期 React。
         # 做法是调用统一清理函数移除 76、281、178、97、326，目的在于把本轮
@@ -192,6 +194,10 @@ class TangQiuCallbacks:
         text, reactions = _extract_reactions(text)
         if reactions:
             await self.add_reactions(trigger, reactions)
+        # 中间回复只发送显式 <tts> 段，不因语音输入自动整段合成。
+        text, voice_segments = voice.voice_plan(text or "", target, "text")
+        if voice_segments:
+            await voice.send_voice_segments(bot, target, trigger.conversation_key, voice_segments)
         if text:
             source_attachments = platform_data.get("_source_attachments")
             if not isinstance(source_attachments, list):

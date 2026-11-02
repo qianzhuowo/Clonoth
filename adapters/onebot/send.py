@@ -42,7 +42,7 @@ import re
 import time
 import uuid
 
-from . import anon, approval, commands, history, inbound_attachments, profiles, state
+from . import anon, approval, commands, history, inbound_attachments, profiles, state, voice
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -1560,9 +1560,12 @@ async def _send_text_and_attachments(
     *,
     source_attachments: List[Dict[str, Any]] | None = None,
     send_context: OutboundSendContext | None = None,
+    input_modality: str = "text",
+    conversation_key: str = "",
 ) -> None:
-    """统一发送最终文本/附件，并持久绑定回复所依据的来源图片。"""
+    """统一发送最终文本/TTS 语音/附件，并持久绑定回复所依据的来源图片。"""
     conv_key = target.get("conversation_key")
+    text, voice_segments = voice.voice_plan(text or "", target, input_modality)
     # 2026-05-01 修改原因：私聊没有群历史缓存，不应写入 _group_history；群聊
     # 仍保留原来的 Bot 回复入库逻辑，维持后续 @Bot 请求的上下文连续性。
     if text:
@@ -1576,6 +1579,8 @@ async def _send_text_and_attachments(
             group_id = target.get("group_id")
             if group_id is not None:
                 history._record_bot_reply(int(group_id), text)
+    if voice_segments:
+        await voice.send_voice_segments(bot, target, conversation_key or str(conv_key or ""), voice_segments)
     if attachments:
         # Delivery completion means the platform-confirmed final attachment send,
         # not merely scheduling a background task.  Failures propagate to the SDK

@@ -69,3 +69,37 @@ def test_stocktool_pack_exposes_exactly_two_tools():
         if spec
     )
     assert names == ["stocktool_history", "stocktool_quote"]
+
+
+IMAGE_TOOLS = {
+    "gemini_image.py": "gemini_image",
+    "gpt_image_2.py": "gpt_image_2",
+    "drawtools/draw_context.py": "draw_context",
+    "drawtools/nai_cleanup.py": "nai_cleanup",
+    "drawtools/nai_generate.py": "nai_generate",
+    "drawtools/nai_generate_from_plan.py": "nai_generate_from_plan",
+}
+
+
+@pytest.mark.parametrize("rel, name", sorted(IMAGE_TOOLS.items()))
+def test_image_tool_spec_is_discoverable(rel, name):
+    spec, _ = _extract_tool_spec(TOOLS / rel)
+    assert spec and spec.get("name") == name
+
+
+@pytest.mark.parametrize("rel", ["gemini_image.py", "gpt_image_2.py"])
+def test_image_tool_has_no_system_models_dependency(rel):
+    assert "system_models" not in (TOOLS / rel).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("rel, var", [("gemini_image.py", "CLONOTH_IMAGE_GEMINI_API_KEY"), ("gpt_image_2.py", "CLONOTH_IMAGE_GPT_API_KEY")])
+def test_image_tool_without_key_fails_naming_its_variable(tmp_path, rel, var):
+    env = {k: v for k, v in os.environ.items() if "API_KEY" not in k and "BASE_URL" not in k and not k.startswith("CLONOTH_IMAGE_")}
+    env["PYTHONIOENCODING"] = "utf-8"
+    proc = subprocess.run(
+        [sys.executable, str(TOOLS / rel)], input=json.dumps({"prompt": "a cat"}),
+        capture_output=True, text=True, encoding="utf-8", timeout=60, env=env, cwd=str(tmp_path),
+    )
+    payload = json.loads(proc.stdout.strip().splitlines()[-1])
+    assert proc.returncode == 1 and payload["ok"] is False
+    assert var in payload["error"]

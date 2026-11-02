@@ -91,3 +91,10 @@ config/qq_user_profiles.yaml
 config/qq_custom_faces.txt
 config/qq_custom_faces.json
 config/nodes/_persona.md
+
+# drawtools user runtime configs (keep *.example.* templates versioned)
+/tools/drawtools/settings.yaml
+/tools/drawtools/character_tags.yaml
+/tools/drawtools/prompts/novelai/top-system.md
+/tools/drawtools/prompts/novelai/output-format.md
+/tools/drawtools/prompts/novelai/tag-guide.md

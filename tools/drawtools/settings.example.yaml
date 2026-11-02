@@ -97,9 +97,9 @@ character_tags:
   auto_search_unknown: true
 llm:
   provider: openai
-  model_env: DRAW_PLANNER_MODEL
-  api_key_env: DRAW_PLANNER_API_KEY
-  base_url_env: DRAW_PLANNER_BASE_URL
+  model_env: DRAW_TAG_MODEL
+  api_key_env: DRAW_TAG_API_KEY
+  base_url_env: DRAW_TAG_BASE_URL
   use_stream: false
 prompts:
   top_system_path: tools/drawtools/prompts/novelai/top-system.md

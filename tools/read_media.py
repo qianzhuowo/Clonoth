@@ -138,7 +138,9 @@ def read_media(args: dict, root: Path) -> dict:
         base_url = base_url[:-3]
     if not api_key:
         raise ValueError("No GEMINI_API_KEY or OPENAI_API_KEY found in environment or .env")
-    model = str(args.get("model") or "gemini-3.8-flash").strip()
+    # READ_MEDIA_MODEL lets deployments behind a gateway pick a model that the gateway actually serves.
+    model = str(args.get("model") or os.environ.get("READ_MEDIA_MODEL") or dotenv.get("READ_MEDIA_MODEL")
+                or "gemini-3.8-flash").strip()
 
     with ThreadPoolExecutor(max_workers=min(len(paths), 8)) as pool:
         prepared = list(pool.map(lambda path: _prepare_media(path, root), paths))
@@ -154,7 +156,8 @@ def read_media(args: dict, root: Path) -> dict:
     if focus:
         instruction += f"\n\nAdditionally, focus specifically on: {focus}"
     parts.append({"text": instruction})
-    body = {"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.15, "maxOutputTokens": 8192}}
+    # Explicit role: the official API tolerates its absence, but gateways often require user/model.
+    body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": {"temperature": 0.15, "maxOutputTokens": 8192}}
     request = urllib_request.Request(
         f"{base_url}/v1beta/models/{model}:generateContent?key={api_key}",
         data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST",

@@ -82,6 +82,42 @@ FORWARD_MSG_MAX_DEPTH = _env_int_range("ONEBOT_FORWARD_MSG_MAX_DEPTH", 3, 0, 8)
 FORWARD_MSG_MAX_MESSAGES = _env_int_range("ONEBOT_FORWARD_MSG_MAX_MESSAGES", 80, 1, 500)
 FORWARD_MSG_TEXT_LIMIT = _env_int_range("ONEBOT_FORWARD_MSG_TEXT_LIMIT", 12000, 500, 100000)
 
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_float_range(name: str, default: float, min_value: float, max_value: float | None = None) -> float:
+    try:
+        value = float(os.environ.get(name, "") or default)
+    except ValueError:
+        value = default
+    value = max(min_value, value)
+    return min(max_value, value) if max_value is not None else value
+
+
+# 入站图片/文件：下载到 data/attachments/<稳定会话键>/，由 engine/data_cleanup.py 统一过期清理。
+ENABLE_IMAGE_INPUT = _env_flag("ONEBOT_ENABLE_IMAGE_INPUT", True)
+ENABLE_FILE_INPUT = _env_flag("ONEBOT_ENABLE_FILE_INPUT", True)
+IMAGE_MAX_BYTES = _env_int_range("ONEBOT_IMAGE_MAX_BYTES", 10 * 1024 * 1024, 1024)
+FILE_MAX_BYTES = _env_int_range("ONEBOT_FILE_MAX_BYTES", 50 * 1024 * 1024, 1024)
+IMAGE_DOWNLOAD_TIMEOUT = _env_float_range("ONEBOT_IMAGE_DOWNLOAD_TIMEOUT", 15.0, 1.0)
+IMAGE_CACHE_TTL_SECONDS = _env_int_range("ONEBOT_IMAGE_CACHE_TTL_SECONDS", 24 * 3600, 60)
+MAX_IMAGES_PER_TURN = _env_int_range("ONEBOT_MAX_IMAGES_PER_TURN", 4, 1, 16)
+MAX_FILES_PER_TURN = _env_int_range("ONEBOT_MAX_FILES_PER_TURN", 3, 1, 16)
+# “再看看图”这类追问：只取同一发送者最近一条消息里的图片。
+RECENT_IMAGE_MAX_ITEMS = _env_int_range("ONEBOT_RECENT_IMAGE_MAX_ITEMS", 20, 1, 200)
+RECENT_IMAGE_MAX_AGE_SECONDS = _env_float_range("ONEBOT_RECENT_IMAGE_MAX_AGE_SECONDS", 60.0, 1.0)
+IMAGE_WAIT_AFTER_TEXT_SECONDS = _env_float_range("ONEBOT_IMAGE_WAIT_AFTER_TEXT_SECONDS", 2.5, 0.0, 10.0)
+# 引用消息附件索引（message_id -> 已落盘图片），get_msg 失败时兜底。
+REPLY_ATTACHMENT_CACHE_FILE = os.environ.get(
+    "ONEBOT_REPLY_ATTACHMENT_CACHE_FILE",
+    os.path.join(CLONOTH_WORKSPACE, "data", "cache", "onebot_reply_attachments.json"),
+)
+
 # QQ 最高权限用户列表（逗号分隔）。这些用户会在 inbound 文本中标记为最高权限管理员。
 _raw_superusers = os.environ.get("CLONOTH_QQ_SUPERUSERS", "")
 QQ_SUPERUSERS: set[int] = {int(u) for u in _raw_superusers.split(",") if u.strip().isdigit()}

@@ -1,7 +1,6 @@
 """read_file — read one or more files (text / image / binary).
 
-Supports batch reading via ``files`` array parameter.
-Backward-compatible with legacy single-file ``path`` parameter.
+Supports single-file ``path`` and batch reading via ``files`` (or ``items``).
 """
 from __future__ import annotations
 
@@ -25,6 +24,7 @@ _MAX_TEXT_FILE_BYTES = 10 * 1024 * 1024       # 10 MB threshold for oversized te
 _MAX_OVERSIZED_SCAN_CHARS = 50 * 1024 * 1024  # 50M chars max streaming skip scan for startLine on oversized files
 _OVERSIZED_PREVIEW_LINES = 50                 # Head lines returned when text file > 10 MB without explicit startLine/endLine
 _OVERSIZED_PREVIEW_CHARS = 8 * 1024           # 8 KB max chars for oversized file head preview
+_MAX_BATCH_FILES = 8
 _MAX_LINES_PER_READ = 500                     # Max lines returned in a single read_file call
 _MAX_OUTPUT_CHARS = 64 * 1024                 # 64 KB max total output chars per file
 _MAX_LINE_READ_CHARS = 8 * 1024               # Bound per readline() call to prevent 50MB single-line OOM
@@ -219,8 +219,8 @@ def _read_single_file_sync(
     except Exception as exc:
         return {"path": path_str, "success": False, "error": str(exc)}, None
 
-    start_val = start_line if isinstance(start_line, int) and start_line > 0 else 1
-    has_explicit_range = isinstance(start_line, int) or isinstance(end_line, int)
+    start_val = start_line or 1
+    has_explicit_range = start_line is not None or end_line is not None
     is_oversized = file_size > _MAX_TEXT_FILE_BYTES
 
     # ---- Strategy A: oversized text file (> 10 MB) without explicit line range -> head preview + hint ----
@@ -268,10 +268,7 @@ def _read_single_file_sync(
         }, None
 
     # ---- Streaming bounded read (<= 10 MB, or > 10 MB with explicit startLine/endLine) ----
-    if isinstance(end_line, int) and end_line >= start_val:
-        requested_end = end_line
-    else:
-        requested_end = None  # up to EOF, capped by _MAX_LINES_PER_READ
+    requested_end = end_line  # None means up to EOF, capped by _MAX_LINES_PER_READ
 
     max_allowed_end = start_val + _MAX_LINES_PER_READ - 1
     if requested_end is None or requested_end > max_allowed_end:
@@ -329,7 +326,7 @@ def _read_single_file_sync(
     except Exception as exc:
         return {"path": path_str, "success": False, "error": str(exc)}, None
 
-    if isinstance(start_line, int) and start_line > total_lines:
+    if start_line is not None and start_line > total_lines:
         return {
             "path": path_str, "success": False,
             "error": f"startLine {start_line} exceeds total lines",
@@ -355,15 +352,12 @@ def _read_single_file_sync(
     if is_oversized:
         result["oversized"] = True
         result["size"] = file_size
-    if has_explicit_range:
-        if not stopped_early_oversized:
-            result["totalLines"] = total_lines
-        result["startLine"] = s + 1
-        result["endLine"] = e
+    if not stopped_early_oversized:
+        result["totalLines"] = total_lines
+    result["startLine"] = s + 1
+    result["endLine"] = e
     if _auto_truncated:
         result["truncated"] = True
-        if not stopped_early_oversized:
-            result["totalLines"] = total_lines
         result["shownLines"] = len(sliced)
         if is_oversized and stopped_early_oversized:
             mb_str = f"{file_size / (1024 * 1024):.1f} MB"
@@ -403,12 +397,32 @@ async def _read_single_file(
     if not path_str:
         return {"path": "", "success": False, "error": "empty path"}, None
 
+    if start_line is not None or end_line is not None:
+        try:
+            if isinstance(start_line, bool) or isinstance(end_line, bool):
+                raise ValueError
+            start_line = int(start_line) if start_line is not None else None
+            end_line = int(end_line) if end_line is not None else None
+            if ((start_line is not None and start_line < 1)
+                    or (end_line is not None and end_line < 1)
+                    or (start_line is not None and end_line is not None and end_line < start_line)):
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            return {
+                "path": path_str, "success": False,
+                "error": "invalid line range (startLine/endLine must be >= 1 and endLine >= startLine)",
+            }, None
+
     _op, err = await request_guard(
         ctx, "read_file",
         {"path": path_str, "start_line": start_line, "end_line": end_line},
     )
     if err is not None:
-        return {"path": path_str, "success": False, "error": err.get("error", "denied")}, None
+        result_entry = {"path": path_str, "success": False, "error": err.get("error", "denied")}
+        cancelled = bool(err.get("cancelled", False))
+        if cancelled:
+            result_entry["cancelled"] = True
+        return result_entry, None
 
     try:
         p = resolve_under_allowed_roots(ctx.workspace_root, path_str, workspace=ctx.workspace)
@@ -434,6 +448,23 @@ def _read_file_result_text(results: list[dict[str, Any]]) -> str:
     # section header format for text, image, binary, and error entries. Purpose:
     # keep model-visible file contents stable without relying on formatter fallback.
     parts: list[str] = []
+    if len(results) > 1:
+        ok_n = sum(1 for r in results if r.get("success"))
+        fail_n = len(results) - ok_n
+        summary_lines = [f"[Batch read: {ok_n} succeeded, {fail_n} failed]"]
+        for r in results:
+            p = r.get("path", "")
+            if r.get("success") and r.get("type") == "text":
+                sl = r.get("startLine", 1)
+                el = r.get("endLine", 0)
+                tl = r.get("totalLines", 0)
+                trunc = " (truncated)" if r.get("truncated") else ""
+                summary_lines.append(f"- {p}: ok (L{sl}-{el}/{tl}{trunc})")
+            elif r.get("success"):
+                summary_lines.append(f"- {p}: ok ({r.get('type', 'file')}, {r.get('size', 0)} bytes)")
+            else:
+                summary_lines.append(f"- {p}: ERROR ({r.get('error', 'unknown')})")
+        parts.append("\n".join(summary_lines))
     for r in results:
         p = r.get("path", "")
         if r.get("success") and r.get("type") == "text":
@@ -453,34 +484,35 @@ def _read_file_result_text(results: list[dict[str, Any]]) -> str:
 
 
 async def read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
-    files_arg = args.get("files")
-    if isinstance(files_arg, list) and files_arg:
-        file_entries = [e for e in files_arg if isinstance(e, dict)]
+    files_arg = args.get("files") if args.get("files") is not None else args.get("items")
+    error = None
+    if files_arg is not None:
+        if not isinstance(files_arg, list) or not files_arg:
+            error = "empty files list"
+        elif len(files_arg) > _MAX_BATCH_FILES:
+            error = f"too many files in batch ({len(files_arg)} > {_MAX_BATCH_FILES}); read at most {_MAX_BATCH_FILES} files per call"
+        elif any(not isinstance(entry, dict) for entry in files_arg):
+            error = "invalid file entry in files list (expected object)"
+        file_entries = files_arg
     else:
-        # Legacy single-file mode
-        path = str(args.get("path", ""))
+        path = str(args.get("path") or "").strip()
         if not path:
-            return {
-                "ok": False, "success": False, "error": "no path specified",
-                "data": {"result": "ERROR: no path specified", "results": [], "successCount": 0, "failCount": 0, "totalCount": 0, "multiRoot": False},
-            }
-        entry_dict: dict[str, Any] = {"path": path}
-        if args.get("start_line") is not None:
-            entry_dict["startLine"] = args["start_line"]
-        if args.get("end_line") is not None:
-            entry_dict["endLine"] = args["end_line"]
-        file_entries = [entry_dict]
+            error = "no path specified"
+        sl = args.get("startLine") if args.get("startLine") is not None else args.get("start_line")
+        el = args.get("endLine") if args.get("endLine") is not None else args.get("end_line")
+        file_entries = [{"path": path, "startLine": sl, "endLine": el}]
 
-    if not file_entries:
+    if error is not None:
         return {
-            "ok": False, "success": False, "error": "empty files list",
-            "data": {"result": "ERROR: empty files list", "results": [], "successCount": 0, "failCount": 0, "totalCount": 0, "multiRoot": False},
+            "ok": False, "success": False, "error": error,
+            "data": {"result": f"ERROR: {error}", "results": [], "successCount": 0, "failCount": 0, "totalCount": 0, "multiRoot": False},
         }
 
     results: list[dict[str, Any]] = []
     multimodal_data: list[dict[str, Any]] = []
     success_count = 0
     fail_count = 0
+    was_cancelled = False
 
     for fe in file_entries:
         path_str = str(fe.get("path", "")).strip()
@@ -492,6 +524,9 @@ async def read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             success_count += 1
         else:
             fail_count += 1
+        if r.get("cancelled"):
+            was_cancelled = True
+            break
         if mm is not None:
             multimodal_data.append(mm)
 
@@ -508,6 +543,8 @@ async def read_file(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
             "multiRoot": False,
         },
     }
+    if was_cancelled:
+        response["cancelled"] = True
     if fail_count > 0:
         response["error"] = f"{fail_count} file(s) failed to read"
     if multimodal_data:

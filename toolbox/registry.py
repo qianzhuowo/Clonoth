@@ -431,13 +431,18 @@ class ToolRegistry:
             ),
             (
                 "read_file",
-                "Read one or more files under workspace root. Supports text files (with optional line range; up to 500 lines / 64 KB per read, or 50-line head preview on >10 MB files when startLine is omitted), images (returned as multimodal), and binary files. Policy+approval guarded.",
+                "Read one local file (pass {path, startLine?, endLine?}) or a batch of 1-8 files (pass {files: [{path, startLine?, endLine?}, ...]}). Supports text files (up to 500 lines / 64 KB per read, or 50-line head preview on >10 MB files when startLine is omitted), images (returned as multimodal), and binary files. Policy+approval guarded.",
                 {
                     "type": "object",
                     "properties": {
+                        "path": {"type": "string", "description": "Single file path relative to workspace root. For reading multiple files at once, use 'files' instead."},
+                        "startLine": {"type": "integer", "description": "Optional 1-based inclusive start line for single-file text read."},
+                        "endLine": {"type": "integer", "description": "Optional 1-based inclusive end line for single-file text read."},
                         "files": {
                             "type": "array",
-                            "description": "Preferred: array of file objects. Each has: path (required), startLine (optional, 1-based), endLine (optional, 1-based inclusive).",
+                            "description": "Batch of 1-8 independent files to read. Each item has: path (required), startLine (optional, 1-based), endLine (optional, 1-based inclusive).",
+                            "minItems": 1,
+                            "maxItems": 8,
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -448,9 +453,6 @@ class ToolRegistry:
                                 "required": ["path"],
                             },
                         },
-                        "path": {"type": "string", "description": "(Deprecated alias, prefer files array) Single file path relative to workspace root."},
-                        "start_line": {"type": "integer", "description": "(Deprecated alias) Start line number."},
-                        "end_line": {"type": "integer", "description": "(Deprecated alias) End line number."},
                     },
                     "required": [],
                 },

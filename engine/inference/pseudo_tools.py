@@ -759,9 +759,9 @@ def resolve_effective_action(tool_name: str, args: dict[str, Any] | None = None)
             act = "upsert"
         return cons_name, act
     if cons_name == "search_web":
-        if not act:
-            act = "fetch" if (a.get("urls") and not a.get("query")) else "search"
-        return cons_name, act
+        if a.get("urls") and not a.get("query"):
+            act = "fetch"
+        return cons_name, act or "search"
     if act:
         return cons_name, act
     return cons_name, None

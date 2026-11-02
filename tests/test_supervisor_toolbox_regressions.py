@@ -614,3 +614,133 @@ def test_legacy_manager_actions_cannot_override_authorized_alias(tmp_path):
     assert not is_tool_action_allowed(node, "manage_skill", {"action": "remove"})
     assert not is_tool_action_allowed(node, "delete_skill", {})
     assert not is_tool_action_allowed(node, "list_skills", {"action": "remove"})
+
+@pytest.fixture
+def read_file_contract(tmp_path):
+    import json
+    import httpx
+    from toolbox.builtins.read_file import read_file
+
+    (tmp_path / "a.txt").write_text("one\ntwo\nthree\nfour\n", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("alpha\nbeta\n", encoding="utf-8")
+    requested_paths = []
+
+    async def run(args, cancel_path=None):
+        def respond(request):
+            if request.url.path == "/v1/ops/request":
+                payload = json.loads(request.content)
+                assert payload["op"] == "read_file"
+                path = payload["parameters"]["path"]
+                requested_paths.append(path)
+                decision = ({"safety_level": "approval_required", "approval_id": "stop"}
+                            if path == cancel_path else {"safety_level": "allow"})
+                return httpx.Response(200, json=decision)
+            if request.url.path == "/v1/approvals/stop":
+                return httpx.Response(200, json={"status": "cancelled"})
+            assert request.url.path == "/v1/sessions/s/cancelled"
+            return httpx.Response(200, json={"cancelled": False})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+            ctx = ToolContext(supervisor_url="http://supervisor", session_id="s", run_id="r",
+                              worker_id="w", workspace_root=tmp_path, http=http, registry=None)
+            return await read_file(args, ctx)
+
+    return run, requested_paths
+
+
+@pytest.mark.parametrize("start,end", [("startLine", "endLine"), ("start_line", "end_line")])
+def test_read_file_single_path_line_range(read_file_contract, start, end):
+    run, paths = read_file_contract
+    result = asyncio.run(run({"path": "a.txt", start: 2, end: 3}))
+    assert result["ok"] and paths == ["a.txt"]
+    entry = result["data"]["results"][0]
+    assert (entry["startLine"], entry["endLine"], entry["totalLines"]) == (2, 3, 4)
+    assert entry["content"] == "   2 | two\n   3 | three"
+
+
+@pytest.mark.parametrize("key", ["files", "items"])
+def test_read_file_batch_summary_precedes_bodies(read_file_contract, key):
+    run, paths = read_file_contract
+    result = asyncio.run(run({key: [
+        {"path": "a.txt", "startLine": 2, "endLine": 3}, {"path": "b.txt"},
+        {"path": "missing.txt"},
+    ]}))
+    data = result["data"]
+    assert not result["ok"] and paths == ["a.txt", "b.txt", "missing.txt"]
+    assert (data["successCount"], data["failCount"], data["totalCount"]) == (2, 1, 3)
+    assert data["result"].startswith(
+        "[Batch read: 2 succeeded, 1 failed]\n"
+        "- a.txt: ok (L2-3/4)\n- b.txt: ok (L1-2/2)\n"
+        "- missing.txt: ERROR (File not found)\n"
+    )
+    assert "   2 | two\n   3 | three" in data["result"]
+    assert "   1 | alpha\n   2 | beta" in data["result"]
+
+
+@pytest.mark.parametrize("args,error", [
+    ({"files": [{"path": "a.txt"}] * 9}, "too many files in batch (9 > 8); read at most 8 files per call"),
+    ({"files": [{"path": "a.txt"}, "b.txt"]}, "invalid file entry in files list (expected object)"),
+    ({"files": []}, "empty files list"),
+    ({"files": "a.txt"}, "empty files list"),
+    ({"path": "a.txt", "startLine": 3, "endLine": 2}, "invalid line range (startLine/endLine must be >= 1 and endLine >= startLine)"),
+    ({"files": [{"path": "a.txt", "startLine": 0}]}, "invalid line range (startLine/endLine must be >= 1 and endLine >= startLine)"),
+    ({"path": "a.txt", "endLine": "bad"}, "invalid line range (startLine/endLine must be >= 1 and endLine >= startLine)"),
+])
+def test_read_file_rejects_invalid_arguments_before_approval(read_file_contract, args, error):
+    run, paths = read_file_contract
+    result = asyncio.run(run(args))
+    assert not result["ok"] and not result["success"]
+    assert result["error"] == error
+    assert error in result["data"]["result"]
+    assert paths == []
+
+
+def test_read_file_cancelled_approval_stops_batch(read_file_contract):
+    run, paths = read_file_contract
+    result = asyncio.run(run({"files": [
+        {"path": "a.txt"}, {"path": "b.txt"}, {"path": "missing.txt"},
+    ]}, cancel_path="b.txt"))
+    assert not result["ok"] and result["cancelled"] is True
+    assert paths == ["a.txt", "b.txt"]
+    data = result["data"]
+    assert (data["successCount"], data["failCount"], data["totalCount"]) == (1, 1, 2)
+    assert [entry["path"] for entry in data["results"]] == paths
+    assert data["results"][-1]["cancelled"] is True
+    assert data["results"][-1]["error"] == "task cancelled"
+
+
+def test_read_file_schema_promotes_single_path_and_bounds_batches(tmp_path):
+    registry = ToolRegistry(workspace_root=tmp_path, tools_dir=tmp_path / "tools")
+    spec = registry.get_spec("read_file")
+    props = spec["input_schema"]["properties"]
+    assert set(props) == {"path", "startLine", "endLine", "files"}
+    assert props["startLine"]["type"] == props["endLine"]["type"] == "integer"
+    assert (props["files"]["minItems"], props["files"]["maxItems"]) == (1, 8)
+    assert "Deprecated" not in props["path"]["description"]
+
+@pytest.mark.parametrize("arguments,action", [
+    ({"query": "example"}, "search"),
+    ({"action": "search", "query": "example"}, "search"),
+    ({"action": "fetch", "urls": ["https://example.com"]}, "fetch"),
+    ({"urls": ["https://example.com"]}, "fetch"),
+    ({"urls": "https://example.com"}, "fetch"),
+    ({"action": "search", "urls": ["https://example.com"]}, "fetch"),
+])
+def test_search_web_discovery_purity_action_and_default_policy(tmp_path, arguments, action):
+    from engine.inference.ai_step import _is_pure_tool_call
+    from engine.inference.pseudo_tools import resolve_effective_action
+    from supervisor.policy import PolicyEngine
+    from supervisor.types import SafetyLevel
+
+    root = Path(__file__).resolve().parents[1]
+    registry = ToolRegistry(workspace_root=tmp_path, tools_dir=root / "tools")
+    spec = registry.get_spec("search_web")
+    assert spec is not None and spec["name"] == "search_web"
+    assert spec["pure"] is True
+    schema = spec["input_schema"]["properties"]
+    assert schema["action"]["enum"] == ["search", "fetch"]
+    assert schema["engine"]["enum"] == ["auto", "tinyfish", "parallel", "exa"]
+    assert _is_pure_tool_call("search_web", arguments, spec) is True
+    assert resolve_effective_action("search_web", arguments) == ("search_web", action)
+    decision = PolicyEngine(workspace_root=tmp_path).evaluate_tool(name="search_web")
+    assert decision.safety_level == SafetyLevel.auto

@@ -163,8 +163,26 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
     elif isinstance(ta_raw, dict):
         _raw_m = str(ta_raw.get("mode") or "none").strip().lower()
         m = {"allow": "allowlist"}.get(_raw_m, _raw_m)
-        allow = [str(x).strip() for x in (ta_raw.get("allow") or []) if isinstance(x, str) and x.strip()]
-        deny = [str(x).strip() for x in (ta_raw.get("deny") or []) if isinstance(x, str) and x.strip()]
+        def _norm_access_list(raw_list: Any) -> list[str]:
+            out: list[str] = []
+            for x in (raw_list or []):
+                if isinstance(x, str) and x.strip():
+                    out.append(x.strip())
+                elif isinstance(x, dict):
+                    for k, v in x.items():
+                        ks = str(k).strip()
+                        if not ks:
+                            continue
+                        if isinstance(v, (list, tuple, set)):
+                            acts = ",".join(str(i).strip() for i in v if str(i).strip())
+                            if acts:
+                                out.append(f"{ks}:{acts}")
+                        elif isinstance(v, str) and v.strip():
+                            out.append(f"{ks}:{v.strip()}")
+            return out
+
+        allow = _norm_access_list(ta_raw.get("allow"))
+        deny = _norm_access_list(ta_raw.get("deny"))
         if m not in {"none", "all", "allowlist"}:
             # [AutoC 2026-08-31] 非法 mode 静默回退 none 会把 allow 列表一起
             # 吞掉（实测：mode="allow" 的 mini 节点 execute_command 未注入，

@@ -60,3 +60,12 @@ def test_sci_calc_evaluates_expression():
     rc, payload = _run("sci_calc", {key: "2+3*4"})
     assert rc == 0, payload
     assert "14" in json.dumps(payload, ensure_ascii=False)
+
+
+def test_stocktool_pack_exposes_exactly_two_tools():
+    names = sorted(
+        (spec or {}).get("name")
+        for spec, _ in (_extract_tool_spec(p) for p in (TOOLS / "stocktool").rglob("*.py") if "__pycache__" not in p.parts)
+        if spec
+    )
+    assert names == ["stocktool_history", "stocktool_quote"]

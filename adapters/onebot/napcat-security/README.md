@@ -74,6 +74,25 @@ QQ 不支持用 `ELECTRON_RUN_AS_NODE=1` 获得独立 Node 模式；检查器将
 - 登录状态恢复不能保证；若要求扫码，等待用户配合，不删除登录数据或反复登录。
 - QQ 收发必须在用户指定私聊/测试群验证；仅有 WS 连接不代表收发验收完成。
 
+## 适配器侧连接加固（Clonoth 仓库内已实现）
+
+NapCat 通过反向 WS 主动连接适配器（`adapters/onebot/app.py`）。能连上监听端口的任何人
+都能伪造 OneBot 事件（包括冒充管理员的消息），因此：
+
+- 适配器默认只监听 `127.0.0.1`；NapCat 在 docker 中时监听 docker 网桥网关地址，
+  **不要监听 `0.0.0.0`**。
+- 监听非回环地址时必须设置 `ONEBOT_ACCESS_TOKEN`（兼容 `ONEBOT_V11_ACCESS_TOKEN`），
+  否则拒绝启动；NapCat 每个启用的 `websocketClients` 写入相同 `token`。
+- 过渡期（NapCat 尚未配置 token）可临时设置 `ONEBOT_ALLOW_NO_TOKEN=1`，配置完成后立即删除。
+- 宿主防火墙只允许 NapCat 容器地址访问该端口；`ws_boundary.py` 提供专用 bridge 网络、
+  配置补丁与可逆 iptables 规则的纯函数辅助（不执行任何命令）。
+
+## compose 加固参数
+
+- 已启用：`no-new-privileges`、`pids_limit`、`mem_limit`、`core: 0`、不发布端口、附件只读挂载。
+- 待实测后再启用：`cap_drop: [ALL]`、`read_only: true`、非 root UID/GID——QQ/Electron
+  可能无法启动或丢失登录状态，必须在测试号上验证收发后才可用于生产。
+
 ## 本地离线测试
 
 ```sh

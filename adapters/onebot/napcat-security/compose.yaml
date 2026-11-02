@@ -13,6 +13,13 @@ services:
       NAPCAT_UID: "0"
       NAPCAT_GID: "0"
       TZ: Asia/Shanghai
+    # Low-risk limits (verified compatible with QQ --no-sandbox in principle; re-check on upgrade).
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: ${NAPCAT_PIDS_LIMIT:-512}
+    mem_limit: ${NAPCAT_MEM_LIMIT:-1g}
+    # NOT enabled until validated with a real login: cap_drop: [ALL], read_only: true,
+    # non-root NAPCAT_UID/GID. QQ/Electron may fail to start or lose login state.
     ulimits:
       core: 0
     volumes:

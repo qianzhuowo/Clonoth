@@ -58,6 +58,7 @@ def register(ctx) -> None:
 | 拦截/修改流程 | `ctx.hooks.register(hook点, handler)` | 两者 |
 | 注册工具 | PLUGIN_META `tools` | engine |
 | 注入 prompt 内容 | `ctx.contributions.get("prompt_sections").register_section(...)` | engine |
+| 按运行时条件隐藏真实工具 / 委派目标 | `ctx.contributions.get("tool_visibility").register_filter(...)` | engine |
 | 注册 HTTP 路由 | `ctx.contributions.get("routes").register(router, ...)` | supervisor |
 | 前端面板/槽位/样式 | PLUGIN_META `web` | 任意（前端读 manifest） |
 

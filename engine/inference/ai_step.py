@@ -1061,6 +1061,7 @@ async def run_ai_node(
     from ..context import EngineContext
     from providers import registry as _provider_registry
     from engine.faces.prompt_sections import prompt_section_registry as _prompt_sections
+    from engine.faces.tool_visibility import tool_visibility_registry as _tool_visibility
 
     _engine_ctx = EngineContext(
         providers=_provider_registry,
@@ -1073,6 +1074,9 @@ async def run_ai_node(
     # unloadable through one ledger.
     _engine_ctx.contributions.mount("prompt_sections", _prompt_sections)
     _engine_ctx.contributions.mount("tools", registry)
+    # tool_visibility face: plugin filters that hide unavailable real tools /
+    # delegate targets; consumed by build_node_tool_specs and dispatch refresh.
+    _engine_ctx.contributions.mount("tool_visibility", _tool_visibility)
     # [AutoC 2026-08-30] nodes face: plugin-declared nodes (Paradox-style
     # override of file-sourced nodes). Storage is module-level, so mounting a
     # fresh thin face per ai_step call shares the same declarations.
@@ -1190,6 +1194,7 @@ async def run_ai_node(
         downstream_info=downstream_info, switch_info=switch_info,
         task_context=rctx.task_context,
         has_active_children=False,
+        workspace_root=rctx.workspace_root,
     )
     if _cache_warm_fork_tools is not None:
         # Keep the exact same tools array in the API payload to preserve 100% of parent's Prefix KV Cache,

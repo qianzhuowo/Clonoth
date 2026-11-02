@@ -7,6 +7,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
+from engine.faces.tool_visibility import tool_visibility_registry
+
 if TYPE_CHECKING:
     from ..node import Node
 
@@ -283,6 +285,10 @@ def refresh_dispatch_to_spec(ls: Any) -> bool:
     raw_targets = [str(t).strip() for t in (fresh_node.delegate_targets or []) if str(t).strip()]
     valid_targets = [t for t in raw_targets if load_node(ws_root, t) is not None]
     targets = valid_targets if (valid_targets or not raw_targets) else raw_targets
+    # Visibility filters apply to refreshed targets too, otherwise a hidden
+    # target would reappear after the first real tool call.
+    _, hidden_targets = tool_visibility_registry.hidden(node, ws_root)
+    targets = [t for t in targets if t not in hidden_targets]
     node.delegate_targets = targets
     existing_idx = next(
         (index for index, spec in enumerate(ls.openai_tools) if spec["function"]["name"] == "dispatch_to"),
@@ -946,9 +952,15 @@ def build_node_tool_specs(
     switch_info: list[dict[str, str]] | None = None,
     task_context: dict[str, Any] | None = None,
     has_active_children: bool = False,
+    workspace_root: Path | str | None = None,
 ) -> tuple[set[str], list[dict]]:
     """Build the model-visible tool list and the allowed real-tool name set."""
     tool_specs = _filter_tool_specs(node, registry.list_specs())
+    # Runtime availability (tool_visibility face): hidden tools leave both the
+    # model-visible list and the authorized set; hidden targets leave dispatch_to.
+    hidden_tools, hidden_targets = tool_visibility_registry.hidden(node, workspace_root)
+    if hidden_tools:
+        tool_specs = [s for s in tool_specs if s.get("name") not in hidden_tools]
     allowed = {s.get("name") for s in tool_specs if s.get("name")}
     # Authorize legacy alias names whenever their consolidated tool is allowed
     for leg_name, cons_name in _LEGACY_TO_CONSOLIDATED.items():
@@ -972,7 +984,10 @@ def build_node_tool_specs(
             return False
         return _ct_allow is None or name in _ct_allow
 
-    delegate_targets = [str(t).strip() for t in list(node.delegate_targets or []) if str(t).strip()]
+    delegate_targets = [
+        str(t).strip() for t in list(node.delegate_targets or [])
+        if str(t).strip() and str(t).strip() not in hidden_targets
+    ]
     if delegate_targets and _ctl("dispatch_to"):
         # Register a single unified dispatch_to tool with dynamic node descriptions and target enum.
         openai_tools.append(_dispatch_to_spec(delegate_targets, downstream_info))

@@ -34,3 +34,4 @@ brotlicffi>=1.1.0          # aiohttp C parser needs this for Brotli (br) decodin
 # - Discord: adapters/discord/README.md
 # - OneBot 11 / QQ: adapters/onebot/README.md
 # Web frontend dependencies are managed by adapters/web/frontend/package-lock.json.
+sympy>=1.12

@@ -198,7 +198,7 @@ def test_build_node_tool_specs_applies_visibility(tmp_path, monkeypatch):
 
     specs = [
         {"name": "gpt_image_2", "description": "", "input_schema": {"type": "object", "properties": {}}},
-        {"name": "web_search", "description": "", "input_schema": {"type": "object", "properties": {}}},
+        {"name": "search_web", "description": "", "input_schema": {"type": "object", "properties": {}}},
     ]
     fake_registry = SimpleNamespace(list_specs=lambda: specs)
     monkeypatch.setattr(pt, "_filter_tool_specs", lambda node, all_specs: list(all_specs))
@@ -209,7 +209,7 @@ def test_build_node_tool_specs_applies_visibility(tmp_path, monkeypatch):
         registry=fake_registry, node=node, workspace_root=tmp_path,
     )
 
-    assert "gpt_image_2" not in allowed and "web_search" in allowed
+    assert "gpt_image_2" not in allowed and "search_web" in allowed
     names = [t["function"]["name"] for t in openai_tools]
     assert "gpt_image_2" not in names
     dispatch = next((t for t in openai_tools if t["function"]["name"] == "dispatch_to"), None)

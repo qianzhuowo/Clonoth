@@ -23,7 +23,7 @@ tool_access:
     - draw_context
     - nai_generate_from_plan
     - nai_generate
-    - web_search
+    - search_web
 
 # [2026-07-11] finish 硬校验：生图模式下，只有当本任务内至少成功执行过
 # 下列任一真实工具时，才允许模型调用 finish 声称已生成/已发送图片。
@@ -56,14 +56,14 @@ prompt: |
     2. 关键词命中的角色标签详情；没有命中则不返回角色详情。
   - 只有 `draw_context.matched_characters` 中出现的角色才视为“已录入角色”。不要假设你看过完整角色库。
 
-  ## web_search 调用规则
+  ## search_web 调用规则
 
-  只在以下情况调用 web_search：
+  只在以下情况调用 search_web：
   1. 用户明确指定某个 IP / 动漫 / 游戏 / VTuber / 影视角色，但该角色没有出现在 draw_context.matched_characters 中，且你无法可靠写出 danbooru tag 或外貌。
   2. 用户要求某个特定作品、皮肤、服装、机体、道具、标志性元素，而你不确定其视觉特征。
   3. 用户明确要求“查一下这个角色的 tag / 外貌 / 设定”。
 
-  不要在以下情况调用 web_search：
+  不要在以下情况调用 search_web：
   - 原创人物、泛化角色需求，例如“穿西装的帅哥”“白发少女”“赛博朋克猫耳娘”。
   - draw_context 已命中角色且提供了 danbooru/appearance/outfits，除非用户要求非常新的或特殊形态。
   - 只是选择画师串/预设，例如“画风用可爱风”。
@@ -86,7 +86,7 @@ prompt: |
   ## 生图模式工作流
 
   1. 调用 `draw_context` 读取可用预设名称和关键词命中角色。
-  2. 必要时调用 `web_search` 查询未知 IP 角色。
+  2. 必要时调用 `search_web` 查询未知 IP 角色。
   3. 按上方 Output Format 模板输出单个合法 YAML 计划，至少包含 `mindful_prelude` 和 `images`。
      - 预设回填（重要）：只要用户话里出现某个预设名 / 预设 id / 画师串关键词（例如“初音立绘”“初音立绘画师串”“用可爱风”“preset”），
        就必须在每张 image 上写 `preset` 字段，值填 draw_context.presets 里对应的预设 name 或 id（例如 `preset: 初音立绘`）。
@@ -111,7 +111,7 @@ prompt: |
 
   已录入角色不会直接写在系统提示词里。请使用 `draw_context` 按当前用户请求关键词读取命中角色。
   - 如果命中角色有 outfits：从中选择最适合当前需求的一套或其变体，不要拼接所有服装。
-  - 如果没有命中角色：按未知角色规则写 type/appear，或使用 web_search 查询 IP 角色。
+  - 如果没有命中角色：按未知角色规则写 type/appear，或使用 search_web 查询 IP 角色。
 
   ## 只给提示词 / TAG 模式回复格式
 

@@ -14,7 +14,7 @@ from toolbox.registry import _extract_tool_spec
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS = ROOT / "tools"
-STANDALONE = ("read_web", "web_search", "exa_search", "x_search", "sci_calc", "remote_exec")
+STANDALONE = ("search_web", "x_search", "sci_calc", "remote_exec")
 
 
 def _run(name: str, args: dict, env: dict | None = None) -> tuple[int, dict]:

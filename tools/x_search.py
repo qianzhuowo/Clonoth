@@ -14,7 +14,7 @@ SPEC = {
     'description': (
         '搜索 X/Twitter 上的帖子。调用时只需要填写 query 字段，例如：'
         '{"query": "今天 AI 领域的热门推文"}。'
-        '需要更稳的自动搜索时优先使用 web_search。'
+        '普通网页搜索或读取网页正文请使用 search_web。'
     ),
     'input_schema': {
         'properties': {

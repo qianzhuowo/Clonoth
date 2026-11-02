@@ -158,9 +158,9 @@ def test_search_in_progress_tracks_start_and_result(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     runtime = _load_runtime(monkeypatch, tmp_path)
-    start = "[qq.orchestrator] 执行 1 个工具：web_search"
-    done = "[qq.orchestrator] web_search: 已获得结果: query=英国 解体"
-    failed = "[qq.orchestrator] web_search: 失败: timeout"
+    start = "[qq.orchestrator] 执行 1 个工具：search_web"
+    done = "[qq.orchestrator] search_web: 已获得结果: query=英国 解体"
+    failed = "[qq.orchestrator] search_web: 失败: timeout"
     other = "[qq.orchestrator] 执行 1 个工具：read_file"
 
     assert runtime.send._search_in_progress([]) is False
@@ -225,13 +225,13 @@ def test_update_progress_only_notifies_while_search_running(
     )
     callbacks = runtime.callbacks.TangQiuCallbacks()
 
-    running = MainTaskState(progress_records=["[qq.orchestrator] 执行 1 个工具：web_search"])
+    running = MainTaskState(progress_records=["[qq.orchestrator] 执行 1 个工具：search_web"])
     asyncio.run(callbacks.update_progress(trigger, running))
     assert notices == [1]
 
     finished = MainTaskState(progress_records=[
-        "[qq.orchestrator] 执行 1 个工具：web_search",
-        "[qq.orchestrator] web_search: 已获得结果: query=x",
+        "[qq.orchestrator] 执行 1 个工具：search_web",
+        "[qq.orchestrator] search_web: 已获得结果: query=x",
     ])
     asyncio.run(callbacks.update_progress(trigger, finished))
     assert notices == [1]  # 搜索已结束，不再发心跳

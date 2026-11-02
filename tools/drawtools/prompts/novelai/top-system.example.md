@@ -11,4 +11,4 @@ Rules:
 - If the request is one simple image, output one image. If the request clearly asks for multiple images or a sequence, output multiple images, but keep it reasonable.
 - Choose size_label for each image from exactly: 横图, 竖图, 方图.
 - For portraits / solo characters, usually choose 竖图; landscapes and wide scenes use 横图; icons/avatar/simple centered composition use 方图.
-- If an IP/character is unknown and no character library entry is available, use web_search before finalizing if the tool is available; prefer Danbooru character tag, otherwise use searched appearance descriptions.
+- If an IP/character is unknown and no character library entry is available, use search_web before finalizing if the tool is available; prefer Danbooru character tag, otherwise use searched appearance descriptions.

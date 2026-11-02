@@ -294,10 +294,11 @@ def _append_unique_path(paths: list[Path], path: Path) -> None:
 def _discover_qq_cache_roots() -> list[Path]:
     """Return conservative candidate roots for NTQQ/NapCat cache cleanup.
 
-    On the Debian server QQ is launched from /opt/QQ/qq but runs with HOME=/app and
-    Chromium child processes use --user-data-dir=/app/.config/QQ.  When /app lives
-    only in QQ's mount namespace, the host-side timer can still access it through
-    /proc/<pid>/root/app/....
+    Typical NapCat/LinuxQQ layouts launch QQ from /opt/QQ/qq (the LinuxQQ package
+    default); the NapCat Docker image runs it with HOME=/app so Chromium child
+    processes use --user-data-dir=/app/.config/QQ.  When /app lives only in QQ's
+    mount namespace, a host-side timer can still access it through
+    /proc/<pid>/root/app/....  Extra roots can be supplied via QQ_CACHE_ROOTS_RAW.
     """
     roots: list[Path] = []
     for p in _split_configured_roots(QQ_CACHE_ROOTS_RAW):

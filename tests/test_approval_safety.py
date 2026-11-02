@@ -28,14 +28,6 @@ def _state(tmp_path):
     )
 
 
-_SUPERVISOR_TERMINAL_GAP = (
-    "supervisor-side (not adapter): NEW SupervisorState.decide_approval "
-    "(supervisor/state.py) has no require_pending guard and POST /v1/approvals/{id} "
-    "(supervisor/api.py approval_decide) returns 200 with the already-decided approval "
-    "instead of 409"
-)
-
-
 @pytest.fixture
 def runtime(monkeypatch, tmp_path):
     return _load_runtime(monkeypatch, tmp_path)
@@ -180,7 +172,6 @@ def test_sdk_rejects_non_json_success():
     asyncio.run(run())
 
 
-@pytest.mark.xfail(reason=_SUPERVISOR_TERMINAL_GAP, strict=True)
 @pytest.mark.parametrize("decision", ["allow", "deny"])
 def test_expired_approval_cannot_be_resubmitted(tmp_path, decision):
     state = _state(tmp_path)
@@ -205,7 +196,6 @@ def test_failed_decision_never_reports_success(runtime, monkeypatch):
     assert "已同意" not in finish.call_args.args[0]
 
 
-@pytest.mark.xfail(reason=_SUPERVISOR_TERMINAL_GAP, strict=True)
 @pytest.mark.parametrize("decision", ["allow", "deny"])
 def test_api_rejects_terminal_approval_and_sdk_reports_failure(tmp_path, monkeypatch, decision):
     import supervisor.admin_api as admin_api

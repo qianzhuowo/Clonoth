@@ -1432,10 +1432,30 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
             )
         return approval
 
-    def decide_approval(self, *, approval_id: str, decision: str, comment: str | None = None) -> Approval | None:
+    def decide_approval(
+        self,
+        *,
+        approval_id: str,
+        decision: str,
+        comment: str | None = None,
+        require_pending: bool = False,
+    ) -> Approval | None:
+        """Record an allow/deny decision for a pending approval.
+
+        Internal paths (conversation reset auto-deny) call this idempotently:
+        an already-decided approval is returned unchanged. External decision
+        entry points pass ``require_pending=True`` so a resubmission of a
+        terminal approval (timed out, reset, or already answered) raises
+        ``ValueError`` instead of looking like a fresh success; the original
+        decision, comment and the single approval_decided event are preserved.
+        """
         with self._lock:
             a = self.approvals.get(approval_id)
-            if a is None or a.status != ApprovalStatus.pending:
+            if a is None:
+                return None
+            if a.status != ApprovalStatus.pending:
+                if require_pending:
+                    raise ValueError(f"approval {approval_id} already decided ({a.status.value})")
                 return a
             a.status = ApprovalStatus.allowed if decision == "allow" else ApprovalStatus.denied
             a.decision = decision

@@ -2359,7 +2359,15 @@ def create_app(
         # Purpose: ensure only authenticated admins can decide web approvals.
         verify_admin_token(request)
         st: SupervisorState = app.state.state
-        a = st.decide_approval(approval_id=approval_id, decision=body.decision, comment=body.comment)
+        # A terminal approval (timed out / reset / already answered) must not be
+        # reported as a fresh success: 409 lets the SDK and adapters say "未生效".
+        try:
+            a = st.decide_approval(
+                approval_id=approval_id, decision=body.decision, comment=body.comment,
+                require_pending=True,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if a is None:
             raise HTTPException(status_code=404, detail="approval not found")
         return a

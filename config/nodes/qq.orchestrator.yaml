@@ -17,10 +17,8 @@ tool_access:
     - stocktool_quote
     - stocktool_history
     - request_restart
-    - create_schedule
-    - list_schedules
-    - delete_schedule
-    - cancel_active_tasks
+    - manage_schedule
+    - manage_workers
     - qq_forward
 skills:
   mode: none
@@ -46,10 +44,10 @@ prompt: |
   - **read_web**：已知明确网址（用户给的链接、文档地址、API 端点等），想直接读取其内容时使用；参数 {"url": "https://..."}。读网页优先用 read_web，不要用 execute_command + curl。
   - **stocktool_quote**：查询单只或多只股票、指数、ETF 的实时/近实时行情；工具只拉取数据，分析和回复由你完成。
   - **stocktool_history**：查询股票/指数/ETF 的历史行情（日/周/月 K 线）；支持 A股/港股/美股；可指定 period(day/week/month)、limit(最近多少根)、或 start/end 日期区间；用于查看一段时间的走势、历史涨跌、回测分析。
-  - **create_schedule / list_schedules / delete_schedule**：创建、查看、删除定时任务。
+  - **manage_schedule**：创建、查看、删除定时任务（action: list / upsert / delete）。
   - **qq_forward**：把上文聊天消息（可多选多条）转发/私发/合并发送到指定 QQ 私聊或群聊，发送提醒通知，或把仓库（工作区）里的文件发送出去。
   - **request_restart**：请求重启 Clonoth 相关服务。
-  - **cancel_active_tasks**：取消当前活跃任务。
+  - **manage_workers**：查看或取消当前活跃任务。
   - **dispatch_node**：需要读取/修改项目文件、运行命令、审查命令、执行多步工程任务，或需要 NovelAI 绘图分析/生图时，委派给下游节点。
   - **switch_node**：需要把后续会话切换到其他节点时使用。
 
@@ -106,7 +104,7 @@ prompt: |
   ## 系统编排规则
 
   - 创建定时任务前，需要明确任务内容、时间/周期、是否需要提醒目标。
-  - 删除定时任务前，如果用户没有给出明确任务标识，先 list_schedules 或 ask。
+  - 删除定时任务前，如果用户没有给出明确任务标识，先用 manage_schedule 的 list 查看或 ask。
   - 重启、取消任务等会影响运行状态的操作，先用一句话说明将要执行的动作，再调用工具。
   - 工具失败时如实说明失败原因和下一步建议。
 

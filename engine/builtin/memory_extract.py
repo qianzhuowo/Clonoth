@@ -310,6 +310,18 @@ class MemoryExtractHandler:
         # hook can redirect save_memory writes to the correct namespace.
         _entry_nid = get_entry_node_id(runtime_cfg)
         source_node_id = str(getattr(task, "node_id", "") or "").strip() or _entry_nid
+        # Isolated chats (QQ group / private) keep their memories in their own
+        # conv_<hash> namespace; extraction must write back there, not to the
+        # shared node namespace.
+        from engine.builtin.knowledge_inject import isolated_memory_namespace
+
+        _task_input = getattr(task, "input", None)
+        _tc = _task_input.get("task_context") if isinstance(_task_input, dict) else None
+        _tc = _tc if isinstance(_tc, dict) else {}
+        memory_ns = isolated_memory_namespace(
+            _tc.get("route_conversation_key") or _tc.get("conversation_key") or "",
+            runtime_cfg,
+        ) or source_node_id
         return {
             "session_id": session_id,
             "session_generation": int(getattr(task, "session_generation", 0) or 0),
@@ -319,6 +331,7 @@ class MemoryExtractHandler:
             "extractor_node": extractor_node,
             "kind": getattr(task, "kind", "node"),
             "_source_node_id": source_node_id,
+            "_memory_ns": memory_ns,
         }
 
     def _schedule_memory_extract_idle_locked(
@@ -408,7 +421,12 @@ class MemoryExtractHandler:
             # while still allowing the extractor to create a new semantic book.
             workspace_value = ctx.get("workspace_root") or pending_extract.get("workspace_root")
             workspace_root = Path(workspace_value) if workspace_value is not None else None
+            _route_ns = str(
+                pending_extract.get("_memory_ns") or pending_extract.get("_source_node_id") or ""
+            ).strip()
             mem_dir = workspace_root / "data" / "memory" if workspace_root is not None else None
+            if mem_dir is not None and _route_ns:
+                mem_dir = mem_dir / _route_ns
             book_names = sorted(
                 p.stem for p in mem_dir.glob("*.yaml")
             ) if mem_dir is not None and mem_dir.exists() else []
@@ -421,10 +439,9 @@ class MemoryExtractHandler:
             child_sid = f"child_{uuid.uuid4().hex[:12]}"
             # [AutoC 2026-08-28] Pass _memory_route_ns so dream_router hook
             # redirects save_memory writes to the source node's directory.
-            _source_nid = str(pending_extract.get("_source_node_id") or "").strip()
             _extra_input: dict[str, Any] = {}
-            if _source_nid:
-                _extra_input["_memory_route_ns"] = _source_nid
+            if _route_ns:
+                _extra_input["_memory_route_ns"] = _route_ns
             create_task(
                 session_id=sid,
                 session_generation=session_generation,

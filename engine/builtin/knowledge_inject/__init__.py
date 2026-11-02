@@ -24,6 +24,7 @@ class CreatePayload(BaseModel):
 class SkillPinsPayload(BaseModel):
     session_id: str
     pinned: list[str] = []
+import hashlib
 import re
 import shutil
 import threading
@@ -690,9 +691,76 @@ def memory_dir(workspace_root: Path, memory_book: str = "") -> Path:
     return base
 
 
-def _effective_memory_ns(node_extra: dict, node_id: str) -> str:
-    """Resolve effective memory namespace: explicit memory_book > node_id."""
-    return str(node_extra.get("memory_book") or "").strip() or node_id
+# Conversations whose memories are strictly private to that chat (one namespace
+# per group / private chat, no shared or root memories). runtime.yaml
+# memory.isolate_conversation_prefixes overrides this list.
+DEFAULT_ISOLATED_CONVERSATION_PREFIXES = ("qq_group", "qq_private")
+ISOLATED_MEMORY_NS_PREFIX = "conv_"
+
+
+def _isolated_prefixes(runtime_cfg: dict | None) -> tuple[str, ...]:
+    mem_cfg = (runtime_cfg or {}).get("memory") if isinstance(runtime_cfg, dict) else None
+    raw = mem_cfg.get("isolate_conversation_prefixes") if isinstance(mem_cfg, dict) else None
+    if isinstance(raw, list):
+        return tuple(str(x).strip() for x in raw if str(x).strip())
+    return DEFAULT_ISOLATED_CONVERSATION_PREFIXES
+
+
+def isolated_conversation_key(conversation_key: Any, runtime_cfg: dict | None = None) -> str:
+    """Return the user-facing isolated key ("qq_group:<id>") inside *conversation_key*.
+
+    Dispatch children use agent:{node}:...:{parent_key}[:uuid]; they belong to
+    the same chat as their parent, so the first "<isolated prefix>:<id>" pair
+    found in the key is the chat identity. Returns "" when not isolated.
+    """
+    parts = str(conversation_key or "").strip().split(":")
+    prefixes = set(_isolated_prefixes(runtime_cfg))
+    for i, part in enumerate(parts[:-1]):
+        if part in prefixes and parts[i + 1]:
+            return f"{part}:{parts[i + 1]}"
+    return ""
+
+
+def conversation_memory_namespace(conversation_key: Any) -> str:
+    """conv_{sha256(key)[:24]} — same digest as the legacy QQ namespace."""
+    raw = str(conversation_key or "").strip()
+    if not raw:
+        return ""
+    return ISOLATED_MEMORY_NS_PREFIX + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def isolated_memory_namespace(conversation_key: Any, runtime_cfg: dict | None = None) -> str:
+    return conversation_memory_namespace(isolated_conversation_key(conversation_key, runtime_cfg))
+
+
+def is_isolated_memory_namespace(ns: str) -> bool:
+    return str(ns or "").startswith(ISOLATED_MEMORY_NS_PREFIX)
+
+
+def _effective_memory_ns(
+    node_extra: dict,
+    node_id: str,
+    conversation_key: Any = "",
+    runtime_cfg: dict | None = None,
+) -> str:
+    """Resolve memory namespace: explicit memory_book > isolated chat > node_id."""
+    explicit = str((node_extra or {}).get("memory_book") or "").strip()
+    if explicit:
+        return explicit
+    return isolated_memory_namespace(conversation_key, runtime_cfg) or node_id
+
+
+def _tool_memory_ns(ctx: Any) -> str:
+    """Namespace for memory tools, from the ToolContext."""
+    from clonoth_runtime import load_runtime_config
+
+    _ns_extra = getattr(ctx, "_node_extra", None) or {}
+    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
+    try:
+        _cfg = load_runtime_config(ctx.workspace_root)
+    except Exception:
+        _cfg = None
+    return _effective_memory_ns(_ns_extra, _ctx_node_id, getattr(ctx, "conversation_key", ""), _cfg)
 
 
 def _workspace_memory_dir(workspace_root: Path, base_ns: str, workspace_name: str) -> Path:
@@ -1439,7 +1507,12 @@ def build_knowledge_context(
     # 为什么：持久化子节点的记忆存储在 data/memory/{memory_book}/ 下。
     # 怎么改：传 memory_book 给 load_memory_catalog，让它扫描正确的目录。
     # 目的：节点只看到自己 namespace 下的记忆条目。
-    _mb = _effective_memory_ns(node.extra, node.id)
+    _tc = task_context or {}
+    _mb = _effective_memory_ns(
+        node.extra, node.id,
+        _tc.get("route_conversation_key") or _tc.get("conversation_key") or "",
+        safe_runtime_cfg,
+    )
     _effective_node_id = node.id
     if node.id in ("system.memory_extractor", "system.dream") and not str(node.extra.get("memory_book") or "").strip():
         from clonoth_runtime import get_entry_node_id
@@ -1471,8 +1544,8 @@ def build_knowledge_context(
             _key = (str(e.get("book") or e.get("_book") or ""), str(e.get("id") or ""))
             if _key not in _seen:
                 mem_entries.append(e)
-    if not mem_entries:
-        # ponytail: fallback to root data/memory/
+    if not mem_entries and not is_isolated_memory_namespace(_mb):
+        # ponytail: fallback to root data/memory/ (never for isolated chats)
         mem_entries = load_memory_catalog(workspace_root, memory_book="")
     entries.extend(normalize_memory_entries(mem_entries))
 
@@ -1898,9 +1971,7 @@ async def save_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]:
     # [2026-05-28] 从节点 extra 获取 memory_book namespace，用于写入子目录和 invalidate 对应缓存。
     # 为什么：持久化子节点的记忆应写入 data/memory/{memory_book}/。
     # 怎么改：传 memory_book 给 memory_dir 来计算实际路径。
-    _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
-    _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
+    _ns_memory_book = _tool_memory_ns(ctx)
     # [AutoC 2026-08-10] scope: "workspace" writes to @{workspace_name}/ subdir.
     _scope = str(args.get("scope") or "workspace").strip().lower()
     _ws_name = str(getattr(ctx, 'workspace_name', '') or '').strip()
@@ -1980,9 +2051,7 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
     # 每条目标记 scope/workspace 来源；ns 目录不存在时保留 root 兜底。
     book_filter = str(args.get("book") or "").strip() or None
     id_filter = str(args.get("id") or "").strip() or None
-    _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
-    _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
+    _ns_memory_book = _tool_memory_ns(ctx)
 
     sources: list[tuple[Path, str, str]] = []  # (dir, scope, workspace)
     base_dir = memory_dir(ctx.workspace_root, _ns_memory_book)
@@ -1991,8 +2060,8 @@ async def list_memories(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
         for sub in sorted(base_dir.iterdir()):
             if sub.is_dir() and sub.name.startswith("@"):
                 sources.append((sub, "workspace", sub.name[1:]))
-    if not sources:
-        # ponytail: fallback to root
+    if not sources and not is_isolated_memory_namespace(_ns_memory_book):
+        # ponytail: fallback to root (never for isolated chats)
         root_dir = memory_dir(ctx.workspace_root, "")
         if root_dir.is_dir():
             sources.append((root_dir, "node", ""))
@@ -2056,9 +2125,7 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
         return _tool_err("empty memory id")
 
     # [2026-05-28] namespace 隔离：使用节点 memory_book 确定存储目录。
-    _ns_extra = getattr(ctx, "_node_extra", None) or {}
-    _ctx_node_id = ctx.node_id or getattr(ctx, "_node_id", "") or ""
-    _ns_memory_book = _effective_memory_ns(_ns_extra, _ctx_node_id)
+    _ns_memory_book = _tool_memory_ns(ctx)
     _explicit_book = str(args.get("book") or "").strip()
     book = _explicit_book or "default"
     # [AutoC 2026-08-31] 查找顺序与 save_memory 的默认落点（scope=workspace）
@@ -2076,7 +2143,8 @@ async def delete_memory(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any
             _ws_ns = f"{_ns_memory_book}/@{_ws_name}"
             candidates.append((memory_dir(ctx.workspace_root, _ws_ns) / f"{_b}.yaml", _ws_ns))
         candidates.append((memory_dir(ctx.workspace_root, _ns_memory_book) / f"{_b}.yaml", _ns_memory_book))
-        candidates.append((memory_dir(ctx.workspace_root, "") / f"{_b}.yaml", ""))
+        if not is_isolated_memory_namespace(_ns_memory_book):
+            candidates.append((memory_dir(ctx.workspace_root, "") / f"{_b}.yaml", ""))
 
     book_path: Path | None = None
     for _cand_path, _cand_ns in candidates:

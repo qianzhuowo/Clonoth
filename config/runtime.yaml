@@ -104,6 +104,11 @@ skills:
 memory:
   max_budget_chars: 0       # 0 = no limit; max total chars of memory content to inject
 
+  # 严格隔离记忆的会话前缀：每个群 / 私聊各自一个 data/memory/conv_<hash>/，
+  # 不读根目录共享记忆，dream 也不汇总这些会话（只由 auto_extract 写回本会话）。
+  # dispatch 子任务（agent:...:qq_group:<id>）归属其父会话。节点显式 memory_book 优先。
+  isolate_conversation_prefixes: ["qq_group", "qq_private"]
+
   auto_extract:
     enabled: true             # true = 入口节点 finish 后由 supervisor 创建记忆提取后置任务
     node_id: "system.memory_extractor"  # 记忆提取节点 id

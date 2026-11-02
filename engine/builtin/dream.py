@@ -12,6 +12,7 @@ import yaml
 
 from clonoth_runtime import get_bool, get_str, load_runtime_config
 from engine.builtin.memory_extract import _format_transcript_for_extract
+from engine.builtin.knowledge_inject import is_isolated_memory_namespace, isolated_conversation_key
 
 
 log = logging.getLogger(__name__)
@@ -572,8 +573,19 @@ class DreamHandler:
             # prevent recursive Dream self-analysis.
             if conv_key.startswith("system:") or channel == "internal":
                 continue
+            # Isolated chats (QQ) never feed the global Dream: their memories
+            # come only from per-session auto extraction into conv_<hash>.
+            if isolated_conversation_key(conv_key, self._runtime_cfg_for(workspace_root)):
+                continue
             active.add(str(entry.get("session_id") or sid))
         return active
+
+    @staticmethod
+    def _runtime_cfg_for(workspace_root: Path) -> dict[str, Any]:
+        try:
+            return load_runtime_config(workspace_root)
+        except Exception:
+            return {}
 
     def _session_memory_targets(self, workspace_root: Path) -> dict[str, dict[str, str]]:
         """Read sessions.json and return sid -> {ns, ws} memory write targets.
@@ -743,7 +755,10 @@ class DreamHandler:
         _SKIP_NS = {"system.dream", "system.memory_extractor"}
         books: set[str] = set()
         for node_dir in sorted(mem_dir.iterdir()):
-            if not node_dir.is_dir() or node_dir.name.startswith(".") or node_dir.name in _SKIP_NS:
+            if (
+                not node_dir.is_dir() or node_dir.name.startswith(".") or node_dir.name in _SKIP_NS
+                or is_isolated_memory_namespace(node_dir.name)
+            ):
                 continue
             for p in node_dir.glob("*.yaml"):
                 books.add(p.stem)
@@ -907,7 +922,7 @@ class DreamHandler:
             if not node_dir.is_dir() or node_dir.name.startswith("."):
                 continue
             ns = node_dir.name
-            if ns in _SKIP_NS:
+            if ns in _SKIP_NS or is_isolated_memory_namespace(ns):
                 continue
             # Node-level yaml (scope=node)
             _scan_dir(node_dir, source_ns=ns, source_ws="")

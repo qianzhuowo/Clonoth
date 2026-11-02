@@ -447,3 +447,47 @@ def _resolve_file_url(url: str, workspace_root: Path) -> str | None:
 
     b64 = base64.b64encode(data).decode("ascii")
     return f"data:{mime};base64,{b64}"
+
+
+def strip_image_blocks(messages: list[dict]) -> list[dict]:
+    """Remove image_url content blocks from all messages.
+
+    Why: non-vision models (e.g. DeepSeek) reject image_url blocks with HTTP 400.
+    Used by the fallback provider path and by nodes declaring ``strip_images``.
+    How: for each message with list-type content, filter out image_url blocks.
+    If a message becomes empty after stripping, replace with placeholder text.
+    """
+    result = []
+    for msg in messages:
+        content = msg.get("content")
+        if not isinstance(content, list):
+            result.append(msg)
+            continue
+        filtered = [p for p in content if not (isinstance(p, dict) and p.get("type") == "image_url")]
+        if len(filtered) == len(content):
+            result.append(msg)
+            continue
+        if not filtered:
+            new_msg = {**msg, "content": "[image content removed]"}
+        elif len(filtered) == 1 and isinstance(filtered[0], dict) and filtered[0].get("type") == "text":
+            new_msg = {**msg, "content": filtered[0].get("text", "")}
+        else:
+            new_msg = {**msg, "content": filtered}
+        result.append(new_msg)
+    return result
+
+
+def node_strips_images(node: Any) -> bool:
+    """Whether a node declares it runs on a non-vision model.
+
+    Node YAML ``strip_images: true`` (alias ``no_vision``) lands in ``Node.extra``;
+    such nodes get every image_url block removed right before the provider call.
+    """
+    extra = getattr(node, "extra", None)
+    if not isinstance(extra, dict):
+        return False
+    for key in ("strip_images", "no_vision"):
+        val = extra.get(key)
+        if val is True or (isinstance(val, str) and val.strip().lower() in {"1", "true", "yes", "on"}):
+            return True
+    return False

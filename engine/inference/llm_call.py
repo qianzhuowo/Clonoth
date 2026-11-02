@@ -15,7 +15,7 @@ from .stream_buffer import _StreamBuffer
 # 正文 token 流，必须在 flush 给前端之前就吞掉，否则用户会看到
 # <｜DSML｜tool_calls> 之类的协议文本。
 from providers.dsml import StreamFilter as _DSMLStreamFilter
-from ..attachments import prepare_messages_for_llm
+from ..attachments import node_strips_images, prepare_messages_for_llm, strip_image_blocks
 from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
 from .loop_state import _LoopState, _persist_ctx, _short
 # message_to_llm 反序列化：在发送 LLM 前做格式转换（role 修正 + 内部字段剥离）
@@ -213,6 +213,8 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     if _llm_hook_result.action is not None:
         return _llm_hook_result.action
     llm_messages = _llm_hook_ctx.messages
+    if node_strips_images(ls.node):
+        llm_messages = strip_image_blocks(llm_messages)
 
     resp = None
     _retry_attempt = 0
@@ -502,6 +504,8 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     # 需要重新走 build_llm_messages + prepare 流程
                     _formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
                     llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
+                    if node_strips_images(ls.node):
+                        llm_messages = strip_image_blocks(llm_messages)
                     resp = None
                     continue  # 重试
 

@@ -18,33 +18,8 @@ import yaml
 
 from .result import hook_result
 from engine.protocol import TaskAction
+from engine.attachments import strip_image_blocks
 
-
-def _strip_image_blocks(messages: list[dict]) -> list[dict]:
-    """Remove image_url content blocks from all messages.
-
-    Why: fallback providers like DeepSeek don't support vision/multimodal.
-    How: for each message with list-type content, filter out image_url blocks.
-    If a message becomes empty after stripping, replace with placeholder text.
-    """
-    result = []
-    for msg in messages:
-        content = msg.get("content")
-        if not isinstance(content, list):
-            result.append(msg)
-            continue
-        filtered = [p for p in content if not (isinstance(p, dict) and p.get("type") == "image_url")]
-        if not filtered:
-            new_msg = {**msg, "content": "[image content removed]"}
-        elif len(filtered) == 1 and isinstance(filtered[0], dict) and filtered[0].get("type") == "text":
-            new_msg = {**msg, "content": filtered[0].get("text", "")}
-        elif len(filtered) == len(content):
-            result.append(msg)
-            continue
-        else:
-            new_msg = {**msg, "content": filtered}
-        result.append(new_msg)
-    return result
 
 logger = logging.getLogger(__name__)
 
@@ -311,7 +286,7 @@ class FallbackProviderHandler:
                 # Keep the existing text-only replacement policy, but delegate
                 # formatting, request hooks, IDs and cancellation to the public
                 # call capability. No private LoopState access or default switch.
-                _fb_messages = _strip_image_blocks(messages)
+                _fb_messages = strip_image_blocks(messages)
                 images_removed = _fb_messages != messages
                 attempt = {"provider": fb_provider_type, "model": fb_model, "index": i}
                 t0 = time.monotonic()

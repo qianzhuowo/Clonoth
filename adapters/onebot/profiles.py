@@ -68,8 +68,10 @@ def load_profiles(path_text: str | Path | None, workspace: str | Path | None = N
 class UserProfiles:
     """Loaded profiles plus the name lookups the adapter needs."""
 
-    def __init__(self, profiles: Optional[Dict[str, Dict[str, str]]] = None) -> None:
+    def __init__(self, profiles: Optional[Dict[str, Dict[str, str]]] = None, anon_map: Any = None) -> None:
         self.profiles: Dict[str, Dict[str, str]] = dict(profiles or {})
+        # Used for the anonymous fallback name and the stable user id line.
+        self.anon_map = anon_map
 
     def reload(self, path_text: str | Path | None = None, workspace: str | Path | None = None) -> None:
         self.profiles = load_profiles(config.USER_PROFILES_PATH if path_text is None else path_text, workspace)
@@ -91,7 +93,7 @@ class UserProfiles:
         for uid in list(self.profiles):
             yield uid, [self.display_name(uid), *self.aliases(uid)]
 
-    def sender_display_name(self, sender: Any, user_id: Any, anon_map: Any) -> str:
+    def sender_display_name(self, sender: Any, user_id: Any) -> str:
         """Profile name > group card > nickname > anonymous alias; never a raw QQ id."""
         profile_name = self.display_name(user_id)
         if profile_name:
@@ -100,13 +102,13 @@ class UserProfiles:
         nickname = (sender.get("nickname") if isinstance(sender, dict) else getattr(sender, "nickname", "")) or ""
         if card or nickname:
             return sanitize_name(card or nickname)
-        return anon_map.anonymize_user_id(user_id) if str(user_id or "").strip() else "未知成员"
+        return self.anon_map.anonymize_user_id(user_id) if str(user_id or "").strip() else "未知成员"
 
-    def identity_lines(self, user_id: Any, display_name: str, anon_map: Any, *, is_admin: bool) -> List[str]:
+    def identity_lines(self, user_id: Any, display_name: str, *, is_admin: bool) -> List[str]:
         """Identity/addressing hints shown to the model; permissions are decided in code."""
         profile = self.profile(user_id)
         lines = [
-            f"稳定用户标识: {anon_map.anonymize_user_id(user_id)}",
+            f"稳定用户标识: {self.anon_map.anonymize_user_id(user_id)}",
             f"显示名: {sanitize_name(display_name)}",
         ]
         if profile.get("address_as"):
@@ -115,6 +117,8 @@ class UserProfiles:
             lines.append(f"身份标签: {sanitize_name(profile['title'])}")
         if profile.get("note"):
             lines.append(f"称呼/语气备注: {sanitize_name(profile['note'], max_len=80)}")
+        if config.QQ_OWNER_ID and str(user_id or "").strip() == config.QQ_OWNER_ID:
+            lines.append(f"项目身份: {sanitize_name(config.QQ_OWNER_NAME or display_name)}，项目所有者")
         lines.append(f"Clonoth 管理员: {'是' if is_admin else '否'}")
         lines.append("权限说明: 管理员权限仅由系统配置判定，以上称呼配置不授予任何权限。")
         return lines

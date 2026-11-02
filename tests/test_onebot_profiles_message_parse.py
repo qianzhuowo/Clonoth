@@ -27,7 +27,7 @@ class Seg:
 
 def _setup(tmp_path):
     a = anon.AnonMap(tmp_path / "anon.json", save_min_interval=0, hash_secret="")
-    p = profiles.UserProfiles({"1111111": {"display_name": "小明", "address_as": "明哥", "title": "群主"}})
+    p = profiles.UserProfiles({"1111111": {"display_name": "小明", "address_as": "明哥", "title": "群主"}}, anon_map=a)
     at_name = lambda qq: p.display_name(qq) or a.anonymize_user_id(qq)
     return a, p, at_name
 
@@ -47,15 +47,15 @@ def test_load_profiles_yaml_and_aliases(tmp_path):
 
 def test_sender_name_never_leaks_raw_id(tmp_path):
     a, p, _ = _setup(tmp_path)
-    assert p.sender_display_name({}, "1111111", a) == "小明"
-    assert p.sender_display_name({"card": "a[b]\nc"}, "2222222", a) == "a(b) c"
-    assert p.sender_display_name({}, "3333333", a) == "UserA"
+    assert p.sender_display_name({}, "1111111") == "小明"
+    assert p.sender_display_name({"card": "a[b]\nc"}, "2222222") == "a(b) c"
+    assert p.sender_display_name({}, "3333333") == "UserA"
     assert profiles.sanitize_name("x" * 40) == "x" * 32 + "…"
 
 
 def test_identity_lines_state_permission_from_code(tmp_path):
     a, p, _ = _setup(tmp_path)
-    lines = p.identity_lines("1111111", "小明", a, is_admin=False)
+    lines = p.identity_lines("1111111", "小明", is_admin=False)
     assert "称呼要求: 请称呼该用户为「明哥」" in lines
     assert "Clonoth 管理员: 否" in lines
     assert all("1111111" not in line for line in lines)

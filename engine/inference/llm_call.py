@@ -17,6 +17,7 @@ from .stream_buffer import _StreamBuffer
 from providers.dsml import StreamFilter as _DSMLStreamFilter
 from ..attachments import prepare_messages_for_llm
 from ..vision import images_allowed, strip_and_describe_images
+from ..thinking_leak import move_leaked_thinking
 from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
 from .loop_state import _LoopState, _persist_ctx, _short
 # message_to_llm 反序列化：在发送 LLM 前做格式转换（role 修正 + 内部字段剥离）
@@ -426,6 +427,11 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                         pass
 
         assert resp is not None
+
+        # Thinking that the model wrote into the visible reply goes to reasoning.
+        # A reply that was only thinking becomes empty and is retried below.
+        if resp.ok and move_leaked_thinking(resp):
+            log.warning("leaked thinking moved to reasoning (node=%s step=%s)", ls.node.id, step)
 
         # ---- 重试判定 ----
         _retry_reason = ""

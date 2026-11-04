@@ -415,6 +415,7 @@ class OpenAIProvider(BaseProvider):
                                     "id": tc.get("id") or "",
                                     "name": fn_name or "",
                                     "arg_parts": [],
+                                    "extra_content": None,
                                 }
                                 # [tool-stream 2026-05-19] 同步发出工具调用开始事件。
                                 # 原因：OpenAI SSE 的 tool_calls delta 已经携带 index/id/name，过去只进入 tc_map。
@@ -432,6 +433,10 @@ class OpenAIProvider(BaseProvider):
                                     tc_map[idx]["id"] = tc["id"]
                                 if fn_name:
                                     tc_map[idx]["name"] = fn_name
+                            # Gemini (OpenAI-compat) attaches thought signatures here; they
+                            # must be echoed back or the next tool round is rejected.
+                            if isinstance(tc.get("extra_content"), dict):
+                                tc_map[idx]["extra_content"] = tc["extra_content"]
                             arg_chunk = fn.get("arguments", "")
                             if arg_chunk:
                                 tc_map[idx]["arg_parts"].append(arg_chunk)
@@ -466,7 +471,10 @@ class OpenAIProvider(BaseProvider):
                         except Exception:
                             fallback = _parse_first_json_object(raw_args)
                             args = fallback if fallback is not None else {"_raw": raw_args}
-                    tool_calls.append(ToolCall(id=tc_data["id"], name=name.strip(), arguments=args))
+                    tool_calls.append(ToolCall(
+                        id=tc_data["id"], name=name.strip(), arguments=args,
+                        extra_content=tc_data.get("extra_content"),
+                    ))
 
                 # [2026-05-24] Detect upstream errors from SSE stream.
                 # Various proxied providers (Gemini, OpenAI, Anthropic via relay)
@@ -604,7 +612,11 @@ class OpenAIProvider(BaseProvider):
                             fallback = _parse_first_json_object(raw_args)
                             args = fallback if fallback is not None else {"_raw": raw_args}
 
-                    tool_calls.append(ToolCall(id=tc_id_str, name=name.strip(), arguments=args))
+                    _extra = tc.get("extra_content")
+                    tool_calls.append(ToolCall(
+                        id=tc_id_str, name=name.strip(), arguments=args,
+                        extra_content=_extra if isinstance(_extra, dict) else None,
+                    ))
 
             # 解析 usage
             usage = _extract_usage(data)

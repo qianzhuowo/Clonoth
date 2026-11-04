@@ -22,6 +22,9 @@ class ToolCall:
     id: str
     name: str
     arguments: dict[str, Any]
+    # Provider-opaque per-call data that must be echoed back verbatim on the next
+    # request, e.g. Gemini's OpenAI-compat {"google": {"thought_signature": ...}}.
+    extra_content: dict[str, Any] | None = None
 
     def __post_init__(self):
         # 入口防御：阻止脏 id 进入系统

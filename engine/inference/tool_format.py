@@ -130,10 +130,15 @@ class ToolFormatter(ABC):
             "content": text.strip() if text else "",
         }
         if tool_calls:
-            msg["tool_calls"] = [
-                {"id": tc.id, "name": tc.name, "arguments": dict(tc.arguments or {})}
-                for tc in tool_calls
-            ]
+            stored: list[dict[str, Any]] = []
+            for tc in tool_calls:
+                entry: dict[str, Any] = {"id": tc.id, "name": tc.name, "arguments": dict(tc.arguments or {})}
+                extra = getattr(tc, "extra_content", None)
+                if isinstance(extra, dict) and extra:
+                    # Opaque provider data (e.g. Gemini thought signature) replayed verbatim.
+                    entry["extra_content"] = extra
+                stored.append(entry)
+            msg["tool_calls"] = stored
         return msg
 
     @abstractmethod
@@ -249,14 +254,17 @@ class NativeToolFormatter(ToolFormatter):
                 if isinstance(tc, dict):
                     args = tc.get('arguments', {})
                     args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args)
-                    api_calls.append({
+                    api_call: dict[str, Any] = {
                         'id': tc.get('id', ''),
                         'type': 'function',
                         'function': {
                             'name': tc.get('name', ''),
                             'arguments': args_str,
                         },
-                    })
+                    }
+                    if isinstance(tc.get('extra_content'), dict) and tc['extra_content']:
+                        api_call['extra_content'] = tc['extra_content']
+                    api_calls.append(api_call)
             clean['tool_calls'] = api_calls
         return clean
 

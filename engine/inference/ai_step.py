@@ -51,7 +51,7 @@ from ..tool_step import (
     truncate_tool_result,
 )
 from clonoth_runtime import get_int, load_runtime_config
-from toolbox.context import ToolContext
+from toolbox.context import ToolContext, platform_user_id_from_task_context
 # Provider 请求视图在此完成动态上下文重排及反序列化格式转换。
 from .tool_format import (
     ParsedToolCall,
@@ -574,6 +574,7 @@ async def _execute_real_tools(
         # session-scoped built-ins stay attached to the durable user session.
         parent_session_id=getattr(ls.rctx, "parent_session_id", "") or "",
         conversation_key=str((getattr(ls.rctx, "task_context", None) or {}).get("conversation_key", "")).strip(),
+        platform_user_id=platform_user_id_from_task_context(getattr(ls.rctx, "task_context", None)),
         # [AutoC 2026-05-31] Why: the context object is created before iterating
         # individual real tool calls. How: initialize node_id here and set
         # tool_call_id inside each loop iteration below. Purpose: approval requests

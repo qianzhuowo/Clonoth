@@ -1,4 +1,9 @@
-"""qq_forward target_type=self in group chats resolves the per-task sender."""
+"""qq_forward target_type=self in group chats resolves the triggering sender.
+
+Chain: task_context.platform_auth.user_id -> ToolContext.platform_user_id ->
+CLONOTH_PLATFORM_USER_ID (script tool env) -> qq_forward payload origin_user_id
+-> forward bridge self target.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -6,8 +11,12 @@ import importlib
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+
+from toolbox.context import platform_user_id_from_task_context
+from toolbox.registry import _script_tool_env
 
 pytest.importorskip("nonebot")
 
@@ -25,45 +34,46 @@ forward_bridge = importlib.import_module("adapters.onebot.forward_bridge")
 
 
 @pytest.fixture(autouse=True)
-def _clean(monkeypatch):
-    monkeypatch.setattr(state, "_task_senders", type(state._task_senders)())
+def _group_session(monkeypatch):
     monkeypatch.setattr(state, "_session_targets", {"sess-g": {"type": "group", "group_id": 8888889}})
     monkeypatch.setattr(state, "_persisted_session_targets", {})
 
 
-def _resolve(task_id: str):
+def _resolve(origin_user_id: str):
     return asyncio.run(forward_bridge._forward_bridge_resolve_target(
-        None, "sess-g", "self", "", parent_session_id="sess-g", runtime_session_id="branch_1", task_id=task_id,
+        None, "sess-g", "self", "",
+        parent_session_id="sess-g", runtime_session_id="branch_1", origin_user_id=origin_user_id,
     ))
 
 
-def test_group_self_without_task_sender_fails_as_before():
-    target, err = _resolve("")
-    assert target is None and "无法确定当前用户" in err
+def test_task_context_sender_extraction():
+    assert platform_user_id_from_task_context({"platform_auth": {"user_id": "7654321"}}) == "7654321"
+    assert platform_user_id_from_task_context({"platform_auth": {}}) == ""
+    assert platform_user_id_from_task_context({}) == ""
+    assert platform_user_id_from_task_context(None) == ""
 
 
-def test_group_self_uses_task_sender():
-    state.remember_task_sender("task-a", 7654321)
-    target, err = _resolve("task-a")
+def test_script_env_carries_platform_user(monkeypatch):
+    monkeypatch.setenv("CLONOTH_PLATFORM_USER_ID", "stale")
+    env = _script_tool_env(SimpleNamespace(platform_user_id="7654321"))
+    assert env["CLONOTH_PLATFORM_USER_ID"] == "7654321"
+    # A missing value never leaks the engine process's stale identity.
+    assert "CLONOTH_PLATFORM_USER_ID" not in _script_tool_env(SimpleNamespace(platform_user_id=""))
+
+
+def test_group_self_uses_origin_user():
+    target, err = _resolve("7654321")
     assert err == "" and target.target_type == "private" and target.target_id == 7654321
 
 
-def test_concurrent_senders_in_same_group_do_not_overwrite():
-    state.remember_task_sender("task-a", 7654321)
-    state.remember_task_sender("task-b", 7654322)
-    assert _resolve("task-a")[0].target_id == 7654321
-    assert _resolve("task-b")[0].target_id == 7654322
+def test_group_self_without_origin_user_fails():
+    target, err = _resolve("")
+    assert target is None and "无法确定当前用户" in err
+    target, err = _resolve("not-a-number")
+    assert target is None
 
 
-def test_task_sender_map_is_bounded(monkeypatch):
-    monkeypatch.setattr(state, "_TASK_SENDERS_MAX", 3)
-    for i in range(5):
-        state.remember_task_sender(f"t{i}", 1000 + i)
-    assert state.task_sender("t0") is None and state.task_sender("t4") == 1004
-    assert len(state._task_senders) == 3
-
-
-def test_invalid_sender_ignored():
-    state.remember_task_sender("t", "not-a-number")
-    state.remember_task_sender("", 123)
-    assert len(state._task_senders) == 0
+def test_qq_forward_payload_sends_origin_user(monkeypatch):
+    qq_forward = importlib.import_module("tools.qq_forward")
+    src = Path(qq_forward.__file__).read_text(encoding="utf-8")
+    assert '"origin_user_id": _env_first("CLONOTH_PLATFORM_USER_ID"' in src

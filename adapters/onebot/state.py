@@ -184,31 +184,6 @@ _conversation_bots: Dict[str, Bot] = {}
 _persisted_session_targets: Dict[str, Dict[str, Any]] = {}
 
 
-# Root task_id -> QQ user who sent that inbound. A group session maps to the whole
-# group, so "send to me" (qq_forward target_type=self) needs the per-task sender;
-# keyed by task so concurrent senders in one group cannot overwrite each other.
-_TASK_SENDERS_MAX = 2000
-_task_senders: "OrderedDict[str, int]" = OrderedDict()
-
-
-def remember_task_sender(task_id: str, user_id: Any) -> None:
-    tid = str(task_id or "").strip()
-    try:
-        uid = int(user_id)
-    except Exception:
-        return
-    if not tid or uid <= 0:
-        return
-    _task_senders[tid] = uid
-    _task_senders.move_to_end(tid)
-    while len(_task_senders) > _TASK_SENDERS_MAX:
-        _task_senders.popitem(last=False)
-
-
-def task_sender(task_id: str) -> Optional[int]:
-    return _task_senders.get(str(task_id or "").strip())
-
-
 _last_bot: Optional[Bot] = None
 
 

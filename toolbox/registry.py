@@ -158,6 +158,7 @@ _SCRIPT_IDENTITY_ENV_KEYS = (
     "CLONOTH_NODE_ID",
     "CLONOTH_CONVERSATION_KEY",
     "CLONOTH_TOOL_CALL_ID",
+    "CLONOTH_PLATFORM_USER_ID",
 )
 
 
@@ -180,6 +181,7 @@ def _script_tool_env(ctx: Any) -> dict[str, str]:
         "CLONOTH_NODE_ID": getattr(ctx, "node_id", ""),
         "CLONOTH_CONVERSATION_KEY": getattr(ctx, "conversation_key", ""),
         "CLONOTH_TOOL_CALL_ID": getattr(ctx, "tool_call_id", ""),
+        "CLONOTH_PLATFORM_USER_ID": getattr(ctx, "platform_user_id", ""),
     }
     for key, value in values.items():
         value = str(value or "").strip()

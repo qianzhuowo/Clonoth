@@ -26,7 +26,7 @@ from clonoth_runtime import (
     SYSTEM_NODE_MODEL_SLOTS,
 )
 from providers import registry as provider_registry
-from toolbox.context import ToolContext
+from toolbox.context import ToolContext, platform_user_id_from_task_context
 from toolbox.registry import ToolRegistry
 
 from .inference import run_ai_node
@@ -1520,6 +1520,7 @@ async def _run_tool_task(
         session_generation=session_generation,
         parent_session_id=parent_session_id,
         conversation_key=str(_task_ctx.get("conversation_key", "")).strip(),
+        platform_user_id=platform_user_id_from_task_context(_task_ctx),
         approval_poll_interval_sec=0.5,
         # [AutoC 2026-05-31] Why: direct standalone tool tasks can still trigger
         # policy approvals. How: use the task id as the best available tool_call_id

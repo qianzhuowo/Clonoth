@@ -8,6 +8,16 @@ from typing import Any
 import httpx
 
 
+def platform_user_id_from_task_context(task_context: Any) -> str:
+    """Sender id recorded by the platform adapter in task_context.platform_auth."""
+    if not isinstance(task_context, dict):
+        return ""
+    auth = task_context.get("platform_auth")
+    if not isinstance(auth, dict):
+        return ""
+    return str(auth.get("user_id") or "").strip()
+
+
 @dataclass
 class ToolContext:
     supervisor_url: str
@@ -38,6 +48,9 @@ class ToolContext:
     # Defaults to workspace_root when unset. AI can change it via set_workspace.
     workspace: Path | None = None
     workspace_name: str = ""
+    # Platform user who triggered the root inbound (task_context.platform_auth.user_id;
+    # dispatch children inherit it). Lets platform tools resolve "send to me".
+    platform_user_id: str = ""
 
     @property
     def effective_workspace(self) -> Path:

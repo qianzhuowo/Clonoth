@@ -491,7 +491,6 @@ async def _submit_or_preempt_inbound(
     if not result.session_id or not result.accepted:
         return False
 
-    state.remember_task_sender(getattr(result, "task_id", ""), getattr(event, "user_id", None))
     state.ANON.real_conversation_keys[stable_conversation_key] = real_conversation_key
     state._session_state.register_session(stable_conversation_key, result.session_id)
     target = dict(platform_updates)

@@ -21,6 +21,8 @@ class InboundResult:
     session_id: str
     inbound_seq: int
     accepted: bool = True
+    # Root task created for this inbound (empty when merged/queued without a task).
+    task_id: str = ""
 
 
 @dataclass(frozen=True)

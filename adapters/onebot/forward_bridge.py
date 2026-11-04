@@ -273,12 +273,14 @@ async def _forward_bridge_resolve_target(
     *,
     parent_session_id: str = "",
     runtime_session_id: str = "",
+    task_id: str = "",
 ) -> tuple[state.ProactiveTarget | None, str]:
     """把工具给出的目标（含 self/current 语义）解析为真实 ProactiveTarget。"""
     target_type = str(target_type or "").strip().lower()
     ref = str(target_ref or "").strip()
     if target_type == "self" or ref in {"我", "自己", "me", "self"}:
-        uid = _forward_bridge_origin_user_id(
+        # 群会话目标是整个群，没有发送者；按触发本次消息的根任务找回发送者。
+        uid = state.task_sender(task_id) or _forward_bridge_origin_user_id(
             session_id,
             parent_session_id=parent_session_id,
             runtime_session_id=runtime_session_id,
@@ -433,6 +435,7 @@ async def _forward_bridge_execute(payload: dict[str, Any]) -> dict[str, Any]:
         target_ref,
         parent_session_id=parent_session_id,
         runtime_session_id=runtime_session_id,
+        task_id=str(payload.get("task_id") or "").strip(),
     )
     if target is None:
         return {"ok": False, "error": error or "目标解析失败。"}

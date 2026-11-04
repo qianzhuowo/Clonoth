@@ -180,6 +180,7 @@ class ClonothClient:
             session_id=data.get("session_id", ""),
             inbound_seq=int(data.get("inbound_seq", 0) or 0),
             accepted=bool(data.get("accepted", True)),
+            task_id=str(data.get("task_id") or ""),
         )
 
     # ================================================================

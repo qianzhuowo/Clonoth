@@ -227,6 +227,8 @@ if __name__ == "__main__":
         "session_id": session_id,
         "parent_session_id": parent_session_id,
         "runtime_session_id": runtime_session_id,
+        # Root task of this QQ message; the bridge maps it to the sender for target_type=self.
+        "task_id": _env_first("CLONOTH_TASK_ID", default=""),
     }
     if op == "list":
         payload["query"] = str(args.get("query") or "").strip()

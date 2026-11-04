@@ -17,7 +17,10 @@ import os
 import sqlite3
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+import yaml
 
 # ── Paths ──────────────────────────────────────
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -77,6 +80,22 @@ CHILD_SESSION_MAX_AGE = 24 * 3600     # 24 h（与默认 TTL 一致）
 # Phase D：node_contexts 目录清理。child session 已替代 snapshot 机制，
 # 保留 48h 宽裕期后清理旧文件（比 child session TTL 长一倍，确保兼容期充分）。
 NODE_CONTEXTS_MAX_AGE = 48 * 3600     # 48 h
+
+# Persistent memory entry cleanup. Entries with constant=true are protected.
+# For ordinary entries, use last_hit_at first, then updated_at, then created_at,
+# so recently activated memories survive even if created long ago. Entries
+# without any timestamp are kept. 0 disables.
+MEMORY_ENTRY_MAX_AGE = float(os.getenv("CLONOTH_MEMORY_ENTRY_MAX_AGE_SECONDS", str(14 * 24 * 3600)))
+
+# TaskRecord transcripts data/transcripts/*.jsonl grow per session forever otherwise.
+TRANSCRIPTS_MAX_AGE = float(os.getenv("CLONOTH_TRANSCRIPTS_MAX_AGE_SECONDS", str(14 * 24 * 3600)))  # 14 d
+
+# Process logs data/logs/*.log (restarts create many small files); keep cleanup.log.
+LOG_MAX_AGE = float(os.getenv("CLONOTH_LOG_MAX_AGE_SECONDS", str(3 * 24 * 3600)))  # 3 d
+LOG_KEEP_NAMES = {"cleanup.log"}
+
+# Debug-only LLM error snapshots.
+LLM_ERROR_SNAPSHOT_MAX_AGE = float(os.getenv("CLONOTH_LLM_ERROR_SNAPSHOT_MAX_AGE_SECONDS", str(3 * 24 * 3600)))
 
 
 def _log_init():
@@ -476,6 +495,113 @@ def purge_onebot_cache():
     logging.info("[onebot_cache] deleted %d files", deleted)
 
 
+# ── persistent memory entry cleanup ───────────
+def _parse_iso_timestamp(value: object) -> float | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _memory_entry_reference_ts(entry: dict) -> float | None:
+    for key in ("last_hit_at", "updated_at", "created_at"):
+        ts = _parse_iso_timestamp(entry.get(key))
+        if ts is not None:
+            return ts
+    return None
+
+
+def purge_expired_memory_entries():
+    """Remove stale non-constant entries from data/memory/**/*.yaml ({book, entries})."""
+    if MEMORY_ENTRY_MAX_AGE <= 0:
+        logging.info("[memory] entry cleanup disabled")
+        return
+    mem_root = DATA_DIR / "memory"
+    if not mem_root.is_dir():
+        return
+    cutoff = time.time() - MEMORY_ENTRY_MAX_AGE
+    scanned_books = deleted_entries = removed_empty_books = 0
+    for book_path in sorted(mem_root.rglob("*.yaml")):
+        try:
+            raw = yaml.safe_load(book_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logging.info("[memory] skipped unreadable book %s: %s", book_path, exc)
+            continue
+        if not isinstance(raw, dict) or not isinstance(raw.get("entries"), list):
+            continue
+        scanned_books += 1
+        kept: list = []
+        for entry in raw["entries"]:
+            if not isinstance(entry, dict) or bool(entry.get("constant", False)):
+                kept.append(entry)
+                continue
+            ref_ts = _memory_entry_reference_ts(entry)
+            if ref_ts is None or ref_ts >= cutoff:
+                kept.append(entry)
+                continue
+            deleted_entries += 1
+        if len(kept) == len(raw["entries"]):
+            continue
+        raw["entries"] = kept
+        try:
+            if kept:
+                book_path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            else:
+                book_path.unlink()
+                removed_empty_books += 1
+        except Exception as exc:
+            logging.info("[memory] failed to update book %s: %s", book_path, exc)
+    for dirpath, _, _ in os.walk(str(mem_root), topdown=False):
+        dp = Path(dirpath)
+        if dp == mem_root:
+            continue
+        try:
+            if not any(dp.iterdir()):
+                dp.rmdir()
+        except Exception:
+            pass
+    logging.info(
+        "[memory] scanned_books=%d deleted_entries=%d removed_empty_books=%d max_age_hours=%.1f",
+        scanned_books, deleted_entries, removed_empty_books, MEMORY_ENTRY_MAX_AGE / 3600,
+    )
+
+
+def purge_expired_transcripts():
+    """Delete data/transcripts/ TaskRecord files not updated within TRANSCRIPTS_MAX_AGE."""
+    if TRANSCRIPTS_MAX_AGE <= 0:
+        logging.info("[transcripts] cleanup disabled")
+        return
+    purge_dir(DATA_DIR / "transcripts", TRANSCRIPTS_MAX_AGE, "transcripts")
+
+
+def purge_old_logs():
+    """Delete data/logs/ files older than LOG_MAX_AGE, keeping cleanup.log."""
+    if LOG_MAX_AGE <= 0:
+        logging.info("[logs] cleanup disabled")
+        return
+    log_dir = DATA_DIR / "logs"
+    if not log_dir.exists():
+        return
+    cutoff = time.time() - LOG_MAX_AGE
+    deleted = 0
+    for p in log_dir.iterdir():
+        try:
+            if p.is_file() and p.name not in LOG_KEEP_NAMES and p.stat().st_mtime < cutoff:
+                p.unlink()
+                deleted += 1
+        except Exception:
+            pass
+    logging.info("[logs] deleted %d files", deleted)
+
+
 def purge_stocktool_cache():
     if STOCKTOOL_CACHE_MAX_AGE <= 0:
         logging.info("[stocktool_cache] disabled")
@@ -510,6 +636,12 @@ def main():
                          max_age=ATTACH_MAX_AGE, label="attachments", recursive=True)),
         (purge_onebot_cache, {}),
         (purge_qq_internal_cache, {}),
+        (purge_expired_memory_entries, {}),
+        (purge_expired_transcripts, {}),
+        (purge_old_logs, {}),
+        (purge_dir, dict(directory=DATA_DIR / "llm_error_snapshots",
+                         max_age=LLM_ERROR_SNAPSHOT_MAX_AGE, label="llm_error_snapshots",
+                         recursive=True)),
         (purge_stocktool_cache, {}),
     ]
 

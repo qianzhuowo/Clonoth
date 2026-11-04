@@ -16,6 +16,15 @@ import time
 
 from . import config, inbound_attachments, message_parse, profiles, routing, send, state
 
+
+def label_bot_faces(text: str, message_id: Any) -> str:
+    """Bot 自己发的表情：按发送时登记的名称依次标成 [表情包: 名称]，无记录时为 [表情包]。"""
+    for name in state.sent_faces(message_id):
+        if "[图片]" not in text:
+            break
+        text = text.replace("[图片]", f"[表情包: {name}]", 1)
+    return text.replace("[图片]", "[表情包]")
+
 def _format_history_line(event: GroupMessageEvent, bot: Bot, override_text: str = "") -> str:
     """把群消息格式化为 tangqiu_main 提示词要求的历史行，并匿名化 QQ ID。"""
     text = state.ANON.anonymize_text(message_parse.compact_text(override_text or message_parse.message_to_text(event.get_message(), state.at_name, getattr(bot, "self_id", None))))
@@ -141,9 +150,9 @@ async def _build_reply_context(event: Event, bot: Bot, conversation_key: str) ->
                 })
                 text = text.replace("[图片]", f"[图片: {rel_path}]", 1)
             # 剩余未匹配的图片占位符（如同消息里的表情包）仍标为表情包。
-            text = text.replace("[图片]", "[表情包]")
+            text = label_bot_faces(text, reply_message_id)
         else:
-            text = text.replace("[图片]", "[表情包]")
+            text = label_bot_faces(text, reply_message_id)
     else:
         images = inbound_attachments.iter_image_sources(message) or inbound_attachments.iter_image_sources(raw_message)
         quoted_attachments, _quoted_errors = await inbound_attachments.image_sources_to_attachments(images, conversation_key)

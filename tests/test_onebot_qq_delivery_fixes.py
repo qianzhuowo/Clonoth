@@ -618,4 +618,4 @@ def test_process_emojis_falls_back_to_metadata_url_when_live_fails(
 
     metadata = [{"name": "开心", "base_name": "开心", "md5": "aaa", "url": "https://stale/old.png"}]
     segments = asyncio.run(runtime.send.process_emojis("[表情:开心]", FakeBot(), [], ["开心"], metadata))
-    assert segments == [{"type": "image", "url": "https://stale/old.png", "emoji": True}]
+    assert segments == [{"type": "image", "url": "https://stale/old.png", "emoji": True, "name": "开心"}]

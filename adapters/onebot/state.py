@@ -228,6 +228,27 @@ _MESSAGE_ATTACHMENT_MAX_ITEMS = int(os.environ.get("ONEBOT_MSG_ATTACHMENT_CACHE_
 _sent_message_attachments: "OrderedDict[str, List[Dict[str, Any]]]" = OrderedDict()
 
 
+# message_id of a Bot-sent sticker message -> sticker names, so a user quoting it
+# shows "[表情包: 名称]" instead of a bare placeholder (no image download/vision).
+_SENT_FACE_MAX_ITEMS = 1024
+_sent_message_faces: "OrderedDict[str, List[str]]" = OrderedDict()
+
+
+def remember_sent_faces(message_id: Any, names: List[str]) -> None:
+    mid = str(message_id or "").strip()
+    names = [str(n).strip() for n in names or [] if str(n or "").strip()]
+    if not mid or not names:
+        return
+    _sent_message_faces[mid] = names
+    _sent_message_faces.move_to_end(mid)
+    while len(_sent_message_faces) > _SENT_FACE_MAX_ITEMS:
+        _sent_message_faces.popitem(last=False)
+
+
+def sent_faces(message_id: Any) -> List[str]:
+    return list(_sent_message_faces.get(str(message_id or "").strip(), ()))
+
+
 @dataclass
 class QueuedInbound:
     matcher: Any

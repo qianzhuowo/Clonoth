@@ -710,6 +710,12 @@ async def _send_split_text(
                         segment_identity[:200], exc,
                     )
                     continue
+            if sent_message_id and kind.startswith("emoji:"):
+                state.remember_sent_faces(sent_message_id, [
+                    str(seg.get("name") or "")
+                    for seg in ordered_groups[out_index][1]
+                    if seg.get("type") == "image" and seg.get("emoji")
+                ])
             if is_primary and sent_message_id and source_attachments:
                 state.REPLY_CACHE.remember(
                     sent_message_id,

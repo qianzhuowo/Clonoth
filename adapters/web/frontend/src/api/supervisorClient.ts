@@ -661,13 +661,41 @@ export interface ProviderConfigPublic {
   model: string;
   api_key_present: boolean;
   api_key_redacted: string;
+  vision: boolean;
+}
+
+export interface FallbackEntryPublic {
+  provider: string;
+  model: string;
+  base_url: string;
+  api_key_present: boolean;
+  api_key_redacted: string;
+  vision: boolean;
+}
+
+export interface FallbackEntryUpdate {
+  provider: string;
+  model: string;
+  base_url: string;
+  api_key: string;
+  clear_api_key?: boolean;
+  source_index: number | null;
 }
 
 export interface ProvidersResponse {
   active_provider: string;
   providers: Record<string, ProviderConfigPublic>;
-  fallbacks: Array<Record<string, any>>;
+  fallbacks: FallbackEntryPublic[];
+  model_capabilities: Record<string, { vision?: boolean }>;
   registered: string[];
+}
+
+export interface SystemModelPublic {
+  slot: string;
+  model: string;
+  base_url: string;
+  api_key_present: boolean;
+  api_key_redacted: string;
 }
 
 export interface MimoAudioConfigPublic {
@@ -750,12 +778,39 @@ export async function setActiveProvider(token: string, provider: string): Promis
 
 export async function updateFallbacks(
   token: string,
-  fallbacks: Array<Record<string, any>>,
+  fallbacks: FallbackEntryUpdate[],
 ): Promise<ProvidersResponse> {
   const resp = await apiFetch('/config/fallbacks', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
     body: JSON.stringify({ fallbacks }),
+  });
+  return resp.json();
+}
+
+export async function setModelVision(token: string, model: string, vision: boolean): Promise<ProvidersResponse> {
+  const resp = await apiFetch('/config/model-vision', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify({ model, vision }),
+  });
+  return resp.json();
+}
+
+export async function getSystemModel(token: string, slot: string): Promise<SystemModelPublic> {
+  const resp = await apiFetch(`/config/system-models/${encodeURIComponent(slot)}`, { headers: authHeaders(token) });
+  return resp.json();
+}
+
+export async function updateSystemModel(
+  token: string,
+  slot: string,
+  data: { model?: string; base_url?: string; api_key?: string },
+): Promise<SystemModelPublic> {
+  const resp = await apiFetch(`/config/system-models/${encodeURIComponent(slot)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+    body: JSON.stringify(data),
   });
   return resp.json();
 }

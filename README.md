@@ -109,6 +109,7 @@ OPENAI_MODEL=gpt-4o-mini
 mkdir -p data
 cp config.example.yaml data/config.yaml
 cp policy.example.yaml data/policy.yaml
+cp config/nodes/_persona.example.md config/nodes/_persona.md   # QQ 机器人人设，按需修改
 ```
 
 三份配置文件的职责：
@@ -117,6 +118,7 @@ cp policy.example.yaml data/policy.yaml
 - **`data/config.yaml`**：Provider 选择、模型、base URL。支持 `${ENV_VAR}` 引用环境变量。不提交到仓库。
 - **`data/policy.yaml`**：安全策略（文件读写权限、命令执行审批规则）。
 - **`config/runtime.yaml`**：Engine 运行时参数（步数限制、上下文压缩阈值、worker 数量等）。可提交到仓库。
+- **`config/nodes/_persona.md`**：QQ 机器人人设，由 `qq.orchestrator` 通过 `{{include:_persona.md}}` 引用。不提交到仓库，模板见 `_persona.example.md`。
 
 `data/config.yaml` 默认通过 `${OPENAI_BASE_URL}` 等引用 `.env` 中的变量，通常无需额外编辑。
 
@@ -161,6 +163,7 @@ cp .env.example .env && \
 mkdir -p data && \
 ( test -f data/config.yaml || cp config.example.yaml data/config.yaml ) && \
 ( test -f data/policy.yaml || cp policy.example.yaml data/policy.yaml ) && \
+( test -f config/nodes/_persona.md || cp config/nodes/_persona.example.md config/nodes/_persona.md ) && \
 ( cd adapters/web/frontend && npm ci && npm run build ) && \
 echo "编辑 .env 填入 API Key，然后运行 python main.py"
 ```

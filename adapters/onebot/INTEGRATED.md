@@ -210,7 +210,7 @@ Get-NetTCPConnection -LocalPort 18080
 当前入口节点为：
 
 ```text
-qq_assistant
+qq.orchestrator
 ```
 
 ## QQ 语音输入与语音回复

@@ -56,6 +56,8 @@ from .types import (
     ProviderUpdateIn,
     ActiveProviderIn,
     FallbacksUpdateIn,
+    ModelVisionIn,
+    SystemModelUpdateIn,
     OpRequestIn,
     OpRequestOut,
     OutboundMessageIn,
@@ -542,7 +544,38 @@ def create_app(
     async def update_fallbacks(body: FallbacksUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
-        return cs.update_fallbacks(body.fallbacks)
+        try:
+            return _with_registered(cs.update_fallbacks([e.model_dump() for e in body.fallbacks]))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.put("/v1/config/model-vision")
+    async def set_model_vision(body: ModelVisionIn, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        cs: ConfigStore = app.state.config_store
+        try:
+            return _with_registered(cs.set_model_vision(body.model, body.vision))
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+
+    def _check_system_model_slot(slot: str) -> None:
+        from clonoth_runtime import SYSTEM_MODEL_SLOT_NAMES
+        if slot not in SYSTEM_MODEL_SLOT_NAMES:
+            raise HTTPException(status_code=404, detail=f"Unknown system model slot '{slot}'")
+
+    @app.get("/v1/config/system-models/{slot}")
+    async def get_system_model(slot: str, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        _check_system_model_slot(slot)
+        return app.state.config_store.get_system_model_public(slot)
+
+    @app.put("/v1/config/system-models/{slot}")
+    async def update_system_model(slot: str, body: SystemModelUpdateIn, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        _check_system_model_slot(slot)
+        return app.state.config_store.update_system_model(
+            slot, model=body.model, base_url=body.base_url, api_key=body.api_key,
+        )
 
     def _mimo_config() -> dict[str, str]:
         """读取 Mimo 语音服务配置。"""

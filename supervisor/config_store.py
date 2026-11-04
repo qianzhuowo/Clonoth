@@ -290,7 +290,10 @@ class ConfigStore:
 
     # system_models holds per-slot model/base_url/api_key blocks; it is not a
     # provider even though its children look like provider blocks.
-    _META_KEYS = frozenset({"version", "provider", "fallbacks", "mimo_audio", "system_models"})
+    _META_KEYS = frozenset({"version", "provider", "fallbacks", "mimo_audio", "system_models", "model_capabilities"})
+    # Fields of one fallback entry the editor manages; other keys of an existing
+    # entry (reasoning_effort, extra headers, ...) are preserved on save.
+    _FALLBACK_EDIT_FIELDS = ("provider", "model", "base_url")
 
     def _load_raw(self) -> dict[str, Any]:
         """Load raw YAML dict from disk."""
@@ -305,11 +308,13 @@ class ConfigStore:
         return isinstance(val, dict) and any(k in val for k in ("base_url", "api_key", "model"))
 
     def get_providers_public(self) -> dict[str, Any]:
-        """Return all providers with redacted api_keys, plus active_provider and fallbacks."""
+        """Providers and fallback chain with redacted api_keys, plus per-model vision flags."""
+        from engine.vision import vision_from_capabilities
+
         with self._lock:
             data = self._load_raw()
             active = data.get("provider", "openai")
-            fallbacks = data.get("fallbacks", []) or []
+            caps = data.get("model_capabilities") if isinstance(data.get("model_capabilities"), dict) else {}
 
             providers: dict[str, dict[str, Any]] = {}
             for key, val in data.items():
@@ -318,17 +323,35 @@ class ConfigStore:
                 if self._is_provider_block(val):
                     raw_key = _resolve_env_value(val.get("api_key", ""))
                     present, redacted = _redact_api_key(raw_key)
+                    model = _resolve_env_value(val.get("model", ""))
                     providers[key] = {
                         "base_url": _resolve_env_value(val.get("base_url", "")),
-                        "model": _resolve_env_value(val.get("model", "")),
+                        "model": model,
                         "api_key_present": present,
                         "api_key_redacted": redacted,
+                        "vision": vision_from_capabilities(caps, model),
                     }
+
+            fallbacks: list[dict[str, Any]] = []
+            for entry in data.get("fallbacks", []) or []:
+                if not isinstance(entry, dict):
+                    continue
+                present, redacted = _redact_api_key(str(entry.get("api_key", "") or ""))
+                model = str(entry.get("model", "") or "")
+                fallbacks.append({
+                    "provider": str(entry.get("provider", "") or ""),
+                    "model": model,
+                    "base_url": str(entry.get("base_url", "") or ""),
+                    "api_key_present": present,
+                    "api_key_redacted": redacted,
+                    "vision": vision_from_capabilities(caps, _resolve_env_value(model)),
+                })
 
             return {
                 "active_provider": active,
                 "providers": providers,
                 "fallbacks": fallbacks,
+                "model_capabilities": caps,
             }
 
     def upsert_provider(self, name: str, *, base_url: str | None = None,
@@ -365,14 +388,96 @@ class ConfigStore:
             self.reload()
             return self.get_providers_public()
 
-    def update_fallbacks(self, fallbacks: list[dict[str, Any]]) -> dict[str, Any]:
-        """Replace the fallback chain."""
+    def update_fallbacks(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        """Replace the fallback chain from editor entries.
+
+        Each entry: provider, model, base_url, optional api_key and source_index.
+        ``source_index`` points at the existing entry it was edited from; that entry's
+        unmanaged keys are kept, and an empty api_key keeps its stored key (the editor
+        only ever sees the redacted form). ``clear_api_key`` removes the stored key.
+        """
         with self._lock:
             data = self._load_raw()
-            data["fallbacks"] = fallbacks
+            old = [e for e in (data.get("fallbacks", []) or []) if isinstance(e, dict)]
+            chain: list[dict[str, Any]] = []
+            for item in entries:
+                provider = str(item.get("provider", "") or "").strip()
+                model = str(item.get("model", "") or "").strip()
+                if not provider or not model:
+                    raise ValueError("Each fallback needs a provider and a model")
+                src = item.get("source_index")
+                base = dict(old[src]) if isinstance(src, int) and 0 <= src < len(old) else {}
+                for field in self._FALLBACK_EDIT_FIELDS:
+                    base[field] = str(item.get(field, "") or "").strip()
+                if not base["base_url"]:
+                    base.pop("base_url")
+                new_key = str(item.get("api_key", "") or "").strip()
+                if new_key:
+                    base["api_key"] = new_key
+                elif item.get("clear_api_key"):
+                    base.pop("api_key", None)
+                chain.append(base)
+            data["fallbacks"] = chain
             self._save_raw(data)
             self.reload()
             return self.get_providers_public()
+
+    def set_model_vision(self, model: str, vision: bool) -> dict[str, Any]:
+        """Record whether ``model`` accepts image input (model_capabilities.<model>.vision)."""
+        model = (model or "").strip()
+        if not model:
+            raise ValueError("model is required")
+        with self._lock:
+            data = self._load_raw()
+            caps = data.get("model_capabilities")
+            if not isinstance(caps, dict):
+                caps = {}
+            entry = caps.get(model) if isinstance(caps.get(model), dict) else {}
+            entry["vision"] = bool(vision)
+            caps[model] = entry
+            data["model_capabilities"] = caps
+            self._save_raw(data)
+            self.reload()
+            return self.get_providers_public()
+
+    def get_system_model_public(self, slot: str) -> dict[str, Any]:
+        """system_models.<slot> with the api_key redacted."""
+        with self._lock:
+            block = (self._load_raw().get("system_models") or {}).get(slot)
+            block = block if isinstance(block, dict) else {}
+            present, redacted = _redact_api_key(str(block.get("api_key", "") or ""))
+            return {
+                "slot": slot,
+                "model": str(block.get("model", "") or ""),
+                "base_url": str(block.get("base_url", "") or ""),
+                "api_key_present": present,
+                "api_key_redacted": redacted,
+            }
+
+    def update_system_model(self, slot: str, *, model: str | None = None, base_url: str | None = None,
+                            api_key: str | None = None) -> dict[str, Any]:
+        """Partial update of system_models.<slot>; None keeps a field, empty string clears it."""
+        with self._lock:
+            data = self._load_raw()
+            slots = data.get("system_models")
+            if not isinstance(slots, dict):
+                slots = {}
+            block = slots.get(slot) if isinstance(slots.get(slot), dict) else {}
+            for field, value in (("model", model), ("base_url", base_url), ("api_key", api_key)):
+                if value is None:
+                    continue
+                if value.strip():
+                    block[field] = value.strip()
+                else:
+                    block.pop(field, None)
+            if block:
+                slots[slot] = block
+            else:
+                slots.pop(slot, None)
+            data["system_models"] = slots
+            self._save_raw(data)
+            self.reload()
+            return self.get_system_model_public(slot)
 
     def delete_provider(self, name: str) -> dict[str, Any]:
         """Delete a provider entry."""
@@ -384,7 +489,7 @@ class ConfigStore:
                 raise ValueError(f"Cannot delete active provider '{name}'; switch to another first")
             del data[name]
             fb = data.get("fallbacks", []) or []
-            data["fallbacks"] = [f for f in fb if f.get("provider") != name]
+            data["fallbacks"] = [f for f in fb if isinstance(f, dict) and f.get("provider") != name]
             self._save_raw(data)
             self.reload()
             return self.get_providers_public()

@@ -393,9 +393,32 @@ class ActiveProviderIn(BaseModel):
     provider: str
 
 
+class FallbackEntryIn(BaseModel):
+    """备用链编辑器的一项。api_key 留空保留 source_index 指向的原条目的 key。"""
+    provider: str
+    model: str
+    base_url: str = ""
+    api_key: str = ""
+    clear_api_key: bool = False
+    source_index: int | None = None
+
+
 class FallbacksUpdateIn(BaseModel):
     """更新 fallback 链"""
-    fallbacks: list[dict[str, Any]]
+    fallbacks: list[FallbackEntryIn]
+
+
+class ModelVisionIn(BaseModel):
+    """设置模型是否可识图（model_capabilities.<model>.vision）"""
+    model: str
+    vision: bool
+
+
+class SystemModelUpdateIn(BaseModel):
+    """更新 system_models.<slot>；None 保持不变，空字符串清除"""
+    model: str | None = None
+    base_url: str | None = None
+    api_key: str | None = None
 
 
 class ConfigReloadOut(BaseModel):

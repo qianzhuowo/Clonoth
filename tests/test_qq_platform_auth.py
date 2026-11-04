@@ -35,7 +35,7 @@ def _task(state: SupervisorState, session_id: str, *, platform_auth: dict | None
     if platform_auth is not None:
         ctx["platform_auth"] = platform_auth
     state.tasks[task_id] = Task(
-        task_id=task_id, session_id=session_id, kind=TaskKind.node, node_id="qq_assistant",
+        task_id=task_id, session_id=session_id, kind=TaskKind.node, node_id="qq.orchestrator",
         status=TaskStatus.running, input={"task_context": ctx}, created_at=now, updated_at=now,
     )
     return task_id
@@ -43,7 +43,7 @@ def _task(state: SupervisorState, session_id: str, *, platform_auth: dict | None
 
 def _request(state: SupervisorState, session_id: str, task_id: str, op: str, **parameters):
     return state.request_operation(
-        session_id=session_id, op=op, parameters=parameters, task_id=task_id, node_id="qq_assistant",
+        session_id=session_id, op=op, parameters=parameters, task_id=task_id, node_id="qq.orchestrator",
     )
 
 
@@ -130,7 +130,7 @@ def test_qq_non_admin_write_and_restart_denied(state, qq_session, op) -> None:
     assert _request(state, qq_session, tid, op, **params).safety_level == SafetyLevel.deny
 
 
-@pytest.mark.parametrize("path", ["config/nodes/qq_assistant.yaml", "data/config.yaml", ".env"])
+@pytest.mark.parametrize("path", ["config/nodes/qq.orchestrator.yaml", "data/config.yaml", ".env"])
 def test_qq_non_admin_sensitive_read_denied(state, qq_session, tmp_path, path) -> None:
     tid = _task(state, qq_session, platform_auth={"platform": "qq", "is_admin": False})
     out = _request(state, qq_session, tid, "read_file", path=str(tmp_path / path))
@@ -165,7 +165,7 @@ def test_qq_admin_non_sensitive_is_auto_and_schedule_is_auto(state, qq_session) 
     ("execute_command", {"command": "chmod +x run.sh"}),
     ("execute_command", {"command": "git push origin main"}),
     ("write_file", {"path": "engine/runner.py"}),
-    ("write_file", {"path": "config/nodes/qq_assistant.yaml"}),
+    ("write_file", {"path": "config/nodes/qq.orchestrator.yaml"}),
     ("restart", {"target": "engine"}),
 ])
 def test_qq_admin_sensitive_still_needs_approval(state, qq_session, op, params) -> None:
@@ -228,7 +228,7 @@ def test_image_inbound_routes_to_vision_node_without_rebinding_session(state, tm
     sid = state.get_or_create_session(channel="qq_group", conversation_key="qq_group:abc")
     base = {
         "channel": "qq_group", "conversation_key": "qq_group:abc", "text": "看图",
-        "entry_node_id": "qq_assistant",
+        "entry_node_id": "qq.orchestrator",
         "platform_auth": {"platform": "qq", "user_id": "u", "is_admin": False},
     }
     img = _inbound(state, sid, {**base, "route_hints": {"platform": "qq", "has_image": True}})
@@ -239,7 +239,7 @@ def test_image_inbound_routes_to_vision_node_without_rebinding_session(state, tm
     assert state.sessions[sid].entry_node_id != "qq_vision"
 
     txt = _inbound(state, sid, {**base, "route_hints": {"platform": "qq", "has_image": False}})
-    assert txt.node_id == "qq_assistant"
+    assert txt.node_id == "qq.orchestrator"
 
 
 def test_vision_routing_disabled_by_default(state, tmp_path) -> None:
@@ -247,9 +247,9 @@ def test_vision_routing_disabled_by_default(state, tmp_path) -> None:
     sid = state.get_or_create_session(channel="qq_group", conversation_key="qq_group:def")
     task = _inbound(state, sid, {
         "channel": "qq_group", "conversation_key": "qq_group:def", "text": "x",
-        "entry_node_id": "qq_assistant", "route_hints": {"has_image": True},
+        "entry_node_id": "qq.orchestrator", "route_hints": {"has_image": True},
     })
-    assert task.node_id == "qq_assistant"
+    assert task.node_id == "qq.orchestrator"
 
 
 def test_callback_inbound_inherits_platform_auth_only() -> None:

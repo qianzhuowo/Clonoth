@@ -283,7 +283,9 @@ _SYSTEM_MODEL_ENV_PREFIX = {
     "summary": "CLONOTH_SUMMARY",
     "image": "CLONOTH_IMAGE",
     "image_gpt": "CLONOTH_IMAGE_GPT",
+    "vision": "CLONOTH_VISION",
 }
+SYSTEM_MODEL_SLOT_NAMES = tuple(_SYSTEM_MODEL_ENV_PREFIX)
 
 # System node id -> slot. Only nodes listed here are overlaid by the runner.
 SYSTEM_NODE_MODEL_SLOTS = {

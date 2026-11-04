@@ -22,7 +22,7 @@ def _set_default_environment() -> None:
     """Set safe local defaults before the plugin reads its configuration."""
     os.environ.setdefault("CLONOTH_WORKSPACE", str(REPO_ROOT))
     os.environ.setdefault("CLONOTH_BASE_URL", os.environ.get("CLONOTH_URL", "http://127.0.0.1:8765"))
-    os.environ.setdefault("CLONOTH_ENTRY_NODE", "qq_assistant")
+    os.environ.setdefault("CLONOTH_ENTRY_NODE", "qq.orchestrator")
 
     # NoneBot / OneBot reverse WebSocket defaults.
     # NapCat or another OneBot implementation should connect to:

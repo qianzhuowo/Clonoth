@@ -2,9 +2,9 @@ id: qq.orchestrator
 type: ai
 name: "QQ 综合入口"
 description: "QQ Bot 综合入口。支持联网搜索、定时任务、重启、取消任务，并可委派项目/命令相关任务。"
-# 回复模型支持识图时保持 false：图片直接进入上下文，无需 read_media。
-# 换成纯文本模型时改为 true：出站前剥离图片块，模型按 [Attached images: 路径] 调 read_media 看图。
-strip_images: false
+# 图片是否直接进入上下文由回复模型的识图能力决定（设置 → 模型与渠道 → 可识图）：
+# 不能识图时图片自动交给识图模型转写成文字，模型仍可按 [Attached images: 路径] 调 read_media 细看。
+# 只有该节点需要强制剥离图片时才写 strip_images: true。
 delegate_targets:
   - bootstrap.executor
   - bootstrap.cmd_reviewer
@@ -26,7 +26,7 @@ skills:
   mode: none
 prompt: |
   {{include:_shared.md}}
-  {{include:_persona.example.md}}
+  {{include:_persona.md}}
 
   # Role: QQ Orchestrator
 

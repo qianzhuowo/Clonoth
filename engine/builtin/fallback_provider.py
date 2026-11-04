@@ -18,7 +18,7 @@ import yaml
 
 from .result import hook_result
 from engine.protocol import TaskAction
-from engine.attachments import strip_image_blocks
+from engine.vision import model_has_vision
 
 
 logger = logging.getLogger(__name__)
@@ -121,6 +121,15 @@ def _is_retryable(status_code: int | None, error: str | None = None) -> bool:
     if 400 <= status_code < 500:
         return False
     return True  # anything else (1xx, 3xx, unknown) → try fallback
+
+
+def _messages_have_images(messages: list[dict[str, Any]]) -> bool:
+    return any(
+        isinstance(part, dict) and part.get("type") == "image_url"
+        for msg in messages or []
+        if isinstance(msg.get("content"), list)
+        for part in msg["content"]
+    )
 
 
 def _create_fallback_provider(
@@ -283,14 +292,16 @@ class FallbackProviderHandler:
                     i, fb_base_url[:40], fb_model,
                 )
 
-                # Keep the existing text-only replacement policy, but delegate
-                # formatting, request hooks, IDs and cancellation to the public
-                # call capability. No private LoopState access or default switch.
-                _fb_messages = strip_image_blocks(messages)
-                images_removed = _fb_messages != messages
+                # Formatting, request hooks, IDs, cancellation and the image policy
+                # (engine.vision, decided by the replacement model's capability) all
+                # run inside the public call capability.
+                images_removed = (
+                    _messages_have_images(messages)
+                    and not model_has_vision(workspace_root, fb_model)
+                )
                 attempt = {"provider": fb_provider_type, "model": fb_model, "index": i}
                 t0 = time.monotonic()
-                new_resp = await call_provider(fb_provider, messages=_fb_messages)
+                new_resp = await call_provider(fb_provider)
                 if isinstance(new_resp, TaskAction):
                     return hook_result(action=new_resp)
                 if new_resp is None:
@@ -316,7 +327,7 @@ class FallbackProviderHandler:
                     ctx.provider = fb_provider  # This hook response only, not the configured provider.
                     text = f"原渠道 {original_model} 请求失败，本次改用 {fb_model}（{fb_provider_type}）。"
                     if images_removed:
-                        text += "本次备用请求未包含图片输入。"
+                        text += "该模型不支持识图，图片已交由识图模型转写为文字。"
                     return hook_result(modified=True, channels={"response_notices": [{
                         "code": "fallback_provider.used", "label": "备用模型", "text": text,
                         "requested": requested, "original_status": status_code,

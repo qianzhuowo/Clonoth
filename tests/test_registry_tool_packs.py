@@ -37,11 +37,11 @@ def test_script_env_carries_identity_and_drops_stale(monkeypatch) -> None:
     monkeypatch.setenv("CLONOTH_CONVERSATION_KEY", "stale-conv")
     ctx = SimpleNamespace(
         supervisor_url="http://127.0.0.1:8765", session_id="s1", parent_session_id="p1",
-        task_id="t1", node_id="qq_assistant", conversation_key="qq_group:abc", tool_call_id="",
+        task_id="t1", node_id="qq.orchestrator", conversation_key="qq_group:abc", tool_call_id="",
     )
     env = _script_tool_env(ctx)
     assert env["CLONOTH_SUPERVISOR_URL"] == "http://127.0.0.1:8765"
     assert env["CLONOTH_PARENT_SESSION_ID"] == "p1"
-    assert env["CLONOTH_NODE_ID"] == "qq_assistant"
+    assert env["CLONOTH_NODE_ID"] == "qq.orchestrator"
     assert env["CLONOTH_CONVERSATION_KEY"] == "qq_group:abc"
     assert "CLONOTH_TOOL_CALL_ID" not in env

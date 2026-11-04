@@ -15,7 +15,8 @@ from .stream_buffer import _StreamBuffer
 # 正文 token 流，必须在 flush 给前端之前就吞掉，否则用户会看到
 # <｜DSML｜tool_calls> 之类的协议文本。
 from providers.dsml import StreamFilter as _DSMLStreamFilter
-from ..attachments import node_strips_images, prepare_messages_for_llm, strip_image_blocks
+from ..attachments import prepare_messages_for_llm
+from ..vision import images_allowed, strip_and_describe_images
 from ..protocol import TaskAction, ACTION_CANCELLED, ACTION_FAIL
 from .loop_state import _LoopState, _persist_ctx, _short
 # message_to_llm 反序列化：在发送 LLM 前做格式转换（role 修正 + 内部字段剥离）
@@ -162,11 +163,27 @@ async def call_provider_once(ls: _LoopState, step: int, provider: Any, *, messag
                    use_stream=False, retry_max=0)
     # A replacement call does not start another reactive-compaction attempt.
     call._reactive_compact_done = True
+    # Image policy of a replacement call follows the replacement model's capability.
+    call._replacement_call = True
     try:
         return await _call_llm_with_retry(call, step)
     finally:
         ls.preempt_after_step = call.preempt_after_step
         ls.preempt_inject_info = call.preempt_inject_info
+
+
+async def _llm_messages_for_call(ls: _LoopState) -> list[dict[str, Any]]:
+    """Provider-ready messages: format, apply the image policy, then resolve file:// images.
+
+    Models that cannot see images get them replaced by vision-model descriptions
+    (engine.vision) before any base64 encoding happens.
+    """
+    formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
+    model = str(getattr(ls.provider, "model", "") or "")
+    if not images_allowed(ls.node, model, ls.rctx.workspace_root,
+                          replacement_call=getattr(ls, "_replacement_call", False)):
+        formatted = await strip_and_describe_images(formatted, ls.rctx.workspace_root)
+    return prepare_messages_for_llm(formatted, ls.rctx.workspace_root)
 
 
 async def _call_llm_with_retry(ls: _LoopState, step: int):
@@ -179,14 +196,13 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     """
     tools_arg = ls.openai_tools if ls.openai_tools else None
     # 反序列化方向：先用 build_llm_messages 做格式转换（修正跨模式 role、剥离 _meta 等内部字段），
-    # 再用 prepare_messages_for_llm 处理图片 file:// → base64 解析。
+    # 再按图片策略处理图片，最后用 prepare_messages_for_llm 解析 file:// → base64。
     # build_llm_messages 会跳过 _ephemeral 消息（retry hint 等），但保留 _dynamic（动态上下文）。
     # 注意：不能修改 ls.messages 本身，它是运行时状态。
-    _formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
     # [2026-10-26] Disabled bound_tool_history in-place truncation of historical tool results:
     # single-step tool outputs are already capped at creation time by tool_trace.max_inline_chars,
     # and mutating mid-history tool messages on every step invalidates the Prefix KV Cache.
-    llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
+    llm_messages = await _llm_messages_for_call(ls)
 
     # [AutoC 2026-08-24] before_llm_call：请求级消息变换点。
     # Why: @文件引用等内容需要“落库保持字面量、出站前展开”的语义，此前没有
@@ -213,8 +229,6 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
     if _llm_hook_result.action is not None:
         return _llm_hook_result.action
     llm_messages = _llm_hook_ctx.messages
-    if node_strips_images(ls.node):
-        llm_messages = strip_image_blocks(llm_messages)
 
     resp = None
     _retry_attempt = 0
@@ -501,11 +515,8 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                         "cleared": _rc_cleared, "error": resp.error or "",
                     })
                     # 重建 llm_messages：microcompact 原地修改了 ls.messages，
-                    # 需要重新走 build_llm_messages + prepare 流程
-                    _formatted = _build_messages_for_provider(ls.messages, ls.formatter, ls.provider)
-                    llm_messages = prepare_messages_for_llm(_formatted, ls.rctx.workspace_root)
-                    if node_strips_images(ls.node):
-                        llm_messages = strip_image_blocks(llm_messages)
+                    # 需要重新走格式转换 + 图片策略 + prepare 流程
+                    llm_messages = await _llm_messages_for_call(ls)
                     resp = None
                     continue  # 重试
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from .config import STRIP_MARKDOWN_ASTERISK_STYLES
 from .config import STRIP_MARKDOWN_UNDERSCORE_STYLES
-from .emoji_handler import strip_output_markers
+from .emoji_handler import _QQ_EMOJI_RE, strip_output_markers
 from nonebot.adapters.onebot.v11 import Bot
 from nonebot.adapters.onebot.v11 import Event
 from nonebot.adapters.onebot.v11 import GroupMessageEvent
@@ -66,7 +66,8 @@ def _record_bot_reply(group_id: int, text: str) -> None:
         strip_asterisk_styles=STRIP_MARKDOWN_ASTERISK_STYLES,
         strip_underscore_styles=STRIP_MARKDOWN_UNDERSCORE_STYLES,
     ).replace(state._SPLIT_SIGNAL, " ")
-    text = state._QQ_EMOJI_MARK_RE.sub(lambda m: f"[表情:{m.group(1)}]", text)
+    # 与引用一致写成 [表情包: 名称]：是记录而非发送指令，避免模型照着历史里的 [表情:..] 学着发。
+    text = _QQ_EMOJI_RE.sub(lambda m: f"[表情包: {m.group(1).strip()}]", text)
     text = state.ANON.anonymize_text(message_parse.compact_text(text))
     if text:
         line = f"[{dt.datetime.now(state._CST).strftime('%H:%M')}] Bot: {text}"

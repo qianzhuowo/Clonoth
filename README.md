@@ -8,6 +8,10 @@
 
 Clonoth 是一个模块化、可扩展的多平台 AI Agent 框架。面向长期运行的 Agent 服务场景，将任务调度、模型推理、平台接入、工具调用、技能注入和记忆管理拆分为独立模块。
 
+> **关于本仓库**：本仓库基于 [inktree/Clonoth](https://github.com/inktree/Clonoth) 的新版代码，并迁入了旧版的 QQ（OneBot/NapCat）接入、人设与会话数据。
+> 原名 `Clonoth-test`，2026-11 起改名为 `Clonoth` 并作为主仓库维护。
+> 旧版代码（源自 HCPTangHY/Clonoth，与本仓库历史不相关）已归档为 [qianzhuowo/Clonoth-legacy](https://github.com/qianzhuowo/Clonoth-legacy)。
+
 ## 架构概览
 
 Clonoth 采用 Supervisor + Engine + Bot Adapter 的多进程架构。

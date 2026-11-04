@@ -78,4 +78,6 @@ def test_qq_orchestrator_declares_strip_images():
 
     node = load_node(Path(__file__).resolve().parents[1], "qq.orchestrator")
     assert node is not None
-    assert node_strips_images(node) is True
+    # Default reply model is vision-capable: images go in natively (read_media is the
+    # fallback for text-only models, which set strip_images: true).
+    assert node_strips_images(node) is False

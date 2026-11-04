@@ -14,9 +14,9 @@ def _node() -> dict:
     return yaml.safe_load((ROOT / "config/nodes/qq.orchestrator.yaml").read_text(encoding="utf-8"))
 
 
-def test_orchestrator_strips_images_but_can_read_media_and_search():
+def test_orchestrator_sees_images_natively_and_keeps_read_media_fallback():
     node = _node()
-    assert node.get("strip_images") is True
+    assert node.get("strip_images") is False
     allow = node["tool_access"]["allow"]
     assert "read_media" in allow
     assert "search_web" in allow

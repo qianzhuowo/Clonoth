@@ -2,9 +2,9 @@ id: qq.orchestrator
 type: ai
 name: "QQ 综合入口"
 description: "QQ Bot 综合入口。支持联网搜索、定时任务、重启、取消任务，并可委派项目/命令相关任务。"
-# 综合入口使用纯文本模型；出站前剥离全部图片块，避免 provider 拒绝 image_url。
-# 看图走 read_media（独立视觉模型把图片转成文字），本节点仍可同时搜索/回复。
-strip_images: true
+# 回复模型支持识图时保持 false：图片直接进入上下文，无需 read_media。
+# 换成纯文本模型时改为 true：出站前剥离图片块，模型按 [Attached images: 路径] 调 read_media 看图。
+strip_images: false
 delegate_targets:
   - bootstrap.executor
   - bootstrap.cmd_reviewer
@@ -44,7 +44,7 @@ prompt: |
   - **ask**：信息不足时向用户补问。
   - **search_web**：联网搜索与读网页。action="search"（默认）传 query，查询最新资料、新闻，或还没有明确网址、需要先“找到”资料来源时使用；action="fetch" 传 urls（1~10 个链接），读取用户给的链接、文档地址等网页正文。读网页优先用 search_web 的 fetch，不要用 execute_command + curl。
   - **x_search**：搜索 X/Twitter/推特上的帖子与讨论；参数 {"query": "..."}。
-  - **read_media**：看图/看视频。你本身看不到图片；当前消息里出现 `[Attached images: 路径]` 且回答需要知道图片内容（识图、OCR、翻译图中文字、问图里是什么等）时，传 {"path": "路径", "prompt": "想重点了解的内容"}，它返回图片的文字描述。需要时可先 read_media 再 search_web。仅生图/改图请求直接把图片交给绘图节点，不必先 read_media。
+  - **read_media**：看视频，或在你看不到图片时看图。能直接看到图片就直接回答，不要调用它；只有消息里只剩 `[Attached images: 路径]` 文字、看不到图片本身，或需要分析视频时，传 {"path": "路径", "prompt": "想重点了解的内容"}。看完图需要查资料时可以接着用 search_web。生图/改图请求直接把图片交给绘图节点。
   - **stocktool_quote**：查询单只或多只股票、指数、ETF 的实时/近实时行情；工具只拉取数据，分析和回复由你完成。
   - **stocktool_history**：查询股票/指数/ETF 的历史行情（日/周/月 K 线）；支持 A股/港股/美股；可指定 period(day/week/month)、limit(最近多少根)、或 start/end 日期区间；用于查看一段时间的走势、历史涨跌、回测分析。
   - **manage_schedule**：创建、查看、删除定时任务（action: list / upsert / delete）。

@@ -1,0 +1,24 @@
+[Unit]
+Description=Clonoth QQ OneBot adapter
+# Must start as a script (adapters/onebot/app.py), not `python -m`.
+# Reverse-WS listen address/port/token come from .env: ONEBOT_HOST, ONEBOT_PORT,
+# ONEBOT_ACCESS_TOKEN (required when ONEBOT_HOST is not loopback).
+After=network-online.target clonoth.service docker.service
+Wants=network-online.target
+Requires=clonoth.service
+
+[Service]
+Type=simple
+WorkingDirectory=@INSTALL_DIR@
+EnvironmentFile=@INSTALL_DIR@/.env
+Environment=CLONOTH_BASE_URL=http://127.0.0.1:8765
+Environment=CLONOTH_URL=http://127.0.0.1:8765
+Environment=CLONOTH_WORKSPACE=@INSTALL_DIR@
+Environment=CLONOTH_ENTRY_NODE=qq.orchestrator
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do curl -fs -o /dev/null --max-time 2 http://127.0.0.1:8765/v1/health && exit 0; sleep 1; done; exit 1'
+ExecStart=@INSTALL_DIR@/.venv/bin/python @INSTALL_DIR@/adapters/onebot/app.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

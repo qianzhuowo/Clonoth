@@ -134,7 +134,9 @@ Sync scope (only these directories):
 - `toolbox/`
 - `clonoth_sdk/`
 - `adapters/`
+- `scripts/` (one-off maintenance such as `migrate_legacy_data.py`)
 
+systemd unit templates live in `deploy/systemd/` (replace `@INSTALL_DIR@`).
 ## Adding New Components
 
 ### New Provider

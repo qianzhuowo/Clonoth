@@ -261,7 +261,10 @@ class ProcessManager:
             return
         self.onebot_adapter = self._spawn(
             name="onebot-adapter",
-            module="adapters.onebot.app",
+            # Run app.py as a script: `-m adapters.onebot.app` imports the
+            # adapters.onebot package first, whose import calls get_driver()
+            # before nonebot.init() and crashes.
+            script_path=self.workspace_root / "adapters" / "onebot" / "app.py",
             capture_output=True,
             new_console=False,
             pass_supervisor_arg=False,

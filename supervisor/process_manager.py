@@ -101,7 +101,7 @@ class ProcessManager:
         self.onebot_owner_id = get_str(runtime_cfg, "supervisor.process_manager.onebot_owner_id", "")
         self.onebot_owner_name = get_str(runtime_cfg, "supervisor.process_manager.onebot_owner_name", "")
         self.onebot_voice_input = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_input", True)
-        self.onebot_voice_reply = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_reply", True)
+        self.onebot_voice_reply = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_reply", False)
         self.onebot_voice_reply_on_voice_input = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_reply_on_voice_input", True)
         self.onebot_voice_reply_auto_on_text = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_reply_auto_on_text", True)
         self.onebot_voice_reply_private = get_bool(runtime_cfg, "supervisor.process_manager.onebot_voice_reply_private", True)

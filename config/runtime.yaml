@@ -209,9 +209,10 @@ supervisor:
 
     # QQ 语音输入与语音回复。
     # 用户发语音时自动转写，处理完成后删除临时音频。
-    # 用户发语音时默认用语音回复；文字输入时由模型判断是否需要额外语音回复。
+    # 语音回复默认关闭：未配置 TTS 后端时合成会失败，模型却仍会声称已发送。
+    # 关闭时不向模型注入 <tts> 提示。配好 TTS（如云端接口）后再打开 onebot_voice_reply。
     onebot_voice_input: true
-    onebot_voice_reply: true
+    onebot_voice_reply: false
     onebot_voice_reply_on_voice_input: true
     onebot_voice_reply_auto_on_text: true
     onebot_voice_reply_private: true

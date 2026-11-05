@@ -91,7 +91,7 @@ CUSTOM_FACE_NAMES_PATH = _env_str(
 CUSTOM_FACE_METADATA_PATH = _env_str(
     "ONEBOT_CUSTOM_FACE_METADATA_PATH", os.path.join(CLONOTH_WORKSPACE, "config", "qq_custom_faces.json")
 )
-CUSTOM_FACE_PROMPT_LIMIT = _env_int("ONEBOT_CUSTOM_FACE_PROMPT_LIMIT", 50, min_value=0, max_value=200)
+CUSTOM_FACE_PROMPT_LIMIT = _env_int("ONEBOT_CUSTOM_FACE_PROMPT_LIMIT", 200, min_value=0, max_value=200)
 # 旧 bqbs.txt 顺序别名文件（可选）。生产环境用 ONEBOT_CUSTOM_EMOJI_INDEX_PATH，新部署用 CLONOTH_BQBS_PATH。
 BQBS_PATH = _env_str("ONEBOT_CUSTOM_EMOJI_INDEX_PATH") or _env_str("CLONOTH_BQBS_PATH")
 

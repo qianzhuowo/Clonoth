@@ -397,15 +397,9 @@ def _custom_face_explicit_name(face: Any, index: int, bqbs: List[str]) -> str:
     return ""
 
 
-def custom_face_metadata_item(face: Any, index: int, bqbs: List[str]) -> Dict[str, Any] | None:
-    """把已命名收藏表情详情压缩成可持久化的内部元数据；未命名返回 None。
-
-    base_name 是 AI 可见的基础名；name 是内部唯一显示名（同名会加 (1)/(2) 后缀）。
-    """
-    name = _custom_face_explicit_name(face, index, bqbs)
-    if not name:
-        return None
-    item: Dict[str, Any] = {"name": name, "base_name": name, "index": index + 1}
+def custom_face_summary(face: Any, index: int, bqbs: List[str]) -> Dict[str, Any]:
+    """收藏表情详情的统一摘要（含未命名项）：base_name 为空表示未命名。"""
+    item: Dict[str, Any] = {"base_name": _custom_face_explicit_name(face, index, bqbs), "index": index + 1}
     if isinstance(face, dict):
         item.update({
             "emoji_id": _custom_face_field(face, "emojiId", "emoji_id", "emoId", "emoid"),
@@ -416,6 +410,18 @@ def custom_face_metadata_item(face: Any, index: int, bqbs: List[str]) -> Dict[st
         })
     elif isinstance(face, str):
         item["url"] = face
+    return item
+
+
+def custom_face_metadata_item(face: Any, index: int, bqbs: List[str]) -> Dict[str, Any] | None:
+    """把已命名收藏表情详情压缩成可持久化的内部元数据；未命名返回 None。
+
+    base_name 是 AI 可见的基础名；name 是内部唯一显示名（同名会加 (1)/(2) 后缀）。
+    """
+    item = custom_face_summary(face, index, bqbs)
+    if not item["base_name"]:
+        return None
+    item["name"] = item["base_name"]
     return {k: v for k, v in item.items() if v not in (None, "", [])}
 
 

@@ -5,20 +5,24 @@ Two files, both kept out of git:
 - metadata file: md5/resId/emojiId per face, used only by code.
 
 Every write command (sync/add/rename/delete) and the list commands are
-admin-only; the caller passes ``is_admin``.
+admin-only; the caller passes ``is_admin``. The web panel (plugins/qq_faces)
+reaches the same operations through the loopback API in faces_api.py.
 """
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from . import config
 from .emoji_handler import (
+    _normalize_name as normalize_face_name,
     count_duplicate_face_names,
+    custom_face_summary,
     extract_named_custom_face_metadata,
     extract_named_custom_face_names,
     fetch_custom_face_details,
@@ -31,7 +35,13 @@ from .emoji_handler import (
     write_custom_face_metadata,
     write_custom_face_names,
 )
-from .inbound_attachments import RecentImages, attachment_abs_path, custom_face_command_images
+from .inbound_attachments import (
+    RecentImages,
+    attachment_abs_path,
+    custom_face_command_images,
+    image_ext_from_url_or_mime,
+    sniff_image_mime,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +91,22 @@ def _limit(match: re.Match[str], default: int) -> int:
     return max(1, min(100, int(match.group(1) or default)))
 
 
+def _find_face(faces: List[Any], *, md5: str = "", res_id: str = "") -> Optional[Dict[str, Any]]:
+    """Locate one live face by md5 (case-insensitive) or resId."""
+    for face in faces:
+        if not isinstance(face, dict):
+            continue
+        if md5 and str(face_value(face, "md5", "MD5") or "").lower() == md5.lower():
+            return face
+        if res_id and str(face_value(face, "resId", "res_id", "id") or "") == res_id:
+            return face
+    return None
+
+
+def _face_desc(face: Dict[str, Any]) -> str:
+    return str(face_value(face, "desc", "description", "name", "title", "alias") or "").strip()
+
+
 class CustomFaces:
     def __init__(
         self,
@@ -91,6 +117,7 @@ class CustomFaces:
         prompt_limit: Optional[int] = None,
         workspace: str | Path | None = None,
         sync_settle_seconds: float = 0.8,
+        verify_attempts: int = 4,
     ) -> None:
         self.names_path = names_path or config.CUSTOM_FACE_NAMES_PATH
         self.metadata_path = metadata_path or config.CUSTOM_FACE_METADATA_PATH
@@ -98,6 +125,7 @@ class CustomFaces:
         self.prompt_limit = config.CUSTOM_FACE_PROMPT_LIMIT if prompt_limit is None else prompt_limit
         self.workspace = workspace
         self.sync_settle_seconds = sync_settle_seconds
+        self.verify_attempts = max(1, verify_attempts)
         self.metadata: List[Dict[str, Any]] = []
 
     # ---- files / prompt ----------------------------------------------
@@ -122,24 +150,55 @@ class CustomFaces:
             f"可用名称：{'、'.join(shown)}{more}"
         )
 
-    async def sync(self, bot: Any) -> List[str]:
-        """Pull named favourites from NapCat; names file keeps unique base names,
-        metadata keeps every same-name face."""
-        faces = await fetch_custom_face_details(bot, force=True)
+    def _write_snapshot(self, faces: List[Any]) -> List[str]:
+        """Write names + metadata files from one live favourites list."""
         self.metadata = extract_named_custom_face_metadata(faces, self.bqbs)
         names = extract_named_custom_face_names(faces, self.bqbs)
         write_custom_face_names(self.names_path, names)
         write_custom_face_metadata(self.metadata_path, self.metadata)
         return names
 
-    async def _sync_quietly(self, bot: Any, after: str) -> None:
-        invalidate_custom_face_cache(bot)
-        try:
-            await self.sync(bot)
-        except Exception:
-            logger.warning("sync custom face names after %s failed", after, exc_info=True)
+    async def sync(self, bot: Any) -> List[str]:
+        """Pull named favourites from NapCat; names file keeps unique base names,
+        metadata keeps every same-name face."""
+        return self._write_snapshot(await self._live_faces(bot))
+
+    def prompt_position(self, name: str) -> int:
+        """0-based position of a base name in the AI names file; -1 when absent."""
+        key = normalize_face_name(name)
+        for pos, item in enumerate(self.current_names()):
+            if normalize_face_name(item) == key:
+                return pos
+        return -1
+
+    def usage_note(self, name: str) -> str:
+        """Tell the admin whether the model can actually see this name."""
+        pos = self.prompt_position(name)
+        if pos < 0:
+            return f"注意：AI 名称列表里还没有「{name}」，可发送“同步表情列表”刷新。"
+        if pos >= self.prompt_limit:
+            return (f"注意：它在 AI 名称列表第 {pos + 1} 位，超过提示上限 {self.prompt_limit}，模型看不到；"
+                    "可调大 ONEBOT_CUSTOM_FACE_PROMPT_LIMIT。")
+        return f"模型可用 [表情:{name}] 调用。"
 
     # ---- NapCat operations ---------------------------------------------
+    # Every write is verified against a fresh favourites list before the
+    # result is reported; NapCat may accept a call without applying it.
+    async def _live_faces(self, bot: Any) -> List[Any]:
+        invalidate_custom_face_cache(bot)
+        return await fetch_custom_face_details(bot, force=True)
+
+    async def _wait_until(self, bot: Any, done: Any) -> tuple[List[Any], bool]:
+        """Re-read favourites until ``done(faces)``; returns (last faces, reached)."""
+        faces: List[Any] = []
+        for _ in range(self.verify_attempts):
+            if self.sync_settle_seconds > 0:
+                await asyncio.sleep(self.sync_settle_seconds)
+            faces = await self._live_faces(bot)
+            if done(faces):
+                return faces, True
+        return faces, False
+
     async def set_desc(self, bot: Any, face: Dict[str, Any], desc: str) -> tuple[bool, str]:
         emoji_id = face_value(face, "emojiId", "emoji_id", "emoId", "emoid")
         res_id = face_value(face, "resId", "res_id", "id")
@@ -147,44 +206,147 @@ class CustomFaces:
         missing = [n for n, v in (("emoji_id", emoji_id), ("res_id", res_id), ("md5", md5)) if v is None or v == ""]
         if missing:
             return False, "找到了该表情，但缺少重命名所需字段：" + "、".join(missing)
+        desc = desc.strip()
+        if not desc:
+            return False, "表情名称不能为空。"
         try:
             await bot.call_api("set_custom_face_desc", emoji_id=emoji_id, res_id=str(res_id), md5=str(md5), desc=desc)
         except Exception:
             logger.warning("set_custom_face_desc failed", exc_info=True)
             return False, "重命名收藏表情失败：当前 OneBot 实现可能不支持 set_custom_face_desc，或该表情资源信息已失效。"
-        await self._sync_quietly(bot, "rename")
-        return True, f"已将收藏表情重命名为：{desc}\n之后模型可用 [表情:{desc}] 调用。"
 
-    async def add_from_attachment(self, bot: Any, alias: str, attachment: Dict[str, Any]) -> str:
-        """add_custom_face, then find the new face by md5 and set its description."""
-        path = attachment_abs_path(attachment, self.workspace)
-        if path is None or not path.exists():
-            return "找不到要收藏的图片文件，请重新发送图片后再试。"
+        def applied(faces: List[Any]) -> bool:
+            live = _find_face(faces, md5=str(md5))
+            return live is not None and normalize_face_name(_face_desc(live)) == normalize_face_name(desc)
+
+        try:
+            faces, ok = await self._wait_until(bot, applied)
+        except Exception:
+            logger.warning("re-read favourites after set_custom_face_desc failed", exc_info=True)
+            return False, "已提交重命名，但重新读取收藏列表失败，无法确认结果。"
+        self._write_snapshot(faces)
+        if not ok:
+            live = _find_face(faces, md5=str(md5))
+            current = _face_desc(live) if live else ""
+            return False, f"NapCat 没有应用新名称，该表情当前名称仍为「{current or '未命名'}」。"
+        return True, f"已将收藏表情重命名为：{desc}\n" + self.usage_note(desc)
+
+    async def delete_face(self, bot: Any, face: Dict[str, Any]) -> tuple[bool, str]:
+        res_id = str(face_value(face, "resId", "res_id", "id") or "")
+        if not res_id:
+            return False, "该表情没有 resId，无法删除。"
+        try:
+            await bot.call_api("delete_custom_face", res_id=res_id)
+        except Exception:
+            logger.warning("delete_custom_face failed", exc_info=True)
+            return False, "删除收藏表情失败：当前 OneBot 实现可能不支持 delete_custom_face，或 resId 已失效。"
+        try:
+            faces, gone = await self._wait_until(bot, lambda fs: _find_face(fs, res_id=res_id) is None)
+        except Exception:
+            logger.warning("re-read favourites after delete_custom_face failed", exc_info=True)
+            return False, "已提交删除，但重新读取收藏列表失败，无法确认结果。"
+        self._write_snapshot(faces)
+        if not gone:
+            return False, "NapCat 返回成功，但该表情仍在收藏列表中。"
+        return True, "已删除收藏表情。"
+
+    async def add_image_file(self, bot: Any, alias: str, path: Path) -> tuple[bool, str]:
+        """Favourite an image file and name it; the reply reflects the verified result.
+
+        An image already in favourites (same md5) is not added again: QQ keeps
+        one entry per image, so the existing entry is renamed instead.
+        """
+        alias = (alias or "").strip()
+        if not alias:
+            return False, "表情名称不能为空。"
+        if not path.is_file():
+            return False, "找不到要收藏的图片文件，请重新发送图片后再试。"
         md5 = hashlib.md5(path.read_bytes()).hexdigest()
         try:
-            await bot.call_api("add_custom_face", file=str(path), md5=md5, file_name=path.name, is_origin=True)
+            faces = await self._live_faces(bot)
         except Exception:
-            logger.warning("add_custom_face failed", exc_info=True)
-            return (
-                "收藏表情失败：NapCat add_custom_face 调用失败。\n"
-                "提示：NapCat 要求 file 是 NapCat 运行环境可访问的本地路径；"
-                "如果 NoneBot 和 NapCat 分容器部署，请把 Clonoth data/attachments 挂载到相同路径。"
-            )
-        invalidate_custom_face_cache(bot)
-        try:
-            if self.sync_settle_seconds > 0:
-                await asyncio.sleep(self.sync_settle_seconds)
-            faces = await fetch_custom_face_details(bot, force=True)
-            target = next((f for f in faces if isinstance(f, dict) and str(f.get("md5") or "").lower() == md5), None)
-            emoji_id = face_value(target, "emojiId", "emoji_id", "emoId", "emoid")
-            res_id = face_value(target, "resId", "res_id")
-            if emoji_id is not None and res_id:
-                await bot.call_api("set_custom_face_desc", emoji_id=emoji_id, res_id=str(res_id), md5=md5, desc=alias)
-                await self._sync_quietly(bot, "add")
-        except Exception:
-            # The face is already saved; a missing description is not fatal.
-            logger.warning("set_custom_face_desc after add_custom_face failed", exc_info=True)
-        return f"已尝试收藏表情：{alias}\n之后模型可用 [表情:{alias}] 调用；如描述设置失败，也可用“表情列表”查看实际名称。"
+            logger.warning("fetch favourites before add_custom_face failed", exc_info=True)
+            return False, f"收藏表情失败：{_DETAIL_UNSUPPORTED}"
+        existing = _find_face(faces, md5=md5)
+        if existing is not None:
+            previous = _face_desc(existing)
+            if normalize_face_name(previous) == normalize_face_name(alias):
+                self._write_snapshot(faces)
+                return True, f"这张图片已在收藏中，名称就是「{alias}」。\n" + self.usage_note(alias)
+            target = existing
+            head = f"这张图片已在收藏中（原名「{previous or '未命名'}」），已改名为：{alias}"
+        else:
+            try:
+                await bot.call_api("add_custom_face", file=str(path), md5=md5, file_name=path.name, is_origin=True)
+            except Exception:
+                logger.warning("add_custom_face failed", exc_info=True)
+                return False, (
+                    "收藏表情失败：NapCat add_custom_face 调用失败。\n"
+                    "提示：NapCat 要求 file 是 NapCat 运行环境可访问的本地路径；"
+                    "如果 NoneBot 和 NapCat 分容器部署，请把 Clonoth data/attachments 挂载到相同路径。"
+                )
+            try:
+                faces, found = await self._wait_until(bot, lambda fs: _find_face(fs, md5=md5) is not None)
+            except Exception:
+                logger.warning("re-read favourites after add_custom_face failed", exc_info=True)
+                return False, "NapCat 已接受收藏请求，但重新读取收藏列表失败，无法确认是否收藏成功。"
+            target = _find_face(faces, md5=md5)
+            if not found or target is None:
+                return False, (
+                    f"收藏表情失败：NapCat 返回成功，但收藏列表里找不到这张图片（md5 {md5[:8]}）。\n"
+                    "可能是 QQ 收藏已满、图片格式不被接受，或 NapCat 无法读取该文件路径。"
+                )
+            head = f"已收藏表情：{alias}"
+        ok, message = await self.set_desc(bot, target, alias)
+        if not ok:
+            where = "图片已在收藏中" if existing is not None else "图片已收藏"
+            return False, f"{where}，但命名为「{alias}」失败：{message}"
+        return True, head + "\n" + self.usage_note(alias)
+
+    async def add_from_attachment(self, bot: Any, alias: str, attachment: Dict[str, Any]) -> str:
+        path = attachment_abs_path(attachment, self.workspace)
+        if path is None:
+            return "找不到要收藏的图片文件，请重新发送图片后再试。"
+        return (await self.add_image_file(bot, alias, path))[1]
+
+    async def add_upload(self, bot: Any, alias: str, filename: str, data: bytes) -> tuple[bool, str]:
+        """Favourite an uploaded image (web panel). The file is stored under
+        data/attachments, which NapCat sees at the same path."""
+        if not data:
+            return False, "上传的文件为空。"
+        if len(data) > config.IMAGE_MAX_BYTES:
+            return False, f"图片超过 {config.IMAGE_MAX_BYTES // (1024 * 1024)} MB 上限。"
+        mime = sniff_image_mime(data)
+        if not mime:
+            return False, "只能上传 PNG / JPEG / GIF / WebP / BMP 图片。"
+        folder = Path(self.workspace or config.CLONOTH_WORKSPACE) / "data" / "attachments" / "qq_faces_upload"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{os.urandom(16).hex()}{image_ext_from_url_or_mime(filename or '', mime)}"
+        path.write_bytes(data)
+        return await self.add_image_file(bot, alias, path)
+
+    async def face_by_res_id(self, bot: Any, res_id: str) -> Optional[Dict[str, Any]]:
+        return _find_face(await self._live_faces(bot), res_id=str(res_id or ""))
+
+    async def overview(self, bot: Any) -> Dict[str, Any]:
+        """Every live favourite with its prompt visibility (web panel listing)."""
+        faces = await self._live_faces(bot)
+        names = self.current_names()
+        positions = {normalize_face_name(n): i for i, n in enumerate(names)}
+        items = [custom_face_summary(face, pos, self.bqbs) for pos, face in enumerate(faces)]
+        counts: Dict[str, int] = {}
+        for item in items:
+            key = normalize_face_name(item["base_name"])
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+        for item in items:
+            key = normalize_face_name(item["base_name"])
+            pos = positions.get(key, -1) if key else -1
+            item["duplicates"] = counts.get(key, 0) if key else 0
+            item["prompt_position"] = pos + 1 if pos >= 0 else 0
+            item["in_prompt"] = 0 <= pos < self.prompt_limit
+        return {"prompt_limit": self.prompt_limit, "names_total": len(names), "faces": items}
+
 
     async def _resolve_unique(self, bot: Any, target: str, verb: str, example: str) -> tuple[Any, Optional[str]]:
         """Resolve a face; ask for an index when a base name is ambiguous."""
@@ -302,16 +464,8 @@ class CustomFaces:
                         "请确认 NapCat 版本支持 fetch_custom_face_detail；仅旧 fetch_custom_face 返回的 URL 不能用于 delete_custom_face。")
             if not isinstance(face, dict):
                 return f"没有找到收藏表情：{name}"
-            res_id = face.get("resId") or face.get("res_id") or face.get("id")
-            if not res_id:
-                return f"找到了表情 {name}，但没有 resId，无法删除。"
-            try:
-                await bot.call_api("delete_custom_face", res_id=str(res_id))
-            except Exception:
-                logger.warning("delete_custom_face failed", exc_info=True)
-                return "删除收藏表情失败：当前 OneBot 实现可能不支持 delete_custom_face，或 resId 已失效。"
-            await self._sync_quietly(bot, "delete")
-            return f"已删除收藏表情：{name}"
+            ok, message = await self.delete_face(bot, face)
+            return f"已删除收藏表情：{name}" if ok else message
 
         match = ADD_RE.match(text)
         if match:

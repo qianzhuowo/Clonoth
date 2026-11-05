@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import sys
 import types
@@ -24,9 +25,11 @@ KEY = "qq_group:abcdef0123456789abcdef01"
 
 
 class FakeNapCat:
-    def __init__(self, faces):
+    def __init__(self, faces, *, ignore_add=False, ignore_desc=False):
         self.faces = [dict(f) for f in faces]
         self.calls = []
+        self.ignore_add = ignore_add
+        self.ignore_desc = ignore_desc
 
     async def call_api(self, api, **kw):
         self.calls.append((api, kw))
@@ -34,14 +37,15 @@ class FakeNapCat:
             return {"data": {"emojiInfoList": [dict(f) for f in self.faces]}}
         if api == "set_custom_face_desc":
             for f in self.faces:
-                if f.get("resId") == kw["res_id"]:
+                if f.get("resId") == kw["res_id"] and not self.ignore_desc:
                     f["desc"] = kw["desc"]
             return {}
         if api == "delete_custom_face":
             self.faces = [f for f in self.faces if f.get("resId") != kw["res_id"]]
             return {}
         if api == "add_custom_face":
-            self.faces.append({"emojiId": 9, "resId": "r9", "md5": kw["md5"], "desc": ""})
+            if not self.ignore_add:
+                self.faces.append({"emojiId": 9, "resId": "r9", "md5": kw["md5"].upper(), "desc": ""})
             return {}
         raise AssertionError(api)
 
@@ -128,7 +132,7 @@ def test_add_from_current_image_sets_description(setup):
     img.parent.mkdir(parents=True)
     img.write_bytes(b"\x89PNG\r\n\x1a\nhello")
     reply = run("收藏表情 好耶", current=[{"type": "image", "path": "data/attachments/x/a.png"}])
-    assert reply.startswith("已尝试收藏表情：好耶")
+    assert reply.startswith("已收藏表情：好耶\n模型可用 [表情:好耶] 调用。")
     add = next(kw for api, kw in bot.calls if api == "add_custom_face")
     assert add["file"] == str(img) and add["is_origin"] is True
     assert any(api == "set_custom_face_desc" and kw["desc"] == "好耶" and kw["res_id"] == "r9" for api, kw in bot.calls)
@@ -138,3 +142,85 @@ def test_add_from_current_image_sets_description(setup):
 def test_add_without_image(setup):
     _, bot, run, _ = setup
     assert run("收藏表情 好耶").startswith("没有找到可收藏的图片")
+
+
+PNG = b"\x89PNG\r\n\x1a\nhello"
+
+
+def _image(tmp, data=PNG):
+    img = tmp / "data" / "attachments" / "x" / "a.png"
+    img.parent.mkdir(parents=True, exist_ok=True)
+    img.write_bytes(data)
+    return [{"type": "image", "path": "data/attachments/x/a.png"}]
+
+
+def test_add_existing_image_renames_instead_of_duplicating(setup):
+    faces, bot, run, tmp = setup
+    md5 = hashlib.md5(PNG).hexdigest()
+    bot.faces[0]["md5"] = md5.upper()  # QQ already has this image as “开心”
+    reply = run("收藏表情 好耶", current=_image(tmp))
+    assert reply.startswith("这张图片已在收藏中（原名「开心」），已改名为：好耶")
+    assert not any(api == "add_custom_face" for api, _ in bot.calls)
+    assert "好耶" in faces.current_names()
+    assert run("收藏表情 好耶", current=_image(tmp)).startswith("这张图片已在收藏中，名称就是「好耶」")
+
+
+def test_add_reports_failure_when_napcat_did_not_save(setup):
+    faces, bot, run, tmp = setup
+    bot.ignore_add = True
+    reply = run("收藏表情 好耶", current=_image(tmp))
+    assert reply.startswith("收藏表情失败：NapCat 返回成功，但收藏列表里找不到这张图片")
+    assert not any(api == "set_custom_face_desc" for api, _ in bot.calls)
+
+
+def test_add_reports_failure_when_name_not_applied(setup):
+    faces, bot, run, tmp = setup
+    bot.ignore_desc = True
+    reply = run("收藏表情 好耶", current=_image(tmp))
+    assert reply.startswith("图片已收藏，但命名为「好耶」失败：NapCat 没有应用新名称")
+    assert "好耶" not in faces.current_names()
+
+
+def test_usage_note_flags_names_beyond_prompt_limit(setup):
+    faces, bot, run, tmp = setup
+    faces.prompt_limit = 1
+    reply = run("命名表情 3 惊讶")
+    assert "超过提示上限 1，模型看不到" in reply
+
+
+def test_overview_marks_duplicates_and_prompt_visibility(setup):
+    faces, bot, run, _ = setup
+    run("同步表情列表")
+    faces.prompt_limit = 1
+    data = asyncio.run(faces.overview(bot))
+    assert data["prompt_limit"] == 1 and data["names_total"] == 2
+    by_res = {f["res_id"]: f for f in data["faces"]}
+    assert by_res["r1"]["duplicates"] == 2 and by_res["r1"]["in_prompt"] and by_res["r1"]["prompt_position"] == 1
+    assert by_res["r3"]["base_name"] == "" and by_res["r3"]["prompt_position"] == 0
+    assert by_res["r4"]["prompt_position"] == 2 and not by_res["r4"]["in_prompt"]
+    assert by_res["r4"]["index"] == 4
+
+
+def test_add_upload_validates_and_saves_under_attachments(setup):
+    faces, bot, run, tmp = setup
+    ok, message = asyncio.run(faces.add_upload(bot, "好耶", "x.txt", b"not an image"))
+    assert not ok and "只能上传" in message
+    ok, message = asyncio.run(faces.add_upload(bot, "好耶", "a.png", PNG))
+    assert ok and message.startswith("已收藏表情：好耶")
+    add = next(kw for api, kw in bot.calls if api == "add_custom_face")
+    saved = Path(add["file"])
+    assert saved.parent == tmp / "data" / "attachments" / "qq_faces_upload" and saved.suffix == ".png"
+
+
+def test_delete_reports_failure_when_face_remains(setup):
+    faces, bot, run, _ = setup
+    original = bot.call_api
+
+    async def stubborn(api, **kw):
+        if api == "delete_custom_face":
+            bot.calls.append((api, kw))
+            return {}
+        return await original(api, **kw)
+
+    bot.call_api = stubborn
+    assert run("删除表情 难过") == "NapCat 返回成功，但该表情仍在收藏列表中。"

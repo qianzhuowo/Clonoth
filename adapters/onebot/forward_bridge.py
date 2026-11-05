@@ -1,4 +1,4 @@
-"""Local HTTP bridge used by the qq_forward tool to forward chat messages."""
+"""Local HTTP bridge (127.0.0.1): qq_forward tool callbacks and the qq_faces admin API."""
 from __future__ import annotations
 
 import logging
@@ -17,7 +17,7 @@ from typing import Dict
 import contextlib
 import uuid
 
-from . import approval, commands, message_parse, profiles, send, state
+from . import approval, commands, faces_api, message_parse, profiles, send, state
 
 logger = logging.getLogger("nonebot.plugin.clonoth_agent")
 
@@ -639,8 +639,9 @@ async def _start_forward_bridge() -> None:
     except Exception:
         logger.warning("qq_forward bridge disabled: aiohttp 未安装。")
         return
-    app = web.Application()
+    app = web.Application(client_max_size=faces_api.MAX_REQUEST_BYTES)
     app.router.add_post("/qq_forward", _forward_bridge_http_handler)
+    faces_api.register(app, _forward_bridge_check_token)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, FORWARD_BRIDGE_HOST, FORWARD_BRIDGE_PORT)

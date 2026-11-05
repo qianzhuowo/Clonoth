@@ -45,11 +45,8 @@ _LOCAL_PATH_RE = re.compile(r"^[a-zA-Z]:[\\/]")
 
 # ---- pure helpers ---------------------------------------------------------------
 
-def guess_image_mime(url: str, content_type: str = "", content: bytes = b"") -> str:
-    """Response header > magic bytes > URL suffix > image/jpeg."""
-    ct = (content_type or "").split(";", 1)[0].strip().lower()
-    if ct.startswith("image/"):
-        return ct
+def sniff_image_mime(content: bytes) -> str:
+    """Image MIME from magic bytes; empty string when not a known image."""
     head = bytes(content[:16] or b"")
     if head.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -61,6 +58,17 @@ def guess_image_mime(url: str, content_type: str = "", content: bytes = b"") -> 
         return "image/webp"
     if head.startswith(b"BM"):
         return "image/bmp"
+    return ""
+
+
+def guess_image_mime(url: str, content_type: str = "", content: bytes = b"") -> str:
+    """Response header > magic bytes > URL suffix > image/jpeg."""
+    ct = (content_type or "").split(";", 1)[0].strip().lower()
+    if ct.startswith("image/"):
+        return ct
+    sniffed = sniff_image_mime(content)
+    if sniffed:
+        return sniffed
     suffix = Path((url or "").split("?", 1)[0].split("#", 1)[0].lower()).suffix
     return {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
             ".webp": "image/webp", ".bmp": "image/bmp"}.get(suffix, "image/jpeg")

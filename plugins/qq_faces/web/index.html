@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QQ 收藏表情</title>
+<style>
+  /* 主题值由宿主注入（themeBridge 写入 :root），本页只做别名映射；
+     --ok/--danger/--warn 是本页局部语义色。 */
+  :root {
+    --bg: var(--duties-bg, #0f1115); --panel: var(--duties-panel, #171a21); --muted: var(--duties-muted, #23262e);
+    --text: var(--duties-text, #d6d9e0); --secondary: var(--duties-secondary, #a5abb8); --tertiary: var(--duties-tertiary, #6b7180);
+    --border: var(--duties-border, #2c3039); --accent: var(--duties-accent, #6d8cff);
+    --ok: #3f9b52; --danger: #c24b4b; --warn: #c08a2e;
+    --mono: ui-monospace, 'Geist Mono', Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font: 12px/1.6 'Inter', ui-sans-serif, system-ui, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  button { font: inherit; }
+
+  .toolbar { position: sticky; top: 0; z-index: 10; background: var(--bg); padding: 14px 20px 10px;
+             border-bottom: 1px solid var(--muted); display: flex; flex-direction: column; gap: 8px; }
+  .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  h1 { font-family: var(--mono); font-size: 13px; font-weight: 600; }
+  .stats { color: var(--tertiary); font: 10.5px var(--mono); flex: 1; min-width: 160px; }
+  .stats b { color: var(--secondary); font-weight: 600; }
+  .stats b.bad { color: var(--danger); }
+  .search { flex: 0 0 220px; font: 11px var(--mono); color: var(--text); background: var(--panel);
+            border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; outline: none; }
+  .search:focus { border-color: var(--secondary); }
+  .chip { font: 10px var(--mono); cursor: pointer; color: var(--tertiary); background: transparent;
+          border: 1px solid var(--border); border-radius: 999px; padding: 2px 9px; white-space: nowrap; }
+  .chip:hover { color: var(--secondary); border-color: var(--secondary); }
+  .chip.active { color: var(--accent); border-color: var(--accent); }
+  .chip .n { opacity: .65; margin-left: 2px; }
+
+  button.op { font: 10px var(--mono); cursor: pointer; padding: 3px 9px; background: transparent; color: var(--secondary);
+              border: 1px solid var(--border); border-radius: 3px; white-space: nowrap; }
+  button.op:hover:not(:disabled) { color: var(--text); border-color: var(--text); }
+  button.op:disabled { opacity: .35; cursor: not-allowed; }
+  button.op.primary { color: var(--accent); border-color: var(--accent); }
+  button.op.danger:hover:not(:disabled), button.op.armed { color: var(--danger); border-color: var(--danger); }
+  button.op.armed { font-weight: 600; }
+
+  /* ── 上传队列 ── */
+  .queue { margin: 12px 20px 0; border: 1px dashed var(--border); border-radius: 6px; padding: 10px; display: none; }
+  .queue.show { display: block; }
+  .queue-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; color: var(--secondary); font: 10.5px var(--mono); }
+  .queue-head span { flex: 1; }
+  .qitem { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-top: 1px solid var(--muted); }
+  .qitem:first-of-type { border-top: none; }
+  .qitem img { width: 44px; height: 44px; object-fit: contain; border-radius: 4px; background: var(--panel); flex: none; }
+  .qitem input { flex: 1; min-width: 80px; font: 11px var(--mono); color: var(--text); background: var(--panel);
+                 border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; outline: none; }
+  .qitem input:focus { border-color: var(--secondary); }
+  .qstate { font: 10px var(--mono); color: var(--tertiary); max-width: 40%; white-space: pre-wrap; }
+  .qstate.ok { color: var(--ok); } .qstate.err { color: var(--danger); }
+
+  /* ── 网格 ── */
+  .grid { padding: 14px 20px 70px; display: grid; gap: 10px; grid-template-columns: repeat(auto-fill, minmax(128px, 1fr)); }
+  .card { position: relative; border: 1px solid var(--muted); border-radius: 6px; overflow: hidden; background: var(--panel);
+          cursor: pointer; transition: border-color .15s, transform .15s; }
+  .card:hover { border-color: var(--secondary); }
+  .card::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 3px; z-index: 1; background: var(--tertiary); }
+  .card.st-in::before { background: var(--ok); }
+  .card.st-over::before { background: var(--danger); }
+  .card.st-unsynced::before { background: var(--warn); }
+  .thumb { aspect-ratio: 1 / 1; display: flex; align-items: center; justify-content: center;
+           background: repeating-conic-gradient(var(--muted) 0% 25%, transparent 0% 50%) 50% / 16px 16px; }
+  .thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
+  .thumb .broken { color: var(--tertiary); font: 10px var(--mono); }
+  .idx { position: absolute; top: 7px; left: 6px; font: 9.5px/15px var(--mono); padding: 0 5px; border-radius: 3px;
+         background: rgba(0,0,0,.55); color: #fff; }
+  .card-body { padding: 6px 8px 8px; border-top: 1px solid var(--muted); }
+  .fname { font-weight: 600; font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .fname.unnamed { color: var(--tertiary); font-style: italic; font-weight: 400; }
+  .badges { display: flex; gap: 3px; flex-wrap: wrap; margin-top: 4px; }
+  .badge { padding: 0 5px; border: 1px solid var(--border); border-radius: 3px; font: 9.5px/15px var(--mono); color: var(--tertiary); }
+  .badge.ok { color: var(--ok); border-color: var(--ok); }
+  .badge.bad { color: var(--danger); border-color: var(--danger); }
+  .badge.warn { color: var(--warn); border-color: var(--warn); }
+  .card-ops { position: absolute; top: 6px; right: 6px; display: none; gap: 4px; z-index: 2; }
+  .card:hover .card-ops { display: flex; }
+  .card-ops button.op { background: var(--bg); }
+
+  .empty { color: var(--tertiary); padding: 48px 0; text-align: center; grid-column: 1 / -1; }
+  #msg { position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%); max-width: 86%; z-index: 40;
+         background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 7px 14px;
+         font: 11px/1.5 var(--mono); color: var(--secondary); white-space: pre-wrap; display: none; box-shadow: 0 6px 24px rgba(0,0,0,.35); }
+  #msg.show { display: block; } #msg.err { color: var(--danger); border-color: var(--danger); } #msg.ok { color: var(--ok); border-color: var(--ok); }
+
+  /* ── 拖拽遮罩 ── */
+  #drop { position: fixed; inset: 0; z-index: 50; display: none; align-items: center; justify-content: center;
+          background: rgba(10,12,16,.72); border: 2px dashed var(--accent); color: var(--accent); font: 14px var(--mono); pointer-events: none; }
+  #drop.show { display: flex; }
+
+  /* ── 预览 ── */
+  #modal { position: fixed; inset: 0; z-index: 30; display: none; background: rgba(0,0,0,.6); align-items: center; justify-content: center; padding: 20px; }
+  #modal.show { display: flex; }
+  .mbox { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; width: min(760px, 100%); max-height: 100%;
+          display: grid; grid-template-columns: minmax(0, 1fr) 260px; overflow: hidden; }
+  .mimg { min-height: 300px; display: flex; align-items: center; justify-content: center; position: relative;
+          background: repeating-conic-gradient(var(--muted) 0% 25%, transparent 0% 50%) 50% / 20px 20px; }
+  .mimg img { max-width: 100%; max-height: 70vh; object-fit: contain; }
+  .nav { position: absolute; top: 50%; transform: translateY(-50%); background: rgba(0,0,0,.45); color: #fff; border: none;
+         width: 30px; height: 44px; cursor: pointer; font-size: 16px; border-radius: 4px; }
+  .nav.prev { left: 8px; } .nav.next { right: 8px; }
+  .mside { padding: 14px; display: flex; flex-direction: column; gap: 10px; border-left: 1px solid var(--muted); overflow: auto; }
+  .mside label { font: 10px var(--mono); color: var(--tertiary); }
+  .mside input { width: 100%; font: 12px var(--mono); color: var(--text); background: var(--panel); border: 1px solid var(--border);
+                 border-radius: 4px; padding: 6px 8px; outline: none; margin-top: 3px; }
+  .mside input:focus { border-color: var(--secondary); }
+  dl { display: grid; grid-template-columns: 62px 1fr; row-gap: 3px; font: 10.5px var(--mono); }
+  dt { color: var(--tertiary); } dd { color: var(--secondary); word-break: break-all; }
+  .mops { display: flex; gap: 6px; flex-wrap: wrap; margin-top: auto; }
+  .hint { font: 10px/1.5 var(--mono); color: var(--tertiary); }
+  .hint.bad { color: var(--danger); } .hint.warn { color: var(--warn); }
+
+  @media (max-width: 640px) {
+    .toolbar { padding: 12px 12px 8px; }
+    .search { flex: 1 1 100%; }
+    .grid { padding: 10px 12px 70px; grid-template-columns: repeat(auto-fill, minmax(100px, 1fr)); }
+    .queue { margin: 10px 12px 0; }
+    .mbox { grid-template-columns: 1fr; }
+    .mside { border-left: none; border-top: 1px solid var(--muted); }
+    .card-ops { display: flex; }
+  }
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <div class="row">
+    <h1>QQ 收藏表情</h1>
+    <span class="stats" id="stats">加载中…</span>
+    <button class="op primary" id="btnUpload">上传图片</button>
+    <button class="op" id="btnSync" title="从 NapCat 重新生成 AI 名称列表">同步</button>
+    <button class="op" id="btnRefresh">刷新</button>
+    <input type="file" id="file" accept="image/png,image/jpeg,image/gif,image/webp,image/bmp" multiple hidden>
+  </div>
+  <div class="row">
+    <input class="search" id="search" type="text" placeholder="搜索名称 / md5 / 序号…" spellcheck="false">
+    <div class="row" id="filters"></div>
+  </div>
+</div>
+<div class="queue" id="queue">
+  <div class="queue-head"><span id="queueTitle">待上传</span>
+    <button class="op primary" id="btnUploadAll">全部上传</button>
+    <button class="op" id="btnClearQueue">清空</button></div>
+  <div id="queueList"></div>
+</div>
+<div class="grid" id="grid"></div>
+<div id="drop">松开鼠标，添加到上传队列</div>
+<div id="msg"></div>
+<div id="modal">
+  <div class="mbox">
+    <div class="mimg"><img id="mImg" alt="" referrerpolicy="no-referrer">
+      <button class="nav prev" id="mPrev" title="上一个 (←)">‹</button><button class="nav next" id="mNext" title="下一个 (→)">›</button></div>
+    <div class="mside">
+      <div><label for="mName">名称（AI 用 [表情:名称] 调用）</label><input id="mName" spellcheck="false" placeholder="输入名称后回车保存"></div>
+      <div class="hint" id="mHint"></div>
+      <dl id="mInfo"></dl>
+      <div class="mops">
+        <button class="op primary" id="mSave">保存名称</button>
+        <button class="op danger" id="mDelete">删除</button>
+        <button class="op" id="mClose">关闭</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+'use strict';
+
+const MAX_BYTES = 10 * 1024 * 1024;
+const FILTERS = [
+  ['all', '全部', () => true],
+  ['in', 'AI 可见', f => f.in_prompt],
+  ['over', '超出上限', f => isOver(f)],
+  ['dup', '同名', f => f.duplicates > 1],
+  ['unnamed', '未命名', f => !f.base_name],
+  ['unsynced', '未同步', f => f.base_name && !f.prompt_position],
+];
+const S = { faces: [], limit: 0, namesTotal: 0, filter: 'all', query: '', view: [], current: -1, busy: false, queue: [] };
+const $ = id => document.getElementById(id);
+
+/* ── 基础设施 ── */
+function token() {
+  try { const b = window.parent.__CLONOTH_BOOT__; if (b && b.token) return b.token; } catch (e) {}
+  return '';
+}
+async function api(path, body) {
+  const t = token();
+  const resp = await fetch('/v1/plugins/qq_faces' + path, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: { 'Content-Type': 'application/json', ...(t ? { Authorization: 'Bearer ' + t } : {}) },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  let data = {};
+  try { data = await resp.json(); } catch (e) {}
+  if (!resp.ok && !data.message) throw new Error('HTTP ' + resp.status + (data.detail ? ' ' + data.detail : ''));
+  if (!resp.ok && resp.status >= 500) throw new Error(data.message);
+  return data;
+}
+let msgTimer = 0;
+function say(text, kind) {
+  const el = $('msg');
+  el.textContent = text; el.className = 'show ' + (kind || '');
+  clearTimeout(msgTimer);
+  msgTimer = setTimeout(() => { el.className = ''; }, kind === 'err' ? 9000 : 5000);
+}
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function isOver(f) { return !!f.base_name && f.prompt_position > S.limit; }
+function stateOf(f) {
+  if (!f.base_name) return 'none';
+  if (!f.prompt_position) return 'unsynced';
+  return f.in_prompt ? 'in' : 'over';
+}
+
+/* ── 数据 ── */
+async function load(quiet) {
+  if (!quiet) $('stats').textContent = '加载中…';
+  try {
+    const data = await api('/list');
+    if (!data.ok) throw new Error(data.message || '加载失败');
+    S.faces = data.faces || []; S.limit = data.prompt_limit || 0; S.namesTotal = data.names_total || 0;
+    render();
+  } catch (e) {
+    $('stats').textContent = '加载失败';
+    say(e.message, 'err');
+  }
+}
+
+async function runOp(label, path, body) {
+  if (S.busy) return null;
+  S.busy = true; setBusy(true); say(label + '…');
+  try {
+    const r = await api(path, body);
+    say(r.message || (r.ok ? '完成' : '失败'), r.ok ? 'ok' : 'err');
+    await load(true);
+    return r;
+  } catch (e) { say(e.message, 'err'); return null; }
+  finally { S.busy = false; setBusy(false); }
+}
+function setBusy(on) {
+  for (const id of ['btnSync', 'btnRefresh', 'mSave', 'mDelete', 'btnUploadAll']) $(id).disabled = on;
+}
+
+/* ── 渲染 ── */
+function render() {
+  const over = S.faces.filter(isOver).length;
+  const named = S.faces.filter(f => f.base_name).length;
+  $('stats').innerHTML = `共 <b>${S.faces.length}</b> 个 · 已命名 <b>${named}</b> · AI 名称 <b>${S.namesTotal}</b> · 提示上限 <b>${S.limit}</b>` +
+    (over ? ` · 超出上限 <b class="bad">${over}</b>` : '');
+  $('filters').innerHTML = FILTERS.map(([key, label, fn]) =>
+    `<button class="chip${S.filter === key ? ' active' : ''}" data-f="${key}">${label}<span class="n">${S.faces.filter(fn).length}</span></button>`).join('');
+  const pass = FILTERS.find(x => x[0] === S.filter)[2];
+  const q = S.query.trim().toLowerCase();
+  S.view = S.faces.filter(f => pass(f) && (!q ||
+    (f.base_name || '').toLowerCase().includes(q) || (f.md5 || '').toLowerCase().includes(q) || String(f.index) === q));
+  const grid = $('grid');
+  if (!S.view.length) {
+    grid.innerHTML = `<div class="empty">${S.faces.length ? '没有符合条件的表情' : '收藏为空，拖拽图片到这里上传'}</div>`;
+    return;
+  }
+  grid.innerHTML = S.view.map((f, i) => {
+    const st = stateOf(f);
+    const badges = [];
+    if (st === 'in') badges.push(`<span class="badge ok" title="AI 名称列表第 ${f.prompt_position} 位">AI #${f.prompt_position}</span>`);
+    if (st === 'over') badges.push(`<span class="badge bad" title="第 ${f.prompt_position} 位，超过提示上限 ${S.limit}，模型看不到">超出上限 #${f.prompt_position}</span>`);
+    if (st === 'unsynced') badges.push('<span class="badge warn" title="AI 名称列表里没有，点“同步”刷新">未同步</span>');
+    if (f.duplicates > 1) badges.push(`<span class="badge warn" title="同名表情发送时随机选一个">同名×${f.duplicates}</span>`);
+    return `<div class="card st-${st}" data-i="${i}">
+      <span class="idx">#${f.index}</span>
+      <div class="card-ops"><button class="op" data-act="rename" data-i="${i}">改名</button><button class="op danger" data-act="delete" data-i="${i}">删除</button></div>
+      <div class="thumb">${f.url ? `<img loading="lazy" referrerpolicy="no-referrer" src="${esc(f.url)}" alt="">` : '<span class="broken">无图片地址</span>'}</div>
+      <div class="card-body"><div class="fname${f.base_name ? '' : ' unnamed'}" title="${esc(f.base_name)}">${esc(f.base_name || '未命名')}</div>
+      <div class="badges">${badges.join('')}</div></div></div>`;
+  }).join('');
+  grid.querySelectorAll('img').forEach(img => img.addEventListener('error', () => {
+    img.replaceWith(Object.assign(document.createElement('span'), { className: 'broken', textContent: '图片加载失败' }));
+  }, { once: true }));
+  if ($('modal').classList.contains('show')) syncModal();
+}
+
+/* ── 预览弹窗 ── */
+function openModal(i, focusName) {
+  S.current = i; $('modal').classList.add('show'); disarm($('mDelete'));
+  fillModal();
+  if (focusName) setTimeout(() => { $('mName').focus(); $('mName').select(); }, 0);
+}
+function closeModal() { $('modal').classList.remove('show'); S.current = -1; }
+function currentFace() { return S.view[S.current]; }
+function syncModal() {
+  // 列表刷新后按 resId 重新定位当前项；已删除则顺延到同位置。
+  const id = S.openResId;
+  const i = S.view.findIndex(f => f.res_id === id);
+  if (i >= 0) { S.current = i; fillModal(true); }
+  else if (S.view.length) { S.current = Math.min(S.current, S.view.length - 1); fillModal(); }
+  else closeModal();
+}
+function fillModal(keepInput) {
+  const f = currentFace(); if (!f) return closeModal();
+  S.openResId = f.res_id;
+  $('mImg').src = f.url || '';
+  if (!keepInput) $('mName').value = f.base_name || '';
+  const st = stateOf(f), hint = $('mHint');
+  hint.className = 'hint' + (st === 'over' ? ' bad' : st === 'in' ? '' : ' warn');
+  hint.textContent = st === 'in' ? `AI 可见：名称列表第 ${f.prompt_position} 位（上限 ${S.limit}）。`
+    : st === 'over' ? `模型看不到：名称列表第 ${f.prompt_position} 位，超过提示上限 ${S.limit}。`
+    : st === 'unsynced' ? 'AI 名称列表里没有它，点“同步”刷新。'
+    : '未命名：AI 不会使用未命名表情，输入名称保存即可。';
+  if (f.duplicates > 1) hint.textContent += ` 共有 ${f.duplicates} 个同名表情，发送时随机选一个。`;
+  const rows = [['序号', '#' + f.index], ['md5', f.md5], ['resId', f.res_id], ['emojiId', f.emoji_id]];
+  $('mInfo').innerHTML = rows.filter(r => r[1]).map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join('');
+  $('mPrev').disabled = S.current <= 0; $('mNext').disabled = S.current >= S.view.length - 1;
+}
+function step(d) {
+  const n = S.current + d;
+  if (n >= 0 && n < S.view.length) { S.current = n; disarm($('mDelete')); fillModal(); }
+}
+async function saveName() {
+  const f = currentFace(); const name = $('mName').value.trim();
+  if (!f) return;
+  if (!name) return say('名称不能为空', 'err');
+  if (name === f.base_name) return say('名称没有变化');
+  await runOp('正在重命名', '/rename', { res_id: f.res_id, name });
+}
+
+/* ── 删除：两次点击确认 ── */
+function arm(btn) { btn.classList.add('armed'); btn.dataset.text = btn.dataset.text || btn.textContent; btn.textContent = '确认删除？';
+  clearTimeout(btn._t); btn._t = setTimeout(() => disarm(btn), 3500); }
+function disarm(btn) { if (!btn.classList.contains('armed')) return; btn.classList.remove('armed'); btn.textContent = btn.dataset.text; clearTimeout(btn._t); }
+async function deleteFace(f, btn) {
+  if (!btn.classList.contains('armed')) return arm(btn);
+  disarm(btn);
+  await runOp('正在删除', '/delete', { res_id: f.res_id });
+}
+
+/* ── 上传队列 ── */
+function enqueue(files) {
+  let skipped = 0;
+  for (const file of files) {
+    if (!/^image\/(png|jpe?g|gif|webp|bmp)$/i.test(file.type)) { skipped++; continue; }
+    S.queue.push({ file, name: file.name.replace(/\.[^.]+$/, ''), url: URL.createObjectURL(file), state: '', kind: '' });
+  }
+  if (skipped) say(`已跳过 ${skipped} 个非图片文件`, 'err');
+  renderQueue();
+}
+function renderQueue() {
+  $('queue').classList.toggle('show', S.queue.length > 0);
+  const pending = S.queue.filter(q => q.kind !== 'ok').length;
+  $('queueTitle').textContent = `待上传 ${pending} / ${S.queue.length}`;
+  $('queueList').innerHTML = S.queue.map((q, i) => `<div class="qitem">
+    <img src="${q.url}" alt="">
+    <input data-q="${i}" value="${esc(q.name)}" placeholder="表情名称" ${q.kind === 'ok' ? 'disabled' : ''}>
+    <span class="qstate ${q.kind}">${esc(q.state || (q.file.size / 1024).toFixed(0) + ' KB')}</span>
+    <button class="op primary" data-qup="${i}" ${q.kind === 'ok' || q.kind === 'run' ? 'disabled' : ''}>上传</button>
+    <button class="op" data-qdel="${i}">移除</button></div>`).join('');
+}
+function readBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(String(r.result).split(',', 2)[1] || '');
+    r.onerror = () => reject(new Error('读取文件失败'));
+    r.readAsDataURL(file);
+  });
+}
+async function uploadOne(q) {
+  if (q.kind === 'ok' || q.kind === 'run') return;
+  if (!q.name.trim()) { q.state = '请先填写名称'; q.kind = 'err'; return renderQueue(); }
+  if (q.file.size > MAX_BYTES) { q.state = '超过 10 MB 上限'; q.kind = 'err'; return renderQueue(); }
+  q.state = '上传中…'; q.kind = 'run'; renderQueue();
+  try {
+    const r = await api('/add', { name: q.name.trim(), filename: q.file.name, data: await readBase64(q.file) });
+    q.state = r.message || (r.ok ? '完成' : '失败'); q.kind = r.ok ? 'ok' : 'err';
+  } catch (e) { q.state = e.message; q.kind = 'err'; }
+  renderQueue();
+}
+async function uploadAll() {
+  if (S.busy) return;
+  S.busy = true; setBusy(true);
+  try { for (const q of S.queue) await uploadOne(q); }
+  finally { S.busy = false; setBusy(false); }
+  const ok = S.queue.filter(q => q.kind === 'ok').length, bad = S.queue.filter(q => q.kind === 'err').length;
+  say(`上传完成：成功 ${ok}，失败 ${bad}`, bad ? 'err' : 'ok');
+  await load(true);
+}
+
+/* ── 事件 ── */
+$('btnRefresh').onclick = () => load();
+$('btnSync').onclick = () => runOp('正在同步', '/sync', {});
+$('btnUpload').onclick = () => $('file').click();
+$('file').onchange = e => { enqueue(e.target.files); e.target.value = ''; };
+$('btnUploadAll').onclick = uploadAll;
+$('btnClearQueue').onclick = () => { S.queue.forEach(q => URL.revokeObjectURL(q.url)); S.queue = []; renderQueue(); };
+$('search').oninput = e => { S.query = e.target.value; render(); };
+$('filters').onclick = e => { const b = e.target.closest('[data-f]'); if (b) { S.filter = b.dataset.f; render(); } };
+$('grid').onclick = e => {
+  const act = e.target.closest('[data-act]');
+  if (act) {
+    e.stopPropagation();
+    const i = +act.dataset.i;
+    if (act.dataset.act === 'rename') return openModal(i, true);
+    return deleteFace(S.view[i], act);
+  }
+  const card = e.target.closest('.card');
+  if (card) openModal(+card.dataset.i, false);
+};
+$('queueList').oninput = e => { const i = e.target.dataset.q; if (i !== undefined) S.queue[+i].name = e.target.value; };
+$('queueList').onclick = async e => {
+  const up = e.target.closest('[data-qup]'), del = e.target.closest('[data-qdel]');
+  if (up && !S.busy) {
+    S.busy = true; setBusy(true);
+    try { await uploadOne(S.queue[+up.dataset.qup]); } finally { S.busy = false; setBusy(false); }
+    await load(true);
+  }
+  if (del) { const [q] = S.queue.splice(+del.dataset.qdel, 1); URL.revokeObjectURL(q.url); renderQueue(); }
+};
+$('mSave').onclick = saveName;
+$('mName').onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); saveName(); } };
+$('mDelete').onclick = () => { const f = currentFace(); if (f) deleteFace(f, $('mDelete')); };
+$('mClose').onclick = closeModal;
+$('mPrev').onclick = () => step(-1);
+$('mNext').onclick = () => step(1);
+$('modal').onclick = e => { if (e.target === $('modal')) closeModal(); };
+document.addEventListener('keydown', e => {
+  if (!$('modal').classList.contains('show')) return;
+  if (e.key === 'Escape') closeModal();
+  if (e.target === $('mName')) return;
+  if (e.key === 'ArrowLeft') step(-1);
+  if (e.key === 'ArrowRight') step(1);
+});
+
+// 整页拖拽上传；dragenter/leave 计数避免子元素闪烁。
+let dragDepth = 0;
+const hasFiles = e => Array.from(e.dataTransfer?.types || []).includes('Files');
+document.addEventListener('dragenter', e => { if (!hasFiles(e)) return; e.preventDefault(); dragDepth++; $('drop').classList.add('show'); });
+document.addEventListener('dragover', e => { if (hasFiles(e)) e.preventDefault(); });
+document.addEventListener('dragleave', e => { if (!hasFiles(e)) return; if (--dragDepth <= 0) { dragDepth = 0; $('drop').classList.remove('show'); } });
+document.addEventListener('drop', e => {
+  if (!hasFiles(e)) return;
+  e.preventDefault(); dragDepth = 0; $('drop').classList.remove('show');
+  enqueue(e.dataTransfer.files);
+});
+// 粘贴图片（截图后 Ctrl+V）
+document.addEventListener('paste', e => {
+  const files = Array.from(e.clipboardData?.files || []);
+  if (files.length) { e.preventDefault(); enqueue(files); }
+});
+
+load();
+</script>
+</body>
+</html>

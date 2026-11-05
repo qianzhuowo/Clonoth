@@ -11,12 +11,14 @@ htmlcov/
 
 # Virtual environments and local Python packaging output
 .venv/
+.venv*/
 venv/
 env/
 ENV/
 build/
 dist/
 *.egg-info/
+*.whl
 pip-wheel-metadata/
 
 # Node and frontend generated output
@@ -51,6 +53,9 @@ pnpm-debug.log*
 *.log
 *.pid
 *.sock
+# Live config belongs in data/ (data/config.yaml, data/policy.yaml); stray root copies stay local
+/config.yaml
+/policy.yaml
 
 # Local-only tools, plans, and editor state
 .limcode/

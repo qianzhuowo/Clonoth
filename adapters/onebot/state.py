@@ -166,7 +166,7 @@ _DELIVERY_DEAD_LETTER_NOTICE = "刚才的回复 QQ 侧没有确认送达，如�
 _IMAGE_TIMEOUT_RESEND_DELAY_SEC = float(os.environ.get("ONEBOT_IMAGE_TIMEOUT_RESEND_DELAY_SEC", "3") or "3")
 
 
-_SEARCH_PROGRESS_KEYWORDS = ("search_web", "x_search")
+_SEARCH_PROGRESS_KEYWORDS = ("search_web",)
 
 
 # 群聊上下文只保留最近 N 条。这样可以给入口节点提供社交语境，

@@ -6,6 +6,10 @@ dist/
 .vite/
 coverage/
 *.tsbuildinfo
+.eslintcache
+vite.config.*.timestamp-*
+test-results/
+playwright-report/
 
 # Local environment overrides
 .env

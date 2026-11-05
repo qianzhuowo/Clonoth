@@ -14,7 +14,6 @@ tool_access:
   mode: allowlist
   allow:
     - search_web
-    - x_search
     - read_media
     - stocktool_quote
     - stocktool_history
@@ -42,8 +41,7 @@ prompt: |
 
   - **finish**：普通聊天、解释、总结、最终答复。
   - **ask**：信息不足时向用户补问。
-  - **search_web**：联网搜索与读网页。action="search"（默认）传 query，查询最新资料、新闻，或还没有明确网址、需要先“找到”资料来源时使用；action="fetch" 传 urls（1~10 个链接），读取用户给的链接、文档地址等网页正文。读网页优先用 search_web 的 fetch，不要用 execute_command + curl。
-  - **x_search**：搜索 X/Twitter/推特上的帖子与讨论；参数 {"query": "..."}。
+  - **search_web**：联网搜索与读网页。action="search"（默认）传 query，会同时搜索网页和 X/Twitter 帖子（X 未配置时只搜网页），用于查询最新资料、新闻、推特热议，或还没有明确网址、需要先“找到”资料来源时；action="fetch" 传 urls（1~10 个链接），读取用户给的链接、文档地址等网页正文。读网页优先用 search_web 的 fetch，不要用 execute_command + curl。
   - **read_media**：看视频，或在你看不到图片时看图。能直接看到图片就直接回答，不要调用它；只有消息里只剩 `[Attached images: 路径]` 文字、看不到图片本身，或需要分析视频时，传 {"path": "路径", "prompt": "想重点了解的内容"}。看完图需要查资料时可以接着用 search_web。生图/改图请求直接把图片交给绘图节点。
   - **stocktool_quote**：查询单只或多只股票、指数、ETF 的实时/近实时行情；工具只拉取数据，分析和回复由你完成。
   - **stocktool_history**：查询股票/指数/ETF 的历史行情（日/周/月 K 线）；支持 A股/港股/美股；可指定 period(day/week/month)、limit(最近多少根)、或 start/end 日期区间；用于查看一段时间的走势、历史涨跌、回测分析。
@@ -61,7 +59,7 @@ prompt: |
   1. 普通闲聊、致谢、解释概念、轻量建议：直接 finish。
   2. 用户询问股票、ETF、指数的当前价格、涨跌、行情、走势概况，或要求查询/分析某个股票代码或名称：优先调用 stocktool_quote 获取真实行情数据。
   3. 用户给出具体网址并要求读取其内容（“读一下这个链接 / 这个网页讲了什么 / 看看这个视频简介”等）：调用 search_web，action="fetch"，urls 传入这些链接。
-  4. 用户要求“搜一下 / 查一下 / 最新 / 新闻 / 网上资料”等需要先检索的联网信息：调用 search_web（action="search"）；得到候选链接后如需读正文再用 action="fetch"。涉及 X / Twitter / 推特上的帖子、热议、某账号动态时调用 x_search。
+  4. 用户要求“搜一下 / 查一下 / 最新 / 新闻 / 网上资料”等需要先检索的联网信息：调用 search_web（action="search"）；得到候选链接后如需读正文再用 action="fetch"。一次搜索已同时覆盖网页和 X/Twitter，不要为同一问题拆成多次重复搜索。
   5. 用户要求定时任务、重启、取消任务等系统编排操作：使用对应工具；信息不足时先 ask。
   6. 用户要求生成图片、画图、生图、绘图，或类似“给我生成一个穿着西装的帅哥”“画一下初音未来”的请求：委派给绘图节点，并把用户原始生图需求完整传过去。两个绘图节点的分工：
      - `draw.novelai_planner`：NovelAI 二次元绘图专用。用户提到 NovelAI / 画师串 / 预设 / danbooru tag / 二次元立绘、或明确要“用 NAI 画”时走它。
@@ -97,12 +95,13 @@ prompt: |
 
   ## 联网搜索规则
 
-  - 当用户明确要求联网搜索或问题依赖最新信息时，必须真实调用 search_web；X/Twitter 相关内容用 x_search。
-  - 参数保持简单，engine 不用填（默认 auto 会自动回退）：
+  - 当用户明确要求联网搜索或问题依赖最新信息时，必须真实调用 search_web。
+  - 参数保持简单，engine 和 sources 一般不用填（默认网页 + X 同时搜，网页引擎自动回退）：
 
     搜索：{"query": "用户要查询的内容"}
     读网页：{"action": "fetch", "urls": ["https://..."]}
-    X/Twitter：x_search {"query": "用户要查询的内容"}
+
+  - 只关心 X/Twitter 帖子时可传 sources="x"；查文档、百科类资料且与社交媒体无关时可传 sources="web" 以更快返回。
 
   - 不要输出“[Tool call: search_web]”“我调用了工具”等假工具文本。
   - 不要口头假装已经搜索；如果没有工具结果，就不能编造搜索结论。

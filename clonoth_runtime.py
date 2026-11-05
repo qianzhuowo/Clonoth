@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -270,17 +271,19 @@ def resolve_env_ref(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-#  System model slots (compact / summary / image / image_gpt)
+#  System model slots (compact / summary / memory / image / image_gpt / vision)
 # ---------------------------------------------------------------------------
 # data/config.yaml:
 #   system_models:
-#     compact: { model: "...", base_url: "${...}", api_key: "${...}" }
-#     summary: { model: "..." }      # url/key follow the node's channel
+#     compact: { provider: "openai", model: "...", base_url: "${...}", api_key: "${...}" }
+#     summary: { model: "..." }
 # Per field: config.yaml system_models.<slot> > CLONOTH_<SLOT>_<FIELD> env >
-# caller default. Empty result means "keep the node's own value".
+# caller default. For system nodes the runner applies non-empty fields over the
+# node; an empty provider/base_url/api_key follows the global active channel.
 _SYSTEM_MODEL_ENV_PREFIX = {
     "compact": "CLONOTH_COMPACT",
     "summary": "CLONOTH_SUMMARY",
+    "memory": "CLONOTH_MEMORY",
     "image": "CLONOTH_IMAGE",
     "image_gpt": "CLONOTH_IMAGE_GPT",
     "vision": "CLONOTH_VISION",
@@ -291,7 +294,16 @@ SYSTEM_MODEL_SLOT_NAMES = tuple(_SYSTEM_MODEL_ENV_PREFIX)
 SYSTEM_NODE_MODEL_SLOTS = {
     "system.compactor": "compact",
     "system.turn_summarizer": "summary",
+    "system.memory_extractor": "memory",
 }
+
+
+@dataclass(frozen=True)
+class SystemModel:
+    provider: str = ""
+    model: str = ""
+    base_url: str = ""
+    api_key: str = ""
 
 
 def resolve_system_model(
@@ -301,8 +313,8 @@ def resolve_system_model(
     default_model: str = "",
     default_base_url: str = "",
     default_api_key: str = "",
-) -> tuple[str, str, str]:
-    """Resolve (model, base_url, api_key) for a system slot."""
+) -> SystemModel:
+    """Resolve provider/model/base_url/api_key for a system slot."""
     slot = (slot or "").strip().lower()
     prefix = _SYSTEM_MODEL_ENV_PREFIX.get(slot, "")
     cfg = load_yaml_dict(workspace_root / "data" / "config.yaml") or {}
@@ -321,10 +333,11 @@ def resolve_system_model(
                 return v
         return fallback
 
-    return (
-        _pick("model", "MODEL", default_model),
-        _pick("base_url", "BASE_URL", default_base_url),
-        _pick("api_key", "API_KEY", default_api_key),
+    return SystemModel(
+        provider=_pick("provider", "PROVIDER", "").lower(),
+        model=_pick("model", "MODEL", default_model),
+        base_url=_pick("base_url", "BASE_URL", default_base_url),
+        api_key=_pick("api_key", "API_KEY", default_api_key),
     )
 
 

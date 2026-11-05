@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import time
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -21,34 +24,62 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 #  Auto-compact circuit breaker (session-level)
-#  [2026-04-24] P1.5 熔断器：连续 N 次压缩失败后暂停自动压缩，
-#  避免每个新 task 的 _LoopState 重置 compacted=False 后反复浪费 API 调用。
-#  _compact_failures 是 module-level dict，进程重启自然清零，无需持久化。
+#  After N consecutive failures automatic compaction pauses for a cooldown,
+#  then one attempt is allowed again (a further failure re-opens it).
+#  Failures are recorded by the supervisor (which applies compactor results)
+#  while the check runs in engine processes, so the state lives in a shared
+#  file instead of process memory.
 # ---------------------------------------------------------------------------
 
 _MAX_CONSECUTIVE_FAILURES = 3
-_compact_failures: dict[str, int] = {}  # session_id → consecutive failure count
+_BREAKER_COOLDOWN_SEC = 30 * 60
+_BREAKER_PATH = Path(__file__).resolve().parent.parent / "data" / "compact_breaker.json"
+
+
+def _load_breaker() -> dict[str, dict[str, float]]:
+    try:
+        data = json.loads(_BREAKER_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_breaker(state: dict[str, dict[str, float]]) -> None:
+    try:
+        _BREAKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _BREAKER_PATH.with_name(f"{_BREAKER_PATH.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(tmp, _BREAKER_PATH)
+    except OSError as exc:
+        logger.warning("compact breaker state not saved: %s", exc)
 
 
 def record_compact_failure(session_id: str) -> None:
     """Record a compact failure. After MAX failures, is_compact_circuit_open returns True."""
-    count = _compact_failures.get(session_id, 0) + 1
-    _compact_failures[session_id] = count
+    state = _load_breaker()
+    count = int((state.get(session_id) or {}).get("failures", 0)) + 1
+    state[session_id] = {"failures": count, "last_failure": time.time()}
+    _save_breaker(state)
     if count >= _MAX_CONSECUTIVE_FAILURES:
         logger.warning(
-            "Compact circuit breaker tripped for session %s after %d consecutive failures",
-            session_id, count,
+            "Compact circuit breaker open for session %s after %d consecutive failures (retry in %d min)",
+            session_id, count, _BREAKER_COOLDOWN_SEC // 60,
         )
 
 
 def record_compact_success(session_id: str) -> None:
     """Reset failure counter on success."""
-    _compact_failures.pop(session_id, None)
+    state = _load_breaker()
+    if state.pop(session_id, None) is not None:
+        _save_breaker(state)
 
 
 def is_compact_circuit_open(session_id: str) -> bool:
-    """Return True if compact should be skipped (too many consecutive failures)."""
-    return _compact_failures.get(session_id, 0) >= _MAX_CONSECUTIVE_FAILURES
+    """Return True if compact should be skipped (too many recent consecutive failures)."""
+    entry = _load_breaker().get(session_id) or {}
+    if int(entry.get("failures", 0)) < _MAX_CONSECUTIVE_FAILURES:
+        return False
+    return time.time() - float(entry.get("last_failure", 0)) < _BREAKER_COOLDOWN_SEC
 
 
 # ---------------------------------------------------------------------------

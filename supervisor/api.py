@@ -574,7 +574,7 @@ def create_app(
         verify_admin_token(request)
         _check_system_model_slot(slot)
         return app.state.config_store.update_system_model(
-            slot, model=body.model, base_url=body.base_url, api_key=body.api_key,
+            slot, provider=body.provider, model=body.model, base_url=body.base_url, api_key=body.api_key,
         )
 
     def _mimo_config() -> dict[str, str]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import json
 import os
@@ -122,6 +123,29 @@ def _instantiate_provider(provider_cls: type, init_kwargs: dict[str, Any]) -> An
         if param.kind in {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
     }
     return provider_cls(**{key: value for key, value in init_kwargs.items() if key in allowed})
+
+
+def _apply_system_model_slot(workspace_root: Path, node: Any) -> Any:
+    """Return the node with its system_models slot applied (system nodes only).
+
+    A configured slot (config.yaml system_models.<slot> or CLONOTH_<SLOT>_* env)
+    replaces the node's own channel and model: an empty provider follows the
+    global active channel, and empty model/base_url/api_key come from that
+    channel's config section.
+    """
+    slot = SYSTEM_NODE_MODEL_SLOTS.get(node.id, "")
+    if not slot:
+        return node
+    sm = resolve_system_model(workspace_root, slot)
+    if not (sm.provider or sm.model or sm.base_url or sm.api_key):
+        return node
+    return dataclasses.replace(
+        node,
+        provider=sm.provider,
+        model=sm.model,
+        base_url=sm.base_url,
+        api_key=sm.api_key,
+    )
 
 
 def _create_provider_from_registry(
@@ -1151,26 +1175,15 @@ async def _run_node_task(
         # default provider for nodes that do not pin node.provider. Purpose: switching
         # ACTIVE to deepseek/openai-responses changes ordinary AI task routing.
         _active_provider = str((_config_data or {}).get("provider") or "openai").strip() if isinstance(_config_data, dict) else "openai"
+        _resolve_node = _apply_system_model_slot(ws_root, node)
         rp = resolve_provider(
             ws_root,
-            node,
+            _resolve_node,
             default_model,
             session_override=session_provider_override,
             provider_configs=_provider_configs,
             default_provider_type=_active_provider,
         )
-        # System nodes (compactor / turn summarizer) can be pointed at a separate
-        # model/base_url/api_key via config.yaml system_models.<slot> or
-        # CLONOTH_<SLOT>_* env; unset fields keep the node's resolved channel.
-        _sys_slot = SYSTEM_NODE_MODEL_SLOTS.get(node.id, "")
-        if _sys_slot:
-            _sm_model, _sm_base_url, _sm_api_key = resolve_system_model(ws_root, _sys_slot)
-            if _sm_model:
-                rp.model = _sm_model
-            if _sm_base_url:
-                rp.base_url = _sm_base_url
-            if _sm_api_key:
-                rp.api_key = _sm_api_key
         provider_cfg = (runtime_cfg.get("providers") or {}).get(rp.provider_type or "openai")
         global_provider_options = provider_cfg.get("options") if isinstance(provider_cfg, dict) else {}
         if not isinstance(global_provider_options, dict):

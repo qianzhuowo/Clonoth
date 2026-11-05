@@ -5,19 +5,17 @@ import {
   type FallbackEntryUpdate,
   type ProviderConfigPublic,
   type ProvidersResponse,
-  type SystemModelPublic,
   deleteProvider,
   getProviders,
-  getSystemModel,
   reloadConfig,
   setActiveProvider,
   setModelVision,
   updateFallbacks,
-  updateSystemModel,
   upsertProvider,
 } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { Button } from '../../common';
+import { SystemModelCard } from './SystemModelCard';
 
 interface ProviderEditState {
   base_url: string;
@@ -58,6 +56,42 @@ const modelVision = (resp: ProvidersResponse | null, model: string): boolean => 
   return flag === undefined ? true : Boolean(flag);
 };
 
+const SYSTEM_SLOTS = [
+  {
+    slot: 'compact',
+    title: '上下文压缩模型',
+    description: '会话超过压缩阈值时生成摘要。建议用便宜、上下文长的模型。',
+    modelPlaceholder: '留空使用所选渠道的默认模型',
+    envHint: '',
+    pickChannel: true,
+  },
+  {
+    slot: 'summary',
+    title: '轮次摘要模型',
+    description: '为每轮任务生成简短执行摘要。',
+    modelPlaceholder: '留空使用所选渠道的默认模型',
+    envHint: '',
+    pickChannel: true,
+  },
+  {
+    slot: 'memory',
+    title: '记忆提取模型',
+    description: '从对话中提取值得长期保存的信息（做梦整理时使用）。',
+    modelPlaceholder: '留空使用所选渠道的默认模型',
+    envHint: '',
+    pickChannel: true,
+  },
+  {
+    slot: 'vision',
+    title: '识图模型',
+    description:
+      'read_media 工具和“不可识图模型收到图片时的自动转写”使用，走 Gemini 原生接口（generateContent）。',
+    modelPlaceholder: '留空默认 gemini-3.8-flash',
+    envHint: ' CLONOTH_VISION_* / GEMINI_* / OPENAI_* 环境变量',
+    pickChannel: false,
+  },
+];
+
 export const ModelSettingsPage = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
 
@@ -78,11 +112,6 @@ export const ModelSettingsPage = () => {
   const [fbDirty, setFbDirty] = useState(false);
   const [fbSaving, setFbSaving] = useState(false);
 
-  // vision model (system_models.vision)
-  const [visionSlot, setVisionSlot] = useState<SystemModelPublic | null>(null);
-  const [visionEdit, setVisionEdit] = useState<ProviderEditState>(emptyEdit());
-  const [visionSaving, setVisionSaving] = useState(false);
-
   const applyResponse = (resp: ProvidersResponse) => {
     setData(resp);
     const e: Record<string, ProviderEditState> = {};
@@ -94,19 +123,12 @@ export const ModelSettingsPage = () => {
     setFbDirty(false);
   };
 
-  const applyVisionSlot = (slot: SystemModelPublic) => {
-    setVisionSlot(slot);
-    setVisionEdit({ model: slot.model, base_url: slot.base_url, api_key: '' });
-  };
-
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
     setLoading(true);
     setMsg('');
     try {
-      const [resp, slot] = await Promise.all([getProviders(adminToken), getSystemModel(adminToken, 'vision')]);
-      applyResponse(resp);
-      applyVisionSlot(slot);
+      applyResponse(await getProviders(adminToken));
     } catch (err) {
       setMsg(err instanceof Error ? err.message : '加载失败');
     } finally {
@@ -203,35 +225,6 @@ export const ModelSettingsPage = () => {
     try {
       applyResponse(await setModelVision(adminToken, model.trim(), vision));
       setMsg(`${model} 已标记为${vision ? '可识图' : '不可识图'}`);
-    } catch (err) {
-      setMsg(err instanceof Error ? err.message : '保存失败');
-    }
-  };
-
-  const handleSaveVisionSlot = async () => {
-    if (!adminToken) return;
-    setVisionSaving(true);
-    setMsg('');
-    try {
-      const payload: { model: string; base_url: string; api_key?: string } = {
-        model: visionEdit.model,
-        base_url: visionEdit.base_url,
-      };
-      if (visionEdit.api_key) payload.api_key = visionEdit.api_key;
-      applyVisionSlot(await updateSystemModel(adminToken, 'vision', payload));
-      setMsg('识图模型已保存');
-    } catch (err) {
-      setMsg(err instanceof Error ? err.message : '保存失败');
-    } finally {
-      setVisionSaving(false);
-    }
-  };
-
-  const handleClearVisionKey = async () => {
-    if (!adminToken) return;
-    try {
-      applyVisionSlot(await updateSystemModel(adminToken, 'vision', { api_key: '' }));
-      setMsg('识图模型密钥已清除，将使用环境变量中的密钥');
     } catch (err) {
       setMsg(err instanceof Error ? err.message : '保存失败');
     }
@@ -456,51 +449,25 @@ export const ModelSettingsPage = () => {
             );
           })()}
 
-          {/* Vision model (system_models.vision) */}
-          <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-            <p className="mb-1 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">识图模型</p>
-            <p className="mb-3 text-xs text-[var(--duties-secondary)]">
-              read_media 工具和“不可识图模型收到图片时的自动转写”使用。走 Gemini 原生接口（generateContent）；
-              留空的字段使用 CLONOTH_VISION_* / GEMINI_* / OPENAI_* 环境变量。
-            </p>
-            <label className="mb-1 block text-xs text-[var(--duties-secondary)]">模型</label>
-            <input
-              className={`mb-3 ${inputCls}`}
-              onChange={e => setVisionEdit(v => ({ ...v, model: e.target.value }))}
-              placeholder="留空默认 gemini-3.8-flash"
-              value={visionEdit.model}
-            />
-            <label className="mb-1 block text-xs text-[var(--duties-secondary)]">基础 URL</label>
-            <input
-              className={`mb-3 ${inputCls}`}
-              onChange={e => setVisionEdit(v => ({ ...v, base_url: e.target.value }))}
-              placeholder="留空使用环境变量"
-              value={visionEdit.base_url}
-            />
-            <label className="mb-1 block text-xs text-[var(--duties-secondary)]">
-              API 密钥 {visionSlot?.api_key_present ? `（已设置: ${visionSlot.api_key_redacted}）` : '（未设置，使用环境变量）'}
-            </label>
-            <input
-              className={`mb-3 ${inputCls}`}
-              onChange={e => setVisionEdit(v => ({ ...v, api_key: e.target.value }))}
-              placeholder="留空以保留当前值"
-              type="password"
-              value={visionEdit.api_key}
-            />
-            <div className="flex items-center gap-3">
-              <Button disabled={visionSaving} onClick={handleSaveVisionSlot} variant="primary">
-                {visionSaving ? '保存中...' : '保存'}
-              </Button>
-              {visionSlot?.api_key_present && (
-                <button
-                  className="text-xs text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)]"
-                  onClick={handleClearVisionKey}
-                >
-                  清除密钥
-                </button>
-              )}
-            </div>
-          </div>
+          {/* System model slots (system_models.<slot>) */}
+          {adminToken && data && (
+            <>
+              {SYSTEM_SLOTS.map(s => (
+                <SystemModelCard
+                  key={s.slot}
+                  activeProvider={data.active_provider}
+                  adminToken={adminToken}
+                  description={s.description}
+                  envHint={s.envHint}
+                  modelPlaceholder={s.modelPlaceholder}
+                  onMessage={setMsg}
+                  providers={s.pickChannel ? Object.keys(data.providers) : undefined}
+                  slot={s.slot}
+                  title={s.title}
+                />
+              ))}
+            </>
+          )}
 
           {/* Fallback chain editor */}
           <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">

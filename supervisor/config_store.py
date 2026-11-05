@@ -448,14 +448,15 @@ class ConfigStore:
             present, redacted = _redact_api_key(str(block.get("api_key", "") or ""))
             return {
                 "slot": slot,
+                "provider": str(block.get("provider", "") or ""),
                 "model": str(block.get("model", "") or ""),
                 "base_url": str(block.get("base_url", "") or ""),
                 "api_key_present": present,
                 "api_key_redacted": redacted,
             }
 
-    def update_system_model(self, slot: str, *, model: str | None = None, base_url: str | None = None,
-                            api_key: str | None = None) -> dict[str, Any]:
+    def update_system_model(self, slot: str, *, provider: str | None = None, model: str | None = None,
+                            base_url: str | None = None, api_key: str | None = None) -> dict[str, Any]:
         """Partial update of system_models.<slot>; None keeps a field, empty string clears it."""
         with self._lock:
             data = self._load_raw()
@@ -463,7 +464,8 @@ class ConfigStore:
             if not isinstance(slots, dict):
                 slots = {}
             block = slots.get(slot) if isinstance(slots.get(slot), dict) else {}
-            for field, value in (("model", model), ("base_url", base_url), ("api_key", api_key)):
+            fields = (("provider", provider), ("model", model), ("base_url", base_url), ("api_key", api_key))
+            for field, value in fields:
                 if value is None:
                     continue
                 if value.strip():

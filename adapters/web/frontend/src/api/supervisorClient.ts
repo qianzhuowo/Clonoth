@@ -692,6 +692,7 @@ export interface ProvidersResponse {
 
 export interface SystemModelPublic {
   slot: string;
+  provider: string;
   model: string;
   base_url: string;
   api_key_present: boolean;
@@ -805,7 +806,7 @@ export async function getSystemModel(token: string, slot: string): Promise<Syste
 export async function updateSystemModel(
   token: string,
   slot: string,
-  data: { model?: string; base_url?: string; api_key?: string },
+  data: { provider?: string; model?: string; base_url?: string; api_key?: string },
 ): Promise<SystemModelPublic> {
   const resp = await apiFetch(`/config/system-models/${encodeURIComponent(slot)}`, {
     method: 'PUT',

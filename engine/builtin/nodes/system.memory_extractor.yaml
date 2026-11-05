@@ -2,8 +2,8 @@ id: system.memory_extractor
 type: ai
 name: "记忆提取节点"
 description: "分析对话记录，提取值得保存到持久记忆的信息。系统内部节点，对用户不可见。"
-model: $ENV{MEMORY_EXTRACT_MODEL}
-provider: gemini-vertex
+model: ""
+provider: ""
 control_tools: none
 output_mode: hybrid
 tool_access:

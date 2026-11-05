@@ -2,7 +2,7 @@ id: system.compactor
 type: ai
 name: 上下文压缩节点
 description: 压缩对话上下文，生成结构化摘要。系统内部节点，对用户不可见。
-model: gemini-3.8-flash
+model: ""
 control_tools: none
 output_mode: hybrid
 tool_access:
@@ -42,4 +42,4 @@ prompt: |
   以下是需要压缩的对话历史（见用户消息）：
 persistent: false
 delegate_targets: []
-provider: gemini-vertex
+provider: ""

@@ -416,6 +416,7 @@ class ModelVisionIn(BaseModel):
 
 class SystemModelUpdateIn(BaseModel):
     """更新 system_models.<slot>；None 保持不变，空字符串清除"""
+    provider: str | None = None
     model: str | None = None
     base_url: str | None = None
     api_key: str | None = None

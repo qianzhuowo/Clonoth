@@ -2,8 +2,8 @@ id: system.turn_summarizer
 type: ai
 name: 轮摘要节点
 description: 生成任务执行摘要。系统内部节点，对用户不可见。
-provider: deepseek
-model: deepseek-flash
+provider: ""
+model: ""
 control_tools: none
 output_mode: hybrid
 tool_access:

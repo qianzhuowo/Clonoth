@@ -159,7 +159,7 @@ if __name__ == "__main__":
         results = data.get("results") or []
         return [
             {"title": r.get("title"), "url": r.get("url"), "snippet": (r.get("snippet") or "")[:500]}
-            for r in results
+            for r in results[:count]
         ]
 
     def _extract_mcp_texts(st: int, data: object) -> list[str] | None:

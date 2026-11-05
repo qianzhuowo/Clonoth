@@ -74,7 +74,7 @@ class ErrorSnapshotHandler:
                     ls = ctx.extra.get("loop_state")
                     formatter = getattr(ls, "formatter", None) if ls else None
                     llm_msgs = _build_messages_for_provider(messages, formatter, provider)
-                    payload = provider._build_payload(llm_msgs)
+                    payload = provider._build_payload(llm_msgs, None)
                     converted_payload = payload.get("messages")
             except Exception as conv_err:
                 converted_payload = {"conversion_error": str(conv_err)}

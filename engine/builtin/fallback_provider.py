@@ -17,6 +17,7 @@ from typing import Any
 import yaml
 
 from .result import hook_result
+from clonoth_runtime import resolve_env_ref
 from engine.protocol import TaskAction
 from engine.vision import model_has_vision
 
@@ -78,11 +79,18 @@ def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) ->
         _val = fb_cfg.get(_opt_key) if _opt_key in fb_cfg else provider_block.get(_opt_key)
         if _val is not None:
             po[_opt_key] = _val
+
+    def _field(name: str) -> str:
+        # Same "${ENV}" convention as the main provider and system_models; an
+        # unresolved reference would otherwise be used verbatim as a URL/key.
+        own = resolve_env_ref(str(fb_cfg.get(name) or "").strip()).strip()
+        return own or resolve_env_ref(str(provider_block.get(name) or "").strip()).strip()
+
     return {
         "provider": provider_name,
-        "base_url": (fb_cfg.get("base_url") or "").strip() or (provider_block.get("base_url") or "").strip(),
-        "api_key": (fb_cfg.get("api_key") or "").strip() or (provider_block.get("api_key") or "").strip(),
-        "model": (fb_cfg.get("model") or "").strip() or (provider_block.get("model") or "").strip(),
+        "base_url": _field("base_url"),
+        "api_key": _field("api_key"),
+        "model": _field("model"),
         "sticky_session": fb_cfg["sticky_session"] if "sticky_session" in fb_cfg else provider_block.get("sticky_session"),
         "provider_options": po,
     }

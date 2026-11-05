@@ -9,6 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from clonoth_runtime import get_bool, get_float, get_int, get_str, load_runtime_config
 
@@ -56,6 +57,11 @@ class ProcessManager:
         self._stopped = False
         self._restart_pending = False
         self._restarting_engine = False  # restart engine 期间抑制信号退出
+        # Set by supervisor.main to ask the HTTP server to exit gracefully. Raising
+        # SystemExit from the signal handler would abort the event loop before
+        # anyio's worker threads are told to stop, and the interpreter then waits
+        # on those non-daemon threads until systemd SIGKILLs the process.
+        self.request_shutdown: Callable[[], None] | None = None
 
         # 日志函数：写日志文件而不是终端。
         self._log = log_func or (lambda msg: print(msg))
@@ -131,6 +137,9 @@ class ProcessManager:
                 if self._restarting_engine:
                     return
                 self._cleanup()
+                if self.request_shutdown is not None:
+                    self.request_shutdown()
+                    return
                 # 调用原有的 handler
                 if callable(_prev) and _prev not in (signal.SIG_IGN, signal.SIG_DFL):
                     _prev(signum, frame)

@@ -400,6 +400,10 @@ def main() -> None:
     # server reference on app.state. Purpose: restart no longer leaves the port
     # in TIME_WAIT.
     app.state._uvicorn_server = _uvi_server
+    if process_manager is not None:
+        # SIGTERM/SIGINT: stop the engines, then let uvicorn return normally so
+        # the event loop finishes its shutdown (including anyio worker threads).
+        process_manager.request_shutdown = lambda: setattr(_uvi_server, "should_exit", True)
     # 用 loop.run_until_complete 替代 asyncio.run()，后者会重装 SIGINT handler
     # 信号处理交给 process_manager._install_signal_handlers + _restarting_engine flag
     _loop = asyncio.new_event_loop()
@@ -410,6 +414,8 @@ def main() -> None:
         _log("[supervisor] interrupted by user")
     finally:
         _loop.close()
+    if process_manager is not None:
+        process_manager._cleanup()
 
     # [2026-06-07] Why: _deferred_exit now signals uvicorn to exit gracefully
     # via should_exit instead of calling os._exit(75). How: after uvicorn

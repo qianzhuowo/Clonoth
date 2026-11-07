@@ -96,6 +96,19 @@ nosetests.xml
 *.db-wal
 *.db-shm
 
+# Runtime secrets/state that must never leave the host, even outside /data
+**/.admin_token
+**/web_auth.json
+**/llm_error_snapshots/
+
+# Ad-hoc deploy bundles at the repo root
+/*.tgz
+/*.tar.gz
+/*.zip
+
+# Frontend test coverage (JS)
+.nyc_output/
+
 # Migration: site-specific artifacts that must stay local
 adapters/onebot/napcat-security/local-reports/
 config/qq_user_profiles.yaml

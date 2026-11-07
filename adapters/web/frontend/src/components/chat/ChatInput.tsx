@@ -21,6 +21,7 @@ import { transcribeAudio } from '../../api/supervisorClient';
 import { type ApprovalLevel, type TtsBackend, type TtsVoicePreset, useChatStore, useClientPrefsStore } from '../../store';
 import { getConversationKey } from '../../store/chatTypes';
 import { isConversationGenerating } from '../../store/eventRouting';
+import { errorText, notify } from '../../store/toastStore';
 import type { Attachment } from '../../types';
 import { Icon } from '../common';
 import { AttachmentList } from './AttachmentList';
@@ -311,7 +312,7 @@ export const ChatInput = ({ disabled = false, onSend }: ChatInputProps) => {
     }
     if (composerDisabled || isTranscribing) return;
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
-      window.alert('当前浏览器不支持录音。');
+      notify.error('当前浏览器不支持录音。');
       return;
     }
     try {
@@ -359,7 +360,7 @@ ${text}` : text;
               await onSend(outboundText, currentAttachments.length > 0 ? currentAttachments : undefined);
             }
           })
-          .catch((error) => window.alert(error instanceof Error ? error.message : '语音识别失败'))
+          .catch((error) => notify.error(errorText(error, '语音识别失败')))
           .finally(() => setIsTranscribing(false));
       };
       recorder.start();
@@ -375,7 +376,7 @@ ${text}` : text;
       mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
       mediaStreamRef.current = null;
       setIsRecording(false);
-      window.alert(error instanceof Error ? error.message : '无法开始录音');
+      notify.error(errorText(error, '无法开始录音'));
     }
   };
 

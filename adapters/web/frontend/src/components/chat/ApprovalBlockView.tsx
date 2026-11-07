@@ -3,6 +3,7 @@
 import { useState } from 'react';
 
 import { decideApproval } from '../../api/supervisorClient';
+import { errorText, notify } from '../../store/toastStore';
 import type { ApprovalBlock } from '../../types/message';
 import { Icon } from '../common';
 
@@ -12,7 +13,6 @@ interface ApprovalBlockViewProps {
 
 export const ApprovalBlockView = ({ block }: ApprovalBlockViewProps) => {
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState('');
 
   const isPending = block.status === 'pending';
   const details = (block.details || {}) as Record<string, unknown>;
@@ -21,11 +21,10 @@ export const ApprovalBlockView = ({ block }: ApprovalBlockViewProps) => {
 
   const handleDecision = async (decision: 'allow' | 'deny') => {
     setLoading(true);
-    setError('');
     try {
       await decideApproval(block.approvalId, decision, `${decision} via approval block`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed');
+      notify.error(`审批操作失败：${errorText(err, '未知错误')}`);
     } finally {
       setLoading(false);
     }
@@ -82,8 +81,6 @@ export const ApprovalBlockView = ({ block }: ApprovalBlockViewProps) => {
           {block.comment && <span>备注：{block.comment}</span>}
         </div>
       )}
-
-      {error && <div className="mt-1 text-[0.65rem] font-semibold text-red-600">{error}</div>}
     </div>
   );
 };

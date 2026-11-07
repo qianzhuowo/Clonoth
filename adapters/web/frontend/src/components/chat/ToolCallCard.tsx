@@ -10,6 +10,7 @@ import { decideApproval } from '../../api/supervisorClient';
 import { autoApprovedApprovalIds } from '../../store/approvalManager';
 import { useClientPrefsStore } from '../../store/clientPrefsStore';
 import { usePluginsStore } from '../../store/pluginsStore';
+import { errorText, notify } from '../../store/toastStore';
 import type { ToolExecution, ToolStatus } from '../../types/message';
 import { Icon } from '../common';
 import { PluginSlotHost } from '../plugins/PluginSlotHost';
@@ -1091,7 +1092,6 @@ interface ToolApprovalSectionProps {
   approvalOperation: string;
   isAutoApprovedPending: boolean;
   approvalLoading: boolean;
-  approvalError: string;
   onApproval: (approvalId: string, decision: ApprovalDecision) => void;
 }
 
@@ -1101,7 +1101,6 @@ function ToolApprovalSection({
   approvalOperation,
   isAutoApprovedPending,
   approvalLoading,
-  approvalError,
   onApproval,
 }: ToolApprovalSectionProps) {
   // Why: pending approval details and action buttons are a distinct section between
@@ -1158,7 +1157,6 @@ function ToolApprovalSection({
           {approvalLoading && <span className="text-[var(--duties-tertiary)]">提交中…</span>}
         </div>
       )}
-      {approvalError && <div className="text-xs font-semibold text-red-600">{approvalError}</div>}
     </div>
   );
 }
@@ -1253,7 +1251,6 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
   // update approvalStatus. Purpose: the UI avoids duplicate clicks without inventing
   // a second source of truth for approval state.
   const [approvalLoading, setApprovalLoading] = useState(false);
-  const [approvalError, setApprovalError] = useState('');
   const statusStyle = getStatusStyle(tool);
   const argumentsText = useMemo(() => getArgumentsText(tool), [tool]);
   const resultText = useMemo(() => getResultText(tool), [tool]);
@@ -1277,11 +1274,10 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
     // Purpose: the button path stays compatible with the old ApprovalCard API while
     // rendering from ToolExecution.
     setApprovalLoading(true);
-    setApprovalError('');
     try {
       await decideApproval(approvalId, decision, `${decision} via tool card`);
     } catch (error) {
-      setApprovalError(error instanceof Error ? error.message : '提交审批决定失败。');
+      notify.error(errorText(error, '提交审批决定失败。'));
     } finally {
       setApprovalLoading(false);
     }
@@ -1361,7 +1357,6 @@ export const ToolCallCard = ({ tool }: ToolCallCardProps) => {
         approvalOperation={approvalOperation}
         isAutoApprovedPending={isAutoApprovedPending}
         approvalLoading={approvalLoading}
-        approvalError={approvalError}
         onApproval={handleApproval}
       />
       <ToolApprovalOutcome tool={tool} />

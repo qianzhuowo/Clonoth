@@ -8,8 +8,9 @@ import { useEffect, useState } from 'react';
 import { createNode, deleteNode, getNodes, type AdminNode } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { errorText, notify } from '../../../store/toastStore';
 import { Button } from '../../common';
-import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, SelectInput, StatusText, TextInput } from './settingsPagePrimitives';
+import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, SelectInput, TextInput } from './settingsPagePrimitives';
 
 function nodeTemplate(id: string, template: string): string {
   // [2026-06-02] Build a minimal node YAML from the selected template type. Why: the
@@ -31,7 +32,6 @@ export const AgentsSettingsPage = () => {
   const [nodes, setNodes] = useState<AdminNode[]>([]);
   const [newId, setNewId] = useState('');
   const [template, setTemplate] = useState('ai');
-  const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
 
   const loadNodes = async () => {
@@ -41,9 +41,8 @@ export const AgentsSettingsPage = () => {
       const items = await getNodes(adminToken);
       setNodes(items);
       if (selectedNode && !items.some((item) => item.id === selectedNode.id)) setSelectedNode(null);
-      setMessage('');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '加载节点失败');
+      notify.error(errorText(error, '加载节点失败'));
     } finally {
       setLoading(false);
     }
@@ -64,15 +63,15 @@ export const AgentsSettingsPage = () => {
   const create = async () => {
     if (!adminToken) return;
     const id = newId.trim();
-    if (!id) { setMessage('请输入节点 ID'); return; }
+    if (!id) { notify.error('请输入节点 ID'); return; }
     try {
       await createNode(adminToken, { id, content: nodeTemplate(id, template) });
       setNewId('');
-      setMessage('节点已创建，请在右栏继续编辑 YAML。');
+      notify.success('节点已创建，请在右栏继续编辑 YAML。');
       await loadNodes();
       setSelectedNode({ id, name: id, type: template === 'tool' ? 'tool' : 'ai', model: '', description: '通过设置页面创建的节点。', delegate_targets: [] } as AdminNode);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '创建节点失败');
+      notify.error(errorText(error, '创建节点失败'));
     }
   };
 
@@ -82,10 +81,10 @@ export const AgentsSettingsPage = () => {
     try {
       await deleteNode(adminToken, selectedNode.id);
       setSelectedNode(null);
-      setMessage('节点已删除');
+      notify.success('节点已删除');
       await loadNodes();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '删除节点失败');
+      notify.error(errorText(error, '删除节点失败'));
     }
   };
 
@@ -104,7 +103,7 @@ export const AgentsSettingsPage = () => {
               <p className="font-mono text-[0.6rem] uppercase tracking-[0.15em] text-[var(--duties-tertiary)]">User Nodes</p>
             )}
             {nodes.filter(n => n.source !== 'system').map((node) => (
-              <button className={`w-full border p-3 text-left ${selectedNode?.id === node.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={node.id} onClick={() => { setSelectedNode(node); setMessage(''); setRightPanelOpen(true); }} type="button">
+              <button className={`w-full border p-3 text-left ${selectedNode?.id === node.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={node.id} onClick={() => { setSelectedNode(node); setRightPanelOpen(true); }} type="button">
                 <p className="font-mono text-xs font-semibold">{node.id}</p>
                 <p className="mt-1 text-xs text-[var(--duties-secondary)]">{node.name || '未命名'} · {node.type || '未知类型'} · {node.model || '未设置模型'}</p>
                 {node.description && <p className="mt-1 line-clamp-2 text-xs leading-5 text-[var(--duties-secondary)]">{node.description}</p>}
@@ -115,7 +114,7 @@ export const AgentsSettingsPage = () => {
               <p className="mt-3 font-mono text-[0.6rem] uppercase tracking-[0.15em] text-[var(--duties-tertiary)]">System Nodes</p>
             )}
             {nodes.filter(n => n.source === 'system').map((node) => (
-              <button className={`w-full border p-3 text-left ${selectedNode?.id === node.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={node.id} onClick={() => { setSelectedNode(node); setMessage(''); setRightPanelOpen(true); }} type="button">
+              <button className={`w-full border p-3 text-left ${selectedNode?.id === node.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={node.id} onClick={() => { setSelectedNode(node); setRightPanelOpen(true); }} type="button">
                 <div className="flex items-center gap-2">
                   <p className="font-mono text-xs font-semibold">{node.id}</p>
                   <span className="rounded-sm bg-[var(--duties-border)] px-1.5 py-0.5 font-mono text-[0.55rem] text-[var(--duties-tertiary)]">system</span>
@@ -134,7 +133,6 @@ export const AgentsSettingsPage = () => {
             </SelectInput>
             <Button className="mt-2" onClick={create} variant="primary">创建节点</Button>
           </div>
-          <StatusText message={message} />
         </Card>
       )}
     </PageShell>

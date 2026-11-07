@@ -6,10 +6,11 @@ import { SessionBrowserModal } from '../../dashboard/SessionBrowserModal';
 
 import { checkHealth, getAdminState, getRuntimeRaw, reloadConfig, restartEngine, updateRuntimeRaw, type AdminState, type HealthState } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { errorText, notify } from '../../../store/toastStore';
 import { useViewStore } from '../../../store/viewStore';
 import { parseRuntimeConfig, serializeRuntimeConfig, type RuntimeConfigFormState, type RuntimeToolMode, type OutputMode } from '../settingsStructuredConfig';
 import { Button } from '../../common';
-import { AuthRequired, Card, PageHeader, PageShell, StatusText, countActiveTasks, formatUptime } from './settingsPagePrimitives';
+import { AuthRequired, Card, PageHeader, PageShell, countActiveTasks, formatUptime } from './settingsPagePrimitives';
 
 const RUNTIME_INPUT_CLASS = 'w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-sm';
 const RUNTIME_LABEL_CLASS = 'block text-xs font-semibold text-[var(--duties-text)]';
@@ -45,7 +46,6 @@ export const SystemSettingsPage = () => {
   const setSettingsTab = useViewStore(state => state.setSettingsTab);
   const [adminState, setAdminState] = useState<AdminState | null>(null);
   const [health, setHealth] = useState<HealthState | null>(null);
-  const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
   const [activeTasksOpen, setActiveTasksOpen] = useState(false);
   const [sessionsOpen, setSessionsOpen] = useState(false);
@@ -53,18 +53,17 @@ export const SystemSettingsPage = () => {
   const [runtimeForm, setRuntimeForm] = useState<RuntimeConfigFormState>(EMPTY_RUNTIME_FORM);
   const [runtimeLoading, setRuntimeLoading] = useState(false);
   const [runtimeLoaded, setRuntimeLoaded] = useState(false);
-  const [runtimeMessage, setRuntimeMessage] = useState('');
 
   const load = useCallback(async (showSpinner = true) => {
     if (!adminToken || !isAuthenticated) return;
     if (showSpinner) setLoading(true);
-    setMessage('');
     try {
       const [state, healthState] = await Promise.all([getAdminState(adminToken), checkHealth()]);
       setAdminState(state);
       setHealth(healthState);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '加载系统状态失败');
+      // Silent background polling (showSpinner=false) must not spam a toast every 15s.
+      if (showSpinner) notify.error(errorText(error, '加载系统状态失败'));
     } finally {
       if (showSpinner) setLoading(false);
     }
@@ -73,7 +72,6 @@ export const SystemSettingsPage = () => {
   const loadRuntimeCommon = useCallback(async (showSpinner = true) => {
     if (!adminToken || !isAuthenticated) return;
     if (showSpinner) setRuntimeLoading(true);
-    setRuntimeMessage('');
     try {
       const raw = await getRuntimeRaw(adminToken);
       setRuntimeRaw(raw);
@@ -81,7 +79,7 @@ export const SystemSettingsPage = () => {
       setRuntimeLoaded(true);
     } catch (error) {
       setRuntimeLoaded(false);
-      setRuntimeMessage(error instanceof Error ? error.message : '加载运行参数失败');
+      notify.error(errorText(error, '加载运行参数失败'));
     } finally {
       if (showSpinner) setRuntimeLoading(false);
     }
@@ -95,19 +93,18 @@ export const SystemSettingsPage = () => {
     if (!adminToken) return;
     if (!runtimeLoaded) {
       await loadRuntimeCommon();
-      setRuntimeMessage('已加载最新运行参数。请确认后再次保存。');
+      notify.info('已加载最新运行参数。请确认后再次保存。');
       return;
     }
     setRuntimeLoading(true);
-    setRuntimeMessage('');
     try {
       const nextRaw = serializeRuntimeConfig(runtimeRaw, runtimeForm);
       await updateRuntimeRaw(adminToken, nextRaw);
       setRuntimeRaw(nextRaw);
       setRuntimeForm(parseRuntimeConfig(nextRaw));
-      setRuntimeMessage('已保存。重载配置后生效。');
+      notify.success('运行参数已保存。重载配置后生效。');
     } catch (error) {
-      setRuntimeMessage(error instanceof Error ? error.message : '保存运行参数失败');
+      notify.error(errorText(error, '保存运行参数失败'));
     } finally {
       setRuntimeLoading(false);
     }
@@ -134,10 +131,10 @@ export const SystemSettingsPage = () => {
     if (!adminToken) return;
     try {
       await reloadConfig(adminToken);
-      setMessage('配置已重载');
+      notify.success('配置已重载');
       await load(false);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '配置重载失败');
+      notify.error(errorText(error, '配置重载失败'));
     }
   };
 
@@ -146,9 +143,9 @@ export const SystemSettingsPage = () => {
     if (!window.confirm('确认要重启引擎吗？这会中断所有运行中的任务。')) return;
     try {
       await restartEngine(adminToken);
-      setMessage('已提交重启请求');
+      notify.success('已提交重启请求');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '重启失败');
+      notify.error(errorText(error, '重启失败'));
     }
   };
 
@@ -226,7 +223,6 @@ export const SystemSettingsPage = () => {
               <Button disabled={runtimeLoading} onClick={() => loadRuntimeCommon()}>{runtimeLoading ? '读取中...' : '重新读取'}</Button>
               <Button disabled={runtimeLoading || !runtimeLoaded} onClick={handleSaveRuntimeCommon} variant="primary">保存运行参数</Button>
             </div>
-            <StatusText message={runtimeMessage} />
           </Card>
 
           <ActiveTasksModal open={activeTasksOpen} onClose={() => setActiveTasksOpen(false)} />
@@ -241,7 +237,6 @@ export const SystemSettingsPage = () => {
               <Button onClick={handleReload} variant="primary">重载配置</Button>
               <Button onClick={handleRestart} variant="danger">重启引擎</Button>
             </div>
-            <StatusText message={message} />
           </Card>
         </>
       )}

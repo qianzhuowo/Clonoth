@@ -17,3 +17,4 @@ export { StatusDot, getChildNodeStatusLabel } from './StatusDot';
 // helper. Purpose: page imports stay short and consistent.
 export { YamlEditor, hasSuspiciousYamlTabs } from './YamlEditor';
 export { Modal } from './Modal';
+export { Toaster } from './Toaster';

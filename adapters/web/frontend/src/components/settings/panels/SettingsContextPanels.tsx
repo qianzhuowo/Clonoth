@@ -20,6 +20,7 @@ import { getNodeRaw, getSchedulesRaw, getToolRaw, reloadTools, updateNodeRaw, up
 import { parseNodeConfig, parseSchedules, serializeNodeConfig, serializeSchedules, type NodeConfigFormState, type NodeConfigType, type ScheduleFormState, type ToolAccessMode } from '../settingsStructuredConfig';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { errorText, notify } from '../../../store/toastStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { YamlEditor } from '../../common';
 
@@ -110,7 +111,8 @@ export const AgentsSettingsRightPanel = () => {
   const [nodeYamlEditable, setNodeYamlEditable] = useState(false);
   const [nodeYamlLoading, setNodeYamlLoading] = useState(false);
   const [nodeYamlSaving, setNodeYamlSaving] = useState(false);
-  const [nodeMessage, setNodeMessage] = useState('');
+  // Persistent load-state text (missing token / load failure); action feedback uses notify.
+  const [nodeLoadError, setNodeLoadError] = useState('');
 
   const updateNodeConfigForm = (patch: Partial<NodeConfigFormState>) => {
     // [2026-06-02] Apply small form patches instead of editing raw YAML directly.
@@ -125,10 +127,10 @@ export const AgentsSettingsRightPanel = () => {
     setNodeYaml('');
     setNodeConfigForm({ ...EMPTY_NODE_CONFIG_FORM, id: node?.id || '' });
     setNodeYamlEditable(false);
-    setNodeMessage('');
+    setNodeLoadError('');
     if (!node) return () => { cancelled = true; };
     if (!adminToken) {
-      setNodeMessage('缺少管理员令牌，无法加载节点配置。');
+      setNodeLoadError('缺少管理员令牌，无法加载节点配置。');
       return () => { cancelled = true; };
     }
     setNodeYamlLoading(true);
@@ -146,7 +148,9 @@ export const AgentsSettingsRightPanel = () => {
       })
       .catch((error) => {
         if (cancelled) return;
-        setNodeMessage(error instanceof Error ? error.message : '加载节点配置失败');
+        const text = errorText(error, '加载节点配置失败');
+        setNodeLoadError(text);
+        notify.error(text);
         setNodeYamlEditable(false);
       })
       .finally(() => {
@@ -158,7 +162,6 @@ export const AgentsSettingsRightPanel = () => {
   const saveNodeConfig = async () => {
     if (!adminToken || !node || !nodeYamlEditable) return;
     setNodeYamlSaving(true);
-    setNodeMessage('保存中。');
     try {
       // [2026-06-02] Serialize the structured node form into YAML before saving.
       // Why: raw YAML is only an advanced fallback and must not be the primary save
@@ -170,9 +173,9 @@ export const AgentsSettingsRightPanel = () => {
       setNodeYaml(nextYaml);
       setNodeConfigForm(parseNodeConfig(nextYaml, node.id));
       window.dispatchEvent(new Event('settings:nodes-updated'));
-      setNodeMessage('节点配置已保存。变更将在下次任务创建时生效，或重载配置后立即生效。');
+      notify.success('节点配置已保存。变更将在下次任务创建时生效，或重载配置后立即生效。');
     } catch (error) {
-      setNodeMessage(error instanceof Error ? error.message : '保存节点配置失败');
+      notify.error(errorText(error, '保存节点配置失败'));
     } finally {
       setNodeYamlSaving(false);
     }
@@ -181,7 +184,6 @@ export const AgentsSettingsRightPanel = () => {
   const saveNodeYaml = async () => {
     if (!adminToken || !node || !nodeYamlEditable) return;
     setNodeYamlSaving(true);
-    setNodeMessage('保存中。');
     try {
       // [2026-06-02] Keep a raw YAML fallback inside the advanced details section.
       // Why: uncommon node fields may not have dedicated form controls yet. How: save
@@ -191,9 +193,9 @@ export const AgentsSettingsRightPanel = () => {
       await updateNodeRaw(adminToken, node.id, nodeYaml);
       setNodeConfigForm(parseNodeConfig(nodeYaml, node.id));
       window.dispatchEvent(new Event('settings:nodes-updated'));
-      setNodeMessage('节点 YAML 已保存。');
+      notify.success('节点 YAML 已保存。');
     } catch (error) {
-      setNodeMessage(error instanceof Error ? error.message : '保存节点 YAML 失败');
+      notify.error(errorText(error, '保存节点 YAML 失败'));
     } finally {
       setNodeYamlSaving(false);
     }
@@ -208,7 +210,7 @@ export const AgentsSettingsRightPanel = () => {
           {nodeYamlLoading ? (
             <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">正在加载节点配置。</p>
           ) : !nodeYamlEditable ? (
-            <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">{nodeMessage || '系统内建节点不可编辑'}</p>
+            <p className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2 text-[var(--duties-secondary)]">{nodeLoadError || '系统内建节点不可编辑'}</p>
           ) : (
             <>
               <div className="space-y-3 border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
@@ -288,8 +290,7 @@ export const AgentsSettingsRightPanel = () => {
                     <input className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ tool_access_denyText: event.target.value })} value={nodeConfigForm.tool_access_denyText} />
                   </label>
                 )}
-                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={nodeYamlSaving} onClick={saveNodeConfig} type="button">保存节点配置</button>
-                {nodeMessage && <p className="text-[var(--duties-tertiary)]">{nodeMessage}</p>}
+                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={nodeYamlSaving} onClick={saveNodeConfig} type="button">{nodeYamlSaving ? '保存中...' : '保存节点配置'}</button>
               </div>
               <details className="border border-[var(--duties-border)] bg-[var(--duties-bg)] p-2">
                 <summary className="cursor-pointer font-mono text-[0.65rem] font-semibold text-[var(--duties-tertiary)]">高级 YAML 编辑</summary>
@@ -301,7 +302,7 @@ export const AgentsSettingsRightPanel = () => {
                       users can recover unsupported fields without reverting the panel
                       to a raw YAML editor. */}
                   <YamlEditor aria-label="节点 YAML 编辑器" height="16rem" onChange={setNodeYaml} value={nodeYaml} />
-                  <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={nodeYamlSaving} onClick={saveNodeYaml} type="button">保存 YAML</button>
+                  <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={nodeYamlSaving} onClick={saveNodeYaml} type="button">{nodeYamlSaving ? '保存中...' : '保存 YAML'}</button>
                 </div>
               </details>
             </>
@@ -320,16 +321,17 @@ export const ToolsSettingsRightPanel = () => {
   const [toolScriptLoading, setToolScriptLoading] = useState(false);
   const [toolScriptSaving, setToolScriptSaving] = useState(false);
   const [toolReloading, setToolReloading] = useState(false);
-  const [toolMessage, setToolMessage] = useState('');
+  // Persistent load-state text (missing token / load failure); action feedback uses notify.
+  const [toolLoadError, setToolLoadError] = useState('');
 
   useEffect(() => {
     let cancelled = false;
     setToolScript('');
     setToolScriptLoaded(false);
-    setToolMessage('');
+    setToolLoadError('');
     if (!tool) return () => { cancelled = true; };
     if (!adminToken) {
-      setToolMessage('缺少管理员令牌，无法加载工具脚本。');
+      setToolLoadError('缺少管理员令牌，无法加载工具脚本。');
       return () => { cancelled = true; };
     }
     setToolScriptLoading(true);
@@ -346,7 +348,9 @@ export const ToolsSettingsRightPanel = () => {
       })
       .catch((error) => {
         if (cancelled) return;
-        setToolMessage(error instanceof Error ? error.message : '加载工具脚本失败');
+        const text = errorText(error, '加载工具脚本失败');
+        setToolLoadError(text);
+        notify.error(text);
         setToolScriptLoaded(false);
       })
       .finally(() => {
@@ -358,7 +362,6 @@ export const ToolsSettingsRightPanel = () => {
   const saveToolScript = async () => {
     if (!adminToken || !tool || !toolScriptLoaded) return;
     setToolScriptSaving(true);
-    setToolMessage('保存中。');
     try {
       // [2026-06-02] Persist edited tool code and notify settings lists.
       // Why: saving from the right rail should update the selected tool file and let
@@ -367,9 +370,9 @@ export const ToolsSettingsRightPanel = () => {
       // list can refresh after a raw script save without requiring an engine restart.
       await updateToolRaw(adminToken, tool.name, toolScript);
       window.dispatchEvent(new Event('settings:tools-updated'));
-      setToolMessage('工具脚本已保存。');
+      notify.success('工具脚本已保存。');
     } catch (error) {
-      setToolMessage(error instanceof Error ? error.message : '保存工具脚本失败');
+      notify.error(errorText(error, '保存工具脚本失败'));
     } finally {
       setToolScriptSaving(false);
     }
@@ -378,7 +381,6 @@ export const ToolsSettingsRightPanel = () => {
   const reloadToolRegistry = async () => {
     if (!adminToken) return;
     setToolReloading(true);
-    setToolMessage('正在重载工具。');
     try {
       // [2026-06-02] Expose tool reload beside the raw script editor.
       // Why: edited Python tools usually need the backend registry to reload before
@@ -386,9 +388,9 @@ export const ToolsSettingsRightPanel = () => {
       // the panel. Purpose: users can save and reload tools without requesting an
       // engine restart.
       await reloadTools(adminToken);
-      setToolMessage('工具已重载。');
+      notify.success('工具已重载。');
     } catch (error) {
-      setToolMessage(error instanceof Error ? error.message : '重载工具失败');
+      notify.error(errorText(error, '重载工具失败'));
     } finally {
       setToolReloading(false);
     }
@@ -423,10 +425,10 @@ export const ToolsSettingsRightPanel = () => {
                 value={toolScriptLoading ? '正在加载工具脚本。' : toolScript}
               />
               <div className="flex flex-wrap gap-2">
-                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!toolScriptLoaded || toolScriptLoading || toolScriptSaving} onClick={saveToolScript} type="button">保存</button>
-                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!adminToken || toolReloading} onClick={reloadToolRegistry} type="button">重载工具</button>
+                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!toolScriptLoaded || toolScriptLoading || toolScriptSaving} onClick={saveToolScript} type="button">{toolScriptSaving ? '保存中...' : '保存'}</button>
+                <button className="border border-[var(--duties-border)] bg-[var(--duties-bg)] px-3 py-2 font-mono text-[0.65rem] hover:border-[var(--duties-text)] disabled:opacity-50" disabled={!adminToken || toolReloading} onClick={reloadToolRegistry} type="button">{toolReloading ? '重载中...' : '重载工具'}</button>
               </div>
-              {toolMessage && <p className="text-[var(--duties-tertiary)]">{toolMessage}</p>}
+              {toolLoadError && <p className="text-[var(--duties-tertiary)]">{toolLoadError}</p>}
             </div>
           </div>
         ) : (
@@ -448,15 +450,16 @@ export const AutomationSettingsRightPanel = () => {
   const [form, setForm] = useState<ScheduleFormState | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState('');
+  // Persistent load-state text (missing token / not found / load failure); action feedback uses notify.
+  const [loadError, setLoadError] = useState('');
 
   useEffect(() => {
     let cancelled = false;
     setForm(null);
-    setMessage('');
+    setLoadError('');
     if (!selectedScheduleId) return () => { cancelled = true; };
     if (!adminToken) {
-      setMessage('缺少管理员令牌，无法加载定时任务。');
+      setLoadError('缺少管理员令牌，无法加载定时任务。');
       return () => { cancelled = true; };
     }
     setLoading(true);
@@ -470,11 +473,13 @@ export const AutomationSettingsRightPanel = () => {
         if (cancelled) return;
         const selected = parseSchedules(raw).find((item) => item.id === selectedScheduleId) || null;
         setForm(selected);
-        if (!selected) setMessage('未在 schedules.yaml 中找到此定时任务。');
+        if (!selected) setLoadError('未在 schedules.yaml 中找到此定时任务。');
       })
       .catch((error) => {
         if (cancelled) return;
-        setMessage(error instanceof Error ? error.message : '加载定时任务失败');
+        const text = errorText(error, '加载定时任务失败');
+        setLoadError(text);
+        notify.error(text);
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -485,7 +490,6 @@ export const AutomationSettingsRightPanel = () => {
   const save = async () => {
     if (!adminToken || !selectedScheduleId || !form) return;
     setSaving(true);
-    setMessage('保存中。');
     try {
       // [2026-06-02] Save one automation schedule inside the raw YAML list.
       // Why: schedules.yaml contains multiple tasks and the selected form should not
@@ -500,9 +504,9 @@ export const AutomationSettingsRightPanel = () => {
       schedules[index] = form;
       await updateSchedulesRaw(adminToken, serializeSchedules(schedules));
       window.dispatchEvent(new Event('settings:schedules-updated'));
-      setMessage('定时任务已保存。');
+      notify.success('定时任务已保存。');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '保存定时任务失败');
+      notify.error(errorText(error, '保存定时任务失败'));
     } finally {
       setSaving(false);
     }
@@ -515,7 +519,7 @@ export const AutomationSettingsRightPanel = () => {
       ) : loading ? (
         <p className="text-xs leading-5 text-[var(--duties-secondary)]">正在加载定时任务。</p>
       ) : !form ? (
-        <p className="text-xs leading-5 text-[var(--duties-secondary)]">{message || '未找到可编辑的定时任务。'}</p>
+        <p className="text-xs leading-5 text-[var(--duties-secondary)]">{loadError || '未找到可编辑的定时任务。'}</p>
       ) : (
         <div className="space-y-3 text-xs leading-5">
           <p><span className="text-[var(--duties-tertiary)]">ID：</span><span className="font-mono">{form.id}</span></p>
@@ -569,8 +573,7 @@ export const AutomationSettingsRightPanel = () => {
               ))}
             </div>
           </details>
-          <button className={buttonClass} disabled={saving} onClick={save} type="button">保存</button>
-          {message && <p className="text-[var(--duties-tertiary)]">{message}</p>}
+          <button className={buttonClass} disabled={saving} onClick={save} type="button">{saving ? '保存中...' : '保存'}</button>
         </div>
       )}
     </PanelShell>

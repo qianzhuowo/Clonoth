@@ -6,6 +6,7 @@ import type {
   UsagePricingResponse, UsageRange, UsageStatsResponse, UsageTimeseriesPoint,
 } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { errorText, notify } from '../../../store/toastStore';
 import { Modal } from '../../common/Modal';
 import { AuthRequired, Card, FieldLabel, PageHeader, TextInput } from './settingsPagePrimitives';
 
@@ -131,19 +132,17 @@ function PricingManager({ pricing, models, initialModel, onClose, onSaved }: {
   const [model, setModel] = useState(initialModel);
   const [draft, setDraft] = useState(() => priceDraft(resolvePrice(initialModel)));
   const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState('');
   const names = [...new Set([...Object.keys(pricing.defaults), ...Object.keys(pricing.effective), ...Object.keys(pricing.overrides), ...models.map(row => row.model)])].sort();
-  const select = (name: string) => { setModel(name); setDraft(priceDraft(resolvePrice(name))); setMessage(''); };
+  const select = (name: string) => { setModel(name); setDraft(priceDraft(resolvePrice(name))); };
   const save = async (reset: boolean) => {
     setSaving(true);
-    setMessage('');
     try {
       const nextPricing = await supervisorClient.updateModelPricing(model.trim(), reset ? null : { input: Number(draft.input), output: Number(draft.output), cache_read: Number(draft.cache_read), cache_write: Number(draft.cache_write) });
       if (reset) setDraft(priceDraft(resolvePrice(model.trim(), nextPricing)));
-      setMessage(reset ? '已恢复官方默认，历史费用将按默认价重算。' : '定价已保存，历史费用已按新价格重算。');
+      notify.success(reset ? '已恢复官方默认，历史费用将按默认价重算。' : '定价已保存，历史费用已按新价格重算。');
       onSaved();
     } catch (error) {
-      setMessage((error as Error).message);
+      notify.error(errorText(error, '保存定价失败'));
     } finally {
       setSaving(false);
     }
@@ -157,7 +156,6 @@ function PricingManager({ pricing, models, initialModel, onClose, onSaved }: {
         <div className="flex flex-wrap items-center gap-2 sm:col-span-2 lg:col-span-4">
           <button type="submit" disabled={saving || !model.trim()} className={`${buttonClass} bg-[var(--duties-muted)]`}>{saving ? '保存中…' : '保存自定义定价'}</button>
           {pricing.overrides[model] && <button type="button" disabled={saving} className={buttonClass} onClick={() => void save(true)}>恢复官方默认</button>}
-          <p role="status" className="text-xs text-[var(--duties-secondary)]">{message}</p>
         </div>
       </form>
       <div className="overflow-x-auto"><table className="w-full whitespace-nowrap font-mono text-xs">
@@ -195,7 +193,13 @@ export function UsageSettingsPage() {
     setError('');
     Promise.all([supervisorClient.getUsageStats(range), supervisorClient.getUsagePricing()])
       .then(([stats, prices]) => { if (!cancelled) { setData(stats); setPricing(prices); } })
-      .catch((cause: Error) => { if (!cancelled) setError(cause.message); })
+      .catch((cause: unknown) => {
+        if (cancelled) return;
+        const text = errorText(cause, '未知错误');
+        // Keep the persistent alert (with retry) and also surface a toast.
+        setError(text);
+        notify.error(`用量加载失败：${text}`);
+      })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [adminToken, range, revision]);

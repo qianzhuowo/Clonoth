@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 
 import { getMimoAudioConfig, updateMimoAudioConfig, type MimoAudioConfigPublic } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { errorText, notify } from '../../../store/toastStore';
 import { Button } from '../../common';
 
 type FormState = {
@@ -67,8 +68,6 @@ export const MimoAudioSettingsPage = () => {
   const [keyPresent, setKeyPresent] = useState(false);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [message, setMessage] = useState('');
-  const [error, setError] = useState('');
 
   const setField = (key: keyof FormState, value: string) => {
     setForm(prev => ({ ...prev, [key]: value }));
@@ -77,14 +76,13 @@ export const MimoAudioSettingsPage = () => {
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
     setLoading(true);
-    setError('');
     try {
       const cfg = await getMimoAudioConfig(adminToken);
       setForm(fromConfig(cfg));
       setRedactedKey(cfg.api_key || '');
       setKeyPresent(cfg.api_key_present);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      notify.error(errorText(err, '读取 Mimo 语音配置失败'));
     } finally {
       setLoading(false);
     }
@@ -97,8 +95,6 @@ export const MimoAudioSettingsPage = () => {
   const save = async () => {
     if (!adminToken) return;
     setSaving(true);
-    setMessage('');
-    setError('');
     try {
       const payload: Partial<FormState> = {
         base_url: form.base_url,
@@ -117,9 +113,9 @@ export const MimoAudioSettingsPage = () => {
       setForm(fromConfig(cfg));
       setRedactedKey(cfg.api_key || '');
       setKeyPresent(cfg.api_key_present);
-      setMessage('已保存 Mimo 语音配置。');
+      notify.success('已保存 Mimo 语音配置。');
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      notify.error(errorText(err, '保存 Mimo 语音配置失败'));
     } finally {
       setSaving(false);
     }
@@ -175,9 +171,6 @@ export const MimoAudioSettingsPage = () => {
           <Field label="TTS 格式" value={form.tts_format} onChange={v => setField('tts_format', v)} />
           <Field label="ffmpeg 路径（可选）" value={form.ffmpeg_path} onChange={v => setField('ffmpeg_path', v)} />
         </div>
-
-        {error && <p className="text-sm text-red-500">{error}</p>}
-        {message && <p className="text-sm text-green-500">{message}</p>}
 
         <div className="flex gap-2">
           <Button disabled={saving || loading} onClick={save} variant="primary">

@@ -8,6 +8,7 @@ import { cancelAsyncTool, cancelTask, fetchActiveTasks, fetchAsyncTools, type Ac
 import { useSettingsStore } from '../../store/settingsStore';
 import { useChatStore, type TaskActivity } from '../../store/chatStore';
 import { useViewStore } from '../../store/viewStore';
+import { errorText, notify } from '../../store/toastStore';
 import { Modal } from '../common';
 
 interface ActiveTasksModalProps {
@@ -183,9 +184,10 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
     setCancellingAsyncIds(current => ({ ...current, [entry.async_id]: true }));
     try {
       await cancelAsyncTool(entry.async_id);
+      notify.info('已请求取消异步工具。');
       setRefreshTick(value => value + 1);
     } catch (cancelError) {
-      setError(cancelError instanceof Error ? cancelError.message : '异步工具取消失败。');
+      notify.error(errorText(cancelError, '异步工具取消失败。'));
     } finally {
       setCancellingAsyncIds(current => {
         const next = { ...current };
@@ -204,9 +206,10 @@ export const ActiveTasksModal = ({ open, onClose }: ActiveTasksModalProps) => {
     setCancellingTaskIds(current => ({ ...current, [task.task_id]: true }));
     try {
       await cancelTask(adminToken, task.task_id);
+      notify.info('已请求取消任务。');
       setRefreshTick(value => value + 1);
     } catch (cancelError) {
-      setError(cancelError instanceof Error ? cancelError.message : '任务取消失败。');
+      notify.error(errorText(cancelError, '任务取消失败。'));
     } finally {
       setCancellingTaskIds(current => {
         const next = { ...current };

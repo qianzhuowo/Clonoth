@@ -8,9 +8,10 @@ import { useCallback, useEffect, useState } from 'react';
 import { decideApproval, getAdminState, type AdminApproval } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { errorText, notify } from '../../../store/toastStore';
 import { Button, Icon } from '../../common';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
-import { AuthRequired, Card, PageHeader, PageShell, StatusText } from './settingsPagePrimitives';
+import { AuthRequired, Card, PageHeader, PageShell } from './settingsPagePrimitives';
 
 function detailString(approval: AdminApproval, key: string): string {
   // [2026-06-02] Read common approval detail fields from arbitrary backend payloads.
@@ -42,20 +43,19 @@ export const ApprovalsSettingsPage = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const { selectedApproval, setSelectedApproval } = useSettingsSelectionStore();
   const [approvals, setApprovals] = useState<AdminApproval[]>([]);
-  const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
 
   const load = useCallback(async (showSpinner = true) => {
     if (!adminToken || !isAuthenticated) return;
     if (showSpinner) setLoading(true);
-    setMessage('');
     try {
       const state = await getAdminState(adminToken);
       const pending = state.pending_approvals || [];
       setApprovals(pending);
       if (selectedApproval && !pending.some((item) => item.approval_id === selectedApproval.approval_id)) setSelectedApproval(null);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '加载审批失败');
+      // Quiet 10s polling (showSpinner=false) must not repeat the same error toast.
+      if (showSpinner) notify.error(errorText(error, '加载审批失败'));
     } finally {
       if (showSpinner) setLoading(false);
     }
@@ -75,10 +75,10 @@ export const ApprovalsSettingsPage = () => {
   const decide = async (approval: AdminApproval, decision: 'allow' | 'deny') => {
     try {
       await decideApproval(approval.approval_id, decision, `settings ${decision}`);
-      setMessage(decision === 'allow' ? '已允许审批' : '已拒绝审批');
+      notify.success(decision === 'allow' ? '已允许审批' : '已拒绝审批');
       await load();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '审批操作失败');
+      notify.error(errorText(error, '审批操作失败'));
     }
   };
 
@@ -136,7 +136,6 @@ export const ApprovalsSettingsPage = () => {
               ))}
             </div>
           )}
-          <StatusText message={message} />
         </Card>
       )}
     </PageShell>

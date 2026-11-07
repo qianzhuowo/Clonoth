@@ -15,6 +15,7 @@ import {
 import { useSettingsSelectionStore } from '../../store/settingsSelectionStore';
 import { useChatStore } from '../../store/chatStore';
 import { useViewStore } from '../../store/viewStore';
+import { errorText, notify } from '../../store/toastStore';
 import { Button, Modal } from '../common';
 
 interface SessionBrowserModalProps {
@@ -152,10 +153,11 @@ export const SessionBrowserModal = ({ open, onClose, pendingApprovals = [] }: Se
     setDeletingBySession(current => ({ ...current, [session.session_id]: true }));
     try {
       const result = await deleteSession(session.session_id);
-      if (!result.ok) setError('删除会话失败。');
+      if (result.ok) notify.success(`会话 ${session.session_id} 已删除`);
+      else notify.error('删除会话失败。');
       setRefreshTick(value => value + 1);
     } catch (deleteError) {
-      setError(deleteError instanceof Error ? deleteError.message : '删除会话失败。');
+      notify.error(errorText(deleteError, '删除会话失败。'));
     } finally {
       setDeletingBySession(current => {
         const next = { ...current };

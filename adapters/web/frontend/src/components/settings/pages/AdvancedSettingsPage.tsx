@@ -6,14 +6,14 @@ import { useEffect, useState } from 'react';
 import { getPolicyRaw, getRuntimeRaw, updatePolicyRaw, updateRuntimeRaw } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { errorText, notify } from '../../../store/toastStore';
 import { Button, YamlEditor } from '../../common';
-import { AuthRequired, Card, PageHeader, PageShell, StatusText, hasLikelyYamlSyntaxIssue } from './settingsPagePrimitives';
+import { AuthRequired, Card, PageHeader, PageShell, hasLikelyYamlSyntaxIssue } from './settingsPagePrimitives';
 
 type FileKey = 'runtime' | 'policy';
 
 interface RawFileState {
   value: string;
-  message: string;
   loading: boolean;
 }
 
@@ -26,8 +26,8 @@ export const AdvancedSettingsPage = () => {
   const { adminToken, isAuthenticated } = useSettingsStore();
   const { setAdvancedFile } = useSettingsSelectionStore();
   const [files, setFiles] = useState<Record<FileKey, RawFileState>>({
-    runtime: { value: '', message: '', loading: false },
-    policy: { value: '', message: '', loading: false },
+    runtime: { value: '', loading: false },
+    policy: { value: '', loading: false },
   });
 
   const setFileState = (key: FileKey, patch: Partial<RawFileState>) => {
@@ -47,12 +47,12 @@ export const AdvancedSettingsPage = () => {
   };
 
   const loadOne = async (key: FileKey) => {
-    setFileState(key, { loading: true, message: '' });
+    setFileState(key, { loading: true });
     try {
       const raw = await fetchRaw(key);
-      setFileState(key, { value: raw, message: '' });
+      setFileState(key, { value: raw });
     } catch (error) {
-      setFileState(key, { message: error instanceof Error ? error.message : '加载失败' });
+      notify.error(`${key}.yaml：${errorText(error, '加载失败')}`);
     } finally {
       setFileState(key, { loading: false });
     }
@@ -66,13 +66,13 @@ export const AdvancedSettingsPage = () => {
     if (key === 'policy' && !window.confirm('修改安全策略可能影响系统安全性')) return;
     const value = files[key].value;
     const issue = hasLikelyYamlSyntaxIssue(value);
-    if (issue) { setFileState(key, { message: issue }); return; }
-    setFileState(key, { loading: true, message: '' });
+    if (issue) { notify.error(issue); return; }
+    setFileState(key, { loading: true });
     try {
       await saveRaw(key, value);
-      setFileState(key, { value, message: '已保存' });
+      notify.success(`${key}.yaml 已保存`);
     } catch (error) {
-      setFileState(key, { message: error instanceof Error ? error.message : '保存失败' });
+      notify.error(`${key}.yaml：${errorText(error, '保存失败')}`);
     } finally {
       setFileState(key, { loading: false });
     }
@@ -96,7 +96,6 @@ export const AdvancedSettingsPage = () => {
                       <Button disabled={state.loading} onClick={() => saveOne(file.key)} variant="primary">保存</Button>
                     </div>
                     <YamlEditor aria-label={`${file.filename} YAML 编辑器`} height="26rem" onChange={(value) => setFileState(file.key, { value })} value={state.value} />
-                    <StatusText message={state.message} />
                   </div>
                 </details>
               </Card>

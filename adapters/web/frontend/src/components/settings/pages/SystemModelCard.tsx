@@ -2,6 +2,7 @@
 import { useEffect, useState } from 'react';
 
 import { type SystemModelPublic, getSystemModel, updateSystemModel } from '../../../api/supervisorClient';
+import { errorText, notify } from '../../../store/toastStore';
 import { Button } from '../../common';
 
 const inputCls =
@@ -17,7 +18,6 @@ interface Props {
   activeProvider?: string;
   modelPlaceholder: string;
   envHint: string;
-  onMessage: (msg: string) => void;
 }
 
 export const SystemModelCard = ({
@@ -29,7 +29,6 @@ export const SystemModelCard = ({
   activeProvider,
   modelPlaceholder,
   envHint,
-  onMessage,
 }: Props) => {
   const [current, setCurrent] = useState<SystemModelPublic | null>(null);
   const [edit, setEdit] = useState({ provider: '', model: '', base_url: '', api_key: '' });
@@ -41,16 +40,16 @@ export const SystemModelCard = ({
   };
 
   useEffect(() => {
-    getSystemModel(adminToken, slot).then(apply).catch(err => onMessage(err instanceof Error ? err.message : '加载失败'));
+    getSystemModel(adminToken, slot).then(apply).catch(err => notify.error(`${title}：${errorText(err, '加载失败')}`));
   }, [adminToken, slot]);
 
   const save = async (payload: { provider?: string; model?: string; base_url?: string; api_key?: string }, done: string) => {
     setSaving(true);
     try {
       apply(await updateSystemModel(adminToken, slot, payload));
-      onMessage(done);
+      notify.success(done);
     } catch (err) {
-      onMessage(err instanceof Error ? err.message : '保存失败');
+      notify.error(`${title}：${errorText(err, '保存失败')}`);
     } finally {
       setSaving(false);
     }

@@ -288,3 +288,14 @@ button.msg-annotation {
   font: inherit;
 }
 button.msg-annotation:hover { color: var(--duties-text); }
+
+/* [2026-11-07] Global toast entrance animation (see components/common/Toaster.tsx).
+   Reduced-motion users get the toast without movement. */
+@keyframes clonoth-toast-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.clonoth-toast { animation: clonoth-toast-in 160ms ease-out; }
+@media (prefers-reduced-motion: reduce) {
+  .clonoth-toast { animation: none; }
+}

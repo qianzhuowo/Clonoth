@@ -13,6 +13,7 @@ import { useEffect } from 'react';
 
 import { checkHealth, resetConversation } from './api/supervisorClient';
 import { LoginPage } from './components/auth/LoginPage';
+import { Toaster } from './components/common/Toaster';
 import { AppLayout } from './components/layout';
 import { PluginStyles } from './components/plugins/PluginStyles';
 import { SetupWizard } from './components/setup/SetupWizard';
@@ -170,9 +171,15 @@ const MainApp = () => {
 
 const App = () => {
   const { isAuthenticated, needsSetup } = useSettingsStore();
-  if (!isAuthenticated) return <LoginPage />;
-  if (needsSetup) return <SetupWizard />;
-  return <MainApp />;
+  // [2026-11-07] The global Toaster is mounted once here, outside the auth gate,
+  // so notify.* works on every screen (login, setup, main app).
+  const screen = !isAuthenticated ? <LoginPage /> : needsSetup ? <SetupWizard /> : <MainApp />;
+  return (
+    <>
+      {screen}
+      <Toaster />
+    </>
+  );
 };
 
 export default App;

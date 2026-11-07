@@ -41,10 +41,6 @@ export const AuthRequired = () => (
   </Card>
 );
 
-export const StatusText = ({ message }: { message: string }) => (
-  message ? <p className="mt-2 text-xs leading-5 text-[var(--duties-tertiary)]">{message}</p> : null
-);
-
 export const FieldLabel = ({ children, htmlFor }: { children: ReactNode; htmlFor?: string }) => (
   <label className="mb-1 block text-xs font-semibold text-[var(--duties-secondary)]" htmlFor={htmlFor}>{children}</label>
 );

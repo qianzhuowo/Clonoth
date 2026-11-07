@@ -8,8 +8,9 @@ import { useEffect, useState } from 'react';
 import { getSchedulesRaw, updateSchedulesRaw } from '../../../api/supervisorClient';
 import { useSettingsSelectionStore } from '../../../store/settingsSelectionStore';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { errorText, notify } from '../../../store/toastStore';
 import { Button } from '../../common';
-import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, StatusText, TextInput } from './settingsPagePrimitives';
+import { AuthRequired, Card, FieldLabel, PageHeader, PageShell, TextInput } from './settingsPagePrimitives';
 import { parseSchedules, serializeSchedules, type ScheduleFormState } from '../settingsStructuredConfig';
 
 function emptySchedule(id: string): ScheduleFormState {
@@ -29,7 +30,6 @@ export const AutomationSettingsPage = () => {
   const { selectedScheduleId, setSelectedScheduleId } = useSettingsSelectionStore();
   const [schedules, setSchedules] = useState<ScheduleFormState[]>([]);
   const [newId, setNewId] = useState('');
-  const [message, setMessage] = useState('');
   const [loading, setLoading] = useState(false);
 
   const load = async () => {
@@ -39,9 +39,8 @@ export const AutomationSettingsPage = () => {
       const parsed = parseSchedules(await getSchedulesRaw(adminToken));
       setSchedules(parsed);
       if (selectedScheduleId && !parsed.some((schedule) => schedule.id === selectedScheduleId)) setSelectedScheduleId(null);
-      setMessage('');
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '加载定时任务失败');
+      notify.error(errorText(error, '加载定时任务失败'));
     } finally {
       setLoading(false);
     }
@@ -61,19 +60,19 @@ export const AutomationSettingsPage = () => {
   const create = async () => {
     if (!adminToken) return;
     const id = newId.trim();
-    if (!id) { setMessage('请输入任务 ID'); return; }
+    if (!id) { notify.error('请输入任务 ID'); return; }
     try {
       const raw = await getSchedulesRaw(adminToken);
       const current = parseSchedules(raw);
-      if (current.some((schedule) => schedule.id === id)) { setMessage('该任务 ID 已存在'); return; }
+      if (current.some((schedule) => schedule.id === id)) { notify.error('该任务 ID 已存在'); return; }
       const next = [...current, emptySchedule(id)];
       await updateSchedulesRaw(adminToken, serializeSchedules(next));
       setNewId('');
       setSelectedScheduleId(id);
-      setMessage('定时任务已创建，请在右栏填写内容。');
+      notify.success('定时任务已创建，请在右栏填写内容。');
       await load();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '创建定时任务失败');
+      notify.error(errorText(error, '创建定时任务失败'));
     }
   };
 
@@ -85,10 +84,10 @@ export const AutomationSettingsPage = () => {
       const next = parseSchedules(raw).filter((schedule) => schedule.id !== selectedScheduleId);
       await updateSchedulesRaw(adminToken, serializeSchedules(next));
       setSelectedScheduleId(null);
-      setMessage('定时任务已删除');
+      notify.success('定时任务已删除');
       await load();
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : '删除定时任务失败');
+      notify.error(errorText(error, '删除定时任务失败'));
     }
   };
 
@@ -103,7 +102,7 @@ export const AutomationSettingsPage = () => {
           </div>
           <div className="max-h-[34rem] space-y-2 overflow-y-auto">
             {schedules.length === 0 ? <p className="text-sm text-[var(--duties-secondary)]">暂无定时任务。</p> : schedules.map((schedule) => (
-              <button className={`w-full border p-3 text-left ${selectedScheduleId === schedule.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={schedule.id} onClick={() => { setSelectedScheduleId(schedule.id); setMessage(''); setRightPanelOpen(true); }} type="button">
+              <button className={`w-full border p-3 text-left ${selectedScheduleId === schedule.id ? 'border-[var(--duties-text)] bg-[var(--duties-bg)]' : 'border-[var(--duties-border)] bg-[var(--duties-bg)]'}`} key={schedule.id} onClick={() => { setSelectedScheduleId(schedule.id); setRightPanelOpen(true); }} type="button">
                 <div className="flex flex-wrap items-center gap-2"><span className="font-mono text-xs font-semibold">{schedule.id}</span><span className={`border px-1.5 py-0.5 text-[0.55rem] ${schedule.enabled ? 'border-green-200 bg-green-50 text-green-700' : 'border-red-200 bg-red-50 text-red-700'}`}>{schedule.enabled ? '启用' : '禁用'}</span><span className="font-mono text-[0.6rem] text-[var(--duties-tertiary)]">{schedule.type}</span></div>
                 <p className="mt-1 font-mono text-[0.65rem] text-[var(--duties-secondary)]">{schedule.cron || '未设置 cron'}</p>
                 <p className="mt-1 line-clamp-2 text-xs leading-5 text-[var(--duties-secondary)]">{schedule.text || '无 text 内容'}</p>
@@ -115,7 +114,6 @@ export const AutomationSettingsPage = () => {
             <TextInput id="new-schedule-id" onChange={(event) => setNewId(event.target.value)} placeholder="任务 ID" value={newId} />
             <Button className="mt-2" onClick={create} variant="primary">创建任务</Button>
           </div>
-          <StatusText message={message} />
         </Card>
       )}
     </PageShell>

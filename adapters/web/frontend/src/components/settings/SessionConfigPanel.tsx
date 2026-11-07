@@ -21,6 +21,7 @@ import {
 } from '../../api/supervisorClient';
 import { useChatStore } from '../../store/chatStore';
 import { useSettingsStore } from '../../store/settingsStore';
+import { errorText, notify } from '../../store/toastStore';
 import { useViewStore } from '../../store/viewStore';
 import type { NodeDef } from '../../types';
 import { Button } from '../common';
@@ -154,17 +155,13 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
   const registeredProviders = Object.keys(providerModels);
   const setSettingsTab = useViewStore(state => state.setSettingsTab);
 
-  const [copyMsg, setCopyMsg] = useState('');
-  const [nodeMsg, setNodeMsg] = useState('');
   const [nodeSaving, setNodeSaving] = useState(false);
   const [modelSaving, setModelSaving] = useState(false);
-  const [modelMsg, setModelMsg] = useState('');
   const [apiKeyPresent, setApiKeyPresent] = useState(false);
   const [edit, setEdit] = useState<SessionModelEdit>({ provider: '', model: '', base_url: '', api_key: '' });
   const [sessionWorkspace, setSessionWorkspace] = useState<{ name?: string; path?: string | null } | null>(null);
   const [wsEdit, setWsEdit] = useState<SessionWorkspaceEdit>({ name: '', path: '' });
   const [wsSaving, setWsSaving] = useState(false);
-  const [wsMsg, setWsMsg] = useState('');
   const connectionStatus = useChatStore((state) => state.connectionStatus);
 
   const switchableNodes = useMemo(() => getSwitchableNodes(availableNodes), [availableNodes]);
@@ -252,20 +249,18 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
 
   const handleCopySessionId = async () => {
     if (!sid) return;
-    setCopyMsg('');
     try {
       await navigator.clipboard?.writeText(sid);
-      setCopyMsg('已复制');
+      notify.success('会话 ID 已复制');
     } catch {
-      setCopyMsg('复制失败');
+      notify.error('复制会话 ID 失败');
     }
   };
 
   const handleSwitchNode = async (targetId: string) => {
-    setNodeMsg('');
     if (!sid) {
       setActiveNode(targetId, Boolean(targetId), defaultNodeId || '', undefined);
-      setNodeMsg('已为下一条消息保存');
+      notify.success('节点已为下一条消息保存');
       return;
     }
     setNodeSaving(true);
@@ -277,19 +272,18 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
           model: result.effective_model || '',
           baseUrl: result.effective_base_url || '',
         });
-        setNodeMsg('已保存');
+        notify.success('会话节点已切换');
       } else {
-        setNodeMsg('切换失败');
+        notify.error('切换节点失败');
       }
     } catch (err) {
-      setNodeMsg(err instanceof Error ? err.message : '切换失败');
+      notify.error(errorText(err, '切换节点失败'));
     } finally {
       setNodeSaving(false);
     }
   };
 
   const handleSaveModel = async () => {
-    setModelMsg('');
     if (!sid) {
       // [2026-06-16] Welcome page: no session yet. Store the override locally;
       // it will be applied via postInbound when the first message creates a session.
@@ -301,10 +295,10 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       if (edit.api_key.trim()) next.api_key = edit.api_key.trim();
       setPendingProviderOverride(next);
       setSessionProviderOverride(next);
-      setModelMsg('已为下一条消息保存');
+      notify.success('模型已为下一条消息保存');
       return;
     }
-    if (!adminToken) { setModelMsg('需要管理员令牌'); return; }
+    if (!adminToken) { notify.error('需要管理员令牌'); return; }
 
     setModelSaving(true);
     try {
@@ -331,18 +325,17 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
         model: active.effective_model || '',
         baseUrl: active.effective_base_url || '',
       });
-      setModelMsg('已保存');
+      notify.success('会话模型已保存');
     } catch (err) {
-      setModelMsg(err instanceof Error ? err.message : '保存失败');
+      notify.error(errorText(err, '保存会话模型失败'));
     } finally {
       setModelSaving(false);
     }
   };
 
   const handleSaveWorkspace = async () => {
-    setWsMsg('');
-    if (!sid) { setWsMsg('需要先创建会话'); return; }
-    if (!adminToken) { setWsMsg('需要管理员令牌'); return; }
+    if (!sid) { notify.error('需要先创建会话'); return; }
+    if (!adminToken) { notify.error('需要管理员令牌'); return; }
     setWsSaving(true);
     try {
       const name = wsEdit.name.trim();
@@ -354,51 +347,49 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
         const cleared = await clearSessionWorkspace(sid, adminToken);
         setSessionWorkspace(cleared);
         setWsEdit({ name: '', path: '' });
-        setWsMsg('已清除');
+        notify.success('会话工作区已清除');
         return;
       }
       const saved = await updateSessionWorkspace(sid, adminToken, body);
       setSessionWorkspace(saved);
       setWsEdit({ name: saved?.name || '', path: saved?.path || '' });
       useSettingsStore.getState().setSessionWorkspaceName(saved?.name || '');
-      setWsMsg('已保存');
+      notify.success('会话工作区已保存');
     } catch (err) {
-      setWsMsg(err instanceof Error ? err.message : '保存失败');
+      notify.error(errorText(err, '保存会话工作区失败'));
     } finally {
       setWsSaving(false);
     }
   };
 
   const handleClearWorkspace = async () => {
-    setWsMsg('');
-    if (!sid) { setWsMsg('需要先创建会话'); return; }
-    if (!adminToken) { setWsMsg('需要管理员令牌'); return; }
+    if (!sid) { notify.error('需要先创建会话'); return; }
+    if (!adminToken) { notify.error('需要管理员令牌'); return; }
     setWsSaving(true);
     try {
       const cleared = await clearSessionWorkspace(sid, adminToken);
       setSessionWorkspace(cleared);
       setWsEdit({ name: '', path: '' });
       useSettingsStore.getState().setSessionWorkspaceName('');
-      setWsMsg('已清除');
+      notify.success('会话工作区已清除');
     } catch (err) {
-      setWsMsg(err instanceof Error ? err.message : '清除失败');
+      notify.error(errorText(err, '清除会话工作区失败'));
     } finally {
       setWsSaving(false);
     }
   };
 
   const handleClearModel = async () => {
-    setModelMsg('');
     if (!sid) {
       // [2026-06-16] Welcome page: clear the pending override.
       setPendingProviderOverride(null);
       setSessionProviderOverride(null);
       setEdit({ provider: '', model: '', base_url: '', api_key: '' });
       setApiKeyPresent(false);
-      setModelMsg('已清除');
+      notify.success('会话模型覆盖已清除');
       return;
     }
-    if (!adminToken) { setModelMsg('需要管理员令牌'); return; }
+    if (!adminToken) { notify.error('需要管理员令牌'); return; }
 
     setModelSaving(true);
     try {
@@ -412,9 +403,9 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
         model: active.effective_model || '',
         baseUrl: active.effective_base_url || '',
       });
-      setModelMsg('已清除');
+      notify.success('会话模型覆盖已清除');
     } catch (err) {
-      setModelMsg(err instanceof Error ? err.message : '清除失败');
+      notify.error(errorText(err, '清除会话模型失败'));
     } finally {
       setModelSaving(false);
     }
@@ -464,7 +455,6 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
             >
               {sid || '没有活动会话'}
             </button>
-            {copyMsg && <p className="mt-1 text-[0.62rem] text-[var(--duties-tertiary)]">{copyMsg}</p>}
           </div>
         </details>
       )}
@@ -492,7 +482,6 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
               <option key={n.id} value={n.id}>{n.name || n.id}</option>
             ))}
           </select>
-          {nodeMsg && <p className="text-[0.62rem] text-[var(--duties-tertiary)]">{nodeMsg}</p>}
         </div>
       )}
 
@@ -552,8 +541,6 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
             value={edit.api_key}
           />
 
-          {modelMsg && <p className="mb-2 text-[0.62rem] text-[var(--duties-tertiary)]">{modelMsg}</p>}
-
           {/* Save/Clear only visible when user has modified something */}
           {(edit.provider.trim() !== '' || edit.model.trim() !== '' || edit.base_url.trim() !== '' || edit.api_key.trim() !== '' || hasSessionOverride) && (
             <div className="flex gap-2">
@@ -602,8 +589,6 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
             placeholder="/path/to/project"
             value={wsEdit.path}
           />
-
-          {wsMsg && <p className="mb-2 text-[0.62rem] text-[var(--duties-tertiary)]">{wsMsg}</p>}
 
           {(wsEdit.name.trim() !== '' || wsEdit.path.trim() !== '' || sessionWorkspace?.name) && (
             <div className="flex gap-2">

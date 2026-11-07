@@ -14,6 +14,7 @@ import {
   upsertProvider,
 } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
+import { errorText, notify } from '../../../store/toastStore';
 import { Button } from '../../common';
 import { SystemModelCard } from './SystemModelCard';
 
@@ -97,7 +98,6 @@ export const ModelSettingsPage = () => {
 
   const [data, setData] = useState<ProvidersResponse | null>(null);
   const [loading, setLoading] = useState(false);
-  const [msg, setMsg] = useState('');
 
   // per-provider edit states, keyed by provider name
   const [edits, setEdits] = useState<Record<string, ProviderEditState>>({});
@@ -126,11 +126,10 @@ export const ModelSettingsPage = () => {
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
     setLoading(true);
-    setMsg('');
     try {
       applyResponse(await getProviders(adminToken));
     } catch (err) {
-      setMsg(err instanceof Error ? err.message : '加载失败');
+      notify.error(errorText(err, '加载失败'));
     } finally {
       setLoading(false);
     }
@@ -145,7 +144,6 @@ export const ModelSettingsPage = () => {
     const edit = edits[name];
     if (!edit) return;
     setSavingKey(name);
-    setMsg('');
     try {
       const params: Record<string, string> = {};
       if (edit.base_url) params.base_url = edit.base_url;
@@ -153,9 +151,9 @@ export const ModelSettingsPage = () => {
       if (edit.api_key) params.api_key = edit.api_key;
       const resp = await upsertProvider(adminToken, name, params);
       applyResponse(resp);
-      setMsg(`${name} 已保存`);
+      notify.success(`${name} 已保存`);
     } catch (err) {
-      setMsg(err instanceof Error ? err.message : '保存失败');
+      notify.error(errorText(err, '保存失败'));
     } finally {
       setSavingKey(null);
     }
@@ -163,26 +161,24 @@ export const ModelSettingsPage = () => {
 
   const handleSetActive = async (name: string) => {
     if (!adminToken) return;
-    setMsg('');
     try {
       const resp = await setActiveProvider(adminToken, name);
       applyResponse(resp);
-      setMsg(`已切换到 ${name}`);
+      notify.success(`已切换到 ${name}`);
     } catch (err) {
-      setMsg(err instanceof Error ? err.message : '切换失败');
+      notify.error(errorText(err, '切换失败'));
     }
   };
 
   const handleDelete = async (name: string) => {
     if (!adminToken) return;
     if (!window.confirm(`确定要删除渠道 "${name}"？`)) return;
-    setMsg('');
     try {
       const resp = await deleteProvider(adminToken, name);
       applyResponse(resp);
-      setMsg(`${name} 已删除`);
+      notify.success(`${name} 已删除`);
     } catch (err) {
-      setMsg(err instanceof Error ? err.message : '删除失败');
+      notify.error(errorText(err, '删除失败'));
     }
   };
 
@@ -190,14 +186,13 @@ export const ModelSettingsPage = () => {
     if (!adminToken || !newName) return;
     const name = newName;
     setAddingNew(true);
-    setMsg('');
     try {
       const resp = await upsertProvider(adminToken, name, {});
       applyResponse(resp);
       setNewName('');
-      setMsg(`渠道 ${name} 已添加`);
+      notify.success(`渠道 ${name} 已添加`);
     } catch (err) {
-      setMsg(err instanceof Error ? err.message : '添加失败');
+      notify.error(errorText(err, '添加失败'));
     } finally {
       setAddingNew(false);
     }
@@ -205,13 +200,12 @@ export const ModelSettingsPage = () => {
 
   const handleReload = async () => {
     if (!adminToken) return;
-    setMsg('');
     try {
       await reloadConfig(adminToken);
       await load();
-      setMsg('✅ 配置已重载');
+      notify.success('配置已重载');
     } catch (err) {
-      setMsg(err instanceof Error ? err.message : '重载失败');
+      notify.error(errorText(err, '重载失败'));
     }
   };
 
@@ -221,12 +215,11 @@ export const ModelSettingsPage = () => {
 
   const handleToggleVision = async (model: string, vision: boolean) => {
     if (!adminToken || !model.trim()) return;
-    setMsg('');
     try {
       applyResponse(await setModelVision(adminToken, model.trim(), vision));
-      setMsg(`${model} 已标记为${vision ? '可识图' : '不可识图'}`);
+      notify.success(`${model} 已标记为${vision ? '可识图' : '不可识图'}`);
     } catch (err) {
-      setMsg(err instanceof Error ? err.message : '保存失败');
+      notify.error(errorText(err, '保存失败'));
     }
   };
 
@@ -274,11 +267,10 @@ export const ModelSettingsPage = () => {
   const handleSaveFallbacks = async () => {
     if (!adminToken) return;
     if (fbRows.some(r => !r.provider.trim() || !r.model.trim())) {
-      setMsg('每个备用模型都需要填写渠道类型和模型名');
+      notify.error('每个备用模型都需要填写渠道类型和模型名');
       return;
     }
     setFbSaving(true);
-    setMsg('');
     try {
       let resp = await updateFallbacks(
         adminToken,
@@ -302,9 +294,9 @@ export const ModelSettingsPage = () => {
         }
       }
       applyResponse(resp);
-      setMsg('备用模型链已保存');
+      notify.success('备用模型链已保存');
     } catch (err) {
-      setMsg(err instanceof Error ? err.message : '保存失败');
+      notify.error(errorText(err, '保存失败'));
     } finally {
       setFbSaving(false);
     }
@@ -330,13 +322,6 @@ export const ModelSettingsPage = () => {
         <div className="p-4 text-sm text-[var(--duties-secondary)]">加载中...</div>
       ) : (
         <>
-          {/* Status bar */}
-          {msg && (
-            <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] px-4 py-2 text-xs text-[var(--duties-tertiary)]">
-              {msg}
-            </div>
-          )}
-
           {/* Provider cards */}
           {providerNames.map(name => {
             const cfg = data!.providers[name];
@@ -460,7 +445,6 @@ export const ModelSettingsPage = () => {
                   description={s.description}
                   envHint={s.envHint}
                   modelPlaceholder={s.modelPlaceholder}
-                  onMessage={setMsg}
                   providers={s.pickChannel ? Object.keys(data.providers) : undefined}
                   slot={s.slot}
                   title={s.title}

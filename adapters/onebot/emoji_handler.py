@@ -786,8 +786,9 @@ async def process_emojis(
                 # （sub_type=1），让客户端按小图/贴纸渲染，而不是普通大图。
                 segments.append({"type": "image", "url": url, "emoji": True, "name": name})
             else:
-                # 未命中或未取到可发送地址时保留可读占位，避免内容无声丢失。
-                segments.append({"type": "text", "content": f"[表情:{name}]"})
+                # 未命中（模型臆造/沿用已删除的表情名）或取不到可发送地址：去掉标记，
+                # 不把 "[表情:名称]" 当文字发进群；记警告供排查。
+                logger.warning("QQ custom face not sent: name=%r (not in favourites or no url)", name)
 
         last_end = end
 

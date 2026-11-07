@@ -619,3 +619,18 @@ def test_process_emojis_falls_back_to_metadata_url_when_live_fails(
     metadata = [{"name": "开心", "base_name": "开心", "md5": "aaa", "url": "https://stale/old.png"}]
     segments = asyncio.run(runtime.send.process_emojis("[表情:开心]", FakeBot(), [], ["开心"], metadata))
     assert segments == [{"type": "image", "url": "https://stale/old.png", "emoji": True, "name": "开心"}]
+
+
+def test_process_emojis_drops_unknown_face_marker_and_warns(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+
+    class FakeBot:
+        async def call_api(self, api, **kwargs):
+            return [{"desc": "开心", "md5": "aaa", "resId": "r1", "url": "https://live/new.png"}]
+
+    with caplog.at_level("WARNING"):
+        segments = asyncio.run(runtime.send.process_emojis("我错了 [表情:已删除的表情]", FakeBot(), [], ["开心"], []))
+    assert segments == [{"type": "text", "content": "我错了 "}]
+    assert "已删除的表情" in caplog.text

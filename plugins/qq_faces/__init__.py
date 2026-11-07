@@ -1,6 +1,9 @@
-"""QQ 收藏表情管理面板：预览、重命名、删除、上传添加、同步。
+"""QQ 收藏表情：管理面板（supervisor）+ 可用列表请求时注入（engine）。
 
-设置区面板（iframe 加载 web/index.html）。本插件只做转发：QQ Bot 进程
+engine 进程：注册 dynamic prompt section（prompt.py），每次 LLM 调用从名称文件
+实时读取可用表情列表，只对 QQ 任务渲染，不写进聊天记录。
+
+supervisor 进程：设置区面板（iframe 加载 web/index.html）。本插件只做转发：QQ Bot 进程
 （adapters/onebot）持有 NapCat 连接，表情操作全部在那里执行（faces_api.py，
 复用 CustomFaces，与 QQ 内的表情命令同一套校验逻辑）。
 
@@ -15,9 +18,9 @@ from pathlib import Path
 PLUGIN_META = {
     "name": "qq_faces",
     "version": "1.0.0",
-    "description": "QQ 收藏表情管理：缩略图预览、重命名、删除、拖拽上传、同名与提示上限标记",
+    "description": "QQ 收藏表情：可用列表请求时注入；管理面板（缩略图预览、重命名、删除、拖拽上传、同名与提示上限标记）",
     "author": "clonoth",
-    "processes": ["supervisor"],
+    "processes": ["supervisor", "engine"],
     "web": {
         "panels": [
             {
@@ -42,7 +45,14 @@ def _bridge() -> tuple[str, dict]:
 
 
 def register(ctx) -> None:
-    routes = getattr(ctx.contributions, "get", lambda _name: None)("routes")
+    get = getattr(ctx.contributions, "get", lambda _name: None)
+    sections = get("prompt_sections")
+    if sections is not None:
+        from .prompt import SECTION_NAME, render
+
+        sections.register_section(SECTION_NAME, render, order=60, scope="dynamic")
+
+    routes = get("routes")
     if routes is None:
         return
 

@@ -88,17 +88,13 @@ def test_non_command_and_admin_only(setup):
     assert bot.calls == []
 
 
-def test_sync_writes_names_and_metadata_and_prompt(setup):
+def test_sync_writes_names_and_metadata(setup):
     faces, bot, run, tmp = setup
     reply = run("同步表情列表")
     assert "已同步 3 个已命名收藏表情（AI 可见基础名 2 个）" in reply
     assert "检测到 1 组同名表情：开心(x2)" in reply
     assert faces.current_names() == ["开心", "难过"]
     assert len(faces.current_metadata()) == 3
-    block = faces.prompt_block()
-    assert "[表情:名称]" in block and "开心、难过" in block
-    faces.prompt_limit = 1
-    assert "另有 1 个未展示" in faces.prompt_block()
     assert run("表情列表").startswith("AI 可用收藏表情：\n1. 开心\n2. 难过")
 
 

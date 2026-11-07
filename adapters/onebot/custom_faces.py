@@ -137,19 +137,6 @@ class CustomFaces:
         self.metadata = load_custom_face_metadata(self.metadata_path)
         return list(self.metadata)
 
-    def prompt_block(self) -> str:
-        names = self.current_names()
-        if self.prompt_limit <= 0 or not names:
-            return ""
-        shown = names[: self.prompt_limit]
-        more = "" if len(names) <= self.prompt_limit else f"（另有 {len(names) - self.prompt_limit} 个未展示）"
-        return (
-            "【QQ可用收藏表情】\n"
-            "你可以在回复中用 [表情:名称] 发送 QQ 收藏表情。"
-            "只使用下列名称，不要臆造未列出的表情名。\n"
-            f"可用名称：{'、'.join(shown)}{more}"
-        )
-
     def _write_snapshot(self, faces: List[Any]) -> List[str]:
         """Write names + metadata files from one live favourites list."""
         self.metadata = extract_named_custom_face_metadata(faces, self.bqbs)

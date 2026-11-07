@@ -264,9 +264,6 @@ async def _build_inbound_text(event: GroupMessageEvent, bot: Bot, user_text: str
         attachments.extend(quoted_attachments)
     if reply_context:
         parts.extend(["", "【当前消息引用】", reply_context])
-    custom_face_prompt = state.FACES.prompt_block()
-    if custom_face_prompt:
-        parts.extend(["", custom_face_prompt])
 
     parts.extend([
         "",
@@ -328,9 +325,6 @@ async def _build_private_inbound_text(event: PrivateMessageEvent, bot: Bot, user
         attachments.extend(quoted_attachments)
     if reply_context:
         parts.extend(["", "【当前消息引用】", reply_context])
-    custom_face_prompt = state.FACES.prompt_block()
-    if custom_face_prompt:
-        parts.extend(["", custom_face_prompt])
     parts.extend([
         "",
         "【当前用户身份】",

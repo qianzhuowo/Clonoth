@@ -92,22 +92,6 @@ def looks_like_image_query(text: str) -> bool:
     return any(keyword in value for keyword in keywords)
 
 
-def should_fallback_to_recent_images(
-    *,
-    has_attachments: bool,
-    image_input_enabled: bool,
-    looks_like_image_query: bool,
-    reply_message_id: Any,
-) -> bool:
-    """Allow implicit recent-image lookup only for non-reply image queries."""
-    return bool(
-        not has_attachments
-        and image_input_enabled
-        and looks_like_image_query
-        and reply_message_id is None
-    )
-
-
 def source_attachments_from_merged(attachments: Iterable[Any]) -> list[dict[str, Any]]:
     """Copy and de-duplicate attachments used by a merged queued task."""
     result: list[dict[str, Any]] = []

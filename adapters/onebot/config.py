@@ -123,7 +123,6 @@ MAX_FILES_PER_TURN = _env_int("ONEBOT_MAX_FILES_PER_TURN", 3, min_value=1, max_v
 # “再看看图”这类追问：只取同一发送者最近一条消息里的图片。
 RECENT_IMAGE_MAX_ITEMS = _env_int("ONEBOT_RECENT_IMAGE_MAX_ITEMS", 20, min_value=1, max_value=200)
 RECENT_IMAGE_MAX_AGE_SECONDS = _env_float("ONEBOT_RECENT_IMAGE_MAX_AGE_SECONDS", 60.0, min_value=1.0)
-IMAGE_WAIT_AFTER_TEXT_SECONDS = _env_float("ONEBOT_IMAGE_WAIT_AFTER_TEXT_SECONDS", 2.5, min_value=0.0, max_value=10.0)
 # 引用消息附件索引（message_id -> 已落盘图片），get_msg 失败时兜底。
 REPLY_ATTACHMENT_CACHE_FILE = _env_str(
     "ONEBOT_REPLY_ATTACHMENT_CACHE_FILE",

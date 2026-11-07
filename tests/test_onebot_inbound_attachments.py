@@ -109,15 +109,7 @@ def test_recent_images_same_sender_latest_batch(tmp_path):
     assert recent.for_sender(KEY, "1111111") == [a2]
     assert recent.for_sender(KEY, "3333333") == []
     assert cache.images_for("m2", KEY) == [a2]
-
-    atts: list = []
-    asyncio.run(recent.merge_after_text(event=_event("1111111"), conversation_key=KEY,
-                                        user_text="看看这张图", attachments=atts, wait=0))
-    assert atts == [a2]
-    quoted: list = []
-    asyncio.run(recent.merge_after_text(event=_event("1111111", raw="[CQ:reply,id=9]"), conversation_key=KEY,
-                                        user_text="看看这张图", attachments=quoted, wait=0))
-    assert quoted == []  # a quote stays on its own chain
+    assert not hasattr(recent, "merge_after_text")  # images enter a turn only via the message or its quote
 
 
 def test_custom_face_image_priority(tmp_path):

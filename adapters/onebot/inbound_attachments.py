@@ -28,10 +28,8 @@ import httpx
 from . import config
 from .attachment_policy import (
     is_downloadable_file_source,
-    looks_like_image_query,
     normalise_file_item,
     select_recent_image_entries,
-    should_fallback_to_recent_images,
 )
 from .message_parse import CQ_RE, extract_reply_message_id, get_reply_message, parse_cq_params, segment_type_and_data
 
@@ -518,28 +516,6 @@ class RecentImages:
             max_age_seconds=config.RECENT_IMAGE_MAX_AGE_SECONDS,
             max_images=config.MAX_IMAGES_PER_TURN,
         )
-
-    async def merge_after_text(self, *, event: Any, conversation_key: str, user_text: str,
-                               attachments: List[Dict[str, Any]], wait: Optional[float] = None) -> None:
-        """Text-only "看看这张图": wait briefly, then attach the sender's latest images.
-
-        A quoted message stays on its own chain (handled by reply context), so
-        no fallback happens when the message quotes something.
-        """
-        reply_id = extract_reply_message_id(
-            event.get_message() if hasattr(event, "get_message") else None, getattr(event, "raw_message", None),
-        )
-        if not should_fallback_to_recent_images(
-            has_attachments=bool(attachments),
-            image_input_enabled=config.ENABLE_IMAGE_INPUT,
-            looks_like_image_query=looks_like_image_query(user_text),
-            reply_message_id=reply_id,
-        ):
-            return
-        delay = config.IMAGE_WAIT_AFTER_TEXT_SECONDS if wait is None else wait
-        if delay > 0:
-            await asyncio.sleep(delay)
-        attachments.extend(self.for_sender(conversation_key, getattr(event, "user_id", "")))
 
 
 async def collect_reply_images(bot: Any, event: Any, conversation_key: str, *,

@@ -38,7 +38,8 @@ def get_admin_token() -> str:
     token = os.environ.get("CLONOTH_ADMIN_TOKEN", "").strip()
     if not token:
         token = secrets.token_urlsafe(24)
-        print(f"[admin] 自动生成管理 token (未设置 CLONOTH_ADMIN_TOKEN): {token}", flush=True)
+        # The value is written to data/.admin_token at startup; never print it.
+        print("[admin] 未设置 CLONOTH_ADMIN_TOKEN，已自动生成管理 token（见 data/.admin_token）", flush=True)
     _admin_token = token
     return _admin_token
 

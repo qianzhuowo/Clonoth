@@ -411,16 +411,25 @@ def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict
     d: dict[str, Any] = {"role": msg.role, "content": msg.content}
     if msg.id:
         d["id"] = msg.id
-    # [AutoC 2026-06-01] Why: stripping every historical image made later LLM
-    # steps in the same task lose the user's image input. How: keep multimodal
-    # list content when source_task_id matches the active task, but preserve the
-    # old all-strip behavior for callers that do not pass current_task_id. Purpose:
-    # task-local history keeps locked user input while cross-task history stays
-    # compact and safe against stale file:// attachment references.
-    # [2026-10-26] Disabled cross-task historical image stripping (_strip_images_from_content):
-    # stripping image_url parts from previous turns mutates the historical message prefix on the next turn
-    # and invalidates the entire Prefix KV Cache from that message onward.
     _meta = dict(msg.meta) if msg.meta else {}
+    # [2026-11-07] Images are task-scoped: a user message keeps its image blocks
+    # only inside the task that received it (the current message, a quoted image
+    # the adapter re-attached, or a preempt injected into the running task).
+    # Later tasks see the path annotation instead and call read_media when they
+    # need another look. Why: re-sending every historical image made one image
+    # rejected by a provider safety filter fail every following request in the
+    # session, and wasted image tokens on unrelated turns. The prefix changes
+    # once, at the boundary between the previous task and this one; everything
+    # before that boundary stays byte-identical across tasks.
+    if isinstance(d["content"], list) and msg.source_task_id != current_task_id:
+        _image_count = sum(
+            1 for p in d["content"] if isinstance(p, dict) and p.get("type") == "image_url"
+        )
+        if _image_count:
+            d["content"] = _strip_images_from_content(d["content"])
+            # Read by compact's prompt-token seed to discount images that were
+            # counted in that task's prompt_tokens but are no longer sent.
+            _meta["_stripped_images_count"] = _image_count
     # P6 Snip Compact: 将 source_task_id 透传到 _meta，供 snip_history 按 task 过滤
     if msg.source_task_id:
         _meta["source_task_id"] = msg.source_task_id
@@ -508,6 +517,7 @@ def _strip_images_from_content(content: list[dict[str, Any]]) -> str:
     """
     text_parts: list[str] = []
     image_refs: list[str] = []
+    file_paths: list[str] = []
     for part in content:
         if not isinstance(part, dict):
             continue
@@ -525,7 +535,7 @@ def _strip_images_from_content(content: list[dict[str, Any]]) -> str:
             # inline marker. Purpose: avoid re-sending image bytes but preserve a
             # read_file-compatible path when one exists.
             if url.startswith("file://"):
-                image_refs.append(f"[image: {url[7:]}]")
+                file_paths.append(url[7:])
             else:
                 image_refs.append("[image: <inline>]")
         elif part.get("type") == "text":
@@ -533,6 +543,9 @@ def _strip_images_from_content(content: list[dict[str, Any]]) -> str:
             if t:
                 text_parts.append(t)
     text = "\n".join(text_parts)
+    # build_multimodal_content already annotates "[Attached images: path]";
+    # only add a reference for paths the text does not mention yet.
+    image_refs = [f"[image: {p}]" for p in file_paths if p not in text] + image_refs
     if image_refs:
         refs = "\n".join(image_refs)
         text = f"{text}\n{refs}" if text else refs

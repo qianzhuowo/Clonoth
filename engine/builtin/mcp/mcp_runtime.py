@@ -14,6 +14,7 @@ from typing import Any
 import yaml
 
 from clonoth_runtime import resolve_env_ref
+from toolbox._common import safe_subprocess_env
 
 _MCP_IMPORT_ERROR: Exception | None = None
 
@@ -403,7 +404,7 @@ async def open_session(workspace_root: Path, client_id: str):
             if not command:
                 raise RuntimeError("stdio client missing command")
             args = spec.get("args") or []
-            env = os.environ.copy()
+            env = safe_subprocess_env()
             for k, v in (spec.get("env") or {}).items():
                 env[str(k)] = resolve_env_ref(v)
             read_stream, write_stream = await stack.enter_async_context(
@@ -557,7 +558,7 @@ async def _get_stdio_actor(workspace_root: Path, client_id: str) -> _StdioSessio
     if not command:
         raise RuntimeError("stdio client missing command")
     args = [str(x) for x in (spec.get("args") or [])]
-    env = os.environ.copy()
+    env = safe_subprocess_env()
     for k, v in (spec.get("env") or {}).items():
         env[str(k)] = resolve_env_ref(v)
     sig = json.dumps({"c": command, "a": args, "e": {str(k): env.get(str(k), "") for k in (spec.get("env") or {})}}, sort_keys=True)

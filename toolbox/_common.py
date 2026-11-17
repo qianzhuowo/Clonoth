@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 from pathlib import Path
 from typing import Any
@@ -52,12 +53,15 @@ def kill_process_group(proc: "asyncio.subprocess.Process") -> None:
 # ---------------------------------------------------------------------------
 
 _SENSITIVE_ENV_KEYS_UPPER = {
-    "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
-    "ANTHROPIC_API_KEY",
-    "GEMINI_API_KEY",
-    "GOOGLE_API_KEY",
 }
+
+# Credential-shaped variable names (API keys, admin / bridge / access tokens,
+# passwords, cookies...). Command output can end up in chat replies, so these
+# never reach subprocesses; tools that need one read it from the workspace .env.
+_SENSITIVE_ENV_NAME = re.compile(
+    r"API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL|COOKIE|ACCESS_KEY"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -73,12 +77,8 @@ def safe_subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
     for k in list(env.keys()):
         ku = k.upper()
-        if ku in _SENSITIVE_ENV_KEYS_UPPER:
+        if ku in _SENSITIVE_ENV_KEYS_UPPER or _SENSITIVE_ENV_NAME.search(ku):
             env.pop(k, None)
-            continue
-        if ku.endswith("_API_KEY"):
-            env.pop(k, None)
-            continue
     return env
 
 

@@ -135,6 +135,7 @@ if __name__ == "__main__":
     import urllib.error
     import urllib.request
     import uuid
+    from pathlib import Path
 
     def _read_input():
         raw = (sys.stdin.read() or "{}").lstrip("\ufeff")
@@ -164,6 +165,18 @@ if __name__ == "__main__":
             if value is not None and str(value).strip():
                 return str(value).strip()
         return default
+
+    def _dotenv_value(name):
+        # Credential variables are stripped from tool subprocesses; read them
+        # from the workspace .env (tools run with cwd = workspace root).
+        env_path = Path.cwd() / ".env"
+        if not env_path.is_file():
+            return ""
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            key, sep, value = line.strip().partition("=")
+            if sep and key.strip() == name:
+                return value.strip().strip("'\"")
+        return ""
 
     args = _read_input()
 
@@ -206,7 +219,7 @@ if __name__ == "__main__":
 
     host = _env_first("ONEBOT_FORWARD_BRIDGE_HOST", default="127.0.0.1")
     port = _env_first("ONEBOT_FORWARD_BRIDGE_PORT", default="8769")
-    token = _env_first("ONEBOT_FORWARD_BRIDGE_TOKEN", default="")
+    token = _dotenv_value("ONEBOT_FORWARD_BRIDGE_TOKEN")
     # session_id 由 Engine 注入，Bridge 用它把请求映射回真实 QQ 群/用户，工具本身看不到真实号码。
     # 说明：入口任务实际运行在 branch session（CLONOTH_SESSION_ID=branch_xxx），而 QQ Bot
     # 侧的 _session_targets 仅按用户可见的 parent session 登记。因此这里优先使用

@@ -478,6 +478,28 @@ class ClonothClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def reset_conversation(self, conversation_key: str) -> dict[str, Any]:
+        """清空会话上下文：下一条消息将开启新 session。
+
+        对应 POST /v1/conversations/reset（需要 admin token）。Supervisor 会取消
+        该会话树内的在途任务并发出 context_reset(reason=clear) 事件。
+
+        Returns:
+            Supervisor 返回的结果 dict；会话不存在（404）时返回
+            ``{"ok": True, "already_clean": True}``，视为已经是干净状态。
+
+        Raises:
+            httpx.HTTPStatusError: 除 404 外的请求失败
+        """
+        resp = await self._http().post(
+            f"{self._base_url}/v1/conversations/reset",
+            json={"conversation_key": conversation_key},
+        )
+        if resp.status_code == 404:
+            return {"ok": True, "already_clean": True}
+        resp.raise_for_status()
+        return resp.json()
+
     # ---- Session Provider Override ----
 
     async def get_session_provider_override(self, session_id: str) -> dict[str, Any]:

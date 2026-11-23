@@ -226,6 +226,13 @@ async def _handle_agent(bot: Bot, event: GroupMessageEvent) -> None:
     stable_conversation_key = state.ANON.stable_conversation_key(real_conversation_key)
     user_text = (await state.forward_expander(bot).to_text(event.get_message(), getattr(bot, "self_id", None))).strip() or "你好"
     user_text = routing._strip_trigger_prefix(user_text)
+    clear_ctx_reply = await commands._maybe_handle_clear_context_command(
+        event=event,
+        user_text=user_text,
+        conversation_key=stable_conversation_key,
+    )
+    if clear_ctx_reply is not None:
+        await _agent_matcher.finish(clear_ctx_reply)
     asyncio.create_task(routing._auto_like_user(bot, int(event.user_id)))
 
     attachments, attachment_errors = await inbound_attachments.collect_message_attachments(bot, event, stable_conversation_key)
@@ -402,6 +409,13 @@ async def _handle_private_agent(bot: Bot, event: PrivateMessageEvent) -> None:
 
     real_conversation_key = f"qq_private:{user_id}"
     stable_conversation_key = state.ANON.stable_conversation_key(real_conversation_key)
+    clear_ctx_reply = await commands._maybe_handle_clear_context_command(
+        event=event,
+        user_text=user_text,
+        conversation_key=stable_conversation_key,
+    )
+    if clear_ctx_reply is not None:
+        await _private_matcher.finish(clear_ctx_reply)
     attachments, attachment_errors = await inbound_attachments.collect_message_attachments(bot, event, stable_conversation_key)
     state.RECENT.remember(stable_conversation_key, event, attachments)
     drawtools_reply = await commands._maybe_handle_drawtools_command(user_text)

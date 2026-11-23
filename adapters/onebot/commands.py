@@ -201,7 +201,9 @@ def _proactive_help_text() -> str:
         "   文本中用单独一行 --- 可拆成多条转发 node。\n\n"
         "5) 清除群记忆（清空指定 QQ 群的长期记忆）\n"
         "   /清除群记忆            —— 群聊内直接清空当前群；私聊内列出可清理的群\n"
-        "   /清除群记忆 <群名>     —— 清空指定群（群名/别名/群号均可）"
+        "   /清除群记忆 <群名>     —— 清空指定群（群名/别名/群号均可）\n"
+        "6) 清空对话上下文（不影响长期记忆；群主/群管也可用，私聊本人可用）\n"
+        "   /清空上下文（别名：/上下文清空 /重置上下文 /新对话 /reset）"
     )
 
 
@@ -862,3 +864,69 @@ async def _maybe_handle_clear_group_memory_command(
     if existed:
         return f"已清空群「{label}」的记忆（删除 {count} 个记忆本）。"
     return f"群「{label}」没有可清理的记忆（记忆目录为空或从未生成）。"
+
+
+def _is_clear_context_command(user_text: str) -> bool:
+    return bool(state._CLEAR_CONTEXT_RE.match(str(user_text or "").strip()))
+
+
+def _may_clear_context(event: Event) -> bool:
+    """私聊：本人即可（调用方已确认私聊放行）；群聊：Clonoth 管理员或群主/群管理。"""
+    if access.is_admin_user(getattr(event, "user_id", "")):
+        return True
+    if not isinstance(event, GroupMessageEvent):
+        return True
+    role = str(getattr(getattr(event, "sender", None), "role", "") or "").strip().lower()
+    return role in {"owner", "admin"}
+
+
+async def _drop_queued_inbound(conversation_key: str) -> bool:
+    """丢弃该会话尚未提交的排队消息，避免清空后旧消息又被送进新会话。"""
+    async with state._qq_queue_condition:
+        item = state._qq_queue_by_key.pop(conversation_key, None)
+        if item is None:
+            return False
+        with contextlib.suppress(ValueError):
+            state._qq_queue.remove(item)
+        return True
+
+
+async def _maybe_handle_clear_context_command(
+    *,
+    event: Event,
+    user_text: str,
+    conversation_key: str,
+) -> str | None:
+    """处理 /清空上下文 等命令：重置当前 QQ 会话，下一条消息开启新对话。
+
+    清理范围：Supervisor 会话（含在途任务、子会话、上下文文件）、适配器本地的
+    群聊历史缓存，以及该会话尚在队列中的消息。不影响长期记忆（见 /清除群记忆）。
+    返回回复文本；None 表示不是本命令。
+    """
+    if not _is_clear_context_command(user_text):
+        return None
+    if not _may_clear_context(event):
+        return "仅群主、群管理员或 Clonoth 管理员可以清空本群上下文。"
+    if state._client is None:
+        return "Clonoth Agent 尚未初始化，请稍后重试。"
+
+    dropped = await _drop_queued_inbound(conversation_key)
+    try:
+        result = await state._client.reset_conversation(conversation_key)
+    except Exception as exc:
+        logger.warning("reset conversation failed: %s", exc, exc_info=True)
+        return f"❌ 清空上下文失败：{exc}"
+
+    # context_reset 事件也会清群历史，但事件有轮询延迟，这里立即清一次。
+    if isinstance(event, GroupMessageEvent):
+        group_id = int(event.group_id)
+        state._group_history.pop(group_id, None)
+        state._group_content_records.pop(group_id, None)
+
+    logger.info(
+        "QQ user %s cleared context conv=%s old_session=%s cancelled=%s dropped_queued=%s",
+        getattr(event, "user_id", ""), conversation_key,
+        (result or {}).get("old_session_id", ""), (result or {}).get("cancelled_tasks", 0), dropped,
+    )
+    where = "本群" if isinstance(event, GroupMessageEvent) else "当前私聊"
+    return f"🧹 已清空{where}上下文，下一条消息将开启新对话。"

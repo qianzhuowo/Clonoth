@@ -139,10 +139,8 @@ def _build_messages_for_provider(
 ) -> list[dict[str, Any]]:
     """Build the message view that should be handed to the provider."""
     messages = [{k: v for k, v in message.items() if k != "response_info"} for message in messages]
-    non_dynamic = [message for message in messages if not message.get("_dynamic")]
-    prefill = non_dynamic[-1] if non_dynamic else None
-    if not (prefill and prefill.get("role") == "assistant" and not prefill.get("tool_calls")):
-        messages = non_dynamic + [message for message in messages if message.get("_dynamic")]
+    # Dynamic context stays where it was emitted; moving it on later steps
+    # invalidates the provider's cached prefix and tool-call pairing positions.
     provider_name = getattr(provider, "name", "") or ""
     formatter_mode = getattr(formatter, "mode", "") if formatter else ""
     if provider_name in {"openai-responses", "gemini", "gemini-vertex", "gemini-aistudio"} and formatter_mode in {"native", "fake-native"}:
@@ -162,7 +160,7 @@ async def call_provider_once(ls: _LoopState, step: int, provider: Any, *, messag
     after_llm_call is fired only by the outer inference loop.
     """
     call = replace(ls, provider=provider, messages=ls.messages if messages is None else messages,
-                   use_stream=False, retry_max=0)
+                   use_stream=ls.use_stream, retry_max=0)
     # A replacement call does not start another reactive-compaction attempt.
     call._reactive_compact_done = True
     # Image policy of a replacement call follows the replacement model's capability.
@@ -172,6 +170,10 @@ async def call_provider_once(ls: _LoopState, step: int, provider: Any, *, messag
     finally:
         ls.preempt_after_step = call.preempt_after_step
         ls.preempt_inject_info = call.preempt_inject_info
+        if call._reasoning_started_iso:
+            ls._reasoning_started_iso = call._reasoning_started_iso
+        if call._reasoning_ended_iso:
+            ls._reasoning_ended_iso = call._reasoning_ended_iso
 
 
 async def _llm_messages_for_call(ls: _LoopState) -> list[dict[str, Any]]:
@@ -196,6 +198,8 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
       - TaskAction(CANCELLED): 被取消
       - None: 思考阶段被 preempt 截断，partial message 已丢弃
     """
+    from engine.builtin.preempt import is_preempt_deferred_for_output_reject
+
     tools_arg = ls.openai_tools if ls.openai_tools else None
     # 反序列化方向：先用 build_llm_messages 做格式转换（修正跨模式 role、剥离 _meta 等内部字段），
     # 再按图片策略处理图片，最后用 prepare_messages_for_llm 解析 file:// → base64。
@@ -323,7 +327,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     # 调用方 ai_step.py 收到 TaskAction 后直接 return，
                     # 不执行 messages.append / _shadow_write，history 停留在上一轮完整状态。
                     return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id)
-                if not ls.preempt_after_step and ls.preempt_inject_info is None:
+                if not ls.preempt_after_step and ls.preempt_inject_info is None and not is_preempt_deferred_for_output_reject(ls):
                     _pi_s = await ls.rctx.check_preempted()
                     if _pi_s.get("preempted"):
                         if _pi_s.get("message"):
@@ -411,7 +415,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                         _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
                         _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, "cancelled": True}, span_id=_span_id))
                         return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id)
-                    if not ls.preempt_after_step and ls.preempt_inject_info is None:
+                    if not ls.preempt_after_step and ls.preempt_inject_info is None and not is_preempt_deferred_for_output_reject(ls):
                         _pi_n = await ls.rctx.check_preempted()
                         if _pi_n.get("preempted"):
                             if _pi_n.get("message"):
@@ -478,7 +482,7 @@ async def _call_llm_with_retry(ls: _LoopState, step: int):
                     _elapsed = round((time.monotonic() - _sig_t0) * 1000, 1)
                     _bus.emit(Signal(name="llm.call.end", payload={**_sig_payload, "elapsed_ms": _elapsed, "cancelled": True}, span_id=_span_id))
                     return TaskAction(action=ACTION_CANCELLED, node_id=ls.node.id)
-                if not ls.preempt_after_step and ls.preempt_inject_info is None:
+                if not ls.preempt_after_step and ls.preempt_inject_info is None and not is_preempt_deferred_for_output_reject(ls):
                     _pi_r = await ls.rctx.check_preempted()
                     if _pi_r.get("preempted"):
                         if _pi_r.get("message"):

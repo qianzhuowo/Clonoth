@@ -101,7 +101,7 @@ export const SetupWizard = () => {
           <div className="flex items-center gap-3 mb-4">
             <img
               src={`${import.meta.env.BASE_URL}logo-sm.jpg`}
-              alt="Clonoth"
+              alt="Console"
               className="h-11 w-11 rounded-lg"
             />
             <div>
@@ -227,7 +227,7 @@ export const SetupWizard = () => {
         </div>
 
         <p className="mt-3 text-center font-mono text-[0.6rem] text-[var(--duties-tertiary)]">
-          Clonoth 初始设置向导
+          初始设置向导
         </p>
       </div>
     </div>

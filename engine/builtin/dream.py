@@ -30,6 +30,14 @@ _TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled", "missing"}
 # access to update scheduler state itself. How: centralize the lock note
 # beside the polling constants. Purpose: keep the generated .dream-lock
 # format stable and avoid scattering literal strings across the handler.
+_ISOLATED_WS_PREFIXES = ("dm-", "vault_", "discord_")
+
+
+def _is_isolated_workspace(ws_name: str, channel: str = "") -> bool:
+    """Keep private workspaces and DM sessions out of global Dream."""
+    return channel == "discord_dm" or ws_name.lstrip("@").startswith(_ISOLATED_WS_PREFIXES)
+
+
 _DREAM_LOCK_NOTE = "Dream cycle completed via automated pipeline"
 _STANDARD_BOOKS = frozenset({
     "changelog", "channels", "default", "jokes", "models", "people",
@@ -351,7 +359,9 @@ class DreamHandler:
                 "content": e.get("_full_content", e["content_preview"]),
             }
             for e in topology_entries
-            if not e.get("constant") and (e["book"] not in _STANDARD_BOOKS or bool(e.get("_source_ws")))
+            if not e.get("constant")
+            and not _is_isolated_workspace(str(e.get("_source_ws") or ""))
+            and (e["book"] not in _STANDARD_BOOKS or str(e.get("_source_ws") or "").startswith("@thread-"))
         ][:20]
         fragment_json = json.dumps(fragment_entries, ensure_ascii=False, indent=2)
         instruction = self._build_dream_instruction(
@@ -492,7 +502,7 @@ class DreamHandler:
                         if not book.get("entries"):
                             book_path.unlink(missing_ok=True)
                 for ws_dir in node_dir.iterdir():
-                    if ws_dir.is_dir() and ws_dir.name.startswith("@"):
+                    if ws_dir.is_dir() and ws_dir.name.startswith("@") and not _is_isolated_workspace(ws_dir.name):
                         for book_path in ws_dir.glob("*.yaml"):
                             book = yaml.safe_load(book_path.read_text(encoding="utf-8")) or {}
                             if not book.get("entries"):
@@ -575,7 +585,13 @@ class DreamHandler:
                 continue
             # Isolated chats (QQ) never feed the global Dream: their memories
             # come only from per-session auto extraction into conv_<hash>.
-            if isolated_conversation_key(conv_key, self._runtime_cfg_for(workspace_root)):
+            # Upstream additionally keeps private workspaces / DMs out.
+            workspace = entry.get("workspace")
+            ws_name = str(workspace.get("name") or "") if isinstance(workspace, dict) else ""
+            if (
+                isolated_conversation_key(conv_key, self._runtime_cfg_for(workspace_root))
+                or _is_isolated_workspace(ws_name, channel)
+            ):
                 continue
             active.add(str(entry.get("session_id") or sid))
         return active
@@ -763,7 +779,7 @@ class DreamHandler:
             for p in node_dir.glob("*.yaml"):
                 books.add(p.stem)
             for ws_dir in node_dir.iterdir():
-                if ws_dir.is_dir() and ws_dir.name.startswith("@"):
+                if ws_dir.is_dir() and ws_dir.name.startswith("@") and not _is_isolated_workspace(ws_dir.name):
                     for p in ws_dir.glob("*.yaml"):
                         books.add(p.stem)
         # Legacy root-level
@@ -780,8 +796,15 @@ class DreamHandler:
             eid = str(e.get("id") or "").strip()
             ns = str(e.get("_source_ns") or "").strip()
             ws = str(e.get("_source_ws") or "").strip()
+            if _is_isolated_workspace(ws):
+                continue
             if book and eid:
-                route[f"{book}/{eid}"] = {"ns": ns, "ws": ws}
+                entry_key = f"{book}/{eid}"
+                if entry_key not in route or (ws and not route[entry_key]["ws"]):
+                    route[entry_key] = {"ns": ns, "ws": ws}
+                wildcard_key = f"*/{eid}"
+                if wildcard_key not in route or (ws and not route[wildcard_key]["ws"]):
+                    route[wildcard_key] = {"ns": ns, "ws": ws}
             if book and (book not in route or (route[book].get("ws") and not ws)):
                 route[book] = {"ns": ns, "ws": ws}
         return route
@@ -928,7 +951,7 @@ class DreamHandler:
             _scan_dir(node_dir, source_ns=ns, source_ws="")
             # Workspace sub-dirs (@guild-xxx, @dm-xxx, @thread-xxx)
             for ws_dir in sorted(node_dir.iterdir()):
-                if ws_dir.is_dir() and ws_dir.name.startswith("@"):
+                if ws_dir.is_dir() and ws_dir.name.startswith("@") and not _is_isolated_workspace(ws_dir.name):
                     _scan_dir(ws_dir, source_ns=ns, source_ws=ws_dir.name)
 
         # Legacy: root-level yaml files (pre-namespace migration)

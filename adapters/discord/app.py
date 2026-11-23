@@ -33,11 +33,15 @@ from clonoth_sdk import BotConfig, ClonothClient, EventRouter, SessionState  # n
 from .agent import ApprovalView, BotRestartConfirmView, _start_bridge, handle_agent, handle_model_command
 from .callbacks import DiscordCallbacks
 from .context import (
+    _ensure_thread_starter_history,
     _format_member_entry,
     _get_display_name,
+    _is_transient_bot_message,
     _previous_history_text,
     _push_history,
     _resolve_mentions_in_text,
+    _resolve_reference_message,
+    _unconsumed_history_messages,
     record_reaction_add,
     record_reaction_remove,
 )
@@ -335,8 +339,11 @@ def register_events(rt: DiscordRuntime) -> None:
         clean_text = await _resolve_mentions_in_text(raw_text, guild, bot_id)
 
         reply_author_name = ""
-        if message.reference and message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
-            reply_author_name = _get_display_name(message.reference.resolved.author)
+        if message.reference and isinstance(message.reference.resolved, discord.Message):
+            _ref_resolved = message.reference.resolved
+            _bot_user = rt.dc_client.user
+            if not (_bot_user and _ref_resolved.author.id == _bot_user.id and _is_transient_bot_message(rt, _ref_resolved.id)):
+                reply_author_name = _get_display_name(_ref_resolved.author)
 
         snapshots = getattr(message, "message_snapshots", None)
         if not clean_text and snapshots and len(snapshots) > 0:
@@ -382,9 +389,24 @@ def register_events(rt: DiscordRuntime) -> None:
             if message.mention_everyone:
                 return
 
-        user_input = clean_text or _current_message_media_text(message)
+        user_input = clean_text
         conversation_key = f"discord:{channel_id}"
-        inbound_attachments = await _collect_attachments(rt, message, conversation_key)
+        await _ensure_thread_starter_history(rt, message)
+        ref_msg = await _resolve_reference_message(rt, message)
+        if not reply_author_name and ref_msg is not None:
+            reply_author_name = _get_display_name(ref_msg.author)
+            for entry in reversed(rt.channel_history.get(channel_id, [])):
+                if entry.get("msg_id") == message.id:
+                    entry["text"] = _format_member_entry(
+                        message.author, clean_text, msg_time=message.created_at, reply_author=reply_author_name,
+                        key_roles=rt.key_roles,
+                    )
+                    break
+        extra_messages = [
+            *_unconsumed_history_messages(rt, channel_id, exclude_msg_id=message.id),
+            *([ref_msg] if ref_msg else []),
+        ]
+        inbound_attachments = await _collect_attachments(rt, message, conversation_key, extra_messages=extra_messages)
         inbound_attachments, transcripts, had_audio = await _transcribe_discord_audio_attachments(rt, inbound_attachments)
         if had_audio:
             user_input, history_text, input_modality = _compose_discord_user_text(user_input, transcripts, True)
@@ -409,6 +431,8 @@ def register_events(rt: DiscordRuntime) -> None:
                 channel_id,
                 inbound_attachments=inbound_attachments,
                 input_modality=input_modality,
+                ref_msg=ref_msg,
+                ref_resolved=True,
             )
         )
 

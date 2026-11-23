@@ -18,7 +18,7 @@ from ..compact_flow import prepare_compaction
 from ..protocol import TaskAction, ACTION_ASK, ACTION_DISPATCH, ACTION_FINISH
 from .loop_state import _LoopState, _short
 from .tool_format import ParsedToolCall
-from .pseudo_tools import _dispatch_target_from_tool_name
+from .pseudo_tools import DC_LIMIT, _dispatch_target_from_tool_name
 from .message_model import MessageMeta, set_message_meta
 from ..conversation_store import MessageType
 
@@ -97,6 +97,34 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
     # intermediate_reply: 非终止，发送中间消息
     if pseudo_call.name == "intermediate_reply":
         reply_text = str(args.get("text") or "").strip()
+        _split_parts = [p.strip() for p in reply_text.split("[SPLIT]") if p.strip()]
+        _over_parts = [
+            f"第{idx + 1}段 {len(part)}字符"
+            for idx, part in enumerate(_split_parts)
+            if len(part) > DC_LIMIT
+        ]
+        if _over_parts:
+            _reject_msg = (
+                f"❌ REJECTED: intermediate_reply 单段长度超出上限 ({DC_LIMIT} 字符)："
+                + ", ".join(_over_parts)
+                + f"。请缩短回复，或用 `[SPLIT]` 拆分长消息（每段不超过 {DC_LIMIT} 字符）后重新调用。"
+            )
+            _emit_pseudo_tool_result(
+                ls, pseudo_call, _reject_msg,
+                meta_patch={"tool_rejected": True, "tool_rejection_code": "exceed_dc_limit"},
+            )
+            await ls.rctx.emit_event("tool_call_end", {
+                "tool_call_id": pseudo_call.id or "",
+                "tool_name": "intermediate_reply",
+                "status": "error",
+                "rejected": True,
+                "rejection_code": "exceed_dc_limit",
+                "error": _reject_msg,
+                "raw_inline": _reject_msg,
+                "node_id": ls.node.id,
+                "task_id": ls.rctx.task_id,
+            })
+            return None
         _reply_att_paths = args.get("attachment_paths") or args.get("attachments") or []
         _reply_atts = _paths_to_attachments(_reply_att_paths, ls.rctx.workspace_root) if _reply_att_paths else []
         if reply_text or _reply_atts:

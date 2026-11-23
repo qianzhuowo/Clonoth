@@ -634,3 +634,84 @@ def test_process_emojis_drops_unknown_face_marker_and_warns(
         segments = asyncio.run(runtime.send.process_emojis("我错了 [表情:已删除的表情]", FakeBot(), [], ["开心"], []))
     assert segments == [{"type": "text", "content": "我错了 "}]
     assert "已删除的表情" in caplog.text
+
+
+# ----------------------------------------------------------------------
+#  合并 upstream：后台 trigger（无本地触发消息）走频道投递
+# ----------------------------------------------------------------------
+
+class _BackgroundCallbacks:
+    def __init__(self) -> None:
+        self.replies: list[tuple[Any, str]] = []
+        self.channel: list[tuple[str, str]] = []
+
+    async def send_reply(self, trigger, text, attachments, *, main_state=None, **kwargs):
+        self.replies.append((trigger, text))
+
+    async def send_to_channel(self, conversation_key, text, attachments, *, node_id="", **kwargs):
+        self.channel.append((conversation_key, text))
+
+
+def _ctx(src_seq: int) -> DeliveryContext:
+    return DeliveryContext(
+        event_id="evt-1", event_seq=10, task_id="task-1", source_inbound_seq=src_seq,
+        conversation_key="qq_group:1", attempt=1, idempotency_key="k",
+    )
+
+
+def test_background_trigger_final_reply_goes_to_channel_and_settles() -> None:
+    callbacks = _BackgroundCallbacks()
+    router = _bare_router(callbacks)
+    router._entry_node_id = "qq.orchestrator"
+    trigger = TriggerInfo(
+        inbound_seq=7, conversation_key="qq_group:1", session_id="s", is_dm=False,
+        platform_data={"background": True},
+    )
+    router._state.register_trigger(trigger)
+    router._state.get_or_create_main_state(7)
+
+    asyncio.run(router._deliver_outbound_message(
+        _event("outbound_message", 7), {"conversation_key": "qq_group:1"},
+        delivery_context=_ctx(7),
+    ))
+
+    # 进度收尾走 send_reply（状态文本），正文走频道路径。
+    assert [text for _t, text in callbacks.replies] == ["✓ 完成"]
+    assert callbacks.channel == [("qq_group:1", "hello")]
+    assert router._state.get_trigger(7) is None
+    assert router._state.get_main_state(7) is None
+
+
+def test_normal_trigger_final_reply_still_uses_send_reply() -> None:
+    callbacks = _BackgroundCallbacks()
+    router = _bare_router(callbacks)
+    router._entry_node_id = "qq.orchestrator"
+    trigger = TriggerInfo(inbound_seq=8, conversation_key="qq_group:1", session_id="s", is_dm=False)
+    router._state.register_trigger(trigger)
+
+    asyncio.run(router._deliver_outbound_message(
+        _event("outbound_message", 8), {"conversation_key": "qq_group:1"},
+        delivery_context=_ctx(8),
+    ))
+
+    assert callbacks.replies == [(trigger, "hello")]
+    assert callbacks.channel == []
+    assert router._state.get_trigger(8) is None
+
+
+def test_qq_send_reply_ignores_background_trigger(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    called: list[Any] = []
+
+    async def fake_send(*args, **kwargs):
+        called.append(args)
+
+    monkeypatch.setattr(runtime.send, "_send_text_and_attachments", fake_send)
+    trigger = TriggerInfo(
+        inbound_seq=9, conversation_key="qq_group:1", session_id="s", is_dm=False,
+        platform_data={"background": True},
+    )
+    asyncio.run(runtime.callbacks.TangQiuCallbacks().send_reply(trigger, "✓ 完成", []))
+    assert called == []

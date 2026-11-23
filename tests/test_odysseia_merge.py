@@ -212,7 +212,36 @@ def test_health_workspace_and_reset_clear_context_usage(tmp_path):
         state=state, process_manager=None, config_store=ConfigStore(path=data / "config.yaml"),
     )
     with TestClient(app) as client:
-        assert client.get("/v1/health").json()["workspace_root"] == str(tmp_path)
+        assert client.get("/v1/health").json()["workspace_root"] == ""
+        assert client.get("/openapi.json").status_code == 404
+        token = (data / ".admin_token").read_text(encoding="utf-8").strip()
+        assert client.get("/v1/health", headers={"Authorization": f"Bearer {token}"}).json()["workspace_root"] == str(tmp_path)
+    assert state.policy.evaluate_read_file(path="data/.admin_token").safety_level.value == "deny"
+    assert state.policy.evaluate_read_file(path="data/web_auth.json").safety_level.value == "deny"
+
+    import httpx
+    from toolbox.builtins import tasks
+
+    active_session_id = state.get_or_create_session(channel="test", conversation_key="test:reset")
+
+    async def _call_context_window():
+        token = (data / ".admin_token").read_text(encoding="utf-8").strip()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://supervisor",
+            headers={"Authorization": f"Bearer {token}"},
+        ) as http:
+            ctx = SimpleNamespace(
+                http=http,
+                supervisor_url="http://supervisor",
+                workspace_root=tmp_path,
+                route_session_id=lambda: active_session_id,
+                task_id="ctx-check",
+            )
+            return await tasks.get_context_window({}, ctx)
+
+    cw_res = asyncio.run(_call_context_window())
+    assert cw_res["ok"] and cw_res["data"]["prompt_tokens"] == 0
 
 
 def test_knowledge_inject_hygiene_static_index_and_progressive_outlines(tmp_path: Path):
@@ -419,11 +448,11 @@ def test_dynamic_tail_alignment_uau_uas_prefill_guard_and_prompt_static_isolatio
         "_meta": {"tool_mode": "native"},
     })
     view = _build_messages_for_provider(str_msgs, formatter, provider)
-    assert view[:4] == initial_view[:4]
-    assert [m["role"] for m in view] == ["system", "user", "assistant", "user", "assistant", "tool", "user"]
+    assert view[:5] == initial_view[:5]
+    assert [m["role"] for m in view] == ["system", "user", "assistant", "user", "user", "assistant", "tool"]
     assert view[3]["content"] == "turn1_q"
-    assert view[5]["content"] == "file_body"
-    assert view[6]["content"] == str_msgs[4]["content"]
+    assert view[4]["content"] == str_msgs[4]["content"]
+    assert view[6]["content"] == "file_body"
     assert str_msgs[4].get("_dynamic") is True
 
     # Block mode with trailing assistant prefill (UAU / UAS): _dynamic must NOT be moved after assistant prefill
@@ -947,3 +976,321 @@ def test_memory_extractor_skips_internal_result_turns(message_type):
     handler._maybe_trigger_memory_extract_locked(ctx={}, task=task)
     assert not handler._memory_extract_pending
     assert not handler._memory_extract_task_counts
+
+
+def test_provider_system_prefix_and_anthropic_top_level_cache():
+    from providers.anthropic import AnthropicProvider, _convert_messages
+    from providers.gemini import GeminiProvider
+
+    messages = [
+        {"role": "system", "content": "static system"},
+        {"role": "developer", "content": "static developer"},
+        {"role": "user", "content": "question"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "system", "content": "historical system"},
+        {"role": "developer", "content": "historical developer"},
+    ]
+    system, gemini = GeminiProvider._convert_messages(messages)
+    assert system == "static system\n\nstatic developer"
+    assert [m["role"] for m in gemini] == ["user", "model", "user", "user"]
+    assert [m["parts"][0]["text"] for m in gemini] == [
+        "question", "answer", "historical system", "historical developer",
+    ]
+    system, anthropic = _convert_messages(messages)
+    assert system == "static system\n\nstatic developer"
+    assert [m["role"] for m in anthropic] == ["user", "assistant", "user"]
+    assert [block["text"] for block in anthropic[-1]["content"]] == [
+        "historical system", "historical developer",
+    ]
+    async def run():
+        async with httpx.AsyncClient() as http:
+            provider = AnthropicProvider(http=http, api_key="test", base_url=None, model="test")
+            assert provider._build_payload(messages)["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+            disabled = AnthropicProvider(http=http, api_key="test", base_url=None, model="test",
+                                         provider_options={"prompt_cache_ttl": "off"})
+            assert "cache_control" not in disabled._build_payload(messages)
+    asyncio.run(run())
+
+
+def test_discord_outbound_named_mentions_preserve_code():
+    import discord
+    from adapters.discord.messaging import _resolve_outbound_mentions
+
+    alice = discord.User(state=None, data={"id": "123456", "username": "alice",
+                                          "discriminator": "0", "avatar": None, "global_name": "昵称"})
+    channel = SimpleNamespace(id=42)
+    runtime = SimpleNamespace(channel_history={42: [{"message": SimpleNamespace(author=alice)}]})
+    text = "<@Alice> <@昵称[alice]> `<@Alice>` ```\n<@Alice>\n``` <@Unknown>"
+    assert _resolve_outbound_mentions(runtime, channel, text) == (
+        "<@123456> <@123456> `<@Alice>` ```\n<@Alice>\n``` @Unknown"
+    )
+
+
+@pytest.mark.parametrize("child_session_id,task_context,expected", [
+    ("", {}, True),
+    ("child", {}, False),
+    ("", {"caller_task_id": "parent"}, False),
+])
+def test_preempt_recognizes_only_top_level_user_tasks(child_session_id, task_context, expected):
+    from engine.builtin.preempt import is_user_entry_task
+
+    ls = SimpleNamespace(rctx=SimpleNamespace(child_session_id=child_session_id, task_context=task_context))
+    assert is_user_entry_task(ls) is expected
+
+
+def test_knowledge_scan_ignores_discord_quote_and_dream_isolates_private_workspaces(tmp_path):
+    from engine.builtin.knowledge_inject import _strip_discord_wrapper_for_scan, build_knowledge_messages
+    from engine.builtin.dream import _is_isolated_workspace
+
+    wrapped = "【当前消息引用】\nquoted bot response\n【当前用户指令】\nAlice: do the actual task"
+    assert _strip_discord_wrapper_for_scan(wrapped) == "Alice: do the actual task"
+    assert _is_isolated_workspace("@dm-123")
+    assert _is_isolated_workspace("@vault_sec")
+    assert _is_isolated_workspace("@ordinary", channel="discord_dm")
+    assert not _is_isolated_workspace("@ordinary", channel="discord_guild")
+    assert _is_isolated_workspace("", channel="discord_dm")
+
+    entries = [
+        {"kind": "skill", "id": "pairing", "strategy": "keyword", "content": "Pairing guide",
+         "keywords": ["pairing"], "compiled_keywords": ["pairing"]},
+        {"kind": "memory", "id": "preference", "book": "people", "strategy": "keyword",
+         "content": "Pairing preference", "keywords": ["pairing"], "compiled_keywords": ["pairing"]},
+    ]
+    _, skill_dynamic, _, memory_dynamic = build_knowledge_messages(
+        tmp_path, entries, instruction_text="pairing",
+    )
+    assert set(skill_dynamic[0]["_injected_hashes"]) == {"skill:pairing"}
+    assert set(memory_dynamic[0]["_injected_hashes"]) == {"memory:people/preference"}
+    history = [
+        {"role": "user", "content": message["content"], "message_type": "dynamic_context",
+         "_meta": {"injected_hashes": message["_injected_hashes"]}}
+        for message in (*skill_dynamic, *memory_dynamic)
+    ]
+    _, skill_dynamic, _, memory_dynamic = build_knowledge_messages(
+        tmp_path, entries, instruction_text="pairing", history=history,
+    )
+    assert not skill_dynamic
+    assert not memory_dynamic
+
+
+def test_discord_thread_starter_and_unresolved_reference_attachments(tmp_path, monkeypatch):
+    import discord
+    from adapters.discord.context import (
+        _build_context_text, _build_reply_context, _ensure_thread_starter_history,
+        _push_history, _resolve_reference_message, _unconsumed_history_messages,
+    )
+    from adapters.discord.messaging import _collect_attachments
+    from clonoth_sdk import SessionState
+
+    class Message(SimpleNamespace):
+        pass
+
+    class Thread(SimpleNamespace):
+        async def fetch_message(self, message_id):
+            self.fetches.append(message_id)
+            assert message_id == 1001
+            return starter_msg
+
+    monkeypatch.setattr(discord, "Message", Message)
+    monkeypatch.setattr(discord, "Thread", Thread)
+    reads = []
+    image_bytes = b"\x89PNG\r\n\x1a\nthread-starter-image"
+
+    async def read_image():
+        reads.append(2001)
+        return image_bytes
+
+    att_starter = SimpleNamespace(id=2001, filename="error.png", content_type="image/png", read=read_image)
+    author = SimpleNamespace(id=42, name="alice", display_name="Alice", bot=False)
+    ch = Thread(id=1001, parent_id=None, parent=None, fetches=[])
+    starter_msg = Message(
+        id=1001, channel=ch, guild=None, author=author, content="一楼报错如图",
+        created_at=datetime.now(timezone.utc), attachments=[att_starter], stickers=[], embeds=[], reference=None,
+    )
+    msg_2 = Message(
+        id=1002, channel=ch, guild=None, author=author, content="请帮我看一下",
+        created_at=datetime.now(timezone.utc), attachments=[], stickers=[], embeds=[], reference=None,
+    )
+    rt = SimpleNamespace(
+        workspace=tmp_path, clonoth_client=None, dc_client=SimpleNamespace(user=None),
+        channel_history={}, history_seq_counter=0, history_max_len=15, key_roles=set(),
+        superusers=set(), session_state=SessionState(), transient_msg_ids=[],
+    )
+
+    async def run():
+        _push_history(rt, ch.id, msg_2.content, message=msg_2)
+        await _ensure_thread_starter_history(rt, msg_2)
+        await _ensure_thread_starter_history(rt, msg_2)
+        assert ch.fetches == [1001]
+        assert [e["msg_id"] for e in rt.channel_history[ch.id]] == [1001, 1002]
+        text = _build_context_text(rt, ch.id, author, msg_2.content, exclude_last=True)
+        assert "【群聊上下文记录】" in text and "一楼报错如图" in text
+        attachments = await _collect_attachments(
+            rt, msg_2, "discord:1001",
+            extra_messages=_unconsumed_history_messages(rt, ch.id, exclude_msg_id=msg_2.id),
+        )
+        assert len(attachments) == 1 and attachments[0]["type"] == "image"
+        assert attachments[0]["path"].startswith("data/attachments/")
+        assert "\\" not in attachments[0]["path"]
+        assert (tmp_path / attachments[0]["path"]).read_bytes() == image_bytes
+
+        msg_reply = Message(**{**vars(msg_2), "id": 1004, "reference": SimpleNamespace(
+            resolved=None, message_id=1001, fail_if_not_exists=False,
+        )})
+        ref_msg = await _resolve_reference_message(rt, msg_reply)
+        assert ref_msg is starter_msg and ch.fetches == [1001]
+        reply_context = await _build_reply_context(rt, msg_reply)
+        quoted = _build_context_text(rt, ch.id, author, msg_reply.content, reply_context=reply_context)
+        assert "【当前消息引用】" in quoted and "一楼报错如图" in reply_context
+        before = len(reads)
+        deduped = await _collect_attachments(rt, msg_reply, "discord:1001", extra_messages=[
+            *_unconsumed_history_messages(rt, ch.id, exclude_msg_id=msg_reply.id), ref_msg,
+        ])
+        assert len(deduped) == 1 and len(reads) == before + 1
+
+        current_seq = rt.channel_history[ch.id][-1]["seq"]
+        rt.session_state.register_watermark(1, ch.id, current_seq)
+        rt.session_state.accept_watermark(1)
+        msg_3 = Message(**{**vars(msg_2), "id": 1003})
+        _push_history(rt, ch.id, msg_3.content, message=msg_3)
+        await _ensure_thread_starter_history(rt, msg_3)
+        assert await _collect_attachments(rt, msg_3, "discord:1001", extra_messages=
+            _unconsumed_history_messages(rt, ch.id, exclude_msg_id=msg_3.id)) == []
+        assert ch.fetches == [1001]
+        # Explicit replies remain readable after history eviction and consumption.
+        rt.channel_history[ch.id] = []
+        assert await _resolve_reference_message(rt, msg_reply) is starter_msg
+        assert ch.fetches == [1001, 1001]
+
+        rt.session_state = SessionState()
+        rt.channel_history[ch.id] = []
+        for i in range(rt.history_max_len):
+            msg_last = Message(**{**vars(msg_2), "id": 1100 + i})
+            _push_history(rt, ch.id, msg_last.content, message=msg_last)
+        assert len(rt.channel_history[ch.id]) == rt.history_max_len
+        await _ensure_thread_starter_history(rt, msg_last)
+        q = rt.channel_history[ch.id]
+        assert len(q) == rt.history_max_len
+        assert q[0]["message"] is starter_msg and q[0]["msg_id"] == 1001
+        assert q[-1]["message"] is msg_last
+
+        starter_msg.content = ""
+        starter_msg.attachments = []
+        starter_msg.message_snapshots = [SimpleNamespace(
+            content="转发的报错", embeds=[], attachments=[att_starter],
+        )]
+        rt.channel_history[ch.id] = []
+        _push_history(rt, ch.id, msg_last.content, message=msg_last)
+        await _ensure_thread_starter_history(rt, msg_last)
+        assert "[转发] 转发的报错 [含1张图片]" in rt.channel_history[ch.id][0]["text"]
+        forwarded = await _collect_attachments(
+            rt, msg_last, "discord:1001",
+            extra_messages=_unconsumed_history_messages(rt, ch.id, exclude_msg_id=msg_last.id),
+        )
+        assert len(forwarded) == 1 and forwarded[0]["type"] == "image"
+        assert (tmp_path / forwarded[0]["path"]).read_bytes() == image_bytes
+
+        async def fetch_missing(message_id):
+            raise discord.HTTPException(SimpleNamespace(status=404, reason="Not Found"), "missing")
+
+        ch.parent = SimpleNamespace(id=999)
+        ch.parent_id = 999
+        ch.fetch_message = fetch_missing
+        rt.channel_history[ch.id] = []
+        assert await _resolve_reference_message(rt, msg_reply) is None
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure_transport", ["sse", "http"])
+def test_openai_responses_stateless_payload_and_item_conflict_recovery(failure_transport):
+    import json
+    from providers.openai_responses import OpenAIResponsesProvider
+
+    raw_output = [
+        {"type": "reasoning", "id": "rs_old", "status": "completed",
+         "summary": [{"type": "summary_text", "text": "do not replay"}],
+         "encrypted_content": "encrypted-thought"},
+        {"type": "reasoning", "id": "rs_empty", "summary": []},
+        {"type": "message", "id": "msg_old", "status": "completed", "role": "assistant",
+         "content": [{"type": "output_text", "text": "Checking"}]},
+        {"type": "function_call", "id": "fc_old", "status": "completed",
+         "call_id": "call_old", "name": "read_file", "arguments": "{}"},
+    ]
+    messages = [
+        {"role": "assistant", "content": "Checking", "_meta": {"metadata": {
+            "openai-responses": {"raw_output": raw_output},
+        }}},
+        {"role": "tool", "tool_call_id": "call_old", "content": "file contents"},
+    ]
+    requests = []
+    completed = {"output": raw_output, "usage": {"input_tokens": 10, "output_tokens": 2}}
+
+    def respond(request):
+        payload = json.loads(request.content)
+        requests.append(payload)
+        if not payload["stream"]:
+            return httpx.Response(200, json=completed)
+        if len(requests) == 1:
+            error = {
+                "type": "invalid_request_error", "code": "item_conflict",
+                "message": "An input item conflicts with an existing record.", "param": "input",
+            }
+            if failure_transport == "http":
+                response = httpx.Response(
+                    400, headers={"content-type": "application/json"},
+                    stream=httpx.ByteStream(json.dumps({"error": error}).encode()),
+                )
+                assert not response.is_stream_consumed
+                with pytest.raises(httpx.ResponseNotRead):
+                    response.json()
+                return response
+            events = [{"type": "error", "error": error}]
+        else:
+            events = [
+                {"type": "response.output_text.delta", "delta": "Recovered"},
+                {"type": "response.completed", "response": completed},
+            ]
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              text="".join(f"data: {json.dumps(event)}\n\n" for event in events))
+
+    async def run():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as http:
+            provider = OpenAIResponsesProvider(http=http, api_key="test", base_url=None, model="test")
+            instructions, input_items = provider._convert_messages(messages)
+            payload = provider._build_payload(
+                input_items=input_items, instructions=instructions, tools=None, stream=True,
+            )
+            assert payload["store"] is False
+            assert payload["include"] == ["reasoning.encrypted_content"]
+            assert all("id" not in item and "status" not in item for item in input_items)
+            reasoning = [item for item in input_items if item["type"] == "reasoning"]
+            assert reasoning == [{"type": "reasoning", "summary": [], "encrypted_content": "encrypted-thought"}]
+            assert input_items[-2] == {
+                "type": "function_call", "call_id": "call_old", "name": "read_file", "arguments": "{}",
+            }
+            assert input_items[-1] == {
+                "type": "function_call_output", "call_id": "call_old", "output": "file contents",
+            }
+            text = []
+
+            async def on_text(delta):
+                text.append(delta)
+
+            result = await provider.chat_stream(messages=messages, on_text=on_text)
+            assert result.ok and result.text == "Recovered"
+            assert text == ["Recovered"]
+            assert len(requests) == 2
+            assert requests[0]["input"] == input_items
+            assert requests[1]["input"] == [item for item in input_items if item["type"] != "reasoning"]
+            assert all(request["store"] is False for request in requests)
+            expected_raw = input_items[:-1]
+            assert result.provider_meta["raw_output"] == expected_raw
+            result = await provider.chat(messages=messages)
+            assert result.ok
+            assert result.provider_meta["raw_output"] == expected_raw
+            # Replaying persisted history must not mutate the stored records.
+            assert raw_output[0]["id"] == "rs_old"
+            assert raw_output[0]["summary"]
+
+    asyncio.run(run())

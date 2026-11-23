@@ -14,6 +14,7 @@ knowledge_inject's skill/memory injection onto this surface is a later step.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,11 @@ SCOPES = ("static", "dynamic")
 # (role/content/...) and pass through so a section can control message
 # boundaries (e.g. knowledge static emits separate system messages).
 SectionRender = Callable[["PromptSectionContext"], "None | str | list"]
+
+
+def content_sha1(text: str) -> str:
+    """Digest an injectable unit consistently across rendering and assembly."""
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
 @dataclass
@@ -159,9 +165,35 @@ class PromptSectionRegistry:
                 messages.append({"role": "user", "content": item.strip(), "_section": True})
         return messages
 
+    def render_dynamic_entries(self, ctx: PromptSectionContext) -> list[tuple[str, dict[str, str]]]:
+        """Render dynamic units with stable section or provider-supplied keys."""
+        entries: list[tuple[str, dict[str, str]]] = []
+        counts: dict[str, int] = {}
+        for name, item in self._render_named_items("dynamic", ctx):
+            if isinstance(item, dict):
+                text = str(item.get("content") or "").strip()
+                hashes = item.get("_injected_hashes")
+            elif isinstance(item, str):
+                text, hashes = item.strip(), None
+            else:
+                continue
+            if not text:
+                continue
+            if not hashes:
+                idx = counts.get(name, 0)
+                counts[name] = idx + 1
+                key = f"section:{name}" if idx == 0 else f"section:{name}#{idx}"
+                hashes = {key: content_sha1(text)}
+            entries.append((text, hashes))
+        return entries
+
     def _render_items(self, scope: str, ctx: PromptSectionContext) -> list[Any]:
         """Call each section render of one scope and flatten list returns."""
-        items: list[Any] = []
+        return [item for _name, item in self._render_named_items(scope, ctx)]
+
+    def _render_named_items(self, scope: str, ctx: PromptSectionContext) -> list[tuple[str, Any]]:
+        """Keep each item's section identity for persistent deduplication."""
+        items: list[tuple[str, Any]] = []
         for section in sorted(self._sections.values(), key=lambda s: (s.order, s.name)):
             if section.scope != scope:
                 continue
@@ -173,9 +205,9 @@ class PromptSectionRegistry:
             if result is None:
                 continue
             if isinstance(result, list):
-                items.extend(result)
+                items.extend((section.name, item) for item in result)
             else:
-                items.append(result)
+                items.append((section.name, result))
         return items
 
 

@@ -203,8 +203,10 @@ def _conversation_message_to_compact_dict(message: Any) -> dict[str, Any]:
         meta.setdefault("message_type", message_type)
     if meta:
         compact_message["_meta"] = meta
-    if raw.get("ephemeral") or raw.get("_dynamic"):
+    from engine.conversation_store import is_dynamic_context
+    if raw.get("ephemeral") or is_dynamic_context(raw):
         compact_message["_dynamic"] = True
+        compact_message.setdefault("message_type", "dynamic_context")
     if isinstance(raw.get("tool_calls"), list) and raw.get("tool_calls"):
         compact_message["tool_calls"] = raw.get("tool_calls")
     if raw.get("tool_call_id"):
@@ -294,7 +296,14 @@ def create_app(
     process_manager: ProcessManager | None,
     config_store: ConfigStore,
 ) -> FastAPI:
-    app = FastAPI(title="Clonoth Supervisor", version="0.1.0")
+    _enable_docs = os.environ.get("CLONOTH_ENABLE_DOCS", "").strip().lower() in {"1", "true", "yes"}
+    app = FastAPI(
+        title="Service",
+        version="0.1.0",
+        docs_url="/docs" if _enable_docs else None,
+        redoc_url="/redoc" if _enable_docs else None,
+        openapi_url="/openapi.json" if _enable_docs else None,
+    )
     app.state.state = state
     app.state.process_manager = process_manager
     app.state.config_store = config_store
@@ -377,12 +386,19 @@ def create_app(
     )
 
     @app.get("/v1/health", response_model=HealthOut)
-    async def health() -> HealthOut:
+    async def health(request: Request) -> HealthOut:
         st: SupervisorState = app.state.state
         uptime = (_now() - st.started_at).total_seconds()
+        is_authed = False
+        try:
+            verify_admin_token(request)
+            is_authed = True
+        except HTTPException:
+            is_authed = app.state.panel_auth.permits(request)
         return HealthOut(
             run_id=st.eventlog.run_id, started_at=st.started_at,
-            uptime_seconds=uptime, workspace_root=str(st.workspace_root),
+            uptime_seconds=uptime,
+            workspace_root=str(st.workspace_root) if is_authed else "",
         )
 
     @app.get("/v1/admin/usage/stats")
@@ -919,7 +935,7 @@ def create_app(
             raise HTTPException(status_code=413, detail="File too large (max 50MB)")
         save_path.write_bytes(content)
 
-        rel_path = str(save_path.relative_to(st.workspace_root))
+        rel_path = save_path.relative_to(st.workspace_root).as_posix()
         mime_type = file.content_type or "application/octet-stream"
         return {
             "path": rel_path,

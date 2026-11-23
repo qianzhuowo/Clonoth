@@ -28,11 +28,11 @@ export const WelcomePage = ({ composer }: WelcomePageProps) => {
         {/* Logo — same image as Sidebar header */}
         <img
           src={`${import.meta.env.BASE_URL}logo-sm.jpg`}
-          alt="Clonoth"
+          alt="Console"
           className="mb-4 h-14 w-14 rounded-xl"
         />
         <h1 className="mb-1 font-mono text-lg font-semibold tracking-[-0.04em] text-[var(--duties-text)]">
-          Clonoth
+          Console
         </h1>
         <p className="mb-6 font-mono text-xs text-[var(--duties-tertiary)]">
           开始新的对话

@@ -6,6 +6,8 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
+from engine.conversation_store import is_dynamic_context
+
 from ._helpers import SessionInfo, _now
 from .eventlog import SYSTEM_SESSION_ID
 from .types import ApprovalStatus, TaskStatus
@@ -979,6 +981,8 @@ class SessionMixin:
         # expected by callers (engine _fetch_history, hook ctx, /messages API)
         msgs: list[dict[str, Any]] = []
         for m in stored_msgs:
+            if is_dynamic_context(m) or m.message_type in ("retry_hint", "output_rejected"):
+                continue
             if m.role in ("user", "assistant", "system"):
                 content = m.content
                 if isinstance(content, str) and content.strip():
@@ -1023,6 +1027,8 @@ class SessionMixin:
                         messages.append(bm)
             # Re-sort by created_at to maintain chronological order
             messages.sort(key=lambda m: m.created_at or "")
+
+        messages = [m for m in messages if not is_dynamic_context(m) and m.message_type not in ("retry_hint", "output_rejected")]
 
         # [AutoC 2026-06-04] Why: the active-task modal needs to show only the
         # messages produced by a single task, not the entire session history.

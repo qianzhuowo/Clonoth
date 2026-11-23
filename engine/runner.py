@@ -44,7 +44,7 @@ from .protocol import TaskAction
 from .tool_step import result_to_raw
 # Phase 1 (Session Conversation Store): 导入 ConversationStore 用于影子写入，
 # 在每个 node task 执行时实例化并挂载到 RunContext，供 ai_step 影子写入消息。
-from .conversation_store import ConversationStore, Message, MessageType
+from .conversation_store import ConversationStore, Message, MessageType, is_dynamic_context
 # Phase 0/1: Signal System — 导入信号总线初始化和桥接函数。
 # 在 _run_node_task 中初始化 bus 并安装 EventLog 桥接，使 LLM 调用信号
 # 自动转发到 data/signals.jsonl 供监控使用。
@@ -398,6 +398,34 @@ def _find_pseudo_history_marker(content: str) -> tuple[str, int]:
     return tail[:separator_pos], pos
 
 
+def _wrap_dispatch_result_text(text: str, *, message_type: str, source: str = "", task_id: str = "") -> str:
+    meta = {}
+    if source:
+        meta["source"] = source
+    if task_id:
+        meta["task_id"] = task_id
+    kind = "async_tool" if message_type == "async_tool_result" else "dispatch"
+    return f'<dispatch_result kind="{kind}">\n' + json.dumps(meta, ensure_ascii=False) + "\n" + text + "\n</dispatch_result>"
+
+
+def _wrap_stored_inbound_callback(content: Any, *, message_type: str, meta: dict[str, Any]) -> Any:
+    """Keep callback presentation byte-identical on first delivery and history reload."""
+    if message_type not in ("dispatch_result", "async_tool_result"):
+        return content
+    def wrap(text: str) -> str:
+        if text.lstrip().startswith("<dispatch_result"):
+            return text
+        return _wrap_dispatch_result_text(text, message_type=message_type, source=meta.get("child_node_id", ""), task_id=meta.get("child_task_id", ""))
+    if isinstance(content, str):
+        return wrap(content)
+    if isinstance(content, list) and content and content[0].get("type") == "text":
+        text = content[0].get("text", "")
+        cut = text.rfind("\n[Attached images: ")
+        body, suffix = (text[:cut], text[cut:]) if cut >= 0 and text.endswith("]") else (text, "")
+        return [{**content[0], "text": wrap(body) + suffix}, *content[1:]]
+    return content
+
+
 def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict[str, Any]:
     """将 ConversationStore 的 Message 转为 runner 期望的 history dict 格式。
 
@@ -408,7 +436,7 @@ def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict
     # ConversationStore.update_message and persist the reject result.
     # How: carry id through the history dict. Purpose: ai_step can
     # locate and update the original finish "ok" row in JSONL.
-    d: dict[str, Any] = {"role": msg.role, "content": msg.content}
+    d: dict[str, Any] = {"role": msg.role, "content": _wrap_stored_inbound_callback(msg.content, message_type=msg.message_type, meta=msg.meta)}
     if msg.id:
         d["id"] = msg.id
     _meta = dict(msg.meta) if msg.meta else {}
@@ -433,11 +461,18 @@ def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict
     # P6 Snip Compact: 将 source_task_id 透传到 _meta，供 snip_history 按 task 过滤
     if msg.source_task_id:
         _meta["source_task_id"] = msg.source_task_id
-    if getattr(msg, "created_at", "") and not _meta.get("timestamp"):
+    if msg.created_at and not _meta.get("timestamp"):
         _meta["timestamp"] = msg.created_at
-    if getattr(msg, "message_type", ""):
+    if msg.message_type:
         d["message_type"] = msg.message_type
         _meta.setdefault("message_type", msg.message_type)
+    if is_dynamic_context(msg):
+        d["_dynamic"] = True
+        d["message_type"] = MessageType.DYNAMIC_CONTEXT
+        _meta["_dynamic"] = True
+        _meta["message_type"] = MessageType.DYNAMIC_CONTEXT
+        if _meta.get("_workspace_context"):
+            d["_workspace_context"] = True
     if _meta:
         d["_meta"] = _meta
     if msg.tool_calls:
@@ -445,9 +480,9 @@ def _message_to_history_dict(msg: Message, *, current_task_id: str = "") -> dict
     # [2026-05-01] 恢复 true native role=tool 消息的配对字段。
     # 怎么改：ConversationStore.Message 新增 tool_call_id/name，这里转回 history dict。
     # 目的：build_llm_messages 在 native 模式下能原样透传 role=tool + tool_call_id。
-    if getattr(msg, "tool_call_id", ""):
+    if msg.tool_call_id:
         d["tool_call_id"] = msg.tool_call_id
-    if getattr(msg, "name", ""):
+    if msg.name:
         d["name"] = msg.name
     return d
 
@@ -703,13 +738,13 @@ async def worker_loop(*, supervisor_url: str, workspace_root: Path, worker_id: s
             if _admin_token:
                 print("[engine] loaded admin token from shared file", flush=True)
 
-    _sup_headers: dict[str, str] = {"User-Agent": "Clonoth"}
+    _sup_headers: dict[str, str] = {}
     if _admin_token:
         _sup_headers["Authorization"] = f"Bearer {_admin_token}"
 
     async with (
         httpx.AsyncClient(timeout=sup_timeout, trust_env=False, headers=_sup_headers) as http,
-        httpx.AsyncClient(timeout=llm_timeout, trust_env=False, headers={"User-Agent": "Clonoth"}) as llm_http,
+        httpx.AsyncClient(timeout=llm_timeout, trust_env=False) as llm_http,
     ):
         await wait_supervisor(http, supervisor_url)
 
@@ -977,6 +1012,10 @@ def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
     _do = input_data.get("_dispatch_origin")
     if isinstance(_do, dict) and _do:
         ctx["dispatch_origin"] = _do
+    if input_data.get("_output_chain"):
+        ctx["_output_chain"] = True
+    if input_data.get("caller_task_id"):
+        ctx["caller_task_id"] = input_data["caller_task_id"]
     return ctx
 
 
@@ -1024,6 +1063,8 @@ async def _run_node_task(
         source_inbound_seq=int(source_inbound_seq) if source_inbound_seq is not None else None,
         task_context=_build_task_context(input_data),
     )
+    if task.get("caller_task_id"):
+        rctx.task_context["caller_task_id"] = task["caller_task_id"]
     # [AutoC 2026-08-10] Why: apply the durable session workspace after RunContext
     # creation. How: fetch {name, path} from supervisor and resolve into
     # workspace/workspace_name, defaulting to workspace_root when path is absent
@@ -1088,16 +1129,11 @@ async def _run_node_task(
             # fork: 先从父 session 复制历史到子 session
             _conv_store.fork(fork_from, child_session_id)
 
-        if not is_resume:
-            # 从子 session 的 JSONL 加载历史，过滤 system 消息（子节点重建自己的 system prompt）
-            stored = _conv_store.load(child_session_id)
-            history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
-            # [2026-05-07] 子会话恢复时先清理 finish 控制流历史。
-            # 原因：system.compactor 等 child session 可能已有旧 finish tool_call/tool_result 污染。
-            # 做法：在进入提示组装前去掉控制流配对，再保留旧 fake-native 尾部兼容清理。
-            # 目的：父会话不会回放子任务 finish 伪工具。
-            history = sanitize_control_tool_history(history)
-            history = _strip_trailing_pseudo_call(history)
+        # Resume uses the child's own durable history, just like the main session.
+        stored = _conv_store.load(child_session_id)
+        history = [_message_to_history_dict(m, current_task_id=task_id) for m in stored if m.role != "system"]
+        history = sanitize_control_tool_history(history)
+        history = _strip_trailing_pseudo_call(history)
         # child session 模式不使用 context_ref（让 ai_step 重建 system prompt）
         context_ref = ""
     elif _main_conv_enabled:
@@ -1123,10 +1159,17 @@ async def _run_node_task(
             # 则要 pop 掉，避免 assemble_initial_messages 再次追加造成重复。
             if not is_resume:
                 _cur_instr = str(input_data.get("instruction") or "").strip()
-                if _cur_instr and history and history[-1].get("role") == "user":
-                    _last_content = history[-1].get("content", "")
-                    if isinstance(_last_content, str) and _last_content.strip() == _cur_instr:
-                        history.pop()
+                if _cur_instr and history:
+                    tail_idx = len(history) - 1
+                    while tail_idx >= 0 and is_dynamic_context(history[tail_idx]):
+                        tail_idx -= 1
+                    if tail_idx >= 0 and history[tail_idx].get("role") == "user":
+                        tail_id = history[tail_idx].get("id")
+                        row = next((message for message in reversed(stored) if tail_id and message.id == tail_id), None)
+                        if row is not None and task_id and row.source_task_id == task_id and isinstance(row.content, str) and row.content.strip() == _cur_instr:
+                            dropped_ids = {message["id"] for message in history[tail_idx:] if message.get("id")}
+                            _conv_store.remove_messages(session_id, dropped_ids)
+                            del history[tail_idx:]
         context_ref = ""  # 走 ai_step 的 assemble_initial_messages 重建系统提示
     elif context_ref and not is_resume:
         # ====== 旧路径（兼容期保留）：从 snapshot 加载 ======
@@ -1278,7 +1321,8 @@ async def _run_node_task(
     # 会破坏对话顺序并复发图片附件。旧 snapshot 路径下此 case 通过 snapshot.messages
     # 直接回放解决，新路径下需要在这里把 instruction 和 attachments 清空。
     # message_assembly.py 同步改为 instruction 为空且无 attachments 时不追加末尾消息。
-    if _main_conv_enabled and not child_session_id and is_resume:
+    _resume_cleared = is_resume and bool(child_session_id or _main_conv_enabled)
+    if _resume_cleared:
         instruction = ""
         input_attachments = None
 
@@ -1364,7 +1408,7 @@ async def _run_node_task(
         )
         _conv_store.append(_target_sid, _user_msg)
 
-    if _inbound_message_type in ("dispatch_result", "async_tool_result"):
+    if _inbound_message_type in ("dispatch_result", "async_tool_result") and not _resume_cleared:
         # [AutoC 2026-06-04] Why: the model still needs context that this inbound came
         # from an async child task, but that presentation must not be persisted in
         # ConversationStore. How: prepend an English, LLM-only wrapper after the raw
@@ -1376,18 +1420,7 @@ async def _run_node_task(
         # async_tool_result 与 dispatch_result 共用标签，kind 属性区分来源。
         # Purpose: 两条回调路径（preempt / fork inbound）的投递形态一致，模型可
         # 靠识别这是系统投递的子任务产物而非用户发言。
-        _dr_meta: dict[str, Any] = {}
-        if _inbound_node_id:
-            _dr_meta["source"] = _inbound_node_id
-        if _inbound_child_task_id:
-            _dr_meta["task_id"] = _inbound_child_task_id
-        _dr_kind = "async_tool" if _inbound_message_type == "async_tool_result" else "dispatch"
-        instruction = (
-            f'<dispatch_result kind="{_dr_kind}">\n'
-            + json.dumps(_dr_meta, ensure_ascii=False)
-            + "\n" + instruction
-            + "\n</dispatch_result>"
-        )
+        instruction = _wrap_dispatch_result_text(instruction, message_type=_inbound_message_type, source=_inbound_node_id, task_id=_inbound_child_task_id)
 
     # Phase 0/1: Signal System — 初始化信号总线并安装 JSONL 桥接。
     # get_bus() 返回全局单例，install_event_bridge 是幂等的（多次调用只注册一次）。

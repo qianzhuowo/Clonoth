@@ -434,6 +434,7 @@ class ClonothClient:
             run_id=d.get("run_id", ""),
             started_at=str(d.get("started_at", "")),
             uptime_seconds=float(d.get("uptime_seconds", 0)),
+            workspace_root=str(d.get("workspace_root", "")),
         )
 
     async def get_openai_config(self) -> OpenAIConfig:

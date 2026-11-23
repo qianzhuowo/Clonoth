@@ -36,7 +36,13 @@ import yaml
 
 from clonoth_runtime import get_int
 from engine.node import Node
-from engine.inference.message_assembly import conversational_history
+from engine.conversation_store import is_dynamic_context
+from engine.faces.prompt_sections import content_sha1
+from engine.inference.message_assembly import (
+    collect_active_injected_hashes,
+    collect_summarized_injected_hashes,
+    conversational_history,
+)
 from toolbox._common import request_guard, resolve_under_allowed_roots
 from toolbox.builtins import SKILL_NAME_RE
 from toolbox.context import ToolContext
@@ -266,65 +272,77 @@ def match_keywords(compiled: list[re.Pattern[str] | str], text: str) -> bool:
 
 
 def _strip_discord_wrapper_for_scan(text: str) -> str:
-    """Strip Discord group-chat history block and role-badge parentheses before keyword scanning."""
-    if not text or "【当前用户指令】" not in text:
+    """Scan the user's command, never the quoted bot response or channel log."""
+    marker = "【当前用户指令】"
+    if marker not in text:
         return text
-    out_parts: list[str] = []
-    q_match = re.search(r"【当前消息引用】\s*\n(.*?)(?=\n当前时间:|\n【当前用户指令】)", text, flags=re.S)
-    if q_match:
-        q_body = re.sub(r"^\[[^\]]+\]\s*[^\n:：]{1,80}(?:\([^)\n]*\))?\s*:\s*", "", q_match.group(1).strip())
-        if q_body:
-            out_parts.append(q_body)
-    m = re.search(r"【当前用户指令】\s*\n?", text)
-    if m:
-        cmd_part = text[m.end():]
-        cmd_part = re.sub(r"\n*请根据以上上下文，执行当前用户的指令并给出回复。\s*$", "", cmd_part)
-        cmd_part = re.sub(r"\n*【Discord 回复方式提示】[\s\S]*$", "", cmd_part)
-        # Keep speaker name (without role list) + actual command body
-        cmd_part = re.sub(r"^([^\n（(]{1,80})(?:（身份组:\s*[^）\n]*）|\([^)\n]*\))\s*:\s*", r"\1: ", cmd_part)
-        out_parts.append(cmd_part)
-    return "\n".join(out_parts) if out_parts else text
+    command = text[text.rfind(marker) + len(marker):].lstrip()
+    command = re.sub(r"\n*请根据以上上下文，执行当前用户的指令并给出回复。\s*$", "", command)
+    command = re.sub(r"\n*【Discord 回复方式提示】[\s\S]*$", "", command)
+    return re.sub(r"^([^\n（(]{1,80})(?:（身份组:\s*[^）\n]*）|\([^)\n]*\))\s*:\s*", r"\1: ", command)
 
 
-def build_scan_text(
-    instruction_text: str,
-    history: list[dict[str, Any]] | None,
-    scan_depth: int,
-) -> str:
-    """Build the text scanned for keyword activation."""
-    # Why: skill and memory scan-depth handling must stay identical. How: always
-    # include the current instruction and append the last scan_depth conversation
-    # rounds using the legacy user-message boundary rule. Purpose: keep keyword
-    # activation scope unchanged after the files are merged.
-    parts: list[str] = [_strip_discord_wrapper_for_scan(instruction_text or "")]
+_NON_SCAN_USER_MESSAGE_TYPES = frozenset({
+    "summary", "output_rejected", "retry_hint", "dispatch_result", "async_tool_result",
+    "system_notice", "tool_result", "tool_result_attachment", "dynamic_context",
+})
+_NON_SCAN_USER_PREFIXES = (
+    "[Below is a structured summary", "[Task summary — original messages snipped]",
+    "reject by ", "reject: ", "<dispatch_result", "[Async tool", "[SYSTEM REJECTED]",
+    "[Execution Warning]", "[Important Reminder]", "The tool executions above produced the following image results:",
+)
+_ATTACHMENT_TEXT_PREFIXES = ("[Attached file:", "[File:", "[Invalid image attachment:")
+_ATTACHED_IMAGES_SUFFIX_RE = re.compile(r"\n\[Attached images: [^\n]*\]\s*$")
+
+
+def _extract_user_text_for_scan(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        _ATTACHED_IMAGES_SUFFIX_RE.sub("", part.get("text", ""))
+        for part in content
+        if isinstance(part, dict) and part.get("type") == "text"
+        and not part.get("text", "").lstrip().startswith(_ATTACHMENT_TEXT_PREFIXES)
+    )
+
+
+def _is_scannable_user_message(message: dict[str, Any]) -> bool:
+    meta = message.get("_meta") or message.get("meta") or {}
+    return bool(
+        message.get("role") == "user" and not is_dynamic_context(message)
+        and (message.get("message_type") or meta.get("message_type")) not in _NON_SCAN_USER_MESSAGE_TYPES
+        and not meta.get("rejected_draft") and not meta.get("is_rejection")
+        and not _extract_user_text_for_scan(message.get("content")).lstrip().startswith(_NON_SCAN_USER_PREFIXES)
+    )
+
+
+def _scan_text_of(message: dict[str, Any]) -> str:
+    return _strip_discord_wrapper_for_scan(_extract_user_text_for_scan(message.get("content")))
+
+
+def build_scan_text(instruction_text: str, history: list[dict[str, Any]] | None, scan_depth: int) -> str:
+    """Count genuine user rounds; current instruction is not charged to history depth."""
+    instruction = _strip_discord_wrapper_for_scan(instruction_text or "")
+    parts = [instruction]
     if history and scan_depth > 0:
-        # Why: the old implementation defined a round as a user message that
-        # starts after a non-user message. How: walk backward until enough round
-        # starts are found. Purpose: preserve keyword activation scope exactly.
-        round_starts: list[int] = []
-        for i in range(len(history) - 1, -1, -1):
-            msg_i = history[i]
-            if msg_i.get("role", "") != "user" or msg_i.get("_dynamic"):
-                continue
-            prev_is_real_user = (
-                i > 0
-                and history[i - 1].get("role", "") == "user"
-                and not history[i - 1].get("_dynamic")
-            )
-            if not prev_is_real_user:
-                round_starts.append(i)
-                if len(round_starts) >= scan_depth:
-                    break
-
-        if round_starts:
-            start_idx = round_starts[-1]
-            for msg in history[start_idx:]:
-                role = msg.get("role", "")
-                if role != "user" or msg.get("_dynamic"):
+        scan_end = len(history)
+        if instruction:
+            for j in range(len(history) - 1, -1, -1):
+                if is_dynamic_context(history[j]):
                     continue
-                content = msg.get("content")
-                if isinstance(content, str):
-                    parts.append(_strip_discord_wrapper_for_scan(content))
+                if _is_scannable_user_message(history[j]) and _scan_text_of(history[j]).strip() == instruction.strip():
+                    scan_end = j
+                break
+        starts = []
+        for i in range(scan_end - 1, -1, -1):
+            if _is_scannable_user_message(history[i]) and not (i > 0 and _is_scannable_user_message(history[i - 1])):
+                starts.append(i)
+                if len(starts) >= scan_depth:
+                    break
+        if starts:
+            parts.extend(_scan_text_of(message) for message in history[starts[-1]:scan_end] if _is_scannable_user_message(message))
     return "\n".join(parts)
 
 
@@ -1257,33 +1275,120 @@ def _sort_render_buckets(buckets: dict[str, list[dict[str, Any]]]) -> None:
         buckets[key].sort(key=lambda entry: str(entry.get("id") or ""))
 
 
+def _memory_dedup_key(entry: dict[str, Any]) -> str:
+    mem_id = str(entry.get("id") or "")
+    book = str(entry.get("book") or "default").strip() or "default"
+    return f"memory:{book}/{mem_id}"
+
+
+def _entry_dedup_keys(bucket_name: str, entry: dict[str, Any]) -> list[str]:
+    entry_id = str(entry.get("id") or "")
+    if bucket_name == "skill_active":
+        return [f"skill:{entry_id}"]
+    return [_memory_dedup_key(entry), f"memory:{entry_id}"]
+
+
+def _entry_outline_body(bucket_name: str, entry: dict[str, Any]) -> str:
+    return _build_skill_outline(entry) if bucket_name == "skill_active" else _build_memory_outline(entry)
+
+
+def _entry_variant_digests(
+    bucket_name: str,
+    entry: dict[str, Any],
+    *,
+    skill_inline_max_chars: int = 6000,
+    memory_inline_max_chars: int = 2000,
+) -> tuple[str | None, str]:
+    entry_id = str(entry.get("id") or "")
+    content = str(entry.get("content") or "")
+    is_skill = bucket_name == "skill_active"
+    header = f"\n## Skill: {entry_id}" if is_skill else f"\n## {entry_id}"
+    inline_max = skill_inline_max_chars if is_skill else memory_inline_max_chars
+    full = content_sha1(f"{header}\n\n{content}") if len(content) <= inline_max else None
+    outline = content_sha1(f"{header}\n\n{_entry_outline_body(bucket_name, entry)}\0{content}")
+    return full, outline
+
+
+def _is_entry_already_active(
+    bucket_name: str,
+    entry: dict[str, Any],
+    active_injected: dict[str, str] | None,
+    *,
+    skill_inline_max_chars: int = 6000,
+    memory_inline_max_chars: int = 2000,
+) -> bool:
+    if not active_injected or not entry.get("id") or not entry.get("content"):
+        return False
+    digests = {
+        d for d in _entry_variant_digests(
+            bucket_name, entry,
+            skill_inline_max_chars=skill_inline_max_chars,
+            memory_inline_max_chars=memory_inline_max_chars,
+        ) if d
+    }
+    return any(active_injected.get(k) in digests for k in _entry_dedup_keys(bucket_name, entry))
+
+
 def _apply_active_budget(
     buckets: dict[str, list[dict[str, Any]]], bucket_names: tuple[str, ...], max_budget_chars: int,
+    *, skill_inline_max_chars: int = 6000, memory_inline_max_chars: int = 2000,
+    active_injected: dict[str, str] | None = None,
 ) -> None:
-    """Budget active bodies only; retain overflow as progressive outlines."""
+    """Budget new bodies, then outlines; omit entries that fit neither."""
     if max_budget_chars <= 0:
         return
-    ranked = [(name, i, entry) for name in bucket_names for i, entry in enumerate(buckets[name])]
+    ranked = [
+        (name, i, entry)
+        for name in bucket_names for i, entry in enumerate(buckets[name])
+        if not _is_entry_already_active(
+            name, entry, active_injected,
+            skill_inline_max_chars=skill_inline_max_chars,
+            memory_inline_max_chars=memory_inline_max_chars,
+        )
+    ]
     ranked.sort(key=lambda item: int(item[2].get("priority") or 0), reverse=True)
     used = 0
+    dropped = set()
     for name, i, entry in ranked:
-        body_len = len(str(entry.get("content") or ""))
-        if used + body_len <= max_budget_chars:
+        body_len = len(entry["content"])
+        inline_max = skill_inline_max_chars if name == "skill_active" else memory_inline_max_chars
+        if body_len <= inline_max and used + body_len <= max_budget_chars:
             used += body_len
-        else:
+            continue
+        outline = _build_skill_outline(entry) if name == "skill_active" else _build_memory_outline(entry)
+        if used + len(outline) <= max_budget_chars:
+            used += len(outline)
             buckets[name][i] = {**entry, "_outline_only": True}
+        else:
+            dropped.add((name, i))
+    for name in bucket_names:
+        buckets[name] = [entry for i, entry in enumerate(buckets[name]) if (name, i) not in dropped]
 
 
-def _apply_skill_budget(buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int) -> None:
-    _apply_active_budget(buckets, ("skill_active",), max_budget_chars)
+def _apply_skill_budget(
+    buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int,
+    *, active_injected: dict[str, str] | None = None, skill_inline_max_chars: int = 6000,
+) -> None:
+    _apply_active_budget(buckets, ("skill_active",), max_budget_chars,
+                         active_injected=active_injected, skill_inline_max_chars=skill_inline_max_chars)
 
 
-def _apply_memory_budget(buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int) -> None:
-    _apply_active_budget(buckets, ("memory_active",), max_budget_chars)
+def _apply_memory_budget(
+    buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int,
+    *, active_injected: dict[str, str] | None = None, memory_inline_max_chars: int = 2000,
+) -> None:
+    _apply_active_budget(buckets, ("memory_active",), max_budget_chars,
+                         active_injected=active_injected, memory_inline_max_chars=memory_inline_max_chars)
 
 
-def _apply_global_budget(buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int) -> None:
-    _apply_active_budget(buckets, ("skill_active", "memory_active"), max_budget_chars)
+def _apply_global_budget(
+    buckets: dict[str, list[dict[str, Any]]], max_budget_chars: int,
+    *, active_injected: dict[str, str] | None = None,
+    skill_inline_max_chars: int = 6000, memory_inline_max_chars: int = 2000,
+) -> None:
+    _apply_active_budget(buckets, ("skill_active", "memory_active"), max_budget_chars,
+                         active_injected=active_injected, skill_inline_max_chars=skill_inline_max_chars,
+                         memory_inline_max_chars=memory_inline_max_chars)
 
 
 def _compact_index_desc(s: str, max_chars: int = 60) -> str:
@@ -1333,13 +1438,14 @@ def _render_skill_messages(
     dynamic_skills: list[dict[str, Any]],
     index_only_skills: list[dict[str, Any]],
     skill_inline_max_chars: int = 6000,
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    active_injected: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Render skill buckets using the legacy SKILLS tags."""
     # Why: callers and tests depend on exact SKILLS tag names and section
     # structure. How: copy the old renderer's joins and header strings while
     # reading unified entry fields. Purpose: make the refactor output-compatible.
     static_msgs: list[dict[str, str]] = []
-    dynamic_msgs: list[dict[str, str]] = []
+    dynamic_msgs: list[dict[str, Any]] = []
 
     if constant_skills:
         parts: list[str] = ["[SKILLS:CONSTANT]"]
@@ -1350,13 +1456,18 @@ def _render_skill_messages(
         static_msgs.append({"role": "system", "content": "\n".join(parts)})
 
     dynamic_parts: list[str] = []
-    if dynamic_skills:
-        dynamic_parts.append("[SKILLS:ACTIVE]")
-        for entry in dynamic_skills:
-            dynamic_parts.append(f"\n## Skill: {entry['id']}\n")
-            content = str(entry.get("content") or "")
-            dynamic_parts.append(_build_skill_outline(entry) if entry.get("_outline_only") or len(content) > skill_inline_max_chars else content)
-        dynamic_parts.append("\n[/SKILLS:ACTIVE]")
+    skill_hashes: dict[str, str] = {}
+    for entry in dynamic_skills:
+        if _is_entry_already_active("skill_active", entry, active_injected, skill_inline_max_chars=skill_inline_max_chars):
+            continue
+        content = str(entry.get("content") or "")
+        full_digest, outline_digest = _entry_variant_digests("skill_active", entry, skill_inline_max_chars=skill_inline_max_chars)
+        use_full = full_digest is not None and not entry.get("_outline_only")
+        rendered_body = content if use_full else _build_skill_outline(entry)
+        skill_hashes[f"skill:{entry['id']}"] = full_digest if use_full else outline_digest
+        dynamic_parts.extend((f"\n## Skill: {entry['id']}\n", rendered_body))
+    if dynamic_parts:
+        dynamic_parts = ["[SKILLS:ACTIVE]", *dynamic_parts, "\n[/SKILLS:ACTIVE]"]
 
     if index_only_skills:
         parts = ["[SKILLS:INDEX]",
@@ -1368,7 +1479,7 @@ def _render_skill_messages(
         static_msgs.append({"role": "system", "content": "\n".join(parts)})
 
     if dynamic_parts:
-        dynamic_msgs.append({"role": "system", "content": "\n".join(dynamic_parts)})
+        dynamic_msgs.append({"role": "system", "content": "\n".join(dynamic_parts), "_injected_hashes": skill_hashes})
 
     return static_msgs, dynamic_msgs
 
@@ -1378,12 +1489,13 @@ def _render_memory_messages(
     dynamic_entries: list[dict[str, Any]],
     index_entries: list[dict[str, Any]] | None = None,
     memory_inline_max_chars: int = 2000,
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    active_injected: dict[str, str] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Render memory buckets using the legacy MEMORY tags."""
     # Keep constant bodies and discovery metadata static; active bodies can
     # degrade to outlines without losing a path to their full content.
     static_msgs: list[dict[str, str]] = []
-    dynamic_msgs: list[dict[str, str]] = []
+    dynamic_msgs: list[dict[str, Any]] = []
 
     if constant_entries:
         parts: list[str] = ["[MEMORY:CONSTANT]"]
@@ -1403,16 +1515,21 @@ def _render_memory_messages(
         static_msgs.append({"role": "system", "content": "\n".join(parts)})
 
     dynamic_parts: list[str] = []
-    if dynamic_entries:
-        dynamic_parts.append("[MEMORY:ACTIVE]")
-        for entry in dynamic_entries:
-            dynamic_parts.append(f"\n## {entry['id']}\n")
-            content = str(entry.get("content") or "")
-            dynamic_parts.append(_build_memory_outline(entry) if entry.get("_outline_only") or len(content) > memory_inline_max_chars else content)
-        dynamic_parts.append("\n[/MEMORY:ACTIVE]")
+    mem_hashes: dict[str, str] = {}
+    for entry in dynamic_entries:
+        if _is_entry_already_active("memory_active", entry, active_injected, memory_inline_max_chars=memory_inline_max_chars):
+            continue
+        content = str(entry.get("content") or "")
+        full_digest, outline_digest = _entry_variant_digests("memory_active", entry, memory_inline_max_chars=memory_inline_max_chars)
+        use_full = full_digest is not None and not entry.get("_outline_only")
+        rendered_body = content if use_full else _build_memory_outline(entry)
+        mem_hashes[_memory_dedup_key(entry)] = full_digest if use_full else outline_digest
+        dynamic_parts.extend((f"\n## {entry['id']}\n", rendered_body))
+    if dynamic_parts:
+        dynamic_parts = ["[MEMORY:ACTIVE]", *dynamic_parts, "\n[/MEMORY:ACTIVE]"]
 
     if dynamic_parts:
-        dynamic_msgs.append({"role": "system", "content": "\n".join(dynamic_parts)})
+        dynamic_msgs.append({"role": "system", "content": "\n".join(dynamic_parts), "_injected_hashes": mem_hashes})
 
     return static_msgs, dynamic_msgs
 
@@ -1457,23 +1574,31 @@ def build_knowledge_messages(
     )
     _sort_render_buckets(buckets)
 
+    active_injected = {**collect_summarized_injected_hashes(history), **collect_active_injected_hashes(history)}
     if knowledge_max_budget_chars > 0:
-        _apply_global_budget(buckets, knowledge_max_budget_chars)
+        _apply_global_budget(
+            buckets, knowledge_max_budget_chars, active_injected=active_injected,
+            skill_inline_max_chars=skill_inline_max_chars, memory_inline_max_chars=memory_inline_max_chars,
+        )
     else:
-        _apply_skill_budget(buckets, skill_max_budget_chars)
-        _apply_memory_budget(buckets, memory_max_budget_chars)
+        _apply_skill_budget(buckets, skill_max_budget_chars, active_injected=active_injected,
+                            skill_inline_max_chars=skill_inline_max_chars)
+        _apply_memory_budget(buckets, memory_max_budget_chars, active_injected=active_injected,
+                             memory_inline_max_chars=memory_inline_max_chars)
 
     skill_static, skill_dynamic = _render_skill_messages(
         buckets["skill_constant"],
         buckets["skill_active"],
         buckets["skill_index"],
         skill_inline_max_chars=skill_inline_max_chars,
+        active_injected=active_injected,
     )
     memory_static, memory_dynamic = _render_memory_messages(
         buckets["memory_constant"],
         buckets["memory_active"],
         buckets["memory_index"],
         memory_inline_max_chars=memory_inline_max_chars,
+        active_injected=active_injected,
     )
     return skill_static, skill_dynamic, memory_static, memory_dynamic
 
@@ -2862,7 +2987,7 @@ class KnowledgeInjector:
             sctx.workspace_root,
             sctx.node,
             sctx.instruction,
-            conversational_history(sctx.history),
+            sctx.history,
             sctx.runtime_cfg,
             task_context={**(sctx.task_context or {}), "workspace_name": sctx.workspace_name},
         )
@@ -2879,14 +3004,13 @@ class KnowledgeInjector:
         msgs = [m for m in (*skill_static, *memory_static) if m.get("content")]
         return msgs or None
 
-    def render_dynamic(self, sctx: Any) -> list[str] | None:
-        """Contribute skill/memory active and index blocks as dynamic text parts."""
+    def render_dynamic(self, sctx: Any) -> list[dict[str, Any]] | None:
+        """Contribute active skill/memory messages with their injected hashes."""
         result = self._compute(sctx)
         if result is None:
             return None
         _skill_static, skill_dynamic, _memory_static, memory_dynamic = result
-        parts = [str(m["content"]) for m in (*skill_dynamic, *memory_dynamic) if m.get("content")]
-        return parts or None
+        return [m for m in (*skill_dynamic, *memory_dynamic) if m.get("content")] or None
 
     # [AutoC 2026-08-28] Dream memory router hook delegate.
     # Registered as ("before_tool_call", "_dream_route") in PLUGIN_META.

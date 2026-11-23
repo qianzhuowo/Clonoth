@@ -68,7 +68,7 @@ async def get_context_window(args: dict[str, Any], ctx: ToolContext) -> dict[str
         # empty branch estimate while the parent has the real usage record.
         route_session_id = ctx.route_session_id()
         r = await ctx.http.get(
-            f"{ctx.supervisor_url}/v1/sessions/{route_session_id}/context_usage",
+            f"{ctx.supervisor_url}/v1/sessions/{route_session_id}/context_window",
         )
         if r.status_code >= 400:
             return _err(r.text)

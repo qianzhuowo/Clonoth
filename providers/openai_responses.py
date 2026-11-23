@@ -51,43 +51,46 @@ _SYNTHETIC_TOOL_OUTPUT = "[No tool result was recorded by the engine.]"
 
 
 def _strip_encrypted_content(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Remove encrypted_content from reasoning items, keeping empty summary."""
-    cleaned: list[dict[str, Any]] = []
-    for item in items:
-        if isinstance(item, dict) and item.get("type") == "reasoning":
-            new_item = {k: v for k, v in item.items() if k != "encrypted_content"}
-            new_item["summary"] = []
-            cleaned.append(new_item)
-        else:
-            cleaned.append(item)
-    return cleaned
+    """Remove reasoning items when encrypted reasoning cannot be verified or conflicts upstream."""
+    return [
+        {k: v for k, v in item.items() if k not in ("id", "status")}
+        for item in items
+        if isinstance(item, dict) and item.get("type") != "reasoning"
+    ]
 
 
-def _strip_reasoning_summary_from_output(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Empty the summary array on reasoning output items so thought summaries are not duplicated or resent."""
+def _sanitize_output_items(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Strip server record IDs/status and empty thought summaries from Responses output items."""
     cleaned: list[dict[str, Any]] = []
     for item in items:
         if not isinstance(item, dict):
             continue
         if item.get("type") == "reasoning":
-            new_item = dict(item)
-            new_item["summary"] = []
-            new_item.pop("content", None)
-            cleaned.append(new_item)
+            enc = item.get("encrypted_content")
+            if not isinstance(enc, str) or not enc:
+                continue
+            cleaned.append({
+                "type": "reasoning",
+                "summary": [],
+                "encrypted_content": enc,
+            })
         else:
-            cleaned.append(dict(item))
+            cleaned.append({k: v for k, v in item.items() if k not in ("id", "status")})
     return cleaned
 
 
-def _is_encrypted_content_error(error_msg: str) -> bool:
-    """Return True for OpenAI encrypted reasoning verification failures."""
+def _is_encrypted_content_error(error_msg: str, error_code: str = "") -> bool:
+    """Return True for OpenAI encrypted reasoning verification or item_conflict failures."""
     lower = str(error_msg or "").lower()
-    # [2026-05-06] Why: generic verification/decryption errors may refer to
-    # unrelated inputs. How: require an encrypted-content marker plus the known
-    # OpenAI verification/decryption phrases. Purpose: retry only the safe
-    # fallback path requested for reasoning.encrypted_content failures.
+    code_lower = str(error_code or "").lower()
+    if code_lower == "item_conflict" or "item_conflict" in lower or "conflicts with an existing record" in lower:
+        return True
     has_encrypted_marker = "encrypted content" in lower or "encrypted_content" in lower
-    has_verification_failure = "could not be verified" in lower or "could not be decrypted" in lower
+    has_verification_failure = (
+        "could not be verified" in lower
+        or "could not be decrypted" in lower
+        or "invalid_encrypted_content" in lower
+    )
     return has_encrypted_marker and has_verification_failure
 
 
@@ -115,13 +118,18 @@ def _normalize_usage(usage: dict[str, Any]) -> dict[str, int]:
     return result
 
 
-def _response_error_message(resp: httpx.Response) -> str:
-    """Extract an API error message from an HTTP response."""
+def _response_error_message(resp: httpx.Response) -> tuple[str, str]:
+    """Extract an API error message and code from an HTTP response."""
     try:
         body = resp.json()
-        return body.get("error", {}).get("message", resp.text[:500])
-    except Exception:
-        return resp.text[:500] if resp.text else f"HTTP {resp.status_code}"
+    except ValueError:
+        return resp.text[:500] if resp.text else f"HTTP {resp.status_code}", ""
+    err = body.get("error") if isinstance(body, dict) else None
+    if isinstance(err, dict):
+        return str(err.get("message") or resp.text[:500]), str(err.get("code") or "")
+    if isinstance(err, str) and err:
+        return err, ""
+    return resp.text[:500] if resp.text else f"HTTP {resp.status_code}", ""
 
 
 class OpenAIResponsesProvider(BaseProvider):
@@ -153,6 +161,43 @@ class OpenAIResponsesProvider(BaseProvider):
         # _normalize_base_url ensures the URL ends with /v1
         self._base_url = _normalize_base_url(base_url)
         self._options = provider_options or {}
+
+        # max_tokens / max_completion_tokens -> max_output_tokens
+        _raw_max_tok = self._options.get("max_tokens")
+        if _raw_max_tok is None:
+            _raw_max_tok = self._options.get("max_completion_tokens")
+        if _raw_max_tok is None:
+            _raw_max_tok = self.default_max_tokens
+        try:
+            value = int(_raw_max_tok) if _raw_max_tok is not None else None
+        except (TypeError, ValueError):
+            value = None
+        self._max_output_tokens: int | None = value if value is not None and value > 0 else None
+
+        # 注入 reasoning 参数（支持 reasoning_effort 与 thought_summary，thought_summary 默认为 False）
+        _reasoning: dict[str, Any] = {}
+        _raw_r_dict = self._options.get("reasoning")
+        if isinstance(_raw_r_dict, dict):
+            _reasoning.update(_raw_r_dict)
+
+        _raw_effort = self._options.get("reasoning_effort", self.default_reasoning_effort)
+        if _raw_effort is not None:
+            _effort_str = str(_raw_effort).strip().lower()
+            if _effort_str:
+                _reasoning["effort"] = _effort_str
+
+        _raw_ts = self._options.get("thought_summary", self.default_thought_summary)
+        if _raw_ts is True or (isinstance(_raw_ts, str) and _raw_ts.strip().lower() in ("true", "1", "yes", "auto")):
+            _reasoning["summary"] = "auto"
+        elif isinstance(_raw_ts, str) and _raw_ts.strip().lower() in ("concise", "detailed"):
+            _reasoning["summary"] = _raw_ts.strip().lower()
+        elif "thought_summary" in self._options:
+            _reasoning.pop("summary", None)
+
+        if _reasoning.get("effort") == "none":
+            _reasoning.pop("summary", None)
+
+        self._reasoning: dict[str, Any] = _reasoning
 
     # ------------------------------------------------------------------
     # URL helpers
@@ -272,14 +317,7 @@ class OpenAIResponsesProvider(BaseProvider):
                     _raw_output = _resp_meta.get("raw_output")
 
                 if _raw_output and isinstance(_raw_output, list):
-                    for _raw_item in _raw_output:
-                        if not isinstance(_raw_item, dict):
-                            continue
-                        # Copy and strip summary text so stored thought_summary is never resent to OpenAI.
-                        _item = dict(_raw_item)
-                        if _item.get("type") == "reasoning":
-                            _item["summary"] = []
-                            _item.pop("content", None)
+                    for _item in _sanitize_output_items(_raw_output):
                         items.append(_item)
                         if _item.get("type") == "function_call" and _item.get("call_id"):
                             pending_calls.append({
@@ -350,13 +388,9 @@ class OpenAIResponsesProvider(BaseProvider):
             return ProviderResponse(ok=False, error=str(exc))
 
         if resp.status_code >= 400:
-            err_msg = _response_error_message(resp)
-            if resp.status_code == 400 and _is_encrypted_content_error(err_msg):
-                # [2026-05-06] Why: stale encrypted reasoning from saved
-                # Responses output can make OpenAI reject the request. How: strip
-                # encrypted_content from reasoning input items and resend this
-                # payload once. Purpose: recover the conversation while keeping
-                # the retry bounded and preserving summaries.
+            err_msg, err_code = _response_error_message(resp)
+            if resp.status_code == 400 and _is_encrypted_content_error(err_msg, err_code):
+                # Retry once without reasoning items that upstream cannot replay.
                 log.warning("Encrypted content verification failed, retrying without encrypted reasoning")
                 payload["input"] = _strip_encrypted_content(payload["input"])
                 try:
@@ -369,7 +403,7 @@ class OpenAIResponsesProvider(BaseProvider):
                 except Exception as exc:
                     return ProviderResponse(ok=False, error=str(exc))
                 if resp.status_code >= 400:
-                    err_msg = _response_error_message(resp)
+                    err_msg, err_code = _response_error_message(resp)
                     return ProviderResponse(ok=False, error=err_msg, status_code=resp.status_code)
             else:
                 return ProviderResponse(ok=False, error=err_msg, status_code=resp.status_code)
@@ -380,7 +414,9 @@ class OpenAIResponsesProvider(BaseProvider):
         # [2026-10-25] 清空 reasoning 项的 summary 数组，避免重复存储与回传摘要
         raw_output = body.get("output")
         if raw_output and isinstance(raw_output, list):
-            result.provider_meta["raw_output"] = _strip_reasoning_summary_from_output(raw_output)
+            sanitized_raw = _sanitize_output_items(raw_output)
+            if sanitized_raw:
+                result.provider_meta["raw_output"] = sanitized_raw
         return result
 
     # ------------------------------------------------------------------
@@ -434,22 +470,14 @@ class OpenAIResponsesProvider(BaseProvider):
                     timeout=600,
                 ) as stream:
                     if stream.status_code >= 400:
-                        body = await stream.aread()
-                        try:
-                            data = json.loads(body)
-                            err_msg = data.get("error", {}).get("message", body.decode()[:500])
-                        except Exception:
-                            err_msg = body.decode("utf-8", errors="replace")[:500]
+                        await stream.aread()
+                        err_msg, err_code = _response_error_message(stream)
                         if (
                             attempt == 0
                             and stream.status_code == 400
-                            and _is_encrypted_content_error(err_msg)
+                            and _is_encrypted_content_error(err_msg, err_code)
                         ):
-                            # [2026-05-06] Why: OpenAI can reject encrypted
-                            # reasoning before sending any SSE event. How: strip
-                            # encrypted_content and continue to the second and
-                            # final attempt. Purpose: recover once without an
-                            # unbounded retry loop.
+                            # HTTP errors precede all output; retry once without reasoning.
                             log.warning(
                                 "Encrypted content verification failed, retrying stream without encrypted reasoning"
                             )
@@ -577,26 +605,29 @@ class OpenAIResponsesProvider(BaseProvider):
                                 raw_output_items = _raw_out
 
                         # --- error / failure ---
-                        elif etype == "response.failed":
-                            err = event.get("response", {}).get("error", {})
-                            err_msg = err.get("message", str(err))
-                            if attempt == 0 and _is_encrypted_content_error(err_msg):
-                                # [2026-05-06] Why: OpenAI may report encrypted
-                                # reasoning failure as response.failed after the
-                                # SSE connection opens. How: close this stream,
-                                # strip encrypted_content, and retry exactly once.
-                                # Purpose: support both HTTP 400 and in-stream
-                                # failure shapes for the same fallback.
-                                log.warning(
-                                    "Encrypted content verification failed, retrying stream without encrypted reasoning"
-                                )
+                        elif etype in ("response.failed", "error"):
+                            if etype == "response.failed":
+                                err = event.get("response", {}).get("error", {})
+                                err_msg = err.get("message", str(err))
+                                err_code = str(err.get("code") or "")
+                            else:
+                                err_obj = event.get("error") if isinstance(event.get("error"), dict) else event
+                                err_msg = err_obj.get("message") or event.get("message") or str(event)
+                                err_code = str(err_obj.get("code") or event.get("code") or "")
+                            if (
+                                attempt == 0
+                                and not text_parts
+                                and not thinking_parts
+                                and not summary_parts
+                                and not pending_calls
+                                and _is_encrypted_content_error(err_msg, err_code)
+                            ):
+                                log.warning("Responses input conflict or verification failed, retrying stream without reasoning")
                                 payload["input"] = _strip_encrypted_content(payload["input"])
                                 retry_without_encrypted = True
                                 break
-                            return ProviderResponse(ok=False, error=f"API failed: {err_msg}")
-                        elif etype == "error":
-                            err_msg = event.get("message", str(event))
-                            return ProviderResponse(ok=False, error=f"Stream error: {err_msg}")
+                            prefix = "API failed" if etype == "response.failed" else "Stream error"
+                            return ProviderResponse(ok=False, error=f"{prefix}: {err_msg}")
 
             except Exception as exc:
                 return ProviderResponse(ok=False, error=str(exc))
@@ -608,7 +639,9 @@ class OpenAIResponsesProvider(BaseProvider):
             # raw_output_items 在 response.completed 事件中捕获（清空 summary 避免重复存储与回传）
             provider_meta: dict[str, Any] = {}
             if raw_output_items:
-                provider_meta["raw_output"] = _strip_reasoning_summary_from_output(raw_output_items)
+                sanitized_raw = _sanitize_output_items(raw_output_items)
+                if sanitized_raw:
+                    provider_meta["raw_output"] = sanitized_raw
 
             tool_calls: list[ToolCall] = []
             for _idx, pc in sorted(pending_calls.items()):
@@ -648,6 +681,7 @@ class OpenAIResponsesProvider(BaseProvider):
             "model": self.model,
             "input": input_items,
             "stream": stream,
+            "store": False,
             # Request encrypted reasoning tokens for multi-turn round-trip
             "include": ["reasoning.encrypted_content"],
         }
@@ -670,43 +704,10 @@ class OpenAIResponsesProvider(BaseProvider):
                 else:
                     resp_tools.append(t)
             payload["tools"] = resp_tools
-        # max_tokens / max_completion_tokens -> max_output_tokens
-        _raw_max_tok = self._options.get("max_tokens")
-        if _raw_max_tok is None:
-            _raw_max_tok = self._options.get("max_completion_tokens")
-        if _raw_max_tok is None:
-            _raw_max_tok = self.default_max_tokens
-        try:
-            if _raw_max_tok is not None and int(_raw_max_tok) > 0:
-                payload["max_output_tokens"] = int(_raw_max_tok)
-        except (TypeError, ValueError):
-            pass
-
-        # 注入 reasoning 参数（支持 reasoning_effort 与 thought_summary，thought_summary 默认为 False）
-        _reasoning: dict[str, Any] = {}
-        _raw_r_dict = self._options.get("reasoning")
-        if isinstance(_raw_r_dict, dict):
-            _reasoning.update(_raw_r_dict)
-
-        _raw_effort = self._options.get("reasoning_effort", self.default_reasoning_effort)
-        if _raw_effort is not None:
-            _effort_str = str(_raw_effort).strip().lower()
-            if _effort_str:
-                _reasoning["effort"] = _effort_str
-
-        _raw_ts = self._options.get("thought_summary", self.default_thought_summary)
-        if _raw_ts is True or (isinstance(_raw_ts, str) and _raw_ts.strip().lower() in ("true", "1", "yes", "auto")):
-            _reasoning["summary"] = "auto"
-        elif isinstance(_raw_ts, str) and _raw_ts.strip().lower() in ("concise", "detailed"):
-            _reasoning["summary"] = _raw_ts.strip().lower()
-        elif "thought_summary" in self._options:
-            _reasoning.pop("summary", None)
-
-        if _reasoning.get("effort") == "none":
-            _reasoning.pop("summary", None)
-
-        if _reasoning:
-            payload["reasoning"] = _reasoning
+        if self._max_output_tokens is not None:
+            payload["max_output_tokens"] = self._max_output_tokens
+        if self._reasoning:
+            payload["reasoning"] = dict(self._reasoning)
         return payload
 
     # ------------------------------------------------------------------

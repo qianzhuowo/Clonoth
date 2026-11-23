@@ -1,512 +1,215 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
 from .dynamic_context import _load_dynamic_context_vars
-from engine.faces.prompt_sections import PromptSectionContext, prompt_section_registry
+from ..conversation_store import MessageType, is_dynamic_context
+from ..compact import INHERITABLE_INJECTED_HASH_PREFIXES
+from engine.faces.prompt_sections import PromptSectionContext, content_sha1, prompt_section_registry
 from ..attachments import build_multimodal_content
 from ..node import Node
 from ..prompt import assemble_prompt
 from clonoth_runtime import get_int
 
-
-def _registry_static_messages(
-    section_context: PromptSectionContext | None,
-) -> list[dict[str, Any]]:
-    """Render registered static sections into cache-friendly pre-history messages."""
-    if section_context is None:
-        return []
-    return prompt_section_registry.render_messages("static", section_context)
+_VOLATILE_PROMPT_DYNAMIC_LINE_RE = re.compile(
+    r"^\s*(?:当前时间|Current\s+time|上下文使用率|Context\s+utilization|上下文占用|Context\s+usage)\s*[：:].*$",
+    re.IGNORECASE | re.MULTILINE,
+)
 
 
-def _registry_dynamic_parts(section_context: PromptSectionContext | None) -> list[str]:
-    """Render registered dynamic sections into per-turn dynamic content parts."""
-    if section_context is None:
-        return []
-    return prompt_section_registry.render_scope("dynamic", section_context)
+def _normalize_prompt_dynamic_for_hash(text: str) -> str:
+    return "\n".join(line.rstrip() for line in _VOLATILE_PROMPT_DYNAMIC_LINE_RE.sub("", text).splitlines() if line.strip()).strip()
 
 
-def conversational_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Filter history to only real conversation messages for keyword scanning.
-
-    Excludes:
-      - tool_result messages (tool execution output)
-      - _dynamic injections (previously injected dynamic context)
-      - messages with no text content (pure tool_call assistants)
-    Keeps everything else: user_input, summary, assistant with text,
-    and legacy messages without message_type.
-    """
-    result: list[dict[str, Any]] = []
-    for m in history:
-        # Skip old dynamic context injections
-        if m.get("_dynamic"):
-            continue
-        # Skip tool execution results
-        if m.get("message_type") == "tool_result":
-            continue
-        # Only include messages with actual text content
-        role = m.get("role", "")
-        if role in ("user", "assistant"):
-            content = m.get("content", "")
-            if isinstance(content, str) and content.strip():
-                result.append(m)
-    return result
+def collect_active_injected_hashes(messages: list[dict[str, Any]] | None) -> dict[str, str]:
+    """Read live injected units from history, the sole source of deduplication state."""
+    active: dict[str, str] = {}
+    for message in messages or []:
+        if is_dynamic_context(message):
+            meta = message.get("_meta") or message.get("meta") or {}
+            active.update(meta.get("injected_hashes", {}))
+    return active
 
 
-def assemble_messages_with_injections(
-    *,
-    workspace_root: Path,
-    system_prompt: list[dict[str, Any]],
-    history: list[dict[str, Any]],
-    instruction: str,
-    attachments: list[dict[str, Any]] | None = None,
-    skill_static: list[dict[str, Any]] | None = None,
-    skill_dynamic: list[dict[str, Any]] | None = None,
-    memory_static: list[dict[str, Any]] | None = None,
-    memory_dynamic: list[dict[str, Any]] | None = None,
-    section_context: PromptSectionContext | None = None,
-) -> tuple[list[dict[str, Any]], bool]:
-    """Lay out prompt messages using precomputed skill and memory injections.
-
-    Why: KnowledgeInjector must be able to rebuild the same prompt layout that
-    assemble_initial_messages historically produced, without duplicating
-    injection in two places. How: keep the block-mode and string-mode
-    placement rules in this shared helper and pass precomputed static/dynamic
-    injection messages into it. Purpose: allow before_prompt_build hooks to own
-    skill and memory construction while preserving byte-level prompt layout.
-    """
-    skill_static = list(skill_static or [])
-    skill_dynamic = list(skill_dynamic or [])
-    memory_static = list(memory_static or [])
-    memory_dynamic = list(memory_dynamic or [])
-    # Why: prompt sections are a plugin-facing contribution surface. How: render
-    # the registry after plugin-provided static lists so built-in ordering is
-    # unchanged when nothing is registered. Purpose: sections extend the prompt
-    # without replacing the existing injection layout.
-    section_static = _registry_static_messages(section_context)
-    section_dynamic = _registry_dynamic_parts(section_context)
-
-    # ---- Prompt cache friendly layout ----
-    # Detect block list mode: assemble_prompt returns blocks with {role: history}
-    _is_block_mode = any(
-        isinstance(m, dict) and m.get("role") == "history"
-        for m in system_prompt
-    )
-
-    messages: list[dict[str, Any]] = []
-
-    if _is_block_mode:
-        # === Block list mode ===
-        # User controls message structure via prompt blocks.
-        # {role: history} marks where conversation history is expanded.
-
-        # Partition blocks around history marker
-        _before_history: list[dict[str, Any]] = []
-        _after_history: list[dict[str, Any]] = []
-        _found_marker = False
-        for _blk in system_prompt:
-            if isinstance(_blk, dict) and _blk.get("role") == "history":
-                _found_marker = True
-                continue
-            if _found_marker:
-                _after_history.append(_blk)
-            else:
-                _before_history.append(_blk)
-
-        # Separate depth-blocks from normal post-history blocks
-        _depth_blocks: list[dict[str, Any]] = []
-        _post_blocks: list[dict[str, Any]] = []
-        for _pb in _after_history:
-            if "depth" in _pb:
-                _depth_blocks.append(_pb)
-            else:
-                _post_blocks.append(_pb)
-
-        # --- Pre-history blocks (user-defined) ---
-        messages.extend(_before_history)
-        # Skill/memory static (cache-friendly, before history)
-        messages.extend(skill_static)
-        messages.extend(memory_static)
-        messages.extend(section_static)
-
-        # --- Conversation history ---
-        messages.extend(history)
-
-        # 如果 history 末尾就是当前 instruction，先 pop 掉（后面统一追加在 dynamic 之后）
-        _last = history[-1] if history else None
-        _last_content = _last.get("content", "") if isinstance(_last, dict) else ""
-        _already_in_history = (
-            _last is not None
-            and _last.get("role") == "user"
-            and isinstance(_last_content, str)
-            and _last_content.strip() == instruction.strip()
-        )
-        if _already_in_history:
-            messages.pop()
-
-        # --- Dynamic (在 instruction 之前) ---
-        _dynamic_parts: list[str] = []
-        for _dm in skill_dynamic:
-            if _dm.get("content"):
-                _dynamic_parts.append(_dm["content"])
-        for _dm in memory_dynamic:
-            if _dm.get("content"):
-                _dynamic_parts.append(_dm["content"])
-        _dynamic_parts.extend(section_dynamic)
-        if _dynamic_parts:
-            messages.append({
-                "role": "user",
-                "content": "Below is this turn's dynamic context; it may change between turns.\n\n" + "\n\n".join(_dynamic_parts),
-                "_dynamic": True,
-            })
-
-        # --- Post-history blocks (no depth) ---
-        for _pb in _post_blocks:
-            messages.append({k: v for k, v in _pb.items() if k != "depth"})
-
-        # --- Instruction（始终在 dynamic/post_blocks 之后） ---
-        # Step 2（2026-04-16）：主节点 ConversationStore resume 场景下 runner 会把
-        # instruction 和 attachments 清空，此时不追加末尾 user 消息，避免与 JSONL
-        # 中已有的原 instruction 重复。
-        if attachments:
-            messages.append({"role": "user", "content": build_multimodal_content(instruction, attachments, workspace_root=workspace_root)})
-        elif instruction:
-            messages.append({"role": "user", "content": instruction})
-
-        # --- Depth blocks (insert from highest depth to lowest) ---
-        if _depth_blocks:
-            _depth_blocks.sort(key=lambda b: b.get("depth", 0), reverse=True)
-            for _db in _depth_blocks:
-                _d = int(_db.get("depth", 0))
-                _clean = {k: v for k, v in _db.items() if k != "depth"}
-                _insert_pos = max(0, len(messages) - _d)
-                messages.insert(_insert_pos, _clean)
-
-    else:
-        # === String mode (existing behavior) ===
-        # Stable prefix → history → instruction → dynamic suffix
-        #
-        # Dynamic content uses role=user instead of role=system so that
-        # Anthropic/Gemini (which merge all system messages into a single
-        # system field) keep a stable system cache across turns.
-
-        # --- stable prefix (system) ---
-        if system_prompt:
-            messages.append(system_prompt[0])  # static part
-        messages.extend(skill_static)
-        messages.extend(memory_static)
-        messages.extend(section_static)
-
-        # --- history ---
-        messages.extend(history)
-
-        # 如果 history 末尾就是当前 instruction，先 pop 掉（后面统一追加在 dynamic 之前）
-        _last = history[-1] if history else None
-        _last_content = _last.get("content", "") if isinstance(_last, dict) else ""
-        _already_in_history = (
-            _last is not None
-            and _last.get("role") == "user"
-            and isinstance(_last_content, str)
-            and _last_content.strip() == instruction.strip()
-        )
-        if _already_in_history:
-            messages.pop()
-
-        # --- instruction（固定历史前缀） ---
-        # Step 2（2026-04-16）：主节点 ConversationStore resume 场景下 runner 会把
-        # instruction 和 attachments 清空，此时不追加末尾 user 消息，避免与 JSONL
-        # 中已有的原 instruction 重复。
-        if attachments:
-            messages.append({"role": "user", "content": build_multimodal_content(instruction, attachments, workspace_root=workspace_root)})
-        elif instruction:
-            messages.append({"role": "user", "content": instruction})
-
-        # --- dynamic (在 instruction 之后) ---
-        _dynamic_parts_s: list[str] = []
-        if len(system_prompt) >= 2 and system_prompt[1].get("content"):
-            _dynamic_parts_s.append(system_prompt[1]["content"])
-        for _dm in skill_dynamic:
-            if _dm.get("content"):
-                _dynamic_parts_s.append(_dm["content"])
-        for _dm in memory_dynamic:
-            if _dm.get("content"):
-                _dynamic_parts_s.append(_dm["content"])
-        _dynamic_parts_s.extend(section_dynamic)
-        if _dynamic_parts_s:
-            messages.append({
-                "role": "user",
-                "content": "Below is this turn's dynamic context information; it may change between turns. If it is irrelevant to the current task, ignore it and continue with your previous work.\n\n" + "\n\n".join(_dynamic_parts_s),
-                "_dynamic": True,
-            })
-
-    return messages, _is_block_mode
+def collect_summarized_injected_hashes(messages: list[dict[str, Any]] | None) -> dict[str, str]:
+    """Read skill/memory units inherited by compact summaries, not live bodies."""
+    active: dict[str, str] = {}
+    for message in messages or []:
+        meta = message.get("_meta") or message.get("meta") or {}
+        if message.get("message_type") == MessageType.SUMMARY or meta.get("message_type") == MessageType.SUMMARY or meta.get("source_task_id") == "compact_summary":
+            active.update({key: value for key, value in meta.get("injected_hashes", {}).items() if key.startswith(INHERITABLE_INJECTED_HASH_PREFIXES)})
+    return active
 
 
-def assemble_initial_messages(
-    *,
-    workspace_root: Path,
-    runtime_cfg: dict[str, Any],
-    node: Node,
-    instruction: str,
-    history: list[dict[str, Any]],
-    task_context: dict[str, Any] | None = None,
-    session_id: str = "",
-    attachments: list[dict[str, Any]] | None = None,
-    workspace_name: str = "",
-) -> tuple[list[dict[str, Any]], bool, list[dict[str, Any]]]:
-    """构建初始 messages 数组。
-
-    返回 (messages, is_block_mode, system_prompt_blocks)。
-    system_prompt_blocks 是 assemble_prompt 的原始输出，供后续 preempt 注入使用。
-    """
-    prompt_vars: dict[str, str] = {
-        "node_id": node.id,
-        "node_name": node.name,
-        "instruction": instruction,
-    }
-    # 合并 config/dynamic_context.yaml 定义的动态变量
-    prompt_vars.update(_load_dynamic_context_vars(
-        workspace_root,
-        task_context=task_context,
-        session_id=session_id,
-        node_id=node.id,
-        compact_threshold=get_int(runtime_cfg, "engine.compact.threshold_tokens", 100_000, min_value=0),
-    ))
-    system_prompt = assemble_prompt(workspace_root, node, variables=prompt_vars)
-    # Why: this function now builds only the prompt skeleton, while knowledge
-    # content is added by before_prompt_build handlers. How: keep the existing
-    # layout code but pass empty skill and memory lists. Purpose: preserve message
-    # ordering without importing injection logic in the inference layer.
-    skill_static, skill_dynamic = [], []
-    memory_static, memory_dynamic = [], []
-    section_context = PromptSectionContext(
-        workspace_root=workspace_root,
-        node=node,
-        session_id=session_id,
-        history=history,
-        instruction=instruction,
-        task_context=dict(task_context or {}),
-        runtime_cfg=runtime_cfg,
-        workspace_name=workspace_name,
-    )
-    section_static = _registry_static_messages(section_context)
-    section_dynamic = _registry_dynamic_parts(section_context)
-
-    # ---- Prompt cache friendly layout ----
-    # Detect block list mode: assemble_prompt returns blocks with {role: history}
-    _is_block_mode = any(
-        isinstance(m, dict) and m.get("role") == "history"
-        for m in system_prompt
-    )
-
-    messages: list[dict[str, Any]] = []
-
-    if _is_block_mode:
-        # === Block list mode ===
-        # User controls message structure via prompt blocks.
-        # {role: history} marks where conversation history is expanded.
-
-        # Partition blocks around history marker
-        _before_history: list[dict[str, Any]] = []
-        _after_history: list[dict[str, Any]] = []
-        _found_marker = False
-        for _blk in system_prompt:
-            if isinstance(_blk, dict) and _blk.get("role") == "history":
-                _found_marker = True
-                continue
-            if _found_marker:
-                _after_history.append(_blk)
-            else:
-                _before_history.append(_blk)
-
-        # Separate depth-blocks from normal post-history blocks
-        _depth_blocks: list[dict[str, Any]] = []
-        _post_blocks: list[dict[str, Any]] = []
-        for _pb in _after_history:
-            if "depth" in _pb:
-                _depth_blocks.append(_pb)
-            else:
-                _post_blocks.append(_pb)
-
-        # --- Pre-history blocks (user-defined) ---
-        messages.extend(_before_history)
-        # Skill/memory static (cache-friendly, before history)
-        messages.extend(skill_static)
-        messages.extend(memory_static)
-        messages.extend(section_static)
-
-        # --- Conversation history ---
-        messages.extend(history)
-
-        # 如果 history 末尾就是当前 instruction，先 pop 掉（后面统一追加在 dynamic 之后）
-        _last = history[-1] if history else None
-        _last_content = _last.get("content", "") if isinstance(_last, dict) else ""
-        _already_in_history = (
-            _last is not None
-            and _last.get("role") == "user"
-            and isinstance(_last_content, str)
-            and _last_content.strip() == instruction.strip()
-        )
-        if _already_in_history:
-            messages.pop()
-
-        # --- Dynamic (在 instruction 之前) ---
-        _dynamic_parts: list[str] = []
-        for _dm in skill_dynamic:
-            if _dm.get("content"):
-                _dynamic_parts.append(_dm["content"])
-        for _dm in memory_dynamic:
-            if _dm.get("content"):
-                _dynamic_parts.append(_dm["content"])
-        _dynamic_parts.extend(section_dynamic)
-        if _dynamic_parts:
-            messages.append({
-                "role": "user",
-                "content": "Below is this turn's dynamic context; it may change between turns.\n\n" + "\n\n".join(_dynamic_parts),
-                "_dynamic": True,
-            })
-
-        # --- Post-history blocks (no depth) ---
-        for _pb in _post_blocks:
-            messages.append({k: v for k, v in _pb.items() if k != "depth"})
-
-        # --- Instruction（始终在 dynamic/post_blocks 之后） ---
-        # Step 2（2026-04-16）：主节点 ConversationStore resume 场景下 runner 会把
-        # instruction 和 attachments 清空，此时不追加末尾 user 消息，避免与 JSONL
-        # 中已有的原 instruction 重复。
-        if attachments:
-            messages.append({"role": "user", "content": build_multimodal_content(instruction, attachments, workspace_root=workspace_root)})
-        elif instruction:
-            messages.append({"role": "user", "content": instruction})
-
-        # --- Depth blocks (insert from highest depth to lowest) ---
-        if _depth_blocks:
-            _depth_blocks.sort(key=lambda b: b.get("depth", 0), reverse=True)
-            for _db in _depth_blocks:
-                _d = int(_db.get("depth", 0))
-                _clean = {k: v for k, v in _db.items() if k != "depth"}
-                _insert_pos = max(0, len(messages) - _d)
-                messages.insert(_insert_pos, _clean)
-
-    else:
-        # === String mode (existing behavior) ===
-        # Stable prefix → history → instruction → dynamic suffix
-        #
-        # Dynamic content uses role=user instead of role=system so that
-        # Anthropic/Gemini (which merge all system messages into a single
-        # system field) keep a stable system cache across turns.
-
-        # --- stable prefix (system) ---
-        if system_prompt:
-            messages.append(system_prompt[0])  # static part
-        messages.extend(skill_static)
-        messages.extend(memory_static)
-        messages.extend(section_static)
-
-        # --- history ---
-        messages.extend(history)
-
-        # 如果 history 末尾就是当前 instruction，先 pop 掉（后面统一追加在 dynamic 之前）
-        _last = history[-1] if history else None
-        _last_content = _last.get("content", "") if isinstance(_last, dict) else ""
-        _already_in_history = (
-            _last is not None
-            and _last.get("role") == "user"
-            and isinstance(_last_content, str)
-            and _last_content.strip() == instruction.strip()
-        )
-        if _already_in_history:
-            messages.pop()
-
-        # --- instruction（固定历史前缀） ---
-        # Step 2（2026-04-16）：主节点 ConversationStore resume 场景下 runner 会把
-        # instruction 和 attachments 清空，此时不追加末尾 user 消息，避免与 JSONL
-        # 中已有的原 instruction 重复。
-        if attachments:
-            messages.append({"role": "user", "content": build_multimodal_content(instruction, attachments, workspace_root=workspace_root)})
-        elif instruction:
-            messages.append({"role": "user", "content": instruction})
-
-        # --- dynamic (在 instruction 之后) ---
-        _dynamic_parts_s: list[str] = []
-        if len(system_prompt) >= 2 and system_prompt[1].get("content"):
-            _dynamic_parts_s.append(system_prompt[1]["content"])
-        for _dm in skill_dynamic:
-            if _dm.get("content"):
-                _dynamic_parts_s.append(_dm["content"])
-        for _dm in memory_dynamic:
-            if _dm.get("content"):
-                _dynamic_parts_s.append(_dm["content"])
-        _dynamic_parts_s.extend(section_dynamic)
-        if _dynamic_parts_s:
-            messages.append({
-                "role": "user",
-                "content": "Below is this turn's dynamic context information; it may change between turns. If it is irrelevant to the current task, ignore it and continue with your previous work.\n\n" + "\n\n".join(_dynamic_parts_s),
-                "_dynamic": True,
-            })
-
-    return messages, _is_block_mode, system_prompt
+def has_current_task_anchor(messages: list[dict[str, Any]] | None, task_id: str) -> bool:
+    """A surviving task segment already contains its dynamic context."""
+    if not task_id:
+        return False
+    for message in messages or []:
+        meta = message.get("_meta") or message.get("meta") or {}
+        if (meta.get("source_task_id") or message.get("source_task_id")) == task_id:
+            if message.get("role") in ("user", "assistant", "tool") or is_dynamic_context(message):
+                return True
+    return False
 
 
-def rebuild_dynamic_context(
-    messages: list[dict[str, Any]],
-    *,
-    workspace_root: Path,
-    node: Node,
-    runtime_cfg: dict[str, Any],
-    history: list[dict[str, Any]],
-    instruction: str,
-    is_block_mode: bool,
-    system_prompt: list[dict[str, Any]],
-    session_id: str = "",
-    workspace_name: str = "",
-    task_context: dict[str, Any] | None = None,
-) -> None:
-    """Append incremental ``_dynamic`` context for a mid-task preempt without mutating prior messages.
-
-    Why: removing the initial ``_dynamic`` message from the middle of ``messages``
-    shifts every subsequent message index and invalidates the Prefix KV Cache built
-    during earlier steps of the same turn. How: keep existing ``_dynamic`` messages
-    in place, render dynamic sections for the new instruction, filter out sections
-    already present in earlier ``_dynamic`` messages of this turn, and only append
-    a new ``_dynamic`` message when genuinely new dynamic content (e.g. newly
-    activated skills/memories) appears.
-    """
-    existing_dynamic_texts = [
-        str(m.get("content") or "")
-        for m in messages
-        if m.get("_dynamic")
-    ]
-    section_context = PromptSectionContext(
-        workspace_root=workspace_root,
-        node=node,
-        session_id=session_id,
-        history=history,
-        instruction=instruction,
-        task_context=dict(task_context or {}),
-        runtime_cfg=runtime_cfg,
-        workspace_name=workspace_name,
-    )
-    parts: list[str] = []
-    if not existing_dynamic_texts and not is_block_mode and len(system_prompt) >= 2 and system_prompt[1].get("content"):
-        parts.append(system_prompt[1]["content"])
-    rendered_parts = prompt_section_registry.render_scope("dynamic", section_context)
-    for part in rendered_parts:
-        if not part:
-            continue
-        if existing_dynamic_texts and any(part in prev for prev in existing_dynamic_texts):
-            continue
-        parts.append(part)
-    if not parts:
-        return
+def _build_dynamic_message(parts: list[str], injected_hashes: dict[str, str], *, is_block_mode: bool) -> dict[str, Any]:
     prefix = (
         "Below is this turn's dynamic context; it may change between turns.\n\n"
         if is_block_mode
         else "Below is this turn's dynamic context information; it may change between turns. If it is irrelevant to the current task, ignore it and continue with your previous work.\n\n"
     )
-    messages.append({
-        "role": "user",
-        "content": prefix + "\n\n".join(parts),
-        "_dynamic": True,
-    })
+    meta: dict[str, Any] = {"_dynamic": True, "message_type": MessageType.DYNAMIC_CONTEXT, "injected_hashes": injected_hashes}
+    return {"role": "user", "content": prefix + "\n\n".join(parts), "_dynamic": True, "message_type": MessageType.DYNAMIC_CONTEXT, "_meta": meta}
+
+
+def _collect_incremental_dynamic_parts(
+    *, system_prompt: list[dict[str, Any]], is_block_mode: bool,
+    skill_dynamic: list[dict[str, Any]], memory_dynamic: list[dict[str, Any]],
+    section_entries: list[tuple[str, dict[str, str]]], active_injected: dict[str, str],
+) -> tuple[list[str], dict[str, str]]:
+    parts: list[str] = []
+    new_hashes: dict[str, str] = {}
+    if not is_block_mode and len(system_prompt) >= 2 and system_prompt[1].get("content"):
+        text = system_prompt[1]["content"]
+        normalized = _normalize_prompt_dynamic_for_hash(text)
+        if normalized and active_injected.get("prompt_dynamic") != content_sha1(normalized):
+            parts.append(text)
+            new_hashes["prompt_dynamic"] = content_sha1(normalized)
+    for scope, units in (("skill_block", skill_dynamic), ("memory_block", memory_dynamic)):
+        for idx, unit in enumerate(units):
+            text = str(unit.get("content") or "").strip()
+            if text:
+                hashes = unit.get("_injected_hashes") or {f"{scope}:{idx}": content_sha1(text)}
+                if any(active_injected.get(key) != value for key, value in hashes.items()):
+                    parts.append(text)
+                    new_hashes.update(hashes)
+    for text, hashes in section_entries:
+        changed = {key: value for key, value in hashes.items() if active_injected.get(key) != value}
+        if text and changed:
+            parts.append(text)
+            new_hashes.update(changed)
+    return parts, new_hashes
+
+
+def conversational_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Exclude injected content, tools and rejection scaffolding from keyword scans."""
+    result: list[dict[str, Any]] = []
+    for message in history:
+        if is_dynamic_context(message):
+            continue
+        meta = message.get("_meta") or message.get("meta") or {}
+        if (message.get("message_type") or meta.get("message_type")) in ("tool_result", "retry_hint", "output_rejected") or meta.get("rejected_draft") or meta.get("is_rejection"):
+            continue
+        if message.get("role") not in ("user", "assistant"):
+            continue
+        content = message.get("content", "")
+        if isinstance(content, str) and content.strip():
+            result.append(message)
+        elif isinstance(content, list) and any(part.get("type") == "text" and part.get("text", "").strip() for part in content):
+            result.append(message)
+    return result
+
+
+def assemble_messages_with_injections(
+    *, workspace_root: Path, system_prompt: list[dict[str, Any]], history: list[dict[str, Any]], instruction: str,
+    attachments: list[dict[str, Any]] | None = None, skill_static: list[dict[str, Any]] | None = None,
+    skill_dynamic: list[dict[str, Any]] | None = None, memory_static: list[dict[str, Any]] | None = None,
+    memory_dynamic: list[dict[str, Any]] | None = None, section_context: PromptSectionContext | None = None,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Build one canonical layout: stable prefix, history, User_N, Dynamic_N."""
+    is_block_mode = any(message.get("role") == "history" for message in system_prompt)
+    section_static = prompt_section_registry.render_messages("static", section_context) if section_context is not None else []
+    section_entries = prompt_section_registry.render_dynamic_entries(section_context) if section_context is not None else []
+    parts, hashes = _collect_incremental_dynamic_parts(
+        system_prompt=system_prompt, is_block_mode=is_block_mode, skill_dynamic=skill_dynamic or [],
+        memory_dynamic=memory_dynamic or [], section_entries=section_entries,
+        active_injected=collect_active_injected_hashes(history),
+    )
+    messages: list[dict[str, Any]] = []
+    post_blocks: list[dict[str, Any]] = []
+    depth_blocks: list[dict[str, Any]] = []
+    if is_block_mode:
+        found_marker = False
+        for block in system_prompt:
+            if block.get("role") == "history":
+                found_marker = True
+            elif not found_marker:
+                messages.append(block)
+            elif "depth" in block:
+                depth_blocks.append(block)
+            else:
+                post_blocks.append(block)
+    elif system_prompt:
+        messages.append(system_prompt[0])
+    messages.extend(skill_static or [])
+    messages.extend(memory_static or [])
+    messages.extend(section_static)
+    messages.extend(history)
+    last = history[-1] if history else None
+    if last is not None and last.get("role") == "user" and not is_dynamic_context(last) and isinstance(last.get("content"), str) and last["content"].strip() == instruction.strip():
+        messages.pop()
+    if attachments:
+        messages.append({"role": "user", "content": build_multimodal_content(instruction, attachments, workspace_root=workspace_root)})
+    elif instruction:
+        messages.append({"role": "user", "content": instruction})
+    if parts:
+        messages.append(_build_dynamic_message(parts, hashes, is_block_mode=is_block_mode))
+    messages.extend(post_blocks)
+    for block in sorted(depth_blocks, key=lambda item: item["depth"], reverse=True):
+        messages.insert(max(0, len(messages) - int(block["depth"])), {key: value for key, value in block.items() if key != "depth"})
+    return messages, is_block_mode
+
+
+def _estimate_history_prompt_tokens(history: list[dict[str, Any]]) -> int:
+    from engine.builtin.compact import _seed_prompt_tokens
+    from ..compact import estimate_message_tokens
+    seeded = _seed_prompt_tokens(history)
+    return max(0, int(seeded)) if seeded is not None else sum(estimate_message_tokens(message) for message in history)
+
+
+def assemble_initial_messages(
+    *, workspace_root: Path, runtime_cfg: dict[str, Any], node: Node, instruction: str,
+    history: list[dict[str, Any]], task_context: dict[str, Any] | None = None, session_id: str = "",
+    attachments: list[dict[str, Any]] | None = None, workspace_name: str = "",
+) -> tuple[list[dict[str, Any]], bool, list[dict[str, Any]]]:
+    prompt_vars = {"node_id": node.id, "node_name": node.name, "instruction": instruction}
+    prompt_vars.update(_load_dynamic_context_vars(
+        workspace_root, task_context=task_context, session_id=session_id, node_id=node.id,
+        prompt_tokens=_estimate_history_prompt_tokens(history),
+        compact_threshold=get_int(runtime_cfg, "engine.compact.threshold_tokens", 100_000, min_value=0),
+    ))
+    system_prompt = assemble_prompt(workspace_root, node, variables=prompt_vars)
+    section_context = PromptSectionContext(
+        workspace_root=workspace_root, node=node, session_id=session_id, history=history, instruction=instruction,
+        task_context=task_context or {}, runtime_cfg=runtime_cfg, workspace_name=workspace_name,
+    )
+    messages, is_block_mode = assemble_messages_with_injections(
+        workspace_root=workspace_root, system_prompt=system_prompt, history=history,
+        instruction=instruction, attachments=attachments, section_context=section_context,
+    )
+    return messages, is_block_mode, system_prompt
+
+
+def rebuild_dynamic_context(
+    messages: list[dict[str, Any]], *, workspace_root: Path, node: Node, runtime_cfg: dict[str, Any],
+    instruction: str, is_block_mode: bool, system_prompt: list[dict[str, Any]],
+    session_id: str = "", workspace_name: str = "", task_context: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Append only new units after resume/preempt, leaving the live prefix intact."""
+    section_context = PromptSectionContext(
+        workspace_root=workspace_root, node=node, session_id=session_id, history=messages, instruction=instruction,
+        task_context=task_context or {}, runtime_cfg=runtime_cfg, workspace_name=workspace_name,
+    )
+    parts, hashes = _collect_incremental_dynamic_parts(
+        system_prompt=system_prompt, is_block_mode=is_block_mode, skill_dynamic=[], memory_dynamic=[],
+        section_entries=prompt_section_registry.render_dynamic_entries(section_context),
+        active_injected=collect_active_injected_hashes(messages),
+    )
+    if not parts:
+        return None
+    message = _build_dynamic_message(parts, hashes, is_block_mode=is_block_mode)
+    messages.append(message)
+    return message

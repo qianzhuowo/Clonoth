@@ -94,6 +94,7 @@ def _message_to_turn_summary_dict(message: Any) -> dict[str, Any]:
 def _format_task_messages_for_turn_summary(messages: list[Any]) -> str:
     """Format task messages for system.turn_summarizer without control-tool plumbing."""
     from engine.inference.tool_format import sanitize_control_tool_history
+    from engine.conversation_store import is_dynamic_context
 
     # [2026-05-07] 轮摘要输入必须跳过 finish 控制流工具历史。
     # 原因：system.turn_summarizer 从 ConversationStore 重新读取任务消息，旧数据中可能已有 finish tool_call/tool_result。
@@ -105,6 +106,9 @@ def _format_task_messages_for_turn_summary(messages: list[Any]) -> str:
 
     parts: list[str] = []
     for msg in cleaned:
+        meta = msg.get("_meta") or msg.get("meta") or {}
+        if is_dynamic_context(msg) or (msg.get("message_type") or meta.get("message_type")) in ("retry_hint", "output_rejected"):
+            continue
         content = msg.get("content") or ""
         if not isinstance(content, str):
             content = str(content)

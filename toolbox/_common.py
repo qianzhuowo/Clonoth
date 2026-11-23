@@ -54,13 +54,25 @@ def kill_process_group(proc: "asyncio.subprocess.Process") -> None:
 
 _SENSITIVE_ENV_KEYS_UPPER = {
     "OPENAI_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "CLONOTH_ADMIN_TOKEN",
+    "DISCORD_TOKEN",
+    "DISCORD_BOT_TOKEN",
+    "ONEBOT_ACCESS_TOKEN",
+    "SQL_DSN",
+    "REDIS_CONN_STRING",
 }
 
 # Credential-shaped variable names (API keys, admin / bridge / access tokens,
-# passwords, cookies...). Command output can end up in chat replies, so these
-# never reach subprocesses; tools that need one read it from the workspace .env.
+# passwords, cookies, DSNs...). Command output can end up in chat replies, so
+# these never reach subprocesses; tools that need one read it from the workspace .env.
+# Superset of upstream's suffix list (_API_KEY/_SECRET/_TOKEN/_PASSWORD/_PASSWD/
+# _PWD/_COOKIE/_PRIVATE_KEY/_DSN); "_PWD$" keeps PWD/OLDPWD untouched.
 _SENSITIVE_ENV_NAME = re.compile(
     r"API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE_KEY|CREDENTIAL|COOKIE|ACCESS_KEY"
+    r"|_PWD$|DSN|CONN_STRING"
 )
 
 
@@ -79,6 +91,8 @@ def safe_subprocess_env() -> dict[str, str]:
         ku = k.upper()
         if ku in _SENSITIVE_ENV_KEYS_UPPER or _SENSITIVE_ENV_NAME.search(ku):
             env.pop(k, None)
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONIOENCODING"] = "utf-8"
     return env
 
 

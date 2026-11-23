@@ -274,6 +274,14 @@ class DiscordCallbacks:
         main_state: MainTaskState | None = None,
     ) -> None:
         pd = trigger.platform_data
+        if pd.get("background"):
+            if main_state is not None:
+                await self._settle_log_msg(main_state, text)
+            seq = trigger.inbound_seq
+            self._dot_states.pop(seq, None)
+            self._last_edit_time.pop(seq, None)
+            self._last_edit_time.pop(f"log:{seq}", None)
+            return
         msg: discord.Message = pd.get("message")
         channel_id: int = pd.get("channel_id", 0)
 

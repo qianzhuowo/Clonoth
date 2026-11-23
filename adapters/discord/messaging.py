@@ -95,25 +95,34 @@ async def _collect_attachments(
     rt: Any,
     message: discord.Message,
     conversation_key: str,
+    *,
+    extra_messages: list[discord.Message] | None = None,
 ) -> list[dict[str, Any]]:
-    """将消息及其引用中的附件保存到 data/attachments/，返回 Clonoth 附件列表。"""
+    """Save attachments from the current message and its ordered context sources."""
     result: list[dict[str, Any]] = []
-    all_atts = list(message.attachments)
-    if message.reference and message.reference.resolved and hasattr(message.reference.resolved, "attachments"):
-        all_atts.extend(message.reference.resolved.attachments)
+    candidates = [*(extra_messages or ()), message]
+    sources: list[discord.Message] = []
+    seen_messages: set[int] = set()
+    for src in candidates:
+        source_id = src.id
+        if source_id not in seen_messages:
+            seen_messages.add(source_id)
+            sources.append(src)
 
-    # --- 转发消息 (message_snapshots) 附件收集 ---
-    # Discord 转发消息的图片附件存储在 snapshot 内部，普通 message.attachments
-    # 为空，需要从 snapshot 额外提取，否则 agent 看不到转发消息里的图片。
-    for src in [message, (getattr(message.reference, "resolved", None) if message.reference else None)]:
-        if src is None:
-            continue
+    all_atts = []
+    seen_attachments: set[int] = set()
+    for src in sources:
+        source_atts = list(src.attachments)
         snaps = getattr(src, "message_snapshots", None)
-        if snaps and len(snaps) > 0:
+        if snaps:
             snap = snaps[0]
             snap_msg = getattr(snap, "message", snap)
-            snap_atts = getattr(snap_msg, "attachments", None) or getattr(snap, "attachments", None) or []
-            all_atts.extend(snap_atts)
+            source_atts.extend(getattr(snap_msg, "attachments", None) or getattr(snap, "attachments", None) or [])
+        for att in source_atts:
+            attachment_id = att.id
+            if attachment_id not in seen_attachments:
+                seen_attachments.add(attachment_id)
+                all_atts.append(att)
 
     logger.info("_collect_attachments: conv_key=%s, message.attachments=%d, all_atts=%d",
                 conversation_key, len(message.attachments), len(all_atts))
@@ -196,6 +205,87 @@ def _current_message_media_text(message: discord.Message) -> str:
     return " ".join(parts).strip()
 
 
+_OUTBOUND_MENTION_OR_CODE_RE = re.compile(r"```[\s\S]*?```|``[^\r\n]+?``|`[^`\r\n]+`|<@!?(?!&)([^>\r\n]+)>")
+_BRACKET_IDENTITY_RE = re.compile(r"^(.+?)\[([^\[\]]+)\]$")
+
+
+def _sanitize_lookup_name(name: str, max_len: int = 32) -> str:
+    """Match the display-name format emitted by Discord context."""
+    name = name.replace("\n", " ").replace("\r", " ")
+    name = name.replace("[", "(").replace("]", ")").strip()
+    return name[:max_len] + "…" if len(name) > max_len else name
+
+
+def _iter_candidate_members(rt: Any, channel: Any) -> list[Any]:
+    """Prefer recent authors, then cached guild members, without duplicates."""
+    candidates: list[Any] = []
+    seen_ids: set[int] = set()
+    for entry in reversed(rt.channel_history.get(channel.id, [])):
+        message = entry["message"]
+        if message is None:
+            continue
+        author = message.author
+        if author.id not in seen_ids:
+            seen_ids.add(author.id)
+            candidates.append(author)
+    if isinstance(channel, (discord.TextChannel, discord.Thread)):
+        for member in channel.guild.members:
+            if member.id not in seen_ids:
+                seen_ids.add(member.id)
+                candidates.append(member)
+    return candidates
+
+
+def _match_member_id(candidates: list[Any], raw_target: str) -> int | None:
+    """Match account names before display names, including context identities."""
+    target = raw_target.strip().lstrip("@").strip()
+    bracket = _BRACKET_IDENTITY_RE.match(target)
+    if bracket:
+        uid = _match_member_id(candidates, bracket.group(2))
+        if uid is not None:
+            return uid
+        return _match_member_id(candidates, bracket.group(1))
+    target_lower = target.lower()
+    for member in candidates:
+        if target_lower in (member.name.lower(), _sanitize_lookup_name(member.name).lower()):
+            return member.id
+    for member in candidates:
+        names = (member.display_name, member.global_name)
+        if isinstance(member, discord.Member):
+            names += (member.nick,)
+        for name in names:
+            if name and target_lower in (name.lower(), _sanitize_lookup_name(name).lower()):
+                return member.id
+    return None
+
+
+def _resolve_outbound_mentions(rt: Any, channel: Any, text: str) -> str:
+    """Resolve named mentions at delivery only, leaving code and history intact."""
+    if "<@" not in text:
+        return text
+    candidates: list[Any] | None = None
+
+    def replace(match: re.Match[str]) -> str:
+        nonlocal candidates
+        target = match.group(1)
+        if target is None:
+            return match.group(0)
+        target = target.strip()
+        if target.isdigit():
+            return match.group(0)
+        if target.lower() in ("everyone", "here"):
+            return f"@{target}"
+        if candidates is None:
+            candidates = _iter_candidate_members(rt, channel)
+        uid = _match_member_id(candidates, target)
+        if uid is not None:
+            return f"<@{uid}>"
+        fallback = _BRACKET_IDENTITY_RE.sub(r"\1", target.lstrip("@"))
+        return f"@{fallback}"
+
+    return _OUTBOUND_MENTION_OR_CODE_RE.sub(replace, text)
+
+
 def _truncate(text: str, limit: int = 2000) -> str:
     if len(text) > limit:
         return text[:limit - 4] + "..."
@@ -245,6 +335,7 @@ async def _send_split_text(
 ) -> list[discord.Message]:
     """发送文本到频道，支持 [SPLIT] 分段和 2000 字符截断。"""
     sent: list[discord.Message] = []
+    text = _resolve_outbound_mentions(rt, channel, text)
     if rt.split_signal in text:
         parts = [p.strip() for p in text.split(rt.split_signal) if p.strip()]
         for i, part in enumerate(parts):

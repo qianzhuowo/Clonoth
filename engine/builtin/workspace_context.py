@@ -14,6 +14,8 @@ from itertools import islice
 from pathlib import Path
 from typing import Any
 
+from ..conversation_store import MessageType, is_dynamic_context
+from engine.faces.prompt_sections import content_sha1
 from .result import hook_result
 
 PLUGIN_META = {
@@ -114,14 +116,20 @@ class WorkspaceContext:
         rctx = ctx.rctx
         if node is None or rctx is None:
             return None
-        if (getattr(node, 'extra', None) or {}).get('workspace_context') is not True:
+        if node.extra.get('workspace_context') is not True:
             return None
-        if (getattr(rctx, 'task_context', None) or {}).get('is_system_task'):
+        if rctx.task_context.get('is_system_task') or ctx.extra.get('is_resume'):
             return None
 
-        bound_path = getattr(rctx, 'workspace', None)
+        bound_path = rctx.workspace
         root = Path(bound_path if bound_path is not None else rctx.workspace_root)
-        name = str(getattr(rctx, 'workspace_name', '') or '').strip()
+        name = rctx.workspace_name
+        workspace_key = f'{name}:{root}'
+        existing = next((i for i in range(len(ctx.messages) - 1, -1, -1) if ctx.messages[i].get('_workspace_context')), None)
+        if existing is not None:
+            previous = ctx.messages[existing]
+            if previous.get('_meta', {}).get('workspace_key') == workspace_key:
+                return None
         # Bounded local filesystem work must not block other sessions' event loop.
         tree = await asyncio.to_thread(build_project_tree, root)
         fallback = '' if bound_path is not None else '\nNo dedicated directory bound: current tools fall back to the Clonoth install directory.'
@@ -138,29 +146,39 @@ class WorkspaceContext:
         message = {
             'role': 'user', 'content': content,
             '_dynamic': True, '_workspace_context': True,
+            'message_type': MessageType.DYNAMIC_CONTEXT,
+            '_meta': {
+                '_dynamic': True, '_workspace_context': True,
+                'message_type': MessageType.DYNAMIC_CONTEXT, 'workspace_key': workspace_key,
+                'injected_hashes': {'workspace_context': content_sha1(content)},
+            },
         }
-        existing = next((i for i, m in enumerate(ctx.messages) if m.get('_workspace_context')), None)
         if existing is not None:
-            # Keep the original position, leaving tool-call/result adjacency and
-            # other dynamic sections intact across ordinary inference steps.
-            if ctx.messages[existing] == message:
+            previous = ctx.messages[existing]
+            if previous.get('id') or previous.get('_persisted_dynamic'):
+                ctx.messages.append(message)
+            elif previous.get('content') == content:
                 return None
-            ctx.messages[existing] = message
-        else:
-            # Fresh/preempt/snapshot contexts: place just before the latest user
-            # instruction, never in the middle of native or fake-native tool pairs.
+            else:
+                ctx.messages[existing] = message
+            return hook_result(modified=True)
+        index = len(ctx.messages)
+        for i in range(len(ctx.messages) - 1, -1, -1):
+            msg = ctx.messages[i]
+            meta = msg.get('_meta') or {}
+            if msg.get('role') != 'user' or is_dynamic_context(msg) or msg.get('tool_call_id'):
+                continue
+            if (msg.get('message_type') or meta.get('message_type')) in ('tool_result', 'retry_hint', 'output_rejected'):
+                continue
+            body = msg.get('content')
+            if isinstance(body, list) and any(part.get('type') == 'tool_result' for part in body):
+                continue
+            index = i + 1
+            while index < len(ctx.messages) and is_dynamic_context(ctx.messages[index]):
+                index += 1
+            break
+        tail = ctx.messages[index:]
+        if any(msg.get('id') or msg.get('_persisted_dynamic') for msg in tail):
             index = len(ctx.messages)
-            for i in range(len(ctx.messages) - 1, -1, -1):
-                msg = ctx.messages[i]
-                meta = msg.get('_meta') or {}
-                if msg.get('role') != 'user' or msg.get('_dynamic') or msg.get('tool_call_id'):
-                    continue
-                if meta.get('message_type') == 'tool_result' or msg.get('message_type') == 'tool_result':
-                    continue
-                body = msg.get('content')
-                if isinstance(body, list) and any(isinstance(p, dict) and p.get('type') == 'tool_result' for p in body):
-                    continue
-                index = i
-                break
-            ctx.messages.insert(index, message)
+        ctx.messages.insert(index, message)
         return hook_result(modified=True)

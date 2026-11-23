@@ -317,6 +317,26 @@ def _content_from_message_like(message: Any) -> Any:
     return getattr(message, "content", "")
 
 
+INHERITABLE_INJECTED_HASH_PREFIXES = ("skill:", "memory:")
+
+
+def inherit_injected_hashes(messages: list[Any]) -> dict[str, str]:
+    """Carry summarized skill/memory activation forward, but not vanished prompt sections."""
+    from engine.conversation_store import MessageType, is_dynamic_context
+
+    inherited: dict[str, str] = {}
+    for message in messages:
+        if isinstance(message, dict):
+            meta = message.get("_meta") or message.get("meta") or {}
+            message_type = message.get("message_type")
+        else:
+            meta = message.meta
+            message_type = message.message_type
+        if is_dynamic_context(message) or message_type == MessageType.SUMMARY or meta.get("message_type") == MessageType.SUMMARY or _source_task_id_from_message_like(message) == "compact_summary":
+            inherited.update({key: value for key, value in meta.get("injected_hashes", {}).items() if key.startswith(INHERITABLE_INJECTED_HASH_PREFIXES)})
+    return inherited
+
+
 def is_snipped_message(message: Any) -> bool:
     """Return True if message is an L2 snipped task stub."""
     content = _content_from_message_like(message)
@@ -374,12 +394,14 @@ def split_task_segments(messages: list[Any]) -> tuple[list[Any], list[list[Any]]
     filtered: list[Any] = []
     for m in messages:
         if isinstance(m, dict):
-            if m.get("role") == "system" or m.get("_dynamic"):
+            if m.get("role") == "system":
                 continue
         else:
             if getattr(m, "role", "") == "system":
                 continue
         filtered.append(m)
+
+    from engine.conversation_store import is_dynamic_context
 
     tids = [_source_task_id_from_message_like(m) for m in filtered]
     n = len(filtered)
@@ -392,16 +414,20 @@ def split_task_segments(messages: list[Any]) -> tuple[list[Any], list[list[Any]]
                     next_tid = tids[j]
                     break
             c = _content_from_message_like(filtered[i])
-            is_mid_task = isinstance(c, str) and (
+            is_mid_task = is_dynamic_context(filtered[i]) or (isinstance(c, str) and (
                 c.startswith("reject by ") or c.startswith("<dispatch_result")
-            )
+            ))
             if prev_tid and prev_tid != "compact_summary" and (prev_tid == next_tid or is_mid_task):
                 tids[i] = prev_tid
+            elif is_dynamic_context(filtered[i]) and next_tid and next_tid != "compact_summary":
+                tids[i] = next_tid
 
     def _is_preempt_turn_boundary(item: Any, cur_seg: list[Any]) -> bool:
         def role(msg: Any) -> str:
             return str(msg.get("role") or "") if isinstance(msg, dict) else str(getattr(msg, "role", "") or "")
 
+        if is_dynamic_context(item):
+            return False
         if role(item) != "user" or not cur_seg:
             return False
         if not any(role(msg) == "assistant" for msg in cur_seg):
@@ -607,6 +633,11 @@ def apply_compact_summary(
                 keep_recent,
             )
 
+    kept_ids = {id(message) for message in to_keep}
+    inherited = inherit_injected_hashes([message for message in conversation if id(message) not in kept_ids])
+    if inherited:
+        summary_msg["_meta"]["injected_hashes"] = inherited
+
     logger.info(
         "apply_compact_summary: %d -> %d messages (keep_recent=%d)",
         len(messages), len(result), keep_recent,
@@ -637,7 +668,10 @@ def _format_messages_for_summary(
 
     parts: list[str] = []
     _prev_tid: str = ""
+    from engine.conversation_store import is_dynamic_context
     for m in messages:
+        if is_dynamic_context(m):
+            continue
         # Task boundary detection
         _meta = m.get("_meta") or {}
         _tid = _meta.get("source_task_id", "") if isinstance(_meta, dict) else ""

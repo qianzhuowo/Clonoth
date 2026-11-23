@@ -1231,10 +1231,8 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         Child Session 隔离（Phase A）：删除 JSONL 文件、从映射表移除、物理删除 registry 条目。
         """
-        # 1. 删除 JSONL 文件
-        conv_path = self.workspace_root / "data" / "conversations" / f"{child_session_id}.jsonl"
-        if conv_path.exists():
-            conv_path.unlink()
+        # 1. 清理会话缓存、JSONL 与 transcript
+        self._delete_conversation_session_locked(child_session_id)
 
         # 2. 从映射表移除
         key_to_remove = None
@@ -1326,15 +1324,7 @@ class SupervisorState(SessionMixin, TaskStoreMixin, TaskRouterMixin):
 
         if to_remove:
             for sid in to_remove:
-                # [2026-09-13] Why: dispatch 子会话改为 TTL 保留后，sweep 删除
-                # registry 但不删 JSONL 会遗留孤儿文件。How: 删除 registry 的同时
-                # 物理删除对应会话文件。Purpose: 磁盘与会话表保持一致。
-                _conv_file = self.workspace_root / "data" / "conversations" / f"{sid}.jsonl"
-                if _conv_file.exists():
-                    try:
-                        _conv_file.unlink()
-                    except OSError:
-                        pass
+                self._delete_conversation_session_locked(sid)
                 self._session_store._registry.pop(sid, None)
                 self.sessions.pop(sid, None)
                 self.session_generations.pop(sid, None)

@@ -62,7 +62,6 @@ async def prepare_compaction(
             message for message in messages
             if isinstance(message, dict)
             and message.get("role") != "system"
-            and not message.get("_dynamic")
         ]
 
         # Split into prefix_msgs (old compact_summary + snipped stubs) and real task segments

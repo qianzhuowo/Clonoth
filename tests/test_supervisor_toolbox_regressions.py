@@ -540,7 +540,7 @@ def test_get_context_window_exposes_token_metrics_and_does_not_limit_calls(tmp_p
                 for text in [f"{effective:,}", f"{threshold:,}", source, "messages=12", f"prompt_tokens={prompt}"]:
                     assert text in data["result"]
     asyncio.run(run())
-    assert urls == ["http://supervisor/v1/sessions/parent/context_usage"] * 4
+    assert urls == ["http://supervisor/v1/sessions/parent/context_window"] * 4
 
 
 def test_manage_memory_dispatch_and_cache_invalidation(tmp_path):
@@ -744,3 +744,37 @@ def test_search_web_discovery_purity_action_and_default_policy(tmp_path, argumen
     assert resolve_effective_action("search_web", arguments) == ("search_web", action)
     decision = PolicyEngine(workspace_root=tmp_path).evaluate_tool(name="search_web")
     assert decision.safety_level == SafetyLevel.auto
+
+
+def test_script_tools_use_utf8_and_surface_stderr(tmp_path, monkeypatch):
+    from toolbox._common import safe_subprocess_env
+    from toolbox.registry import _make_script_tool
+
+    monkeypatch.delenv("PYTHONUTF8", raising=False)
+    monkeypatch.delenv("PYTHONIOENCODING", raising=False)
+    monkeypatch.setenv("CLONOTH_ADMIN_TOKEN", "secret")
+    monkeypatch.setenv("CUSTOM_SECRET", "s")
+    env = safe_subprocess_env()
+    assert env["PYTHONUTF8"] == "1"
+    assert env["PYTHONIOENCODING"] == "utf-8"
+    assert "CLONOTH_ADMIN_TOKEN" not in env
+    assert "CUSTOM_SECRET" not in env
+    script = tmp_path / "unicode_tool.py"
+    script.write_text(
+        "import json, sys\n"
+        "args = json.load(sys.stdin)\n"
+        "if args['fail']:\n"
+        "    print('脚本具体错误 🛒🎁😎', file=sys.stderr)\n"
+        "    sys.exit(1)\n"
+        "print(json.dumps({'ok': True, 'data': {'result': args['text']}}, ensure_ascii=False))\n",
+        encoding="utf-8",
+    )
+    ctx = ToolContext(workspace_root=tmp_path, registry=None, supervisor_url="test",
+                      session_id="s", run_id="r", worker_id="w", http=None)
+    tool = _make_script_tool(script_path=script, timeout_sec=10)
+    result = asyncio.run(tool({"text": "中文 🛒🎁😎", "fail": False}, ctx))
+    assert result["ok"] is True
+    assert result["data"]["result"] == "中文 🛒🎁😎"
+    error = asyncio.run(tool({"fail": True}, ctx))
+    assert error["ok"] is False
+    assert "脚本具体错误 🛒🎁😎" in error["data"]["result"]

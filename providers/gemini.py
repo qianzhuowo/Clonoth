@@ -110,7 +110,7 @@ class GeminiProvider(BaseProvider):
         Returns (system_text_or_None, gemini_contents_list).
 
         Conversion rules:
-        - role=system  → extracted and merged into a single systemInstruction
+        - leading system/developer → merged into systemInstruction; later ones → user
         - role=user    → role="user", text/image parts
         - role=assistant → role="model", text + optional functionCall parts
         - role=tool     → role="function", functionResponse parts
@@ -123,15 +123,19 @@ class GeminiProvider(BaseProvider):
         # when processing role=tool messages (which only carry tool_call_id).
         tc_id_to_name: dict[str, str] = {}
 
+        seen_non_system = False
         for msg_idx, msg in enumerate(messages):
             role = msg.get("role", "")
 
             # ── system ──
-            if role == "system":
-                txt = _extract_text(msg)
-                if txt:
-                    system_parts.append(txt)
-                continue
+            if role in ("system", "developer"):
+                if not seen_non_system:
+                    txt = _extract_text(msg)
+                    if txt:
+                        system_parts.append(txt)
+                    continue
+                role = "user"
+            seen_non_system = True
 
             # ── user ──
             if role == "user":
@@ -248,9 +252,6 @@ class GeminiProvider(BaseProvider):
             if txt:
                 contents.append({"role": "user", "parts": [{"text": txt}]})
 
-        if contents and contents[-1].get("role") == "model":
-            contents.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
-
         system_text = "\n\n".join(system_parts) if system_parts else None
         return system_text, contents
 
@@ -298,8 +299,16 @@ class GeminiProvider(BaseProvider):
         )
         if not contents:
             contents = [{"role": "user", "parts": [{"thought": True, "text": " "}]}]
-        if is_vertex and not strip_system_role:
+        elif contents[-1].get("role") == "model":
+            contents.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
+        elif is_vertex and not strip_system_role:
             contents.append({"role": "system", "parts": [{"text": " "}]})
+        elif not is_vertex:
+            contents.append({
+                "role": "model",
+                "parts": [{"codeExecutionResult": {"outcome": "OUTCOME_OK", "output": " "}}],
+            })
+            contents.append({"role": "user", "parts": [{"thought": True, "text": " "}]})
         body: dict[str, Any] = {"contents": contents}
         if system_text:
             body["systemInstruction"] = {"parts": [{"text": system_text}]}

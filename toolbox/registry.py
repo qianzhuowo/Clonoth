@@ -294,8 +294,11 @@ def _make_script_tool(*, script_path: Path, timeout_sec: float | None) -> ToolFu
                     return parsed
             except (json.JSONDecodeError, ValueError):
                 pass
+            err_msg = f"script exited with code {proc.returncode}"
+            if stderr_text:
+                err_msg = f"{err_msg}: {stderr_text[:500]}"
             return _error_tool_response(
-                f"script exited with code {proc.returncode}",
+                err_msg,
                 stderr=stderr_text[:2000] if stderr_text else "",
                 stdout=stdout_text[:2000] if stdout_text else "",
             )

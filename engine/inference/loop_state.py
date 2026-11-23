@@ -12,6 +12,7 @@ from typing import Any, TYPE_CHECKING
 from toolbox.registry import ToolRegistry
 from providers.base import BaseProvider
 from ..node import Node
+from ..conversation_store import is_dynamic_context
 from ..context_store import save_context_snapshot, write_context_snapshot
 
 if TYPE_CHECKING:
@@ -52,7 +53,12 @@ def _persist_node_context(
     # 目的：ConversationStore 与旧 snapshot 两条持久化路径保持同一语义。
     from .tool_format import sanitize_control_tool_history
     _clean_history = sanitize_control_tool_history(messages)
-    _persisted_msgs = [m for m in _clean_history if not m.get("_dynamic") and not m.get("_ephemeral") and not m.get("_retry_hint")]
+    # Retain persisted dynamic context; only runtime-only injections are dropped.
+    _persisted_msgs = [
+        m for m in _clean_history
+        if not m.get("_ephemeral") and not m.get("_retry_hint")
+        and (not is_dynamic_context(m) or m.get("message_type") == "dynamic_context")
+    ]
     # Phase 3 (Session Conversation Store): snapshot version 升至 2，
     # 新增 last_message_id 字段指向 ConversationStore 中最后一条影子写入的消息。
     # messages 数组暂时保留（向后兼容），后续 Phase 可移除。
@@ -123,6 +129,10 @@ class _LoopState:
 
     # ---- 流式 ----
     use_stream: bool = False
+    _reasoning_started_iso: str = ""
+    _reasoning_ended_iso: str = ""
+    _cache_warm_fork: bool = False
+    _reactive_compact_done: bool = False
 
     # ---- 工具格式 ----
     formatter: ToolFormatter | None = None

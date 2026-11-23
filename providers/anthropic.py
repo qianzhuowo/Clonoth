@@ -145,7 +145,7 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
     Returns (system_text, converted_messages).
 
     Key transformations:
-    1. system messages -> extracted into a single system string
+    1. Leading system/developer messages -> system string; later ones -> user messages
     2. tool result messages (role=tool) -> grouped into user messages with tool_result blocks
     3. assistant messages with tool_calls -> content blocks with tool_use entries
     4. Consecutive same-role messages are merged (Anthropic requires strict alternation)
@@ -153,19 +153,22 @@ def _convert_messages(messages: list[dict]) -> tuple[str, list[dict]]:
     system_parts: list[str] = []
     converted: list[dict] = []
 
+    seen_non_system = False
     i = 0
     while i < len(messages):
         msg = messages[i]
         role = msg.get("role", "")
         content = msg.get("content")
 
-        if role == "system":
-            # Extract system messages into a single string
-            if content:
-                text = content if isinstance(content, str) else str(content)
-                system_parts.append(text)
-            i += 1
-            continue
+        if role in ("system", "developer"):
+            if not seen_non_system:
+                if content:
+                    text = content if isinstance(content, str) else str(content)
+                    system_parts.append(text)
+                i += 1
+                continue
+            role = "user"
+        seen_non_system = True
 
         if role == "tool":
             # Collect consecutive tool result messages into one user message
@@ -463,6 +466,11 @@ class AnthropicProvider(BaseProvider):
             "messages": converted,
             "max_tokens": eff_max_tokens,
         }
+        cache_ttl = self._options.get("prompt_cache_ttl", "1h")
+        if cache_ttl is not False and cache_ttl not in ("off", "none", ""):
+            payload["cache_control"] = {"type": "ephemeral"}
+            if cache_ttl != "5m":
+                payload["cache_control"]["ttl"] = cache_ttl
         if system_text:
             payload["system"] = system_text
         if converted_tools:

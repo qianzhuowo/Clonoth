@@ -30,9 +30,9 @@ from ..context_store import load_context_snapshot
 from ..attachments import build_multimodal_content
 # Phase 1 (Session Conversation Store): 导入 Message 模型用于影子写入。
 # ai_step 在每次 append assistant/tool_result 消息后，best-effort 写入 ConversationStore。
-from ..conversation_store import Message, MessageType
+from ..conversation_store import Message, MessageType, is_dynamic_context
 from ..node import Node
-from .message_assembly import assemble_initial_messages
+from .message_assembly import assemble_initial_messages, has_current_task_anchor, rebuild_dynamic_context
 from ..protocol import (
     TaskAction,
     ACTION_DISPATCH,
@@ -96,11 +96,14 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
         pending.append((msg_dict, message_type))
         return
     try:
-        store = getattr(ls.rctx, 'conversation_store', None)
+        store = ls.rctx.conversation_store
         if store is None:
             return
         # 跳过 dynamic context 和 ephemeral 消息（如 retry hint）
-        if msg_dict.get('_dynamic') or msg_dict.get('_ephemeral'):
+        is_dynamic = message_type == MessageType.DYNAMIC_CONTEXT
+        if msg_dict.get('_ephemeral') or (msg_dict.get('_dynamic') and not is_dynamic):
+            return
+        if is_dynamic and (msg_dict.get('id') or msg_dict.get('_persisted_dynamic')):
             return
         # [2026-05-07] 不再按 control_tool_name 跳过 finish。
         # 原因：finish 已恢复为真实 API 工具，正常结果必须像普通工具一样进入 ConversationStore。
@@ -123,11 +126,11 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
             content=_content,
             message_type=message_type,
             created_at=datetime.now(timezone.utc).isoformat(),
-            meta=msg_dict.get('_meta', {}),
-            response_info=dict(getattr(ls.rctx, 'response_info', {}) or {})
+            meta=dict(msg_dict.get('_meta') or {}),
+            response_info=dict(ls.rctx.response_info)
                 if msg_dict.get('role') == 'assistant' else {},
-            source_node_id=getattr(ls.node, 'id', ''),
-            source_task_id=getattr(ls.rctx, 'task_id', ''),
+            source_node_id=ls.node.id,
+            source_task_id=ls.rctx.task_id,
             tool_calls=msg_dict.get('tool_calls', []),
             # [2026-05-01] 影子写入时保留原生 role=tool 的配对字段。
             # 原因：ConversationStore 是下一轮历史来源；丢失 tool_call_id 会破坏 true native。
@@ -138,8 +141,11 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
         # Why: rctx.session_id may now be an entry branch, not the user-facing parent session. How:
         # keep child_session_id for delegated nodes and use rctx.session_id for main branch tasks.
         # Purpose: ConversationStore writes stay isolated until supervisor merges the branch.
-        target_session = getattr(ls.rctx, 'child_session_id', '') or ls.rctx.session_id
+        target_session = ls.rctx.child_session_id or ls.rctx.session_id
         store.append(target_session, msg)
+        if is_dynamic:
+            msg_dict['id'] = msg_id
+            msg_dict['_persisted_dynamic'] = True
         # Phase 3: 记录最后一次影子写入的 message id，供 snapshot 持久化使用
         ls.last_shadow_message_id = msg_id
         # P0 Task 内核化：追踪 first/last message ID 到 RunContext
@@ -148,6 +154,15 @@ def _shadow_write(ls: _LoopState, msg_dict: dict, message_type: str = "") -> Non
         ls.rctx.last_shadow_message_id = msg_id
     except Exception:
         pass  # best-effort, never break main flow
+
+
+def _persist_dynamic_messages(ls: _LoopState) -> None:
+    """Write new dynamic units in history order before their first LLM call."""
+    if ls._cache_warm_fork:
+        return
+    for message in ls.messages:
+        if is_dynamic_context(message):
+            _shadow_write(ls, message, MessageType.DYNAMIC_CONTEXT)
 
 
 def _close_execution(execution: Any) -> None:
@@ -1155,8 +1170,10 @@ async def run_ai_node(
             task_context=rctx.task_context,
             session_id=rctx.session_id,
             attachments=attachments,
-            workspace_name=getattr(rctx, 'workspace_name', '') or '',
+            workspace_name=rctx.workspace_name,
         )
+        if resume_data and not instruction:
+            messages = [message for message in messages if not (is_dynamic_context(message) and not message.get("id") and not message.get("_persisted_dynamic"))]
         _assembled_fresh = True
 
     if _assembled_fresh:
@@ -1173,6 +1190,7 @@ async def run_ai_node(
                 "history": history,
                 "attachments": attachments,
                 "system_prompt": system_prompt,
+                "is_resume": bool(resume_data),
             },
         )
         _prompt_result = await hook_registry.afire("before_prompt_build", _prompt_ctx)
@@ -1232,6 +1250,10 @@ async def run_ai_node(
     )
 
     ls._cache_warm_fork = _cache_warm_fork_tools is not None
+    if str((resume_data or {}).get("type") or "") == "output_rejected":
+        from engine.builtin.preempt import is_user_entry_task
+        if is_user_entry_task(ls):
+            ls.plugin_data.setdefault("preempt", {})["defer_for_output_reject"] = True
 
     # [fix 2026-09-11] Why: a compactor failure resumes the caller with
     # compact_done success=False. Marking only deduplicated resumes as compacted
@@ -1241,6 +1263,15 @@ async def run_ai_node(
     # one failed upstream compaction cannot create a resume loop.
     if str((resume_data or {}).get("type") or "") == "compact_done":
         ls.compacted = True
+        if not has_current_task_anchor(ls.messages, rctx.task_id):
+            rebuild_dynamic_context(
+                ls.messages, workspace_root=rctx.workspace_root, node=node, runtime_cfg=runtime_cfg,
+                instruction=rctx.user_text or instruction, is_block_mode=_is_block_mode,
+                system_prompt=system_prompt, session_id=rctx.session_id,
+                workspace_name=rctx.workspace_name, task_context=rctx.task_context,
+            )
+
+    _persist_dynamic_messages(ls)
 
     # ---- 推理循环 ----
     for step in range(step_count, max_steps):
@@ -1263,6 +1294,7 @@ async def run_ai_node(
             return _step_result.action
         if _step_result.skip_step:
             continue
+        _persist_dynamic_messages(ls)
 
         result = await _call_llm_with_retry(ls, step)
         if isinstance(result, TaskAction):

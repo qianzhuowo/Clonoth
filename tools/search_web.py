@@ -37,6 +37,9 @@ if __name__ == "__main__":
     import json
     import os
     import sys
+
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     import uuid
     from concurrent.futures import ThreadPoolExecutor
     from pathlib import Path
@@ -103,32 +106,36 @@ if __name__ == "__main__":
 
     def http_json(url: str, method: str = "GET", headers: dict | None = None, body: dict | None = None, timeout: int = 35):
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        h = {"User-Agent": "Clonoth-SearchWeb/2.0", "Accept": "application/json, text/event-stream"}
+        h = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36", "Accept": "application/json, text/event-stream"}
         if headers:
             h.update(headers)
         if data is not None and "Content-Type" not in h:
             h["Content-Type"] = "application/json"
         req = urllib_request.Request(url, data=data, headers=h, method=method)
-        try:
-            with urllib_request.urlopen(req, timeout=timeout) as r:
-                raw = r.read().decode("utf-8", errors="replace")
-                if raw.lstrip().startswith(("event:", "data:")) or "\ndata:" in raw:
-                    for line in reversed(raw.splitlines()):
-                        if line.startswith("data:"):
-                            try:
-                                return r.status, json.loads(line[5:].strip())
-                            except Exception:
-                                pass
-                return r.status, json.loads(raw)
-        except HTTPError as e:
+        for attempt in range(2):
             try:
-                err_raw = e.read().decode("utf-8", errors="replace")
-                err_payload = json.loads(err_raw)
-            except Exception:
-                err_payload = err_raw if "err_raw" in locals() else str(e)
-            return e.code, err_payload
-        except Exception as e:
-            return 0, {"error": str(e)}
+                with urllib_request.urlopen(req, timeout=timeout) as r:
+                    raw = r.read().decode("utf-8", errors="replace")
+                    if raw.lstrip().startswith(("event:", "data:")) or "\ndata:" in raw:
+                        for line in reversed(raw.splitlines()):
+                            if line.startswith("data:"):
+                                try:
+                                    return r.status, json.loads(line[5:].strip())
+                                except json.JSONDecodeError:
+                                    pass
+                    return r.status, json.loads(raw)
+            except HTTPError as e:
+                try:
+                    err_raw = e.read().decode("utf-8", errors="replace")
+                    err_payload = json.loads(err_raw)
+                except Exception:
+                    err_payload = err_raw if "err_raw" in locals() else str(e)
+                return e.code, err_payload
+            except OSError as e:
+                if attempt == 1:
+                    return 0, {"error": str(e)}
+            except json.JSONDecodeError as e:
+                return 0, {"error": str(e)}
 
     def format_search_summary(engine_used: str, query_str: str, items: list[dict]) -> str:
         lines = [f"[{engine_used}] Search results for {query_str!r} ({len(items)} items):"]
@@ -190,6 +197,7 @@ if __name__ == "__main__":
         st, data = http_json(
             f"https://mcp.exa.ai/mcp?exaApiKey={quote(exa_key, safe='')}",
             method="POST",
+            headers={"x-api-key": exa_key},
             body={
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -335,6 +343,7 @@ if __name__ == "__main__":
         st, data = http_json(
             f"https://mcp.exa.ai/mcp?exaApiKey={quote(exa_key, safe='')}",
             method="POST",
+            headers={"x-api-key": exa_key},
             body={
                 "jsonrpc": "2.0",
                 "id": 1,

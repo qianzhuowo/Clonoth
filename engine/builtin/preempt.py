@@ -29,6 +29,25 @@ PLUGIN_META = {
 }
 
 
+def is_user_entry_task(ls: Any) -> bool:
+    """Return whether this run belongs to a top-level user entry task."""
+    rctx = ls.rctx
+    if rctx is None or str(rctx.child_session_id or "").strip():
+        return False
+    tctx = rctx.task_context or {}
+    return not (
+        tctx.get("is_system_task")
+        or tctx.get("caller_task_id")
+        or tctx.get("_output_chain")
+        or tctx.get("dispatch_origin")
+    )
+
+
+def is_preempt_deferred_for_output_reject(ls: Any) -> bool:
+    """Return whether this run is repairing an output_rejected draft."""
+    return bool((ls.plugin_data.get("preempt") or {}).get("defer_for_output_reject"))
+
+
 class PreemptChecker:
     """Handle cancellation and preempt message injection before each LLM step."""
 
@@ -60,6 +79,9 @@ class PreemptChecker:
                     node_id=ls.node.id,
                 )
             )
+
+        if is_preempt_deferred_for_output_reject(ls):
+            return None
 
         if not ls.preempt_after_step and ls.preempt_inject_info is None:
             preempt_info = await ls.rctx.check_preempted()
@@ -96,6 +118,17 @@ class PreemptChecker:
         if ls is None or terminal_call is None:
             return None
 
+        if is_preempt_deferred_for_output_reject(ls):
+            return None
+
+        terminal_name = str(terminal_call.name or "finish").strip() or "finish"
+        if (
+            terminal_name == "finish"
+            and is_user_entry_task(ls)
+            and str((terminal_call.arguments or {}).get("text") or "").strip()
+        ):
+            return None
+
         # [Preempt V3 需求2] 终止工具执行前的最终 preempt 检查
         # （真实工具执行期间可能有新消息到达）。同时补全 V2 遗漏：无消息 preempt
         # 在只有 finish/ask 没有真工具的场景下也需被检查。
@@ -114,30 +147,32 @@ class PreemptChecker:
         if ls.preempt_inject_info is not None:
             # 有消息的 preempt：拦截终止工具，塞假 tool_result 维持 native 配对，
             # 任务继续，下一轮由 handle() 注入新用户消息。
-            _terminal_name = str(getattr(terminal_call, "name", "") or "finish").strip() or "finish"
+            _terminal_name = str(terminal_call.name or "finish").strip() or "finish"
             _finish_parsed = ParsedToolCall(
-                id=getattr(terminal_call, "id", "") or "",
+                id=terminal_call.id or "",
                 name=_terminal_name,
-                arguments=dict(getattr(terminal_call, "arguments", None) or {}),
+                arguments=terminal_call.arguments or {},
             )
             _intercept_msg = ls.formatter.format_tool_result(
                 _finish_parsed,
                 "\u26a0\ufe0f Preempted: new user input received. Task continues.",
             )
-            # [2026-05-07] preempt 拦截 ACK 只服务当前运行期配对：该终止工具未交付，
-            # 不能让结果在恢复后压制未来正常 finish/ask。补齐 ephemeral/
-            # tool_call_id/name 供 snapshot 清洗按调用 ID 精确移除。
-            _intercept_msg["_ephemeral"] = True
+            # Persist the intercepted ACK so restored history retains the same
+            # assistant/tool-result pairing and provider cache prefix.
             if _finish_parsed.id:
                 _intercept_msg.setdefault("tool_call_id", _finish_parsed.id)
             _intercept_msg.setdefault("name", _terminal_name)
             set_message_meta(_intercept_msg, MessageMeta(
-                tool_mode=getattr(ls.node, "tool_mode", "fake-native"),
+                tool_mode=ls.node.tool_mode,
                 message_type="tool_result",
                 control_tool_name=_terminal_name,
                 control_tool_status="preempt_intercepted",
             ))
             ls.messages.append(_intercept_msg)
+            if not ls._cache_warm_fork:
+                from engine.conversation_store import MessageType
+                from engine.inference.ai_step import _shadow_write
+                _shadow_write(ls, _intercept_msg, MessageType.TOOL_RESULT)
             await ls.rctx.emit_event("preempt_finish_intercepted", {
                 "node_id": ls.node.id,
                 "task_id": ls.rctx.task_id,
@@ -149,11 +184,11 @@ class PreemptChecker:
             # 无消息的 preempt：补配对结果后保存上下文退出。
             # [2026-05-01] 补写 finish/ask 的 tool_result，确保 native 模式下
             # functionCall/functionResponse 严格 1:1 配对（Gemini 强校验）。
-            _terminal_name2 = str(getattr(terminal_call, "name", "") or "finish").strip() or "finish"
+            _terminal_name2 = str(terminal_call.name or "finish").strip() or "finish"
             _finish_parsed2 = ParsedToolCall(
-                id=getattr(terminal_call, "id", "") or "",
+                id=terminal_call.id or "",
                 name=_terminal_name2,
-                arguments=dict(getattr(terminal_call, "arguments", None) or {}),
+                arguments=terminal_call.arguments or {},
             )
             _preempt_result = ls.formatter.format_tool_result(
                 _finish_parsed2, "preempted",
@@ -165,7 +200,7 @@ class PreemptChecker:
                 _preempt_result.setdefault("tool_call_id", _finish_parsed2.id)
             _preempt_result.setdefault("name", _terminal_name2)
             set_message_meta(_preempt_result, MessageMeta(
-                tool_mode=getattr(ls.node, "tool_mode", "fake-native"),
+                tool_mode=ls.node.tool_mode,
                 message_type="tool_result",
                 control_tool_name=_terminal_name2,
                 control_tool_status="preempted",
@@ -184,30 +219,11 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     """Inject a pending preempt message into the loop state.
 
     Why: the next LLM prompt must include the user's new message instead of
-    finishing stale work. How: remove old dynamic messages, rebuild dynamic
-    skill and memory context, append the preempt user input, and acknowledge the
-    runtime. Purpose: keep Preempt V2 behavior identical after extraction.
+    finishing stale work. Append and persist the user input before rebuilding
+    incremental dynamic context, preserving the existing provider cache prefix.
     """
     new_instruction = ls.preempt_inject_info.get("message", "")
     new_attachments = ls.preempt_inject_info.get("attachments", [])
-
-    # Why: dynamic context (skills, memory) must be refreshed for the new
-    # instruction. How: the shared assembly helper drops old _dynamic messages
-    # and re-renders all dynamic-scope prompt sections in place. Purpose: the
-    # preempt handler no longer imports the knowledge plugin or duplicates the
-    # block/string prefix logic.
-    rebuild_dynamic_context(
-        ls.messages,
-        workspace_root=ls.rctx.workspace_root,
-        node=ls.node,
-        runtime_cfg=ls.runtime_cfg,
-        history=ls.history,
-        instruction=new_instruction,
-        is_block_mode=ls.is_block_mode,
-        system_prompt=ls.system_prompt,
-        session_id=getattr(ls.rctx, "session_id", "") or "",
-        workspace_name=getattr(ls.rctx, "workspace_name", "") or "",
-    )
 
     _in_mem_meta: dict[str, Any] = {
         "preempt": True,
@@ -243,14 +259,14 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
     # delegated child nodes and otherwise using rctx.session_id, which may be an entry branch.
     # Purpose: preempted branch histories remain complete and merge back with the injected input.
     try:
-        store = getattr(ls.rctx, "conversation_store", None)
+        store = ls.rctx.conversation_store
         if store is not None and (new_instruction or new_attachments):
             from datetime import datetime, timezone
             from uuid import uuid4
 
             from engine.conversation_store import Message, MessageType
 
-            target_session = getattr(ls.rctx, "child_session_id", "") or ls.rctx.session_id
+            target_session = ls.rctx.child_session_id or ls.rctx.session_id
             # [AutoC 2026-06-01] Why: preempt messages with attachments were
             # appended to the live prompt as multimodal content but persisted as
             # plain text, so a resume inside the same task lost the image. How:
@@ -282,12 +298,25 @@ async def _inject_preempt_message(ctx: Any, ls: Any) -> None:
                     message_type=MessageType.USER_INPUT,
                     created_at=datetime.now(timezone.utc).isoformat(),
                     meta=_meta,
-                    source_node_id=getattr(ls.node, "id", ""),
-                    source_task_id=getattr(ls.rctx, "task_id", ""),
+                    source_node_id=ls.node.id,
+                    source_task_id=ls.rctx.task_id,
                 ),
             )
     except Exception:
         pass
+
+    rebuild_dynamic_context(
+        ls.messages,
+        workspace_root=ls.rctx.workspace_root,
+        node=ls.node,
+        runtime_cfg=ls.runtime_cfg,
+        instruction=new_instruction,
+        is_block_mode=ls.is_block_mode,
+        system_prompt=ls.system_prompt,
+        session_id=ls.rctx.session_id or "",
+        workspace_name=ls.rctx.workspace_name or "",
+        task_context=ls.rctx.task_context,
+    )
 
     # [2026-09-13] 携带实际消费内容：注入到清空之间并发追加的消息不会被误删。
     await ls.rctx.consume_preempt(

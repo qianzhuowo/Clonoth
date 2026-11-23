@@ -925,6 +925,36 @@ class EventRouter:
             return conv_key
         return ""
 
+    def _ensure_background_trigger(
+        self, event: Event, payload: dict,
+    ) -> tuple[int, TriggerInfo] | None:
+        """Register an owned entry task with no local user trigger."""
+        src_seq = int(payload.get("source_inbound_seq") or 0)
+        if not src_seq:
+            return None
+        conv_key = self._resolve_owned_route_conversation_key(event, payload)
+        if not conv_key:
+            return None
+        trigger = TriggerInfo(
+            inbound_seq=src_seq,
+            conversation_key=conv_key,
+            session_id=event.session_id,
+            is_dm=bool(self._state.get_dm_channel(event.session_id)),
+            platform_data={"background": True},
+        )
+        self._state.register_trigger(trigger)
+        return src_seq, trigger
+
+    async def _settle_background_main_state(
+        self, trigger: TriggerInfo, main_state: MainTaskState | None,
+        status: str = "✓ 完成",
+    ) -> None:
+        """Hand final progress cleanup to the adapter through send_reply."""
+        try:
+            await self._cb.send_reply(trigger, status, [], main_state=main_state)
+        except Exception as e:
+            logger.error("background progress settlement failed: %s", e)
+
     def _register_dispatch_child_session(self, event: Event, payload: dict) -> None:
         """Map dispatch child sessions to their parent conversation key."""
         try:
@@ -1039,7 +1069,7 @@ class EventRouter:
         # Main reply: retain both objects while the callback is in flight. This
         # lets a failed send retry with the exact same adapter-owned references.
         trigger = self._state.get_trigger(src_seq) if src_seq else None
-        if trigger is not None:
+        if trigger is not None and not trigger.platform_data.get("background"):
             main_state = self._state.get_main_state(src_seq)
             await self._invoke_callback(
                 "send_reply", trigger, text, attachments,
@@ -1053,6 +1083,14 @@ class EventRouter:
                 self._state.remove_main_state(src_seq)
             await self._notify_response_info(event, trigger)
             return
+        if trigger is not None:
+            # Background entry task (no local user trigger: adapter restart,
+            # scheduled run...). Settle its progress UI best-effort, then deliver
+            # the text through the durable channel path below (upstream semantics).
+            main_state = self._state.get_main_state(src_seq)
+            self._state.consume_trigger(src_seq)
+            self._state.remove_main_state(src_seq)
+            await self._settle_background_main_state(trigger, main_state)
 
         # Recovery after an adapter restart cannot reconstruct opaque platform
         # objects in TriggerInfo. Use the route captured when the event was first
@@ -1121,31 +1159,34 @@ class EventRouter:
             main_state = self._state.get_main_state(src_seq)
             if main_state:
                 main_state.stream_parts.clear()
-            if text or attachments:
-                entry_context = replace(
-                    context, conversation_key=trigger.conversation_key,
-                )
-                if not attachments:
-                    await self._invoke_callback(
-                        "send_intermediate_reply", trigger, text,
-                        delivery_context=entry_context,
+            # Background triggers have no local message to reply to; their text
+            # falls through to the channel path below (upstream semantics).
+            if not trigger.platform_data.get("background"):
+                if text or attachments:
+                    entry_context = replace(
+                        context, conversation_key=trigger.conversation_key,
                     )
-                elif self._callback_has_param("send_intermediate_reply", "attachments"):
-                    await self._invoke_callback(
-                        "send_intermediate_reply", trigger, text,
-                        attachments=attachments, delivery_context=entry_context,
-                    )
-                else:
-                    # Adapters whose send_intermediate_reply predates attachments
-                    # (trigger, text) still get the files via the channel path.
-                    await self._invoke_callback(
-                        "send_to_channel", trigger.conversation_key, text, attachments,
-                        node_id=node_id, delivery_context=entry_context,
-                    )
-                await self._notify_response_info(event, trigger)
-            # Intermediate delivery never consumes trigger/MainTaskState. They are
-            # reserved for the later final outbound_message acknowledgement.
-            return
+                    if not attachments:
+                        await self._invoke_callback(
+                            "send_intermediate_reply", trigger, text,
+                            delivery_context=entry_context,
+                        )
+                    elif self._callback_has_param("send_intermediate_reply", "attachments"):
+                        await self._invoke_callback(
+                            "send_intermediate_reply", trigger, text,
+                            attachments=attachments, delivery_context=entry_context,
+                        )
+                    else:
+                        # Adapters whose send_intermediate_reply predates attachments
+                        # (trigger, text) still get the files via the channel path.
+                        await self._invoke_callback(
+                            "send_to_channel", trigger.conversation_key, text, attachments,
+                            node_id=node_id, delivery_context=entry_context,
+                        )
+                    await self._notify_response_info(event, trigger)
+                # Intermediate delivery never consumes trigger/MainTaskState. They are
+                # reserved for the later final outbound_message acknowledgement.
+                return
 
         if node_id.startswith("system.") or not (text or attachments):
             return
@@ -1234,6 +1275,8 @@ class EventRouter:
         result = None
         if not is_system:
             result = self._state.resolve_trigger(src_seq, event.session_id)
+            if not result and node_id == self._entry_node_id:
+                result = self._ensure_background_trigger(event, p)
 
         # 入口节点 → 主任务进度
         if result and node_id == self._entry_node_id:
@@ -1304,6 +1347,9 @@ class EventRouter:
         is_system = (node_id or "").startswith("system.")
 
         # 主节点进度
+        if not is_system and node_id == self._entry_node_id and src_seq:
+            if src_seq not in self._state.triggers:
+                self._ensure_background_trigger(event, p)
         if (
             not is_system
             and src_seq
@@ -1528,13 +1574,16 @@ class EventRouter:
             if result:
                 trigger_seq, trigger = result
                 self._state.consume_trigger(trigger_seq)
-                self._state.remove_main_state(trigger_seq)
-                try:
-                    await self._cb.edit_status_message(
-                        trigger, "⚠️ 任务已取消。",
-                    )
-                except Exception:
-                    pass
+                main_state = self._state.remove_main_state(trigger_seq)
+                if trigger.platform_data.get("background"):
+                    await self._settle_background_main_state(trigger, main_state, "⚠️ 已取消")
+                else:
+                    try:
+                        await self._cb.edit_status_message(
+                            trigger, "⚠️ 任务已取消。",
+                        )
+                    except Exception:
+                        pass
             return
 
         # 非入口节点 → 移除子任务状态并通知最终更新
@@ -1583,13 +1632,16 @@ class EventRouter:
         if result:
             trigger_seq, trigger = result
             self._state.consume_trigger(trigger_seq)
-            self._state.remove_main_state(trigger_seq)
-            try:
-                await self._cb.edit_status_message(
-                    trigger, "⚠️ 任务已取消。",
-                )
-            except Exception:
-                pass
+            main_state = self._state.remove_main_state(trigger_seq)
+            if trigger.platform_data.get("background"):
+                await self._settle_background_main_state(trigger, main_state, "⚠️ 已取消")
+            else:
+                try:
+                    await self._cb.edit_status_message(
+                        trigger, "⚠️ 任务已取消。",
+                    )
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     #  task_preempted — 任务被新消息打断
@@ -1611,17 +1663,21 @@ class EventRouter:
         # Why: session fallback can clear a different branch's trigger or child progress. How:
         # cleanup_for_task_preempted consumes only the matching source trigger and removes only the
         # exact child task key when present. Purpose: a preempt event cannot affect sibling branches.
+        main_state = self._state.get_main_state(src_seq)
         trigger, child_states = self._state.cleanup_for_task_preempted(
             src_seq, event.session_id, task_id=task_id,
         )
 
         if trigger:
-            try:
-                await self._cb.edit_status_message(
-                    trigger, "⚡ 已被新消息打断。",
-                )
-            except Exception:
-                pass
+            if trigger.platform_data.get("background"):
+                await self._settle_background_main_state(trigger, main_state, "⚡ 被打断")
+            else:
+                try:
+                    await self._cb.edit_status_message(
+                        trigger, "⚡ 已被新消息打断。",
+                    )
+                except Exception:
+                    pass
         # 最终化所有精确关联的子任务状态。无 trigger 时按非 DM 处理，避免 session fallback。
         is_dm = trigger.is_dm if trigger else False
         for task_key, child_state in child_states:

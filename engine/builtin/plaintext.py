@@ -48,6 +48,13 @@ class PlaintextRetryHandler:
         if not text:
             return None
 
+        from .preempt import is_preempt_deferred_for_output_reject, is_user_entry_task
+
+        if ls.node.output_mode == "hybrid" and (
+            is_user_entry_task(ls) or is_preempt_deferred_for_output_reject(ls)
+        ):
+            return hook_result(action=_build_implicit_finish(ctx, ls, resp, text))
+
         if ls.preempt_after_step:
             ctx_ref = _persist_ctx(ls, ctx.step + 1)
             return hook_result(action=TaskAction(

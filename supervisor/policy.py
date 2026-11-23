@@ -70,6 +70,9 @@ def _default_policy_dict() -> dict[str, Any]:
             "rules": [
                 {"pattern": ".env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
                 {"pattern": "**/.env", "decision": "deny", "reason": "do not allow reading dotenv secrets"},
+                {"pattern": "data/.admin_token", "decision": "deny", "reason": "do not allow reading admin token"},
+                {"pattern": "data/web_auth.json", "decision": "deny", "reason": "do not allow reading web auth secrets"},
+                {"pattern": "data/keys_*.txt", "decision": "deny", "reason": "do not allow reading API key files"},
             ],
         },
         "write_file": {
@@ -92,6 +95,9 @@ def _default_policy_dict() -> dict[str, Any]:
                 {"pattern": "main.py", "decision": "approval_required", "reason": "entrypoint changes require approval"},
                 {"pattern": ".env", "decision": "deny", "reason": "do not allow writing dotenv secrets"},
                 {"pattern": "**/.env", "decision": "deny", "reason": "do not allow writing dotenv secrets"},
+                {"pattern": "data/.admin_token", "decision": "deny", "reason": "do not allow writing admin token"},
+                {"pattern": "data/web_auth.json", "decision": "deny", "reason": "do not allow writing web auth secrets"},
+                {"pattern": "data/keys_*.txt", "decision": "deny", "reason": "do not allow writing API key files"},
             ],
         },
         "execute_command": {

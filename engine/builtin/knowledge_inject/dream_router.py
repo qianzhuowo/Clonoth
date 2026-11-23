@@ -78,8 +78,10 @@ class DreamMemoryRouter(Handler):
             book = str(tool_args.get("book") or "default").strip()
             mid = str(tool_args.get("id") or "").strip()
             target = None
-            if mid and eff_action in ("delete", "list"):
+            if mid:
                 target = memory_route.get(f"{book}/{mid}")
+                if target is None and eff_action == "upsert":
+                    target = memory_route.get(f"*/{mid}")
             if target is None:
                 target = memory_route.get(book)
             if target is None:

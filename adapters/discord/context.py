@@ -260,32 +260,152 @@ def _is_transient_bot_message(rt: Any, msg_id: int | None) -> bool:
     return isinstance(msg_id, int) and msg_id in rt.transient_msg_ids
 
 
-async def _build_reply_context(rt: Any, message: discord.Message) -> str:
-    """提取被引用消息的作者、身份组、时间和正文。"""
+async def _resolve_reference_message(rt: Any, message: discord.Message) -> discord.Message | None:
+    """Resolve replies from Discord payloads, channel history, or the Discord API."""
     if not message.reference:
-        return ""
-    ref: discord.Message | None = None
-    if message.reference.resolved and isinstance(message.reference.resolved, discord.Message):
-        ref = message.reference.resolved
-    ref_id = getattr(message.reference, "message_id", None) or (getattr(ref, "id", None) if ref else None)
-    if not ref and message.reference.message_id:
-        q = _ensure_channel(rt, message.channel.id)
-        for entry in reversed(q):
-            if entry.get("msg_id") == message.reference.message_id and entry.get("message"):
-                ref = entry["message"]
+        return None
+    ref = message.reference.resolved if isinstance(message.reference.resolved, discord.Message) else None
+    ref_id = getattr(message.reference, "message_id", None) or (ref.id if ref else None)
+    if ref is None and ref_id:
+        channel = message.channel
+        channel_ids = [channel.id]
+        if isinstance(channel, discord.Thread) and channel.parent_id and ref_id == channel.id:
+            channel_ids.append(channel.parent_id)
+        for channel_id in channel_ids:
+            for entry in reversed(rt.channel_history.get(channel_id, [])):
+                if entry.get("msg_id") == ref_id and isinstance(entry.get("message"), discord.Message):
+                    ref = entry["message"]
+                    break
+            if ref is not None:
                 break
-    if not ref and message.reference.message_id:
-        try:
-            ref = await message.channel.fetch_message(message.reference.message_id)
-        except Exception:
-            pass
+    if ref is None and ref_id:
+        channels = [channel]
+        if isinstance(channel, discord.Thread) and ref_id == channel.id and channel.parent and hasattr(channel.parent, "fetch_message"):
+            channels.append(channel.parent)
+        for source in channels:
+            try:
+                fetched = await source.fetch_message(ref_id)
+            except discord.HTTPException:
+                continue
+            if isinstance(fetched, discord.Message):
+                ref = fetched
+                break
+    bot_user = getattr(rt.dc_client, "user", None)
+    if ref and bot_user and ref.author.id == bot_user.id and _is_transient_bot_message(rt, ref_id):
+        return None
+    return ref
+
+
+async def _ensure_thread_starter_history(rt: Any, message: discord.Message) -> None:
+    """Include a thread's human starter in its first unconsumed context snapshot."""
+    channel = message.channel
+    if not isinstance(channel, discord.Thread) or message.id == channel.id:
+        return
+    starter_id = channel.id
+    wm = rt.session_state.get_high_watermark(channel.id) if rt.session_state else -1
+    q = _ensure_channel(rt, channel.id)
+    if wm >= 0 or any(e.get("msg_id") == starter_id for e in q):
+        return
+    starter = getattr(channel, "starter_message", None)
+    if not isinstance(starter, discord.Message):
+        starter = None
+    if starter is None and channel.parent_id:
+        for entry in reversed(rt.channel_history.get(channel.parent_id, [])):
+            if entry.get("msg_id") == starter_id and isinstance(entry.get("message"), discord.Message):
+                starter = entry["message"]
+                break
+    if starter is None:
+        channels = [channel]
+        if channel.parent and hasattr(channel.parent, "fetch_message"):
+            channels.append(channel.parent)
+        for source in channels:
+            try:
+                fetched = await source.fetch_message(starter_id)
+            except discord.HTTPException:
+                continue
+            if isinstance(fetched, discord.Message):
+                starter = fetched
+                break
+    if starter is None or getattr(starter.author, "bot", False):
+        return
+    starter_text = await _resolve_mentions_in_text(
+        (starter.content or "").strip(), message.guild, rt.dc_client.user.id if rt.dc_client.user else None,
+    )
+    snapshots = getattr(starter, "message_snapshots", None)
+    if not starter_text and snapshots:
+        snap = snapshots[0]
+        snap_msg = getattr(snap, "message", snap)
+        snap_content = (getattr(snap_msg, "content", "") or "").strip()
+        snap_embeds = getattr(snap_msg, "embeds", []) or getattr(snap, "embeds", [])
+        if snap_content:
+            fwd_preview = snap_content[:80] + ("..." if len(snap_content) > 80 else "")
+        elif snap_embeds:
+            e = snap_embeds[0]
+            fwd_preview = ((getattr(e, "title", "") or "") or (getattr(e, "description", "") or ""))[:80] or "[嵌入内容]"
+        else:
+            fwd_preview = "[转发内容]"
+        snap_atts = getattr(snap_msg, "attachments", None) or getattr(snap, "attachments", None) or []
+        img_count = sum(
+            1 for a in snap_atts
+            if _context_image_mime(getattr(a, "content_type", None), getattr(a, "filename", "") or "")
+        )
+        if img_count:
+            fwd_preview += f" [含{img_count}张图片]"
+        starter_text = f"[转发] {fwd_preview}"
+    if not starter_text:
+        parts = []
+        if starter.stickers:
+            parts.append("[贴纸: " + ", ".join(s.name for s in starter.stickers) + "]")
+        if starter.attachments:
+            img_count = sum(1 for a in starter.attachments if _context_image_mime(a.content_type, a.filename or ""))
+            other_count = len(starter.attachments) - img_count
+            if img_count:
+                parts.append(f"[图片×{img_count}]")
+            if other_count:
+                parts.append(f"[附件×{other_count}]")
+        if starter.embeds:
+            parts.append(f"[嵌入内容×{len(starter.embeds)}]")
+        starter_text = " ".join(parts)
+    if starter_text:
+        entry_text = _format_member_entry(starter.author, starter_text, msg_time=starter.created_at, key_roles=rt.key_roles)
+        if len(entry_text) > 500:
+            entry_text = entry_text[:497] + "..."
+        if q:
+            seq = q[0].get("seq", 0)
+            q.insert(0, {"text": entry_text, "message": starter, "msg_id": starter.id, "reactions": {}, "seq": seq})
+            if len(q) > rt.history_max_len:
+                q.pop(1)
+        else:
+            _push_history(rt, channel.id, entry_text, message=starter, msg_id=starter.id)
+
+
+def _unconsumed_history_messages(
+    rt: Any, channel_id: int, *, exclude_msg_id: int | None = None,
+) -> list[discord.Message]:
+    """Return human messages belonging to the current unconsumed history snapshot."""
+    wm = rt.session_state.get_high_watermark(channel_id) if rt.session_state else -1
+    if rt.session_state:
+        for t in rt.session_state.triggers.values():
+            if t.conversation_key == f"discord:{channel_id}":
+                t_wm = t.platform_data.get("_context_watermark")
+                if isinstance(t_wm, int):
+                    wm = max(wm, t_wm)
+    return [
+        e["message"] for e in _ensure_channel(rt, channel_id)
+        if e.get("seq", -1) > wm and not e.get("is_bot") and e.get("msg_id") != exclude_msg_id
+        and isinstance(e.get("message"), discord.Message)
+    ]
+
+
+async def _build_reply_context(
+    rt: Any, message: discord.Message, *,
+    ref_msg: discord.Message | None = None, ref_resolved: bool = False,
+) -> str:
+    """提取被引用消息的作者、身份组、时间和正文。"""
+    ref = ref_msg if ref_resolved else await _resolve_reference_message(rt, message)
     if not ref:
         return ""
-
     author = ref.author
-    bot_user = getattr(rt.dc_client, "user", None)
-    if bot_user and author.id == bot_user.id and _is_transient_bot_message(rt, ref_id):
-        return ""
     identity = _format_identity(author, rt.key_roles)
     time_prefix = _format_time_prefix(ref.created_at)
     text = ""

@@ -36,11 +36,8 @@ def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
         + completion_tokens    # 上轮输出，本轮成为历史（真实）
         + tail chars//3        # 上轮末尾新增（finish 结果等）与新 user（估算）
 
-    This turn's dynamic injection is deliberately NOT counted: the stale
-    previous-turn dynamic still sits inside the real prompt_tokens, and the
-    two renders are near-identical between turns, so the residual phantom
-    stands in for the new one. Net error is only the turn-to-turn delta of
-    the dynamic content, not its full size.
+    Earlier dynamic_context rows are already in prompt_tokens; count this turn's
+    incremental injection in the tail just like new user and tool messages.
     Purpose: the first before_step check of a task sees real usage and can
     compact before the first LLM request goes out.
     """
@@ -60,9 +57,6 @@ def _seed_prompt_tokens(messages: list[dict[str, Any]]) -> int | None:
         tail_chars = 0
         for tail in messages[i + 1:]:
             if not isinstance(tail, dict):
-                continue
-            if tail.get("_dynamic"):
-                # 抵消项：本轮动态不数，由基数里残留的上轮动态顶替。
                 continue
             content = tail.get("content", "")
             if isinstance(content, str):

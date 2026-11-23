@@ -103,6 +103,11 @@ class TangQiuCallbacks:
     ) -> None:
         """发送主节点最终回复。"""
         platform_data = trigger.platform_data
+        if platform_data.get("background"):
+            # SDK 为“无本地触发”的入口任务（适配器重启、定时任务等）创建后台 trigger，
+            # 并用 send_reply 发送 "✓ 完成"/"⚠️ 已取消" 等进度收尾状态；QQ 没有进度卡片，
+            # 忽略即可。正文由 SDK 另走 send_to_channel 投递。
+            return
         bot = platform_data.get("bot") or send._get_fallback_bot()
         target = send._target_from_platform_data(platform_data) or state.ANON.target_from_conversation_key(trigger.conversation_key)
         if not bot:

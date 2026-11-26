@@ -101,6 +101,8 @@ def _build_implicit_finish(ctx: Any, ls: Any, resp: Any, text: str) -> TaskActio
     reasoning_text = getattr(resp, "reasoning", None) or ""
     implicit_meta = MessageMeta(
         provider=provider_name,
+        channel=(ls.rctx.response_info or {}).get("channel") or getattr(ls.provider, "channel_id", "") or "",
+        model=(ls.rctx.response_info or {}).get("model") or getattr(ls.provider, "model", "") or "",
         tool_mode=getattr(ls.node, "tool_mode", "fake-native"),
         message_type="assistant",
         timestamp=datetime.now(timezone.utc).isoformat(),

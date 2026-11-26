@@ -367,6 +367,9 @@ def migrate(data: Mapping[str, Any], *, root: Path | str | None = None) -> tuple
             new = {"channel": ref_for(entry, hint=f"fallback-{i}", name=f"备用渠道 {i}"),
                    "model": str(entry.get("model") or "")}
             new.update({k: v for k, v in entry.items() if k in OPTION_KEYS})
+            target = next((c for c in builder.items if c.get("id") == new["channel"]), None)
+            if target is not None and not str(target.get("model") or "").strip() and new["model"]:
+                target["model"] = new["model"]  # a scheme made for a fallback is usable on its own
             out.append(new)
         data["fallbacks"] = out
 

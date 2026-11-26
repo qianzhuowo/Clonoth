@@ -2813,7 +2813,16 @@ def create_app(
         async def _web_trailing_slash() -> _RR:
             return _RR("./web/")
 
-        app.mount("/web", StaticFiles(directory=str(web_dist), html=True), name="web")
+        class _WebFiles(StaticFiles):
+            """index.html must be revalidated, or browsers keep loading an old bundle after a deploy."""
+
+            async def get_response(self, path: str, scope: Any) -> Any:
+                response = await super().get_response(path, scope)
+                if path in ("", ".", "index.html") or path.endswith(".html"):
+                    response.headers["Cache-Control"] = "no-cache"
+                return response
+
+        app.mount("/web", _WebFiles(directory=str(web_dist), html=True), name="web")
         web_mounted = True
         print(f"[web] 前端地址: http://{_display_host}:{_display_port}/web/", flush=True)
 

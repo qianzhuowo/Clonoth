@@ -1026,7 +1026,24 @@ def _coalesce_raw_parts(raw_parts: list[dict[str, Any]]) -> list[dict[str, Any]]
         else:
             merged.append(dict(p))
 
-    return merged
+    return _drop_empty_parts(merged)
+
+
+def _drop_empty_parts(parts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Gemini rejects a part whose data is empty ("required oneof field 'data'"), e.g. a trailing
+    streamed {"text": ""}. A signature on such a part moves to the preceding part."""
+    kept: list[dict[str, Any]] = []
+    for p in parts:
+        if any(k in p for k in _DATA_KEYS if k != "text") or p.get("text"):
+            kept.append(p)
+            continue
+        sig = p.get("thoughtSignature")
+        if sig and kept and "thoughtSignature" not in kept[-1]:
+            kept[-1]["thoughtSignature"] = sig
+    return kept
+
+
+_DATA_KEYS = ("text", "functionCall", "functionResponse", "inlineData", "fileData", "executableCode", "codeExecutionResult")
 
 
 _SKIP_THOUGHT_SIG = "skip_thought_signature_validator"

@@ -150,3 +150,12 @@ def test_replay_keeps_reasoning_only_for_same_channel_and_model():
         assert not {"metadata", "reasoning", "has_reasoning"} & set(clean["_meta"]) and clean["_meta"]["id"] == "m1"
     # without a channel nothing is trusted
     assert all("reasoning_content" not in m for m in drop_foreign_reasoning(msgs, "", "g4")[1:])
+
+
+def test_gemini_replay_drops_empty_text_parts():
+    from providers.gemini import _coalesce_raw_parts
+
+    parts = [{"functionCall": {"name": "bash", "args": {}}, "thoughtSignature": "sig"}, {"text": ""}]
+    assert _coalesce_raw_parts(parts) == [parts[0]]
+    moved = _coalesce_raw_parts([{"text": "hi"}, {"text": "", "thoughtSignature": "s2"}])
+    assert moved == [{"text": "hi", "thoughtSignature": "s2"}]

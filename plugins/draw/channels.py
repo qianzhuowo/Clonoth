@@ -1,7 +1,7 @@
 """生图渠道是否启用的唯一判定。
 
-某渠道“可用”当且仅当 data/config.yaml 的 system_models 里配置了对应槽位
-（设置 → 系统模型 → 生图）：gpt → image_gpt，gemini → image。读取走 clonoth_channels，
+某渠道“可用”当且仅当 data/config.yaml 里对应的生图渠道存在且开启
+（设置 → 模型 → Gemini/GPT 生图）：gpt → image_gpt，gemini → image。读取走 clonoth_channels，
 与 tools/gpt_image_2.py、tools/gemini_image.py 一致。
 
 被渠道门控（gating）和 draw.image_gen 可用性注入（image_gen_inject）共用。
@@ -12,7 +12,7 @@ from pathlib import Path
 
 import clonoth_channels as chn
 
-# 渠道 -> (system_models 槽位, 生图工具名)
+# 绘图渠道 -> (生图角色渠道 id, 生图工具名)
 IMAGE_CHANNELS: dict[str, tuple[str, str]] = {
     "gpt": ("image_gpt", "gpt_image_2"),
     "gemini": ("image", "gemini_image"),

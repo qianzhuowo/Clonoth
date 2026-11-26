@@ -150,7 +150,7 @@ def resolve_provider(
     session_override: dict[str, Any] | None = None,
     cfg: dict[str, Any] | None = None,
 ) -> ResolvedProvider:
-    """节点要用的渠道：系统槽位 / node_models / 当前方案，再叠加会话覆盖（clonoth_channels）。
+    """节点要用的渠道：角色渠道 / node_models / 主模型，再叠加会话覆盖（clonoth_channels）。
 
     Raises clonoth_channels.ChannelError when no scheme is configured.
     """

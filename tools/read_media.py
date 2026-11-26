@@ -107,7 +107,7 @@ def _prepare_media(raw_path: str, root: Path) -> tuple[dict, bool]:
 
 
 def _vision_channel(root: Path):
-    """Settings → 识图模型 (system_models.vision); unset = the current channel scheme."""
+    """Settings → 识图模型 (the vision channel); missing or off = the main channel."""
     code_root = str(Path(__file__).resolve().parent.parent)
     if code_root not in sys.path:
         sys.path.insert(0, code_root)

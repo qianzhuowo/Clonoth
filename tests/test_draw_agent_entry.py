@@ -240,7 +240,7 @@ def test_entry_uses_agent_preset_model_when_configured(tmp_path: Path, monkeypat
     root = _workspace(tmp_path, monkeypatch, planner={"tool_protocol": "text", "timeout_sec": 5},
                       agent={"current_preset_id": "a1", "presets": [{"id": "a0", "name": "别的"}, preset]})
     (root / "data").mkdir(exist_ok=True)
-    (root / "data" / "config.yaml").write_text(yaml.safe_dump({"active_channel": "relay", "channels": [
+    (root / "data" / "config.yaml").write_text(yaml.safe_dump({"channels": [
         {"id": "relay", "name": "中转", "type": "openai", "base_url": "https://relay.test/v1", "api_key": "sk-test", "model": "m0"},
     ]}), encoding="utf-8")
     seen = _spy_runtime(monkeypatch)
@@ -282,7 +282,7 @@ def test_entry_reports_unusable_agent_preset_without_retrying(tmp_path: Path, mo
     delays = _no_sleep(monkeypatch)
     node_provider = FakeProvider([_plan_response()])
     text = _handle(root, node_provider).action.result["text"]
-    assert text.startswith("场景规划失败：场景 Agent 预设「坏预设」无法使用") and "渠道方案不存在" in text
+    assert text.startswith("场景规划失败：场景 Agent 预设「坏预设」无法使用") and "渠道不存在" in text
     assert node_provider.requests == [] and delays == []
 
 

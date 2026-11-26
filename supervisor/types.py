@@ -338,40 +338,31 @@ class ChannelSummary(BaseModel):
 
 class AppConfigPublic(BaseModel):
     version: int = 1
-    active_channel: str = ""
-    active_model: str = ""
+    main_model: str = ""
     channels: list[ChannelSummary] = Field(default_factory=list)
     mimo_audio: MimoAudioConfigPublic
 
 
 class ChannelUpdateIn(BaseModel):
-    """新建/更新渠道方案（部分更新）；api_key 留空保留原值"""
+    """新建/更新渠道（部分更新）；api_key 留空保留原值；enabled=False 关闭该角色"""
     name: str | None = None
     type: str | None = None
     base_url: str | None = None
     api_key: str | None = None
     model: str | None = None
+    enabled: bool | None = None
     clear_api_key: bool = False
+    copy_key_from: str | None = None  # 新渠道未填密钥时，沿用该渠道的密钥
 
 
-class ActiveChannelIn(BaseModel):
-    channel: str
-
-
-class ActiveModelIn(BaseModel):
-    """修改当前方案的模型（聊天命令用）"""
+class MainModelIn(BaseModel):
+    """修改主模型（聊天命令用）"""
     model: str
 
 
-class FallbackEntryIn(BaseModel):
-    """备用链的一项：引用渠道方案，model 留空用方案自己的模型"""
-    channel: str
-    model: str = ""
-    source_index: int | None = None
-
-
 class FallbacksUpdateIn(BaseModel):
-    fallbacks: list[FallbackEntryIn]
+    """备用链路顺序（渠道 id 列表）"""
+    fallbacks: list[str]
 
 
 class ModelVisionIn(BaseModel):
@@ -381,13 +372,13 @@ class ModelVisionIn(BaseModel):
 
 
 class ChannelRefUpdateIn(BaseModel):
-    """system_models.<slot> / node_models.<node>；None 保持不变，空字符串清除"""
+    """node_models.<node>；None 保持不变，空字符串清除"""
     channel: str | None = None
     model: str | None = None
 
 
 class ChannelModelsIn(BaseModel):
-    """拉取模型列表：已保存方案用 channel；表单草稿用 type/base_url/api_key（api_key 空时取 channel 的）"""
+    """拉取模型列表：已保存渠道用 channel；表单草稿用 type/base_url/api_key（api_key 空时取 channel 的）"""
     channel: str = ""
     type: str = ""
     base_url: str = ""

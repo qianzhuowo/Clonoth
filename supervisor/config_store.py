@@ -37,7 +37,7 @@ _CHANNEL_ID_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ012
 
 
 class ConfigStore:
-    """YAML-backed store for data/config.yaml (channel schemes, slots, fallbacks, audio).
+    """YAML-backed store for data/config.yaml (channels, fallback order, node choices, audio).
 
     The layout is described in ``clonoth_channels``; reading an older file migrates
     it once and writes it back. api_key values are secrets (data/config.yaml is ignored by git).
@@ -81,23 +81,21 @@ class ConfigStore:
     def get_public(self) -> AppConfigPublic:
         with self._lock:
             data = self._load_raw()
-            active = chn.active_channel_id(data)
             summaries = [
                 ChannelSummary(id=str(c["id"]), name=str(c.get("name") or c["id"]),
                                type=str(c.get("type") or ""), model=chn.resolve_ref(c.get("model"), self.root))
                 for c in chn.channel_list(data)
             ]
-            active_model = next((s.model for s in summaries if s.id == active), "")
-            return AppConfigPublic(version=int(data.get("version") or 1), active_channel=active,
-                                   active_model=active_model, channels=summaries,
-                                   mimo_audio=self.get_mimo_audio_public())
+            main_model = next((s.model for s in summaries if s.id == chn.MAIN), "")
+            return AppConfigPublic(version=int(data.get("version") or 1), main_model=main_model,
+                                   channels=summaries, mimo_audio=self.get_mimo_audio_public())
 
     def _vision(self, caps: dict[str, Any], model: str) -> bool:
         from engine.vision import vision_from_capabilities
         return vision_from_capabilities(caps, model)
 
     def get_channels_public(self) -> dict[str, Any]:
-        """Channel schemes, fallback chain, slots and node choices; api_keys redacted."""
+        """Channels (each with its role), the fallback order and node choices; api_keys redacted."""
         with self._lock:
             data = self._load_raw()
             caps = data.get("model_capabilities") if isinstance(data.get("model_capabilities"), dict) else {}
@@ -107,28 +105,19 @@ class ConfigStore:
                 model = chn.resolve_ref(c.get("model"), self.root)
                 base_url = str(c.get("base_url") or "")
                 kind = str(c.get("type") or "")
+                cid = str(c["id"])
                 channels.append({
-                    "id": str(c["id"]), "name": str(c.get("name") or c["id"]), "type": kind,
+                    "id": cid, "name": str(c.get("name") or cid), "type": kind,
+                    "role": chn.role_of(data, cid), "enabled": c.get("enabled") is not False,
                     "base_url": base_url, "base_url_resolved": chn.resolve_ref(base_url, self.root),
                     "model": model, "api_key_present": present, "api_key_redacted": redacted,
                     "vision": self._vision(caps, model),
                     "type_hint": chn.type_mismatch(kind, chn.resolve_ref(base_url, self.root)),
                 })
-            by_id = {c["id"]: c for c in channels}
-            fallbacks = []
-            for entry in data.get("fallbacks") or []:
-                if not isinstance(entry, dict):
-                    continue
-                cid = str(entry.get("channel") or "").strip()
-                model = str(entry.get("model") or "").strip() or by_id.get(cid, {}).get("model", "")
-                fallbacks.append({"channel": cid, "model": str(entry.get("model") or ""),
-                                  "effective_model": model, "missing": cid not in by_id,
-                                  "vision": self._vision(caps, model)})
             return {
-                "active_channel": chn.active_channel_id(data),
                 "channels": channels,
-                "fallbacks": fallbacks,
-                "system_models": {s: self._ref_public(data, "system_models", s) for s in chn.SYSTEM_MODEL_SLOT_NAMES},
+                "fallbacks": chn.fallback_ids(data),
+                "roles": dict(chn.ROLE_CHANNELS),
                 "node_models": {k: self._ref_public(data, "node_models", k)
                                 for k in (data.get("node_models") or {})},
                 "model_capabilities": caps,
@@ -140,7 +129,7 @@ class ConfigStore:
         entry = block.get(key) if isinstance(block.get(key), dict) else {}
         return {"channel": str(entry.get("channel") or ""), "model": str(entry.get("model") or "")}
 
-    # ---- channel schemes ----
+    # ---- channels ----
 
     def get_channel_secret(self, channel_id: str) -> chn.Channel:
         with self._lock:
@@ -148,18 +137,20 @@ class ConfigStore:
 
     def upsert_channel(self, channel_id: str, *, name: str | None = None, type: str | None = None,
                        base_url: str | None = None, api_key: str | None = None, model: str | None = None,
-                       clear_api_key: bool = False) -> dict[str, Any]:
+                       enabled: bool | None = None, clear_api_key: bool = False,
+                       copy_key_from: str | None = None) -> dict[str, Any]:
         cid = (channel_id or "").strip()
         if not cid or not set(cid) <= _CHANNEL_ID_CHARS or len(cid) > 64:
-            raise ValueError("方案 id 只能用字母、数字、_ . -，最长 64 位")
+            raise ValueError("渠道 id 只能用字母、数字、_ . -，最长 64 位")
         with self._lock:
             data = self._load_raw()
             channels = [dict(c) for c in chn.channel_list(data)]
             entry = next((c for c in channels if str(c["id"]) == cid), None)
             if entry is None:
                 if not (type or "").strip():
-                    raise ValueError("新方案必须选择类型")
-                entry = {"id": cid, "name": cid, "type": "", "base_url": "", "api_key": "", "model": ""}
+                    raise ValueError("新渠道必须选择格式")
+                entry = {"id": cid, "name": chn.ROLE_CHANNELS.get(cid, cid), "type": "",
+                         "base_url": "", "api_key": "", "model": ""}
                 channels.append(entry)
             for key, value in (("name", name), ("type", type), ("base_url", base_url), ("model", model)):
                 if value is not None:
@@ -168,72 +159,70 @@ class ConfigStore:
                 entry["api_key"] = api_key.strip()
             elif clear_api_key:
                 entry["api_key"] = ""
-            entry["name"] = entry.get("name") or cid
+            elif copy_key_from and not str(entry.get("api_key") or "").strip():
+                src = next((c for c in channels if str(c["id"]) == copy_key_from.strip()), None)
+                if src is None:
+                    raise ValueError(f"渠道不存在：{copy_key_from}")
+                entry["api_key"] = src.get("api_key") or ""
+            if enabled is not None:
+                if cid == chn.MAIN and not enabled:
+                    raise ValueError("主模型不能关闭")
+                if enabled:
+                    entry.pop("enabled", None)
+                else:
+                    entry["enabled"] = False
+            entry["name"] = entry.get("name") or chn.ROLE_CHANNELS.get(cid, cid)
             data["channels"] = channels
-            if not chn.active_channel_id({**data, "active_channel": data.get("active_channel")}) or not data.get("active_channel"):
-                data["active_channel"] = cid
             self._save_raw(data)
             return self.get_channels_public()
 
     def delete_channel(self, channel_id: str) -> dict[str, Any]:
         with self._lock:
             data = self._load_raw()
+            if channel_id == chn.MAIN:
+                raise ValueError("主模型不能删除")
             used = chn.references(data, channel_id)
             if used:
-                raise ValueError(f"方案「{channel_id}」正在使用：{'、'.join(used)}；请先改掉这些引用")
+                raise ValueError(f"渠道「{channel_id}」正在使用：{'、'.join(used)}；请先改掉这些引用")
             data["channels"] = [c for c in chn.channel_list(data) if str(c["id"]) != channel_id]
+            if "fallbacks" in data:
+                data["fallbacks"] = [e for e in (data.get("fallbacks") or [])
+                                     if not (isinstance(e, dict) and e.get("channel") == channel_id)]
             self._save_raw(data)
             return self.get_channels_public()
 
-    def set_active_channel(self, channel_id: str) -> dict[str, Any]:
-        with self._lock:
-            data = self._load_raw()
-            if channel_id not in {str(c["id"]) for c in chn.channel_list(data)}:
-                raise ValueError(f"渠道方案不存在：{channel_id}")
-            data["active_channel"] = channel_id
-            self._save_raw(data)
-            return self.get_channels_public()
-
-    def set_active_model(self, model: str) -> str:
-        """Change the model of the current scheme (chat commands); returns the scheme id."""
+    def set_main_model(self, model: str) -> str:
+        """Change the main model (chat commands); returns its channel id."""
         model = (model or "").strip()
         if not model:
             raise ValueError("model is required")
         with self._lock:
             data = self._load_raw()
-            active = chn.active_channel_id(data)
-            if not active:
-                raise ValueError("还没有配置渠道方案")
             channels = [dict(c) for c in chn.channel_list(data)]
-            for c in channels:
-                if str(c["id"]) == active:
-                    c["model"] = model
+            main = next((c for c in channels if str(c["id"]) == chn.MAIN), None)
+            if main is None:
+                raise ValueError("还没有配置主模型")
+            main["model"] = model
             data["channels"] = channels
             self._save_raw(data)
-            return active
+            return chn.MAIN
 
     # ---- fallbacks / capabilities ----
 
-    def update_fallbacks(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
-        """Replace the fallback chain. Options of the entry at ``source_index`` are preserved."""
+    def update_fallbacks(self, channel_ids: list[str]) -> dict[str, Any]:
+        """Set the fallback order. Options already on an entry are kept."""
         with self._lock:
             data = self._load_raw()
             ids = {str(c["id"]) for c in chn.channel_list(data)}
-            old = [e for e in (data.get("fallbacks") or []) if isinstance(e, dict)]
+            old = {str(e.get("channel")): e for e in (data.get("fallbacks") or []) if isinstance(e, dict)}
             chain: list[dict[str, Any]] = []
-            for item in entries:
-                cid = str(item.get("channel") or "").strip()
+            for cid in channel_ids:
+                cid = str(cid or "").strip()
                 if cid not in ids:
-                    raise ValueError(f"备用链引用了不存在的方案：{cid or '（空）'}")
-                src = item.get("source_index")
-                base = dict(old[src]) if isinstance(src, int) and 0 <= src < len(old) else {}
-                base["channel"] = cid
-                model = str(item.get("model") or "").strip()
-                if model:
-                    base["model"] = model
-                else:
-                    base.pop("model", None)
-                chain.append(base)
+                    raise ValueError(f"备用链路引用了不存在的渠道：{cid or '（空）'}")
+                if cid in chn.ROLE_CHANNELS:
+                    raise ValueError(f"「{chn.ROLE_CHANNELS[cid]}」不能当作备用链路")
+                chain.append({**old.get(cid, {}), "channel": cid})
             data["fallbacks"] = chain
             self._save_raw(data)
             return self.get_channels_public()
@@ -252,38 +241,28 @@ class ConfigStore:
             self._save_raw(data)
             return self.get_channels_public()
 
-    # ---- system slots / node models ----
+    # ---- node models ----
 
-    def _update_ref(self, scope: str, key: str, channel: str | None, model: str | None) -> dict[str, str]:
+    def update_node_model(self, node_id: str, *, channel: str | None = None, model: str | None = None) -> dict[str, str]:
         with self._lock:
             data = self._load_raw()
-            block = data.get(scope) if isinstance(data.get(scope), dict) else {}
-            entry = dict(block.get(key)) if isinstance(block.get(key), dict) else {}
+            block = data.get("node_models") if isinstance(data.get("node_models"), dict) else {}
+            entry = dict(block.get(node_id)) if isinstance(block.get(node_id), dict) else {}
             if channel is not None:
                 cid = channel.strip()
                 if cid and cid not in {str(c["id"]) for c in chn.channel_list(data)}:
-                    raise ValueError(f"渠道方案不存在：{cid}")
+                    raise ValueError(f"渠道不存在：{cid}")
                 entry["channel"] = cid
             if model is not None:
                 entry["model"] = model.strip()
             entry = {k: v for k, v in entry.items() if v}
             if entry:
-                block[key] = entry
+                block[node_id] = entry
             else:
-                block.pop(key, None)
-            data[scope] = block
+                block.pop(node_id, None)
+            data["node_models"] = block
             self._save_raw(data)
-            return self._ref_public(data, scope, key)
-
-    def get_system_model_public(self, slot: str) -> dict[str, str]:
-        with self._lock:
-            return {"slot": slot, **self._ref_public(self._load_raw(), "system_models", slot)}
-
-    def update_system_model(self, slot: str, *, channel: str | None = None, model: str | None = None) -> dict[str, str]:
-        return {"slot": slot, **self._update_ref("system_models", slot, channel, model)}
-
-    def update_node_model(self, node_id: str, *, channel: str | None = None, model: str | None = None) -> dict[str, str]:
-        return {"node_id": node_id, **self._update_ref("node_models", node_id, channel, model)}
+            return {"node_id": node_id, **self._ref_public(data, "node_models", node_id)}
 
     # ---- mimo audio ----
 

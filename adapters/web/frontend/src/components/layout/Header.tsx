@@ -76,7 +76,7 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
   // Fetch global config once
   useEffect(() => {
     getAppConfig()
-      .then(r => setChannelConfig(r.active_channel, r.channels || []))
+      .then(r => setChannelConfig(r.channels || []))
       .catch(() => {});
   }, [setChannelConfig]);
 

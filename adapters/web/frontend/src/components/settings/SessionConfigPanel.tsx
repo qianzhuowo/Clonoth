@@ -146,7 +146,6 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     entryNodeId,
     activeEffectiveModel,
     activeEffectiveBaseUrl,
-    activeChannel,
     channels,
     sessionProviderOverride,
     setActiveNode,
@@ -193,7 +192,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
         .catch(() => {});
     }
     getAppConfig()
-      .then(r => setChannelConfig(r.active_channel, r.channels || []))
+      .then(r => setChannelConfig(r.channels || []))
       .catch(() => {});
     if (adminToken) {
       if (availableNodes.length === 0) {
@@ -475,13 +474,13 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
             </span>
           </div>
 
-          <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">渠道方案</label>
+          <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">渠道</label>
           <select
             className="mb-2 w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
             onChange={e => setEdit(p => ({ ...p, channel: e.target.value }))}
             value={edit.channel}
           >
-            <option value="">默认（节点 / 当前方案 {channels.find(c => c.id === activeChannel)?.name || activeChannel || '未设置'}）</option>
+            <option value="">默认（节点设置 / 主模型）</option>
             {channels.map(c => (
               <option key={c.id} value={c.id}>
                 {c.name}{c.model ? ` — ${c.model}` : ''}
@@ -496,7 +495,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
           <input
             className="mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
             onChange={e => setEdit(p => ({ ...p, model: e.target.value }))}
-            placeholder={activeEffectiveModel || '留空使用方案的模型'}
+            placeholder={activeEffectiveModel || '留空使用渠道的模型'}
             value={edit.model}
           />
 

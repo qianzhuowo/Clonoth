@@ -35,8 +35,8 @@ def _image_slots(root: Path, *slots: str) -> None:
     import yaml
     (root / "data").mkdir(exist_ok=True)
     (root / "data" / "config.yaml").write_text(yaml.safe_dump({
-        "active_channel": "c", "channels": [{"id": "c", "type": "openai", "base_url": "https://x.test/v1", "api_key": "k"}],
-        "system_models": {s: {"channel": "c", "model": f"{s}-model"} for s in slots},
+        "channels": [{"id": s, "type": "openai", "base_url": "https://x.test/v1", "api_key": "k", "model": f"{s}-model"}
+                     for s in ("main", *slots)] + [{"id": "image", "type": "gemini", "enabled": False}] * ("image" not in slots),
     }), encoding="utf-8")
 
 
@@ -177,7 +177,7 @@ def test_gating_hides_everything_when_no_channel_configured(tmp_path):
     assert hidden == {"tools": {"gpt_image_2", "gemini_image"}, "delegate_targets": {"draw.image_gen"}}
 
 
-def test_gating_reads_system_model_slots_and_keeps_draw_node(tmp_path):
+def test_gating_reads_image_channels_and_keeps_draw_node(tmp_path):
     _image_slots(tmp_path, "image")
     hidden = image_gen_visibility(_vis_ctx(tmp_path))
     assert hidden == {"tools": {"gpt_image_2"}, "delegate_targets": set()}

@@ -1,5 +1,5 @@
-// A scheme + model reference editor: system_models.<slot> or node_models.<node_id>.
-// Empty scheme = the current scheme; empty model = the scheme's own model.
+// Channel + model reference editor for node_models.<node_id>.
+// Empty channel = the main model; empty model = the channel's own model.
 import { useEffect, useState } from 'react';
 
 import type { ChannelPublic, ChannelRef } from '../../../api/supervisorClient';
@@ -13,14 +13,13 @@ interface Props {
   title: string;
   description: string;
   channels: ChannelPublic[];
-  activeChannel: string;
   value: ChannelRef | undefined;
-  /** Text for the empty-scheme option; defaults to “当前方案”. */
+  /** Text for the empty-channel option; defaults to the main model. */
   emptyLabel?: string;
   onSave: (ref: ChannelRef) => Promise<void>;
 }
 
-export const SystemModelCard = ({ title, description, channels, activeChannel, value, emptyLabel, onSave }: Props) => {
+export const NodeModelCard = ({ title, description, channels, value, emptyLabel, onSave }: Props) => {
   const [edit, setEdit] = useState<ChannelRef>({ channel: '', model: '' });
   const [saving, setSaving] = useState(false);
 
@@ -28,8 +27,8 @@ export const SystemModelCard = ({ title, description, channels, activeChannel, v
     setEdit({ channel: value?.channel || '', model: value?.model || '' });
   }, [value?.channel, value?.model]);
 
-  const active = channels.find(c => c.id === activeChannel);
-  const picked = channels.find(c => c.id === (edit.channel || activeChannel));
+  const main = channels.find(c => c.id === 'main');
+  const picked = channels.find(c => c.id === (edit.channel || 'main'));
   const dirty = edit.channel !== (value?.channel || '') || edit.model !== (value?.model || '');
 
   const save = async () => {
@@ -50,11 +49,11 @@ export const SystemModelCard = ({ title, description, channels, activeChannel, v
       <p className="mb-3 text-xs text-[var(--duties-secondary)]">{description}</p>
       <div className="grid gap-2 sm:grid-cols-2">
         <div>
-          <label className="mb-1 block text-xs text-[var(--duties-secondary)]">渠道方案</label>
+          <label className="mb-1 block text-xs text-[var(--duties-secondary)]">渠道</label>
           <select className={inputCls} onChange={e => setEdit(v => ({ ...v, channel: e.target.value }))} value={edit.channel}>
-            <option value="">{emptyLabel || `当前方案（${active?.name || '未设置'}）`}</option>
+            <option value="">{emptyLabel || `主模型（${main?.model || '未设置'}）`}</option>
             {channels.map(c => (
-              <option key={c.id} value={c.id}>{c.name}（{c.type}）</option>
+              <option key={c.id} value={c.id}>{c.name}（{c.model || c.type}）</option>
             ))}
             {edit.channel && !channels.some(c => c.id === edit.channel) && (
               <option value={edit.channel}>{edit.channel}（不存在）</option>
@@ -66,7 +65,7 @@ export const SystemModelCard = ({ title, description, channels, activeChannel, v
           <input
             className={inputCls}
             onChange={e => setEdit(v => ({ ...v, model: e.target.value }))}
-            placeholder={picked?.model ? `留空使用 ${picked.model}` : '留空使用方案的模型'}
+            placeholder={picked?.model ? `留空使用 ${picked.model}` : '留空使用渠道的模型'}
             value={edit.model}
           />
         </div>

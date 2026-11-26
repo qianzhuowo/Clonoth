@@ -2,20 +2,26 @@
 
 data/config.yaml::
 
-    active_channel: main
     channels:
-      - {id: main, name: 主渠道, type: gemini, base_url: ..., api_key: ..., model: ...}
-    fallbacks:                 # tried in order when the primary request fails
-      - {channel: gw, model: rp/gemini-4-argon}
-    system_models:             # system slots; empty channel = active channel
-      compact: {model: deepseek-flash}
-    node_models:               # per-node choice made in the WebUI; empty channel = active channel
+      - {id: main, name: 主模型, type: gemini, base_url: ..., api_key: ..., model: ...}
+      - {id: vision, ...}                 # role channels: one per role, edited on the model page
+      - {id: fallback-1, ...}
+      - {id: image, ..., enabled: false}  # enabled: false = the role is off, its settings are kept
+      - {id: draw, ...}                   # other channels, picked by node_models / draw presets
+    fallbacks:                 # fallback channels, tried in order when the primary request fails
+      - {channel: fallback-1}
+    node_models:               # per-node choice made in the WebUI; empty channel = main
       draw.novelai_planner: {channel: draw}
 
-Every reader (engine, fallback chain, system slots, vision, supervisor header,
-chat commands) resolves through this module. ``migrate`` converts the previous
-layout (top-level provider blocks, ``provider:``, provider-keyed fallbacks and
-slots, model fields inside node YAML) once; nothing reads the old layout.
+Each role owns the channel whose id is the role name (``ROLE_CHANNELS``). A missing
+or disabled role channel means: compact / summary / memory / vision use the main
+channel, image / image_gpt are unavailable.
+
+Every reader (engine, fallback chain, roles, vision, supervisor header, chat
+commands) resolves through this module. ``migrate`` converts earlier layouts
+(top-level provider blocks, ``provider:``, ``active_channel`` + shared schemes
+referenced by ``system_models`` / fallbacks, model fields inside node YAML) once;
+nothing reads an old layout.
 """
 from __future__ import annotations
 
@@ -31,8 +37,19 @@ import yaml
 # Options a channel (or a fallback entry) may carry; passed to the provider as provider_options.
 OPTION_KEYS = ("reasoning_field", "reasoning_effort", "max_tokens", "max_completion_tokens", "thought_summary", "sticky_session")
 
-SYSTEM_MODEL_SLOT_NAMES = ("compact", "summary", "memory", "image", "image_gpt", "vision")
-# System node id -> slot.
+MAIN = "main"
+# Role channel id -> label. Fallback channels are listed in ``fallbacks``.
+ROLE_CHANNELS = {
+    MAIN: "主模型",
+    "vision": "识图模型",
+    "compact": "上下文压缩模型",
+    "summary": "轮次摘要模型",
+    "memory": "记忆提取模型",
+    "image": "Gemini 生图",
+    "image_gpt": "GPT 生图",
+}
+SYSTEM_MODEL_SLOT_NAMES = tuple(k for k in ROLE_CHANNELS if k != MAIN)
+# System node id -> role.
 SYSTEM_NODE_MODEL_SLOTS = {
     "system.compactor": "compact",
     "system.turn_summarizer": "summary",
@@ -53,6 +70,7 @@ class Channel:
     api_key: str
     model: str
     options: dict = field(default_factory=dict)
+    enabled: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -109,21 +127,13 @@ def channel_list(cfg: Mapping[str, Any]) -> list[dict[str, Any]]:
     return [c for c in (raw or []) if isinstance(c, dict) and str(c.get("id") or "").strip()]
 
 
-def active_channel_id(cfg: Mapping[str, Any]) -> str:
-    ids = [str(c["id"]).strip() for c in channel_list(cfg)]
-    wanted = str(cfg.get("active_channel") or "").strip()
-    if wanted in ids:
-        return wanted
-    return ids[0] if ids else ""
-
-
 def get_channel(cfg: Mapping[str, Any], channel_id: str = "", *, model: str = "",
                 root: Path | str | None = None) -> Channel:
-    """The named channel (empty = active channel); ``model`` overrides the channel's model."""
-    cid = str(channel_id or "").strip() or active_channel_id(cfg)
+    """The named channel (empty = main); ``model`` overrides the channel's model."""
+    cid = str(channel_id or "").strip() or MAIN
     raw = next((c for c in channel_list(cfg) if str(c["id"]).strip() == cid), None)
     if raw is None:
-        raise ChannelError(f"渠道方案不存在：{cid}" if cid else "还没有配置渠道方案")
+        raise ChannelError("还没有配置主模型" if cid == MAIN else f"渠道不存在：{cid}")
     return Channel(
         id=cid,
         name=str(raw.get("name") or cid),
@@ -132,6 +142,7 @@ def get_channel(cfg: Mapping[str, Any], channel_id: str = "", *, model: str = ""
         api_key=resolve_ref(raw.get("api_key"), root),
         model=str(model or "").strip() or resolve_ref(raw.get("model"), root),
         options={k: raw[k] for k in OPTION_KEYS if k in raw},
+        enabled=raw.get("enabled") is not False,
     )
 
 
@@ -142,16 +153,15 @@ def _ref_of(entry: Any) -> tuple[str, str]:
 
 
 def slot_channel(cfg: Mapping[str, Any], slot: str, *, root: Path | str | None = None) -> Channel | None:
-    """system_models.<slot>; None when the slot is not configured."""
-    slots = cfg.get("system_models") if isinstance(cfg.get("system_models"), Mapping) else {}
-    channel, model = _ref_of(slots.get(slot))
-    if not (channel or model):
+    """The role's own channel; None when it is missing or switched off."""
+    if not any(str(c["id"]).strip() == slot for c in channel_list(cfg)):
         return None
-    return get_channel(cfg, channel, model=resolve_ref(model, root), root=root)
+    ch = get_channel(cfg, slot, root=root)
+    return ch if ch.enabled else None
 
 
 def node_channel(cfg: Mapping[str, Any], node_id: str, *, root: Path | str | None = None) -> Channel:
-    """Channel for a node: its system slot or node_models entry, otherwise the active channel."""
+    """Channel for a node: its role channel or node_models entry, otherwise main."""
     slot = SYSTEM_NODE_MODEL_SLOTS.get(node_id, "")
     if slot:
         chosen = slot_channel(cfg, slot, root=root)
@@ -178,34 +188,37 @@ def apply_session_override(cfg: Mapping[str, Any], channel: Channel, override: M
     return replace(channel, **changes) if changes else channel
 
 
+def fallback_ids(cfg: Mapping[str, Any]) -> list[str]:
+    return [cid for cid, _model in (_ref_of(e) for e in cfg.get("fallbacks") or []) if cid]
+
+
 def fallback_channels(cfg: Mapping[str, Any], *, root: Path | str | None = None) -> list[Channel]:
-    """The fallback chain; entries naming a missing channel are skipped."""
+    """The fallback chain; missing or switched-off channels are skipped."""
     out: list[Channel] = []
     for entry in cfg.get("fallbacks") or []:
-        channel_id, model = _ref_of(entry)
+        channel_id, _model = _ref_of(entry)
         try:
-            ch = get_channel(cfg, channel_id, model=model, root=root)
+            ch = get_channel(cfg, channel_id, root=root)
         except ChannelError:
+            continue
+        if not ch.enabled:
             continue
         extra = {k: entry[k] for k in OPTION_KEYS if k in entry}
         out.append(replace(ch, options={**ch.options, **extra}) if extra else ch)
     return out
 
 
+def role_of(cfg: Mapping[str, Any], channel_id: str) -> str:
+    """``main`` / a role name / ``fallback`` / ``other``."""
+    if channel_id in ROLE_CHANNELS:
+        return channel_id
+    return "fallback" if channel_id in fallback_ids(cfg) else "other"
+
+
 def references(cfg: Mapping[str, Any], channel_id: str) -> list[str]:
-    """Human-readable places that use ``channel_id`` (deletion guard)."""
-    used: list[str] = []
-    if active_channel_id(cfg) == channel_id:
-        used.append("当前方案")
-    for i, entry in enumerate(cfg.get("fallbacks") or []):
-        if _ref_of(entry)[0] == channel_id:
-            used.append(f"备用链第 {i + 1} 项")
-    for scope, label in (("system_models", "系统模型"), ("node_models", "节点模型")):
-        block = cfg.get(scope) if isinstance(cfg.get(scope), Mapping) else {}
-        for name, entry in block.items():
-            if _ref_of(entry)[0] == channel_id:
-                used.append(f"{label} {name}")
-    return used
+    """Node choices that use ``channel_id`` (deletion guard)."""
+    block = cfg.get("node_models") if isinstance(cfg.get("node_models"), Mapping) else {}
+    return [f"节点模型 {name}" for name, entry in block.items() if _ref_of(entry)[0] == channel_id]
 
 
 # ---------------------------------------------------------------------------
@@ -351,7 +364,7 @@ def migrate(data: Mapping[str, Any], *, root: Path | str | None = None) -> tuple
             api_key=own_key or str(parent.get("api_key") or ""),
         )
 
-    if "active_channel" not in data or not str(data.get("active_channel") or "").strip():
+    if blocks and not str(data.get("active_channel") or "").strip():
         if builder.items:
             data["active_channel"] = for_provider(legacy_active) or str(builder.items[0]["id"])
             changed = True
@@ -397,15 +410,135 @@ def migrate(data: Mapping[str, Any], *, root: Path | str | None = None) -> tuple
     if builder.items != channel_list(data):
         data["channels"] = builder.items
         changed = True
+    if _to_roles(data, root):
+        changed = True
     if not changed:
         return data, False
 
     ordered: dict[str, Any] = {"version": data.pop("version", 1)}
-    for key in ("active_channel", "channels"):
-        if key in data:
-            ordered[key] = data.pop(key)
+    if "channels" in data:
+        ordered["channels"] = data.pop("channels")
     ordered.update(data)
     return ordered, True
+
+
+def _to_roles(data: dict[str, Any], root: Path | str | None) -> bool:
+    """``active_channel`` + shared schemes referenced by ``system_models`` / fallbacks -> one channel per role.
+
+    The active scheme becomes ``main``; a role or fallback that pointed at a scheme gets its
+    own copy (with the model it named), so editing one role never changes another.
+    """
+    fallbacks = [e for e in (data.get("fallbacks") or []) if isinstance(e, dict)]
+    if not ("active_channel" in data or "system_models" in data or any("model" in e for e in fallbacks)):
+        return False
+    chans = [dict(c) for c in channel_list(data)]
+    ids = {str(c["id"]) for c in chans}
+
+    def unique(base: str) -> str:
+        cid, n = base, 2
+        while cid in ids:
+            cid, n = f"{base}-{n}", n + 1
+        ids.add(cid)
+        return cid
+
+    renames: dict[str, str] = {}
+
+    def rename(old: str, new: str) -> None:
+        for c in chans:
+            if c["id"] == old:
+                c["id"] = new
+        ids.discard(old)
+        ids.add(new)
+        renames.update({k: new for k, v in renames.items() if v == old})
+        renames[old] = new
+
+    def find(cid: str) -> dict[str, Any] | None:
+        cid = renames.get(cid, cid)
+        return next((c for c in chans if c["id"] == cid), None)
+
+    def copy_as(src: dict[str, Any], new_id: str, name: str, model: str) -> None:
+        c = {**src, "id": new_id, "name": name}
+        if model:
+            c["model"] = model
+        c.pop("enabled", None)
+        chans.append(c)
+
+    active = str(data.pop("active_channel", "") or "").strip()
+    if active not in ids:
+        active = chans[0]["id"] if chans else ""
+    if active and active != MAIN:
+        if MAIN in ids:
+            rename(MAIN, unique("main-old"))
+        rename(active, MAIN)
+    for c in chans:
+        if c["id"] == MAIN:
+            c["name"] = ROLE_CHANNELS[MAIN]
+
+    slots = data.pop("system_models", None)
+    for slot, entry in (slots.items() if isinstance(slots, Mapping) else ()):
+        if slot not in SYSTEM_MODEL_SLOT_NAMES:
+            continue
+        channel, model = _ref_of(entry)
+        if not (channel or model):
+            continue
+        src = find(channel or MAIN)
+        if src is None:
+            continue
+        if src["id"] == slot:
+            if model:
+                src["model"] = model
+            continue
+        if slot in ids:
+            rename(slot, unique(f"{slot}-old"))
+        copy_as(src, slot, ROLE_CHANNELS[slot], model)
+        ids.add(slot)
+
+    chain: list[dict[str, Any]] = []
+    taken: set[str] = set()
+    for i, entry in enumerate(fallbacks, start=1):
+        channel, model = _ref_of(entry)
+        src = find(channel or MAIN)
+        if src is None:
+            continue
+        options = {k: v for k, v in entry.items() if k in OPTION_KEYS}
+        if src["id"] not in ROLE_CHANNELS and src["id"] not in taken and not references(data, src["id"]):
+            cid = src["id"]  # the scheme only served this fallback: it becomes that fallback's channel
+            if model:
+                src["model"] = model
+        else:
+            cid = unique(f"fallback-{i}")
+            copy_as(src, cid, f"备用链路 {i}", model)
+        taken.add(cid)
+        chain.append({"channel": cid, **options})
+    if "fallbacks" in data:
+        data["fallbacks"] = chain
+
+    nodes = data.get("node_models")
+    if isinstance(nodes, dict):
+        for entry in nodes.values():
+            if isinstance(entry, dict) and entry.get("channel") in renames:
+                entry["channel"] = renames[entry["channel"]]
+    if root is not None and renames:
+        _rename_draw_preset_channels(Path(root), renames)
+    data["channels"] = chans
+    return True
+
+
+def _rename_draw_preset_channels(root: Path, renames: Mapping[str, str]) -> None:
+    path = root.joinpath(*_DRAW_SETTINGS)
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    agent = raw.get("agent") if isinstance(raw, dict) else None
+    presets = agent.get("presets") if isinstance(agent, dict) else None
+    touched = False
+    for preset in presets if isinstance(presets, list) else []:
+        if isinstance(preset, dict) and preset.get("channel") in renames:
+            preset["channel"] = renames[preset["channel"]]
+            touched = True
+    if touched:
+        path.write_text(yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8")
 
 
 def _migrate_node_files(root: Path, builder: _Channels, node_models: dict[str, Any], for_provider: Any) -> bool:

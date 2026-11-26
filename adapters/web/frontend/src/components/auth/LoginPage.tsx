@@ -46,7 +46,7 @@ export const LoginPage = () => {
   const checkSetupNeeded = async (token: string) => {
     try {
       const config = await getAppConfig();
-      setChannelConfig(config.active_channel, config.channels || []);
+      setChannelConfig(config.channels || []);
       const { channels } = await getChannels(token);
       const anyKeyPresent = channels.some(c => c.api_key_present);
       if (!anyKeyPresent) {

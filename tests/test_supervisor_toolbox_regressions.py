@@ -314,7 +314,7 @@ def test_read_media_legacy_paths_and_concurrent_mixed_inputs(tmp_path, monkeypat
     video.write_bytes(b"video bytes")
     (tmp_path / "data").mkdir()
     (tmp_path / "data" / "config.yaml").write_text(
-        "active_channel: g\nchannels:\n- {id: g, type: gemini, base_url: 'https://api.example.test', api_key: test-key, model: m}\n",
+        "channels:\n- {id: main, type: gemini, base_url: 'https://api.example.test', api_key: test-key, model: m}\n",
         encoding="utf-8")
     captured = []
 

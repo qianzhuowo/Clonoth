@@ -7,8 +7,8 @@ Configuration (data/config.yaml):
 
     model_capabilities:          # keyed by model name; unlisted models can see images
       deepseek-flash: {vision: false}
-    system_models:
-      vision: {model: ..., base_url: ..., api_key: ...}   # used by read_media
+    channels:
+      - {id: vision, type: ..., base_url: ..., api_key: ..., model: ...}   # used by read_media
 
 Decision for one provider request:
   * primary call: node ``strip_images`` (alias ``no_vision``) when declared, otherwise

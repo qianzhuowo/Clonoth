@@ -654,7 +654,7 @@ export function updateConfigRaw(token: string, yaml: string): Promise<any> {
   return writeRawConfig('/admin/config/config/raw', token, yaml);
 }
 
-// ── Channel schemes (data/config.yaml channels / active_channel) ──
+// ── Channels (data/config.yaml channels / fallbacks / node_models) ──
 
 export interface ChannelPublic {
   id: string;
@@ -668,21 +668,10 @@ export interface ChannelPublic {
   vision: boolean;
   /** Non-empty when the address format does not fit the chosen type. */
   type_hint: string;
-}
-
-export interface FallbackEntryPublic {
-  channel: string;
-  /** Model override; empty = the scheme's own model. */
-  model: string;
-  effective_model: string;
-  missing: boolean;
-  vision: boolean;
-}
-
-export interface FallbackEntryUpdate {
-  channel: string;
-  model: string;
-  source_index: number | null;
+  /** main / vision / compact / summary / memory / image / image_gpt / fallback / other */
+  role: string;
+  /** false = the role is switched off (settings kept). */
+  enabled: boolean;
 }
 
 export interface ChannelRef {
@@ -691,10 +680,11 @@ export interface ChannelRef {
 }
 
 export interface ChannelsResponse {
-  active_channel: string;
   channels: ChannelPublic[];
-  fallbacks: FallbackEntryPublic[];
-  system_models: Record<string, ChannelRef>;
+  /** Fallback channel ids in order. */
+  fallbacks: string[];
+  /** Role channel id -> label. */
+  roles: Record<string, string>;
   node_models: Record<string, ChannelRef>;
   model_capabilities: Record<string, { vision?: boolean }>;
   registered: string[];
@@ -706,7 +696,10 @@ export interface ChannelUpdate {
   base_url?: string;
   api_key?: string;
   model?: string;
+  enabled?: boolean;
   clear_api_key?: boolean;
+  /** For a new channel without a key: copy the key of this channel. */
+  copy_key_from?: string;
 }
 
 export interface MimoAudioConfigPublic {
@@ -773,12 +766,7 @@ export async function deleteChannel(token: string, id: string): Promise<Channels
   return resp.json();
 }
 
-export async function setActiveChannel(token: string, channel: string): Promise<ChannelsResponse> {
-  const resp = await apiFetch('/config/active-channel', jsonInit(token, 'PUT', { channel }));
-  return resp.json();
-}
-
-/** Pull the model list: a saved scheme by id, or draft type/base_url/api_key (empty key = the scheme's). */
+/** Pull the model list: a saved channel by id, or draft type/base_url/api_key (empty key = the channel's). */
 export async function pullChannelModels(
   token: string,
   data: { channel?: string; type?: string; base_url?: string; api_key?: string },
@@ -787,7 +775,8 @@ export async function pullChannelModels(
   return resp.json();
 }
 
-export async function updateFallbacks(token: string, fallbacks: FallbackEntryUpdate[]): Promise<ChannelsResponse> {
+/** Fallback order (channel ids). */
+export async function updateFallbacks(token: string, fallbacks: string[]): Promise<ChannelsResponse> {
   const resp = await apiFetch('/config/fallbacks', jsonInit(token, 'PUT', { fallbacks }));
   return resp.json();
 }
@@ -797,13 +786,7 @@ export async function setModelVision(token: string, model: string, vision: boole
   return resp.json();
 }
 
-/** system_models.<slot>: undefined keeps a field, empty string clears it (empty slot = current scheme). */
-export async function updateSystemModel(token: string, slot: string, data: Partial<ChannelRef>): Promise<ChannelRef> {
-  const resp = await apiFetch(`/config/system-models/${encodeURIComponent(slot)}`, jsonInit(token, 'PUT', data));
-  return resp.json();
-}
-
-/** node_models.<node_id>: same rules as system slots. */
+/** node_models.<node_id>: undefined keeps a field, empty string clears it (empty channel = main). */
 export async function updateNodeModel(token: string, nodeId: string, data: Partial<ChannelRef>): Promise<ChannelRef> {
   const resp = await apiFetch(`/config/node-models/${encodeURIComponent(nodeId)}`, jsonInit(token, 'PUT', data));
   return resp.json();
@@ -1149,8 +1132,7 @@ export interface ChannelSummary {
 
 export interface AppConfigPublic {
   version?: number;
-  active_channel: string;
-  active_model: string;
+  main_model: string;
   channels: ChannelSummary[];
   entry_node_id?: string;
   default_entry_node_id?: string;

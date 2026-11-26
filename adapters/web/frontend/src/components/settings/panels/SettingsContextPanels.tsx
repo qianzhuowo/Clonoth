@@ -23,7 +23,7 @@ import { useSettingsStore } from '../../../store/settingsStore';
 import { errorText, notify } from '../../../store/toastStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { YamlEditor } from '../../common';
-import { SystemModelCard } from '../pages/SystemModelCard';
+import { NodeModelCard } from '../pages/NodeModelCard';
 
 const PanelShell = ({ title, eyebrow, children }: { title: string; eyebrow?: string; children: ReactNode }) => (
   <section className="flex h-full min-h-0 flex-col overflow-y-auto p-3">
@@ -244,10 +244,9 @@ export const AgentsSettingsRightPanel = () => {
                   </select>
                 </label>
                 {nodeConfigForm.type === 'ai' && channelData && (
-                  <SystemModelCard
-                    activeChannel={channelData.active_channel}
+                  <NodeModelCard
                     channels={channelData.channels}
-                    description="这个节点用哪个渠道方案和模型；都留空 = 当前方案。"
+                    description="这个节点用哪个渠道和模型；都留空 = 主模型。"
                     onSave={saveNodeModel}
                     title="节点模型"
                     value={channelData.node_models[nodeConfigForm.id]}

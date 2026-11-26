@@ -7,7 +7,7 @@ import { createElement, useMemo, type ComponentType } from 'react';
 
 import { ClientSettingsPage } from './pages/ClientSettingsPage';
 import { GeneralSettingsPage } from './pages/GeneralSettingsPage';
-import { ModelSettingsPage } from './pages/ModelSettingsPage';
+import { ModelHeaderActions, ModelSettingsPage } from './pages/ModelSettingsPage';
 import { MimoAudioSettingsPage } from './pages/MimoAudioSettingsPage';
 import { NodeSettingsPage } from './pages/NodeSettingsPage';
 import { AdvancedSettingsPage } from './pages/AdvancedSettingsPage';
@@ -34,6 +34,8 @@ export interface SettingsTabDefinition {
   order: number;
   Page: ComponentType;
   RightPanel?: ComponentType;
+  /** Buttons shown on the right of the settings header for this tab. */
+  HeaderActions?: ComponentType;
 }
 
 const ModelSettingsRightPanel = () => {
@@ -53,7 +55,7 @@ export const settingsTabs: SettingsTabDefinition[] = [
   // policy. How: point the new Client tab to ClientSettingsPage. Purpose: future
   // client preferences can be added without editing App.tsx or settings hosts.
   { id: 'client', label: '客户端', icon: 'display_settings', order: 1, Page: ClientSettingsPage },
-  { id: 'model', label: '模型', icon: 'model_training', order: 2, Page: ModelSettingsPage, RightPanel: ModelSettingsRightPanel },
+  { id: 'model', label: '模型', icon: 'model_training', order: 2, Page: ModelSettingsPage, RightPanel: ModelSettingsRightPanel, HeaderActions: ModelHeaderActions },
   { id: 'mimo-audio', label: '语音', icon: 'graphic_eq', order: 3, Page: MimoAudioSettingsPage },
   // [2026-06-02] Register the full P0/P1 settings surface requested by operators.
   // Why: system, approvals, agents, tools, skills, MCP, automation, and advanced raw

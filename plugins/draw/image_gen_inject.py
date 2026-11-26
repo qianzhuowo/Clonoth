@@ -32,7 +32,7 @@ def build_availability_text(gpt_ok: bool, gemini_ok: bool) -> str:
     if not gpt_ok and not gemini_ok:
         lines.append(
             "\n当前**没有任何生图渠道被配置**。不要调用任何生图工具，直接用 finish "
-            "如实告诉用户：生图功能尚未配置，需要在 设置 → 系统模型 → 生图 中选择渠道方案。"
+            "如实告诉用户：生图功能尚未配置，需要在 设置 → 模型 中配置并开启 Gemini 生图或 GPT 生图。"
         )
     return "\n".join(lines)
 

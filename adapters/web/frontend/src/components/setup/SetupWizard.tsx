@@ -3,7 +3,7 @@
 // Guides the user through configuring their first LLM provider.
 import { useState } from 'react';
 
-import { getAppConfig, setActiveChannel, upsertChannel } from '../../api/supervisorClient';
+import { getAppConfig, upsertChannel } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { Button } from '../common';
 
@@ -43,7 +43,6 @@ export const SetupWizard = () => {
   const [baseUrl, setBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
   const [model, setModel] = useState('');
-  const [providerName, setProviderName] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
 
@@ -52,7 +51,6 @@ export const SetupWizard = () => {
     setProviderKey(key);
     setBaseUrl(preset.base_url);
     setModel(preset.model);
-    setProviderName(key === 'custom' ? '' : key);
     setApiKey('');
     setError('');
     setStep('config');
@@ -60,25 +58,21 @@ export const SetupWizard = () => {
 
   const handleSave = async () => {
     if (!adminToken) return;
-    const name = providerName.trim() || providerKey;
-    if (!name) { setError('请输入渠道名称'); return; }
     if (!apiKey.trim()) { setError('请输入 API Key'); return; }
 
     setSaving(true);
     setError('');
     try {
-      // The scheme id is the name with unsupported characters replaced; custom endpoints speak OpenAI format.
-      const id = name.replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '') || 'main';
-      await upsertChannel(adminToken, id, {
-        name,
+      // The first channel is the main model; custom endpoints speak OpenAI format.
+      await upsertChannel(adminToken, 'main', {
+        name: '主模型',
         type: providerKey === 'custom' ? 'openai' : providerKey,
         base_url: baseUrl.trim(),
         api_key: apiKey.trim(),
         model: model.trim(),
       });
-      await setActiveChannel(adminToken, id);
       const config = await getAppConfig();
-      setChannelConfig(config.active_channel, config.channels || []);
+      setChannelConfig(config.channels || []);
       setStep('done');
     } catch (err) {
       setError(err instanceof Error ? err.message : '保存失败');
@@ -143,20 +137,6 @@ export const SetupWizard = () => {
               >
                 ← 返回选择
               </button>
-
-              {providerKey === 'custom' && (
-                <div>
-                  <label className="block text-[0.65rem] text-[var(--duties-tertiary)] mb-1">
-                    渠道名称
-                  </label>
-                  <input
-                    className="w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-                    onChange={(e) => setProviderName(e.target.value)}
-                    placeholder="my-provider"
-                    value={providerName}
-                  />
-                </div>
-              )}
 
               <div>
                 <label className="block text-[0.65rem] text-[var(--duties-tertiary)] mb-1">

@@ -12,7 +12,7 @@ GPT Image 2 生图工具 (Clonoth external tool)
   - 【重要】工具本身**不再** POST intermediate_reply 推图，否则会与 dispatch_attachment
     双发（同一张图发两次）——这正是 NovelAI 插件当年修复过的坑。
 
-API 渠道：data/config.yaml system_models.image_gpt 引用的渠道方案（设置 → 系统模型）。
+API 渠道：data/config.yaml 的 image_gpt 渠道（设置 → 模型 → GPT 生图，可开关）。
 """
 
 SPEC = {
@@ -70,7 +70,7 @@ if __name__ == "__main__":
         print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False)); sys.exit(1)
 
     def _slot_channel(slot):
-        """Settings → 系统模型 data/config.yaml system_models.<slot>; None when unset."""
+        """The role channel (设置 → 模型); None when missing or switched off."""
         import os as _os
         from pathlib import Path as _Path
         code_root = _Path(__file__).resolve().parent.parent

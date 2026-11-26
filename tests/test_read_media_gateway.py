@@ -22,12 +22,12 @@ _PNG = base64.b64decode(
 def _config(root: Path, kind: str, base_url: str, vision: dict | None = None) -> None:
     import yaml
     (root / "data").mkdir(exist_ok=True)
-    data = {"active_channel": "main", "channels": [
-        {"id": "main", "name": "主渠道", "type": kind, "base_url": base_url, "api_key": "test-key", "model": "main-model"},
-        {"id": "gw", "name": "网关", "type": "gemini", "base_url": "https://gw.example/v1beta", "api_key": "${SLOT_KEY}", "model": "gw-model"},
+    data = {"channels": [
+        {"id": "main", "name": "主模型", "type": kind, "base_url": base_url, "api_key": "test-key", "model": "main-model"},
     ]}
     if vision is not None:
-        data["system_models"] = {"vision": vision}
+        data["channels"].append({"id": "vision", "type": "gemini", "base_url": "https://gw.example/v1beta",
+                                 "api_key": "${SLOT_KEY}", **vision})
     (root / "data" / "config.yaml").write_text(yaml.safe_dump(data), encoding="utf-8")
 
 
@@ -61,7 +61,7 @@ def test_request_contents_carry_user_role(captured):
     assert seen["body"]["contents"][0]["role"] == "user"
 
 
-def test_unset_vision_slot_uses_current_scheme(captured):
+def test_missing_vision_channel_uses_main(captured):
     root, seen = captured
     out = read_media_mod.read_media({"path": "pic.png"}, root)
     assert out["data"]["model"] == "main-model"
@@ -74,17 +74,17 @@ def test_explicit_model_arg_wins(captured):
     assert out["data"]["model"] == "other"
 
 
-def test_vision_slot_picks_scheme_and_model(captured, monkeypatch):
+def test_vision_channel_is_used(captured, monkeypatch):
     root, seen = captured
     monkeypatch.setenv("SLOT_KEY", "slot-key")
-    _config(root, "gemini", "https://gw.example", vision={"channel": "gw", "model": "LL/gemini-4-argon"})
+    _config(root, "gemini", "https://gw.example", vision={"model": "LL/gemini-4-argon"})
     out = read_media_mod.read_media({"path": "pic.png"}, root)
     assert out["data"]["model"] == "LL/gemini-4-argon"
     assert "/v1beta/v1beta/" not in seen["url"]
     assert "/models/LL/gemini-4-argon:generateContent" in seen["url"] and "key=slot-key" in seen["url"]
 
 
-def test_non_gemini_scheme_is_rejected(captured):
+def test_non_gemini_channel_is_rejected(captured):
     root, _ = captured
     _config(root, "openai", "https://x.test/v1")
     with pytest.raises(ValueError, match="Gemini"):

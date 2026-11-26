@@ -25,6 +25,7 @@ export const SettingsHeader = () => {
             </span>
           </div>
         </div>
+        {tab.HeaderActions && <tab.HeaderActions />}
       </div>
     </header>
   );

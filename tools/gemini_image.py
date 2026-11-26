@@ -12,7 +12,7 @@ as an attachment path compatible with Clonoth's multimodal pipeline.
   - 图片发送统一交给 supervisor 的 dispatch_attachment 路由（子节点任务完成时
     自动发送），工具本身不再 POST intermediate_reply，避免双发同一张图。
 
-API 渠道：data/config.yaml system_models.image 引用的渠道方案（设置 → 系统模型）。
+API 渠道：data/config.yaml 的 image 渠道（设置 → 模型 → Gemini 生图，可开关）。
 """
 
 SPEC = {
@@ -85,7 +85,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     def _slot_channel(slot):
-        """Settings → 系统模型 data/config.yaml system_models.<slot>; None when unset."""
+        """The role channel (设置 → 模型); None when missing or switched off."""
         import os as _os
         from pathlib import Path as _Path
         code_root = _Path(__file__).resolve().parent.parent

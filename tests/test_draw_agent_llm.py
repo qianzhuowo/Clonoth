@@ -165,14 +165,14 @@ def _pull(preset: dict[str, Any], handler) -> tuple[list[str], list[httpx.Reques
         raise
 
 
-def test_pull_models_tries_versioned_path_first_and_filters():
+def test_pull_models_tries_versioned_path_first_and_dedupes():
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/v1/models":
             return httpx.Response(404, json={"error": {"message": "not here"}})
         return httpx.Response(200, json={"data": [{"id": "gpt-4o"}, {"id": "text-embedding-3"}, {"id": "gpt-4o"}, {"id": "tts-1"}]})
 
     models, seen = _pull(_preset(base_url="https://relay.test/"), handler)
-    assert models == ["gpt-4o"]
+    assert models == ["gpt-4o", "text-embedding-3", "tts-1"]
     assert [str(r.url) for r in seen] == ["https://relay.test/v1/models", "https://relay.test/models"]
     assert all(r.headers["authorization"] == "Bearer sk-test" for r in seen)
 
@@ -204,7 +204,7 @@ def test_pull_models_native_auth_on_official_hosts_and_bearer_on_relays():
 
     google = lambda r: httpx.Response(200, json={"models": [{"name": "models/gemini-x"}, {"name": "models/embedding-001"}]})  # noqa: E731
     models, seen = _pull(_preset(provider="gemini-aistudio"), google)
-    assert models == ["gemini-x"]
+    assert models == ["gemini-x", "embedding-001"]
     assert str(seen[0].url) == "https://generativelanguage.googleapis.com/v1beta/models"
     assert seen[0].headers["x-goog-api-key"] == "sk-test"
 
@@ -213,8 +213,6 @@ def test_pull_models_reports_empty_lists():
     with pytest.raises(clonoth_model_list.ModelListError) as info:
         _pull(_preset(base_url="https://relay.test/v1"), lambda r: httpx.Response(200, json={"data": []}))
     assert "模型列表为空" in info.value.message
-    # 全被关键词剔除时退回原列表
-    assert clonoth_model_list.filter_models(["text-embedding-3", "tts-1"]) == ["text-embedding-3", "tts-1"]
 
 
 # ---- 测试连接 ----

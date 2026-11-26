@@ -43,8 +43,7 @@ interface SettingsState {
   activeEffectiveProvider: string;
   activeEffectiveModel: string;
   activeEffectiveBaseUrl: string;
-  // Channel schemes from GET /v1/config (no secrets): the current scheme and the list.
-  activeChannel: string;
+  // Channels from GET /v1/config (no secrets).
   channels: ChannelSummary[];
   // [2026-06-01] Session-level provider override cache.
   // Why: the right panel shows the model/base_url that apply only to the current
@@ -78,7 +77,7 @@ interface SettingsState {
   setEntryNodeId: (id: string) => void;
   setAvailableNodes: (nodes: NodeDef[]) => void;
   setActiveNode: (nodeId: string, isOverride: boolean, defaultId: string, effective?: { provider?: string; model?: string; baseUrl?: string }) => void;
-  setChannelConfig: (activeChannel: string, channels: ChannelSummary[]) => void;
+  setChannelConfig: (channels: ChannelSummary[]) => void;
   setSessionProviderOverride: (override: SessionProviderOverride | null) => void;
   setPendingProviderOverride: (override: SessionProviderOverride | null) => void;
   setSessionWorkspaceName: (name: string) => void;
@@ -101,7 +100,6 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   activeEffectiveProvider: '',
   activeEffectiveModel: '',
   activeEffectiveBaseUrl: '',
-  activeChannel: '',
   channels: [],
   sessionProviderOverride: null,
   pendingProviderOverride: null,
@@ -137,7 +135,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
     activeEffectiveModel: effective?.model || '',
     activeEffectiveBaseUrl: effective?.baseUrl || '',
   }),
-  setChannelConfig: (activeChannel, channels) => set({ activeChannel, channels }),
+  setChannelConfig: (channels) => set({ channels }),
   setSessionProviderOverride: (override) => set({ sessionProviderOverride: override }),
   setPendingProviderOverride: (override) => set({ pendingProviderOverride: override }),
   setSessionWorkspaceName: (name) => set({ sessionWorkspaceName: name }),

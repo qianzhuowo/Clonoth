@@ -201,7 +201,7 @@ def _raw_agent(root: Path) -> dict:
 
 def _with_channels(root: Path) -> Path:
     (root / "data").mkdir(exist_ok=True)
-    (root / "data" / "config.yaml").write_text(yaml.safe_dump({"active_channel": "main", "channels": [
+    (root / "data" / "config.yaml").write_text(yaml.safe_dump({"channels": [
         {"id": "main", "name": "主渠道", "type": "openai", "base_url": "https://relay.test/v1", "api_key": "sk-main", "model": "m-main"},
         {"id": "draw", "name": "绘图分析", "type": "gemini", "base_url": "https://g.test/v1beta", "api_key": "sk-draw", "model": "m-draw"},
     ]}, allow_unicode=True), encoding="utf-8")

@@ -14,7 +14,7 @@ SDK 是纯协议层，不包含任何平台（Discord / Telegram 等）相关逻
   GET    /v1/sessions/{id}/running_tasks      ← _handle_agent_inner() preempt 目标查找
   GET    /v1/health                           ← 健康检查
   GET    /v1/config                           ← !model show（当前渠道方案与模型）
-  PUT    /v1/config/active-model              ← !model set（改当前方案的模型）
+  PUT    /v1/config/main-model                ← !model set（改主模型）
   POST   /v1/admin/restart                    ← 重启流程
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any, AsyncGenerator
 
 import httpx
 
-from .types import ActiveModel, Event, HealthInfo, InboundResult, RunningTask
+from .types import MainModel, Event, HealthInfo, InboundResult, RunningTask
 
 
 class ClonothClient:
@@ -437,21 +437,21 @@ class ClonothClient:
             workspace_root=str(d.get("workspace_root", "")),
         )
 
-    async def get_active_model(self) -> ActiveModel:
-        """当前渠道方案及其模型（GET /v1/config）。"""
+    async def get_main_model(self) -> MainModel:
+        """主模型（GET /v1/config）。"""
         resp = await self._http().get(f"{self._base_url}/v1/config")
         resp.raise_for_status()
         d = resp.json()
         names = {c.get("id"): c.get("name") for c in d.get("channels") or [] if isinstance(c, dict)}
-        cid = str(d.get("active_channel") or "")
-        return ActiveModel(channel=cid, channel_name=str(names.get(cid) or cid), model=str(d.get("active_model") or ""))
+        cid = "main" if "main" in names else ""
+        return MainModel(channel=cid, channel_name=str(names.get(cid) or cid), model=str(d.get("main_model") or ""))
 
-    async def set_active_model(self, model: str) -> ActiveModel:
-        """修改当前渠道方案的模型（PUT /v1/config/active-model，需要 admin token）。"""
-        resp = await self._http().put(f"{self._base_url}/v1/config/active-model", json={"model": model})
+    async def set_main_model(self, model: str) -> MainModel:
+        """修改主模型（PUT /v1/config/main-model，需要 admin token）。"""
+        resp = await self._http().put(f"{self._base_url}/v1/config/main-model", json={"model": model})
         resp.raise_for_status()
         d = resp.json()
-        return ActiveModel(channel=str(d.get("channel") or ""), channel_name=str(d.get("channel") or ""),
+        return MainModel(channel=str(d.get("channel") or ""), channel_name=str(d.get("channel") or ""),
                            model=str(d.get("model") or ""))
 
     async def reset_conversation(self, conversation_key: str) -> dict[str, Any]:

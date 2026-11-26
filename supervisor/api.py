@@ -50,8 +50,7 @@ from .types import (
     MimoAudioConfigPublic,
     MimoAudioConfigSecret,
     MimoAudioConfigUpdateIn,
-    ActiveChannelIn,
-    ActiveModelIn,
+    MainModelIn,
     ChannelModelsIn,
     ChannelRefUpdateIn,
     ChannelUpdateIn,
@@ -431,7 +430,7 @@ def create_app(
         return ConfigReloadOut(ok=True, config=cs.get_public())
 
     # ================================================================
-    #  Channel schemes (data/config.yaml channels / active_channel / ...)
+    #  Channels (data/config.yaml channels / fallbacks / node_models)
     # ================================================================
 
     def _channels_out(result: dict[str, Any]) -> dict[str, Any]:
@@ -472,18 +471,11 @@ def create_app(
         _log_channel_change(f"delete {channel_id}")
         return _channels_out(out)
 
-    @app.put("/v1/config/active-channel")
-    async def set_active_channel(body: ActiveChannelIn, request: Request) -> dict[str, Any]:
+    @app.put("/v1/config/main-model")
+    async def set_main_model(body: MainModelIn, request: Request) -> dict[str, Any]:
+        """Change the main model (used by !model / /切换模型)."""
         verify_admin_token(request)
-        out = _config_call(app.state.config_store.set_active_channel, body.channel)
-        _log_channel_change(f"active {body.channel}")
-        return _channels_out(out)
-
-    @app.put("/v1/config/active-model")
-    async def set_active_model(body: ActiveModelIn, request: Request) -> dict[str, Any]:
-        """Change the model of the current scheme (used by !model / /切换模型)."""
-        verify_admin_token(request)
-        cid = _config_call(app.state.config_store.set_active_model, body.model)
+        cid = _config_call(app.state.config_store.set_main_model, body.model)
         _log_channel_change(f"model {cid} -> {body.model}")
         return {"channel": cid, "model": body.model.strip()}
 
@@ -492,14 +484,13 @@ def create_app(
         verify_admin_token(request)
         import clonoth_model_list
         cs: ConfigStore = app.state.config_store
-        kind, base_url, api_key = body.type.strip().lower(), body.base_url.strip(), body.api_key.strip()
-        if body.channel:
+        import clonoth_channels
+        kind = body.type.strip().lower()
+        base_url = clonoth_channels.resolve_ref(body.base_url.strip(), cs.root)
+        api_key = clonoth_channels.resolve_ref(body.api_key.strip(), cs.root)
+        if body.channel:  # 未填的字段（如密钥）用该渠道已保存的值
             saved = _config_call(cs.get_channel_secret, body.channel)
             kind, base_url, api_key = kind or saved.type, base_url or saved.base_url, api_key or saved.api_key
-        else:
-            import clonoth_channels
-            base_url = clonoth_channels.resolve_ref(base_url, cs.root)
-            api_key = clonoth_channels.resolve_ref(api_key, cs.root)
         try:
             models = await clonoth_model_list.pull_models(kind, base_url, api_key)
         except clonoth_model_list.ModelListError as e:
@@ -509,7 +500,7 @@ def create_app(
     @app.put("/v1/config/fallbacks")
     async def update_fallbacks(body: FallbacksUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
-        out = _config_call(app.state.config_store.update_fallbacks, [e.model_dump() for e in body.fallbacks])
+        out = _config_call(app.state.config_store.update_fallbacks, body.fallbacks)
         _log_channel_change("fallbacks")
         return _channels_out(out)
 
@@ -517,16 +508,6 @@ def create_app(
     async def set_model_vision(body: ModelVisionIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         return _channels_out(_config_call(app.state.config_store.set_model_vision, body.model, body.vision))
-
-    @app.put("/v1/config/system-models/{slot}")
-    async def update_system_model(slot: str, body: ChannelRefUpdateIn, request: Request) -> dict[str, Any]:
-        verify_admin_token(request)
-        from clonoth_channels import SYSTEM_MODEL_SLOT_NAMES
-        if slot not in SYSTEM_MODEL_SLOT_NAMES:
-            raise HTTPException(status_code=404, detail=f"Unknown system model slot '{slot}'")
-        out = _config_call(app.state.config_store.update_system_model, slot, channel=body.channel, model=body.model)
-        _log_channel_change(f"slot {slot}")
-        return out
 
     @app.put("/v1/config/node-models/{node_id}")
     async def update_node_model(node_id: str, body: ChannelRefUpdateIn, request: Request) -> dict[str, Any]:

@@ -643,10 +643,10 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
 
     if sub == "show":
         try:
-            cur = await rt.clonoth_client.get_active_model()
+            cur = await rt.clonoth_client.get_main_model()
             lines = [
-                "🤖 **Current channel scheme**",
-                f"Scheme: `{cur.channel_name or '(none)'}`",
+                "🤖 **Main model**",
+                f"Channel: `{cur.channel_name or '(none)'}`",
                 f"Model: `{cur.model or '(not set)'}`",
             ]
             if session_id:
@@ -708,7 +708,7 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
         model_name = parts[2].strip()
         try:
             if is_global:
-                out = await rt.clonoth_client.set_active_model(model_name)
+                out = await rt.clonoth_client.set_main_model(model_name)
                 await message.reply(f"✅ **{out.channel}** model → `{out.model}`", mention_author=False)
             elif session_id:
                 ov = await rt.clonoth_client.get_session_provider_override(session_id)

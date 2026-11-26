@@ -139,8 +139,8 @@ class HealthInfo:
 
 
 @dataclass
-class ActiveModel:
-    """当前渠道方案及其模型（GET /v1/config 的 active_channel / active_model）。"""
+class MainModel:
+    """主模型（GET /v1/config 的 main_model）。"""
     channel: str
     channel_name: str
     model: str

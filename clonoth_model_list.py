@@ -8,10 +8,6 @@ import re
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 
-MODEL_EXCLUDE_KEYWORDS = (
-    "embedding", "embed", "rerank", "reranker", "tts", "speech", "audio",
-    "whisper", "transcription", "stt", "image", "sdxl", "flux", "moderation",
-)
 LIST_AUTHS = ("auto", "bearer", "x-api-key", "x-goog-api-key")
 _DEFAULT_BASE = {
     "openai": "https://api.openai.com/v1",
@@ -44,14 +40,13 @@ def default_base_url(kind: str) -> str:
 
 
 def filter_models(models: list[Any]) -> list[str]:
-    """去重并剔除向量 / 语音 / 生图类模型；全被剔除时退回原列表。"""
+    """去重，保持上游顺序（生图 / 语音等模型也要能选，不按名字剔除）。"""
     unique: list[str] = []
     for item in models:
         text = str(item or "").strip()
         if text and text not in unique:
             unique.append(text)
-    kept = [m for m in unique if not any(word in m.lower() for word in MODEL_EXCLUDE_KEYWORDS)]
-    return kept or unique
+    return unique
 
 
 def extract_model_ids(data: Any) -> list[str]:

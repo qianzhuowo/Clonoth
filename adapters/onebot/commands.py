@@ -118,7 +118,7 @@ async def _maybe_handle_model_command(
 ) -> str | None:
     """处理 QQ 管理员 /切换模型 <模型名> 命令：修改当前渠道方案的模型。
 
-    返回回复文本；None 表示不是本命令。通过 Supervisor 的 PUT /v1/config/active-model
+    返回回复文本；None 表示不是本命令。通过 Supervisor 的 PUT /v1/config/main-model
     写入 data/config.yaml；Engine 每次任务都重新读取配置，无需重启。
     """
     text = (user_text or "").strip()
@@ -138,12 +138,12 @@ async def _maybe_handle_model_command(
         if not is_admin:
             return "模型命令仅限 Clonoth 管理员使用。"
         try:
-            cur = await state._client.get_active_model()
+            cur = await state._client.get_main_model()
         except Exception as exc:
             logger.warning("get active model failed: %s", exc, exc_info=True)
             return f"❌ 获取当前模型失败：{exc}"
         return (
-            f"ℹ️ 当前方案 {cur.channel_name or '(未配置)'} → {cur.model or '(未设置)'}\n"
+            f"ℹ️ 主模型 {cur.model or '(未设置)'}\n"
             "切换：/切换模型 <模型名>"
         )
 
@@ -158,12 +158,12 @@ async def _maybe_handle_model_command(
         if not model_name:
             return "用法：/切换模型 <模型名>"
         try:
-            out = await state._client.set_active_model(model_name)
+            out = await state._client.set_main_model(model_name)
         except Exception as exc:
             logger.warning("switch model failed: %s", exc, exc_info=True)
             return f"❌ 切换失败：{exc}"
         logger.info("QQ admin %s switched model of %s -> %s", getattr(event, "user_id", ""), out.channel, out.model)
-        return f"✅ {out.channel} 的 model → {out.model or model_name}"
+        return f"✅ 主模型 → {out.model or model_name}"
 
     return None
 

@@ -12,8 +12,7 @@ GPT Image 2 生图工具 (Clonoth external tool)
   - 【重要】工具本身**不再** POST intermediate_reply 推图，否则会与 dispatch_attachment
     双发（同一张图发两次）——这正是 NovelAI 插件当年修复过的坑。
 
-API 渠道配置：读环境变量或 .env 的 CLONOTH_IMAGE_GPT_MODEL/BASE_URL/API_KEY，
-  留空则回退主渠道 OPENAI_BASE_URL / OPENAI_API_KEY（model 默认 gpt-image-2）。
+API 渠道：data/config.yaml system_models.image_gpt 引用的渠道方案（设置 → 系统模型）。
 """
 
 SPEC = {
@@ -69,6 +68,20 @@ if __name__ == "__main__":
     def output(result): print(json.dumps(result, ensure_ascii=False)); sys.exit(0)
     def fail(error):
         print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False)); sys.exit(1)
+
+    def _slot_channel(slot):
+        """Settings → 系统模型 data/config.yaml system_models.<slot>; None when unset."""
+        import os as _os
+        from pathlib import Path as _Path
+        code_root = _Path(__file__).resolve().parent.parent
+        root = _Path(_os.environ.get("CLONOTH_WORKSPACE") or code_root)
+        if str(code_root) not in sys.path:
+            sys.path.insert(0, str(code_root))
+        import clonoth_channels as chn
+        try:
+            return chn.slot_channel(chn.load_config(root), slot, root=root)
+        except chn.ChannelError as error:
+            fail(f"生图渠道配置错误：{error}")
     args = _input
     import base64, json, urllib.request, urllib.error, os, time, hashlib
     from pathlib import Path
@@ -96,45 +109,16 @@ if __name__ == "__main__":
     except ValueError:
         fail(f'Invalid size format: {size}. Use WxH, e.g. 1024x1536')
 
-    # ============================================================
-    # API 渠道配置解析
-    # 优先级：环境变量/.env 的 CLONOTH_IMAGE_GPT_* > 主渠道 OPENAI_*（model 默认 gpt-image-2）
-    # ============================================================
-    def _load_dotenv():
-        env_path = Path.cwd() / ".env"
-        kv = {}
-        if env_path.exists():
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                kv[k.strip()] = v.strip().strip("'\"")
-        return kv
-
-    dotenv = _load_dotenv()
-
-    def _env(key: str) -> str:
-        return (os.environ.get(key, "") or dotenv.get(key, "")).strip()
-
-
-    def _pick(env_suffix: str, *fallbacks: str) -> str:
-        v = _env(f"CLONOTH_IMAGE_GPT_{env_suffix}")
-        if v:
-            return v
-        for fb in fallbacks:
-            if fb and fb.strip():
-                return fb.strip()
-        return ""
-
-    api_key = _pick("API_KEY", _env("OPENAI_API_KEY"))
-    base_url = _pick("BASE_URL", _env("OPENAI_BASE_URL")).rstrip("/")
-    model_name = _pick("MODEL", "gpt-image-2")
-
+    ch = _slot_channel("image_gpt")
+    if ch is None:
+        fail("GPT 生图未配置：在 设置 → 系统模型 → 生图(GPT) 选择渠道方案")
+    api_key = ch.api_key
+    base_url = ch.base_url.rstrip("/")
+    model_name = ch.model or "gpt-image-2"
     if not api_key:
-        fail('No API key found: set CLONOTH_IMAGE_GPT_API_KEY in .env')
+        fail(f"渠道方案「{ch.name}」没有 API Key")
     if not base_url:
-        fail('No base_url configured (CLONOTH_IMAGE_GPT_BASE_URL / OPENAI_BASE_URL)')
+        fail(f"渠道方案「{ch.name}」没有地址")
 
     if base_url.endswith("/chat/completions"):
         url = base_url

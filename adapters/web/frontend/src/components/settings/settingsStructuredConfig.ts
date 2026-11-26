@@ -42,8 +42,6 @@ export interface NodeConfigFormState {
   name: string;
   description: string;
   type: NodeConfigType;
-  model: string;
-  provider: string;
   memory_book: string;
   persistent: boolean;
   prompt: string;
@@ -147,8 +145,6 @@ export function parseNodeConfig(raw: string, fallbackId = ''): NodeConfigFormSta
     name: str(doc.name),
     description: str(doc.description),
     type: normalizeNodeConfigType(str(doc.type, 'ai')),
-    model: str(doc.model),
-    provider: str(doc.provider),
     memory_book: str(doc.memory_book),
     persistent: doc.persistent === true,
     prompt: str(doc.prompt),
@@ -165,8 +161,8 @@ export function serializeNodeConfig(raw: string, form: NodeConfigFormState): str
   doc.name = form.name.trim();
   doc.description = form.description.trim();
   doc.type = form.type;
-  doc.model = form.model.trim();
-  if (form.provider.trim()) doc.provider = form.provider.trim(); else delete doc.provider;
+  // The model is chosen in data/config.yaml node_models (channel scheme + model), not in the node file.
+  for (const key of ['model', 'provider', 'base_url', 'api_key']) delete doc[key];
   if (form.memory_book.trim()) doc.memory_book = form.memory_book.trim(); else delete doc.memory_book;
   doc.persistent = form.persistent;
   if (form.prompt.trim()) doc.prompt = form.prompt; else delete doc.prompt;

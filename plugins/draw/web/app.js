@@ -60,7 +60,7 @@ loaders.api = async () => {
   $('a-key').value = ''; $('a-base').value = a.base_url || ''; $('a-timeout').value = a.timeout_sec ?? ''; $('a-keyenv').value = a.api_key_env || '';
   $('a-attempts').value = p.max_attempts ?? 3; $('a-custom').value = p.max_custom_tool_calls ?? 5;
   $('a-maximg').value = p.max_plan_images ?? 4;
-  $('a-turns').value = p.recent_dialogue_turns ?? 6; $('a-sendeach').checked = p.send_each_image !== false;
+  $('a-sendeach').checked = p.send_each_image !== false;
   $('g-retry').value = g.retry_max_attempts ?? 5; $('g-wait').value = g.retry_wait_sec ?? 3; $('g-delay').value = g.request_delay_sec ?? 0;
   $('g-lretry').value = g.lock_retry_max_attempts ?? 8; $('g-lmin').value = g.lock_retry_wait_min_sec ?? 6; $('g-lmax').value = g.lock_retry_wait_max_sec ?? 8;
   $('s-enabled').checked = st.cleanup_enabled !== false; $('s-days').value = st.retention_days ?? 7; $('s-mb').value = st.max_total_mb ?? 2048; $('s-interval').value = st.cleanup_interval_sec ?? 3600;
@@ -70,7 +70,7 @@ $('a-save').onclick = async () => {
   const patch = {
     api: { base_url: $('a-base').value.trim(), timeout_sec: num('a-timeout', 130), api_key_env: $('a-keyenv').value.trim() || 'NOVELAI_API_KEY' },
     planner: { max_attempts: num('a-attempts', 3), max_custom_tool_calls: num('a-custom', 5),
-               max_plan_images: num('a-maximg', 4), recent_dialogue_turns: num('a-turns', 6), send_each_image: $('a-sendeach').checked },
+               max_plan_images: num('a-maximg', 4), send_each_image: $('a-sendeach').checked },
     generation: { retry_max_attempts: num('g-retry', 5), retry_wait_sec: num('g-wait', 3), request_delay_sec: num('g-delay', 0),
                   lock_retry_max_attempts: num('g-lretry', 8), lock_retry_wait_min_sec: num('g-lmin', 6), lock_retry_wait_max_sec: num('g-lmax', 8) },
     storage: { cleanup_enabled: $('s-enabled').checked, retention_days: num('s-days', 7), max_total_mb: num('s-mb', 2048), cleanup_interval_sec: num('s-interval', 3600) },
@@ -87,11 +87,13 @@ $('a-clear').onclick = async () => {
 // [key, 标签, min, max, step, 默认值]；每个 Provider 实际发送哪几项由后端返回的 providers[].sampling 决定。
 const SAMPLING_ROWS = [['temperature', '温度', 0, 2, 0.05, 1], ['top_p', 'Top P', 0, 1, 0.01, 1], ['top_k', 'Top K', 1, '', 1, 40],
   ['frequency_penalty', '频率惩罚', -2, 2, 0.05, 0], ['presence_penalty', '存在惩罚', -2, 2, 0.05, 0], ['repetition_penalty', '重复惩罚', 0, '', 0.05, 1]];
-const LIST_AUTH_LABELS = { auto: '自动（官方地址用原生头，其它地址用 Bearer）', bearer: 'Bearer', 'x-api-key': 'x-api-key', 'x-goog-api-key': 'x-goog-api-key' };
 const agModels = {}; // 预设 id -> 已拉取的模型，只在内存里
 const agCur = () => (S.agent ? S.agent.presets[S.agIndex] : null);
 const agSnapshot = () => JSON.stringify([S.agent.presets, S.agent.current_preset_id]);
 const agDirty = () => !!S.agent && agSnapshot() !== S.agSaved;
+function agChannel(id) { return ((S.agent && S.agent.channels) || []).find(c => c.id === id) || null; }
+function agChannelLabel(p) { const c = agChannel(p.channel); return c ? c.name : (p.channel ? p.channel + '（不存在）' : '未选择渠道方案'); }
+function agModelOf(p) { const c = agChannel(p.channel); return p.model || (c && c.model) || ''; }
 function agProvider(id) {
   return ((S.agent && S.agent.providers) || []).find(x => x.id === id)
     || { id, label: id || '未选择', sampling: [], list_auth: [], default_base_url: '', sampling_note: '', reasoning_note: '' };
@@ -100,7 +102,7 @@ function agNewId() { return 'agent-' + Date.now().toString(36) + Math.random().t
 function agUniqueName(base) { const names = new Set(S.agent.presets.map(p => p.name)); let name = base; for (let i = 2; names.has(name); i++) name = base + ' ' + i; return name; }
 function blankAgent() {
   const sampling = {}; SAMPLING_ROWS.forEach(r => { sampling[r[0]] = { enabled: false, value: r[5] }; });
-  return { id: agNewId(), name: agUniqueName('新预设'), provider: 'openai', base_url: '', api_key: '', api_key_configured: false, model: '', model_list_auth: 'auto',
+  return { id: agNewId(), name: agUniqueName('新预设'), channel: ((S.agent.channels || [])[0] || {}).id || '', model: '',
     max_tokens: 0, timeout_sec: 180, tool_mode: 'native', sampling, reasoning: { mode: 'inherit', effort: '' } };
 }
 // 后端返回的整份数据就是“已保存”的状态：顶部的生效说明按它来写，未保存的草稿不影响这句话。
@@ -111,24 +113,20 @@ function agAdopt(data, keepId) {
   const cur = data.presets.find(p => p.id === data.current_preset_id) || data.presets[0];
   const eff = data.effective || {};
   S.agEffective = eff.source === 'preset'
-    ? { ok: true, text: `规划正在使用预设「${cur.name}」：${agProvider(cur.provider).label} / ${cur.model}` }
-    : { ok: false, text: `预设「${cur.name}」还没填 ${(eff.missing || []).join('、')}，规划仍使用节点自身的模型配置（config/nodes/draw.novelai_planner.yaml，即 DRAW_TAG_* 环境变量）。` };
+    ? { ok: true, text: `规划正在使用预设「${cur.name}」：${agChannelLabel(cur)} / ${agModelOf(cur) || '方案未设模型'}` }
+    : { ok: false, text: `预设「${cur.name}」${eff.reason || '未选择渠道方案'}，规划使用节点 draw.novelai_planner 的渠道（主设置 → 节点模型）。` };
   renderAgent();
 }
 loaders.agent = async () => agAdopt(await api('/agent'));
 function renderAgentList() {
   const A = S.agent;
-  $('ag-list').innerHTML = A.presets.map((p, i) => `<div class="item ${i === S.agIndex ? 'active' : ''}" data-i="${i}"><span class="name" title="${esc(p.name)}">${esc(p.name || '（未命名）')}</span><span class="meta"><span class="sub">${esc(agProvider(p.provider).label + ' / ' + (p.model || '未填 Model'))}</span>${p.id === A.current_preset_id ? '<span class="tag">使用中</span>' : ''}</span></div>`).join('');
+  $('ag-list').innerHTML = A.presets.map((p, i) => `<div class="item ${i === S.agIndex ? 'active' : ''}" data-i="${i}"><span class="name" title="${esc(p.name)}">${esc(p.name || '（未命名）')}</span><span class="meta"><span class="sub">${esc(agChannelLabel(p) + ' / ' + (agModelOf(p) || '方案未设模型'))}</span>${p.id === A.current_preset_id ? '<span class="tag">使用中</span>' : ''}</span></div>`).join('');
   $('ag-dirty').textContent = agDirty() ? '有未保存的改动' : '';
 }
 // 跟着 Provider / Reasoning 变的部分：地址占位、模型列表鉴权、思考强度、采样参数行。切换 Provider 不改任何已填的值。
 function renderAgentProvider() {
-  const p = agCur(), info = agProvider(p.provider);
-  $('ag-base').placeholder = info.default_base_url || '接口地址';
-  const auths = info.list_auth || [];
-  $('ag-auth-wrap').style.display = auths.length ? '' : 'none';
-  $('ag-auth').innerHTML = auths.map(a => `<option value="${esc(a)}">${esc(LIST_AUTH_LABELS[a] || a)}</option>`).join('');
-  if (auths.length) $('ag-auth').value = auths.includes(p.model_list_auth) ? p.model_list_auth : 'auto';
+  const p = agCur(), ch = agChannel(p.channel), info = agProvider(ch ? ch.type : '');
+  $('ag-model').placeholder = ch && ch.model ? `留空用方案的模型：${ch.model}` : '留空用方案的模型';
   $('ag-effort-wrap').style.display = ((p.reasoning || {}).mode || 'inherit') === 'on' ? '' : 'none';
   $('ag-rnote').textContent = info.reasoning_note || '';
   const rows = SAMPLING_ROWS.filter(r => (info.sampling || []).includes(r[0]));
@@ -149,12 +147,13 @@ function renderAgent() {
   if (document.activeElement !== $('ag-retries')) $('ag-retries').value = A.planner_max_retries;
   renderAgentList();
   $('ag-form').style.display = p ? '' : 'none'; if (!p) return;
-  const isCurrent = p.id === A.current_preset_id, hasKey = !!(p.api_key_configured || p.copy_key_from);
+  const isCurrent = p.id === A.current_preset_id;
   $('ag-name').value = p.name || ''; $('ag-current').checked = isCurrent; $('ag-current').disabled = isCurrent;
-  $('ag-provider').innerHTML = A.providers.map(x => `<option value="${esc(x.id)}">${esc(x.label)}</option>`).join('')
-    + (A.providers.some(x => x.id === p.provider) ? '' : `<option value="${esc(p.provider)}">${esc(p.provider)}（未注册）</option>`);
-  $('ag-provider').value = p.provider; $('ag-base').value = p.base_url || '';
-  $('ag-key').value = p.api_key || ''; $('ag-key').placeholder = hasKey ? '已保存，留空不改' : '未填写'; $('ag-key-clear').disabled = !hasKey;
+  const chs = A.channels || [];
+  $('ag-channel').innerHTML = '<option value="">（不接管，用节点自身的渠道）</option>'
+    + chs.map(c => `<option value="${esc(c.id)}">${esc(c.name)}（${esc(c.type)}${c.model ? ' / ' + esc(c.model) : ''}）</option>`).join('')
+    + (p.channel && !agChannel(p.channel) ? `<option value="${esc(p.channel)}">${esc(p.channel)}（不存在）</option>` : '');
+  $('ag-channel').value = p.channel || '';
   $('ag-model').value = p.model || ''; $('ag-maxtok').value = p.max_tokens ?? 0; $('ag-timeout').value = p.timeout_sec ?? 180;
   $('ag-tool').value = p.tool_mode || 'native'; $('ag-rmode').value = (p.reasoning || {}).mode || 'inherit';
   $('ag-effort').innerHTML = '<option value="">跟随模型默认</option>' + (A.reasoning_efforts || []).map(e => `<option value="${esc(e)}">${esc(e)}</option>`).join('');
@@ -165,10 +164,7 @@ function renderAgent() {
 function agInt(id, dflt) { const v = Math.floor(num(id, dflt)); return Number.isFinite(v) && v >= 0 ? v : dflt; }
 function collectAgent() {
   const p = agCur(); if (!p) return;
-  p.name = $('ag-name').value.trim(); p.provider = $('ag-provider').value; p.base_url = $('ag-base').value.trim(); p.model = $('ag-model').value.trim();
-  // key 留空 = 沿用已保存的；填了新的就不再是“清空”。
-  p.api_key = $('ag-key').value.trim(); if (p.api_key) p.clear_api_key = false;
-  if ($('ag-auth-wrap').style.display !== 'none') p.model_list_auth = $('ag-auth').value;
+  p.name = $('ag-name').value.trim(); p.channel = $('ag-channel').value; p.model = $('ag-model').value.trim();
   p.max_tokens = agInt('ag-maxtok', 0); p.timeout_sec = agInt('ag-timeout', 180); p.tool_mode = $('ag-tool').value;
   p.reasoning = { mode: $('ag-rmode').value, effort: $('ag-effort').value };
   p.sampling = p.sampling || {};
@@ -183,8 +179,6 @@ $('ag-add').onclick = () => { collectAgent(); S.agent.presets.push(blankAgent())
 $('ag-dup').onclick = () => {
   collectAgent(); const p = agCur(); if (!p) return;
   const c = JSON.parse(JSON.stringify(p)); c.id = agNewId(); c.name = agUniqueName((p.name || '预设') + ' 副本');
-  // 副本没法从页面拿到已保存的 key（不回显）：告诉后端保存时从哪套预设抄。
-  if (!c.api_key && (p.api_key_configured || p.copy_key_from)) c.copy_key_from = p.copy_key_from || p.id;
   S.agent.presets.splice(S.agIndex + 1, 0, c); S.agIndex++; renderAgent();
 };
 $('ag-del').onclick = () => {
@@ -195,17 +189,12 @@ $('ag-del').onclick = () => {
   if (A.current_preset_id === p.id) A.current_preset_id = A.presets[S.agIndex].id;
   renderAgent();
 };
-$('ag-key-clear').onclick = () => {
-  const p = agCur(); if (!p) return; collectAgent();
-  p.api_key = ''; p.clear_api_key = true; p.api_key_configured = false; delete p.copy_key_from;
-  renderAgent(); say('点“保存全部预设”后清空这套预设的 key');
-};
 $('ag-pulled').onchange = () => { const v = $('ag-pulled').value; if (v) $('ag-model').value = v; };
 $('ag-form').addEventListener('change', e => {
   const row = e.target.closest('[data-samp]');
   if (row) row.querySelector('input[type=number]').disabled = !row.querySelector('input[type=checkbox]').checked;
   collectAgent();
-  if (e.target.id === 'ag-provider' || e.target.id === 'ag-rmode') renderAgentProvider();
+  if (e.target.id === 'ag-channel' || e.target.id === 'ag-rmode') renderAgentProvider();
   if (e.target.id === 'ag-current') $('ag-current').disabled = $('ag-current').checked;
   renderAgentList();
 });
@@ -213,7 +202,7 @@ $('ag-save').onclick = async () => {
   collectAgent(); const keep = agCur() && agCur().id;
   try { agAdopt(await api('/agent', { presets: S.agent.presets, current_preset_id: S.agent.current_preset_id }), keep); say('已保存', 'ok'); } catch (e) { fail(e); }
 };
-// “拉取模型 / 测试连接”用的是表单里还没保存的内容；key 留空时后端补上已保存的那一个。
+// “拉取模型 / 测试连接”用表单里还没保存的内容，地址和 key 取自所选渠道方案。
 async function agCall(btn, stateEl, path, busyText, done) {
   collectAgent(); const p = agCur(); if (!p) return;
   btn.disabled = true; stateEl.className = 'hint'; stateEl.textContent = busyText;

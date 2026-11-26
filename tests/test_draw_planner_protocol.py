@@ -224,9 +224,9 @@ def test_character_info_and_content_block():
     assert "  别名: 小艾, Alice" in info
     assert "服装参考: 校服（school uniform）" in info
     assert frame.build_character_info([]) == "【已录入角色】: 无"
-    block = frame.build_content_block(None, character_info=info, draw_request="画她 {{drawRequest}}", recent_dialogue="")
-    assert block.count("画她 {{drawRequest}}") == 1 and "（无）" in block
-    assert frame.missing_content_placeholders("{{characterInfo}}") == ["{{drawRequest}}", "{{recentDialogue}}"]
+    block = frame.build_content_block(None, character_info=info, draw_request="画她 {{drawRequest}}")
+    assert block.count("画她 {{drawRequest}}") == 1 and "近期对话" not in block
+    assert frame.missing_content_placeholders("{{characterInfo}}") == ["{{drawRequest}}"]
     assert frame.build_limits_line(0, 2, 4) == "本次提交数量约束：images 最多包含 4 项；每项 characters 最多 2 人。"
     assert frame.build_limits_line(1, 0, 4) == "本次提交数量约束：images 必须恰好包含 1 项。"
     assert frame.build_limits_line(0, 0, 0) == ""

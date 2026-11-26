@@ -1,133 +1,89 @@
-// [2026-06-03] Model & Provider settings — dynamic multi-provider editor.
+// Model settings: channel schemes (type + address + key + model), the current scheme,
+// system model slots and the fallback chain. Every model user picks a scheme by id.
 import { useEffect, useState } from 'react';
 
 import {
-  type FallbackEntryUpdate,
-  type ProviderConfigPublic,
-  type ProvidersResponse,
-  deleteProvider,
-  getProviders,
+  type ChannelPublic,
+  type ChannelRef,
+  type ChannelsResponse,
+  deleteChannel,
+  getChannels,
+  pullChannelModels,
   reloadConfig,
-  setActiveProvider,
+  setActiveChannel,
   setModelVision,
   updateFallbacks,
-  upsertProvider,
+  updateSystemModel,
+  upsertChannel,
 } from '../../../api/supervisorClient';
 import { useSettingsStore } from '../../../store/settingsStore';
 import { errorText, notify } from '../../../store/toastStore';
 import { Button } from '../../common';
 import { SystemModelCard } from './SystemModelCard';
 
-interface ProviderEditState {
+interface ChannelEdit {
+  name: string;
+  type: string;
   base_url: string;
   model: string;
   api_key: string;
 }
 
-interface FallbackRow extends FallbackEntryUpdate {
+interface FallbackRow {
   key: number;
-  vision: boolean;
-  api_key_present: boolean;
-  api_key_redacted: string;
+  channel: string;
+  model: string;
+  source_index: number | null;
 }
-
-const emptyEdit = (): ProviderEditState => ({ base_url: '', model: '', api_key: '' });
 
 const inputCls =
   'w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
+const labelCls = 'mb-1 block text-xs text-[var(--duties-secondary)]';
 
 let rowSeq = 0;
 
-const rowsFrom = (resp: ProvidersResponse): FallbackRow[] =>
-  resp.fallbacks.map((fb, i) => ({
-    key: ++rowSeq,
-    provider: fb.provider,
-    model: fb.model,
-    base_url: fb.base_url,
-    api_key: '',
-    clear_api_key: false,
-    source_index: i,
-    vision: fb.vision,
-    api_key_present: fb.api_key_present,
-    api_key_redacted: fb.api_key_redacted,
-  }));
-
-const modelVision = (resp: ProvidersResponse | null, model: string): boolean => {
-  const flag = resp?.model_capabilities?.[model.trim()]?.vision;
-  return flag === undefined ? true : Boolean(flag);
-};
+const editFrom = (c: ChannelPublic): ChannelEdit => ({
+  name: c.name, type: c.type, base_url: c.base_url, model: c.model, api_key: '',
+});
 
 const SYSTEM_SLOTS = [
-  {
-    slot: 'compact',
-    title: '上下文压缩模型',
-    description: '会话超过压缩阈值时生成摘要。建议用便宜、上下文长的模型。',
-    modelPlaceholder: '留空使用所选渠道的默认模型',
-    envHint: '',
-    pickChannel: true,
-  },
-  {
-    slot: 'summary',
-    title: '轮次摘要模型',
-    description: '为每轮任务生成简短执行摘要。',
-    modelPlaceholder: '留空使用所选渠道的默认模型',
-    envHint: '',
-    pickChannel: true,
-  },
-  {
-    slot: 'memory',
-    title: '记忆提取模型',
-    description: '从对话中提取值得长期保存的信息（做梦整理时使用）。',
-    modelPlaceholder: '留空使用所选渠道的默认模型',
-    envHint: '',
-    pickChannel: true,
-  },
-  {
-    slot: 'vision',
-    title: '识图模型',
-    description:
-      'read_media 工具和“不可识图模型收到图片时的自动转写”使用，走 Gemini 原生接口（generateContent）。',
-    modelPlaceholder: '留空默认 gemini-3.8-flash',
-    envHint: ' CLONOTH_VISION_* / GEMINI_* / OPENAI_* 环境变量',
-    pickChannel: false,
-  },
+  { slot: 'compact', title: '上下文压缩模型', description: '会话超过压缩阈值时生成摘要。建议用便宜、上下文长的模型。' },
+  { slot: 'summary', title: '轮次摘要模型', description: '为每轮任务生成简短执行摘要。' },
+  { slot: 'memory', title: '记忆提取模型', description: '从对话中提取值得长期保存的信息（做梦整理时使用）。' },
+  { slot: 'vision', title: '识图模型', description: 'read_media 工具和“不可识图模型收到图片时的自动转写”使用；需要 Gemini 类型的方案。' },
+  { slot: 'image', title: '生图(Gemini)', description: 'gemini_image 工具使用；需要 Gemini 类型的方案。不设置则该工具不可用。' },
+  { slot: 'image_gpt', title: '生图(GPT)', description: 'gpt_image_2 工具使用；OpenAI 格式的图片接口。不设置则该工具不可用。' },
 ];
+const UNSET_MEANS_OFF = new Set(['image', 'image_gpt']);
 
 export const ModelSettingsPage = () => {
-  const { adminToken, isAuthenticated } = useSettingsStore();
+  const { adminToken, isAuthenticated, setChannelConfig } = useSettingsStore();
 
-  const [data, setData] = useState<ProvidersResponse | null>(null);
+  const [data, setData] = useState<ChannelsResponse | null>(null);
   const [loading, setLoading] = useState(false);
+  const [edits, setEdits] = useState<Record<string, ChannelEdit>>({});
+  const [models, setModels] = useState<Record<string, string[]>>({});
+  const [busy, setBusy] = useState<string | null>(null);
 
-  // per-provider edit states, keyed by provider name
-  const [edits, setEdits] = useState<Record<string, ProviderEditState>>({});
-  const [savingKey, setSavingKey] = useState<string | null>(null);
+  const [newId, setNewId] = useState('');
+  const [newType, setNewType] = useState('');
 
-  // new provider: select from registered list
-  const [newName, setNewName] = useState('');
-  const [addingNew, setAddingNew] = useState(false);
-
-  // fallback chain editor
   const [fbRows, setFbRows] = useState<FallbackRow[]>([]);
   const [fbDirty, setFbDirty] = useState(false);
-  const [fbSaving, setFbSaving] = useState(false);
 
-  const applyResponse = (resp: ProvidersResponse) => {
+  const apply = (resp: ChannelsResponse) => {
     setData(resp);
-    const e: Record<string, ProviderEditState> = {};
-    for (const [name, cfg] of Object.entries(resp.providers)) {
-      e[name] = { base_url: cfg.base_url, model: cfg.model, api_key: '' };
-    }
-    setEdits(e);
-    setFbRows(rowsFrom(resp));
+    setEdits(Object.fromEntries(resp.channels.map(c => [c.id, editFrom(c)])));
+    setFbRows(resp.fallbacks.map((f, i) => ({ key: ++rowSeq, channel: f.channel, model: f.model, source_index: i })));
     setFbDirty(false);
+    setChannelConfig(resp.active_channel, resp.channels.map(c => ({ id: c.id, name: c.name, type: c.type, model: c.model })));
   };
 
   const load = async () => {
     if (!adminToken || !isAuthenticated) return;
     setLoading(true);
     try {
-      applyResponse(await getProviders(adminToken));
+      apply(await getChannels(adminToken));
     } catch (err) {
       notify.error(errorText(err, '加载失败'));
     } finally {
@@ -139,435 +95,265 @@ export const ModelSettingsPage = () => {
     void load();
   }, [adminToken, isAuthenticated]);
 
-  const handleSave = async (name: string) => {
+  const run = async (key: string, fn: () => Promise<ChannelsResponse | void>, done?: string) => {
     if (!adminToken) return;
-    const edit = edits[name];
-    if (!edit) return;
-    setSavingKey(name);
+    setBusy(key);
     try {
-      const params: Record<string, string> = {};
-      if (edit.base_url) params.base_url = edit.base_url;
-      if (edit.model) params.model = edit.model;
-      if (edit.api_key) params.api_key = edit.api_key;
-      const resp = await upsertProvider(adminToken, name, params);
-      applyResponse(resp);
-      notify.success(`${name} 已保存`);
+      const resp = await fn();
+      if (resp) apply(resp);
+      if (done) notify.success(done);
     } catch (err) {
-      notify.error(errorText(err, '保存失败'));
+      notify.error(errorText(err, '操作失败'));
     } finally {
-      setSavingKey(null);
+      setBusy(null);
     }
   };
 
-  const handleSetActive = async (name: string) => {
-    if (!adminToken) return;
-    try {
-      const resp = await setActiveProvider(adminToken, name);
-      applyResponse(resp);
-      notify.success(`已切换到 ${name}`);
-    } catch (err) {
-      notify.error(errorText(err, '切换失败'));
-    }
+  const updateEdit = (id: string, patch: Partial<ChannelEdit>) =>
+    setEdits(prev => ({ ...prev, [id]: { ...prev[id], ...patch } }));
+
+  const saveChannel = (c: ChannelPublic) => {
+    const e = edits[c.id];
+    return run(`save:${c.id}`, () => upsertChannel(adminToken!, c.id, {
+      name: e.name, type: e.type, base_url: e.base_url, model: e.model, ...(e.api_key ? { api_key: e.api_key } : {}),
+    }), `方案「${e.name || c.id}」已保存`);
   };
 
-  const handleDelete = async (name: string) => {
-    if (!adminToken) return;
-    if (!window.confirm(`确定要删除渠道 "${name}"？`)) return;
-    try {
-      const resp = await deleteProvider(adminToken, name);
-      applyResponse(resp);
-      notify.success(`${name} 已删除`);
-    } catch (err) {
-      notify.error(errorText(err, '删除失败'));
-    }
-  };
-
-  const handleAddProvider = async () => {
-    if (!adminToken || !newName) return;
-    const name = newName;
-    setAddingNew(true);
-    try {
-      const resp = await upsertProvider(adminToken, name, {});
-      applyResponse(resp);
-      setNewName('');
-      notify.success(`渠道 ${name} 已添加`);
-    } catch (err) {
-      notify.error(errorText(err, '添加失败'));
-    } finally {
-      setAddingNew(false);
-    }
-  };
-
-  const handleReload = async () => {
-    if (!adminToken) return;
-    try {
-      await reloadConfig(adminToken);
-      await load();
-      notify.success('配置已重载');
-    } catch (err) {
-      notify.error(errorText(err, '重载失败'));
-    }
-  };
-
-  const updateEdit = (name: string, field: keyof ProviderEditState, value: string) => {
-    setEdits(prev => ({ ...prev, [name]: { ...prev[name], [field]: value } }));
-  };
-
-  const handleToggleVision = async (model: string, vision: boolean) => {
-    if (!adminToken || !model.trim()) return;
-    try {
-      applyResponse(await setModelVision(adminToken, model.trim(), vision));
-      notify.success(`${model} 已标记为${vision ? '可识图' : '不可识图'}`);
-    } catch (err) {
-      notify.error(errorText(err, '保存失败'));
-    }
-  };
-
-  const updateRow = (key: number, patch: Partial<FallbackRow>) => {
-    setFbRows(rows => rows.map(r => (r.key === key ? { ...r, ...patch } : r)));
-    setFbDirty(true);
-  };
-
-  const moveRow = (index: number, delta: number) => {
-    setFbRows(rows => {
-      const target = index + delta;
-      if (target < 0 || target >= rows.length) return rows;
-      const next = [...rows];
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
+  const pull = (c: ChannelPublic) => {
+    const e = edits[c.id];
+    return run(`pull:${c.id}`, async () => {
+      const out = await pullChannelModels(adminToken!, { channel: c.id, type: e.type, base_url: e.base_url, api_key: e.api_key });
+      setModels(prev => ({ ...prev, [c.id]: out.models }));
+      notify.success(`拉取到 ${out.models.length} 个模型`);
     });
+  };
+
+  const addChannel = () => {
+    const id = newId.trim();
+    if (!id || !newType) return;
+    void run('add', () => upsertChannel(adminToken!, id, { name: id, type: newType }), `方案「${id}」已添加`).then(() => {
+      setNewId('');
+      setNewType('');
+    });
+  };
+
+  const saveRef = async (slot: string, ref: ChannelRef) => {
+    await updateSystemModel(adminToken!, slot, ref);
+    apply(await getChannels(adminToken!));
+  };
+
+  const editRows = (fn: (rows: FallbackRow[]) => FallbackRow[]) => {
+    setFbRows(fn);
     setFbDirty(true);
   };
 
-  const addRow = () => {
-    const provider = data?.active_provider || data?.registered?.[0] || 'openai';
-    setFbRows(rows => [
-      ...rows,
-      {
-        key: ++rowSeq,
-        provider,
-        model: '',
-        base_url: '',
-        api_key: '',
-        clear_api_key: false,
-        source_index: null,
-        vision: true,
-        api_key_present: false,
-        api_key_redacted: '',
-      },
-    ]);
-    setFbDirty(true);
-  };
-
-  const removeRow = (key: number) => {
-    setFbRows(rows => rows.filter(r => r.key !== key));
-    setFbDirty(true);
-  };
-
-  const handleSaveFallbacks = async () => {
-    if (!adminToken) return;
-    if (fbRows.some(r => !r.provider.trim() || !r.model.trim())) {
-      notify.error('每个备用模型都需要填写渠道类型和模型名');
+  const saveFallbacks = () => {
+    if (fbRows.some(r => !r.channel)) {
+      notify.error('每个备用项都需要选择渠道方案');
       return;
     }
-    setFbSaving(true);
-    try {
-      let resp = await updateFallbacks(
-        adminToken,
-        fbRows.map(r => ({
-          provider: r.provider,
-          model: r.model,
-          base_url: r.base_url,
-          api_key: r.api_key,
-          clear_api_key: r.clear_api_key,
-          source_index: r.source_index,
-        })),
-      );
-      // Vision is a property of the model name (model_capabilities), shared with provider cards.
-      const seen = new Set<string>();
-      for (const r of fbRows) {
-        const model = r.model.trim();
-        if (seen.has(model)) continue;
-        seen.add(model);
-        if (modelVision(resp, model) !== r.vision) {
-          resp = await setModelVision(adminToken, model, r.vision);
-        }
-      }
-      applyResponse(resp);
-      notify.success('备用模型链已保存');
-    } catch (err) {
-      notify.error(errorText(err, '保存失败'));
-    } finally {
-      setFbSaving(false);
-    }
+    void run('fallbacks', () => updateFallbacks(adminToken!, fbRows.map(r => ({
+      channel: r.channel, model: r.model.trim(), source_index: r.source_index,
+    }))), '备用链已保存');
   };
 
-  const providerNames = data ? Object.keys(data.providers) : [];
+  const channels = data?.channels || [];
+  const active = data?.active_channel || '';
 
   return (
     <section className="mx-auto flex h-full max-w-4xl flex-col gap-5 overflow-y-auto p-4 sm:p-6">
       <div>
         <p className="font-mono text-[0.6rem] uppercase tracking-[0.22em] text-[var(--duties-tertiary)]">设置</p>
-        <h2 className="mt-1 font-mono text-xl font-semibold tracking-[-0.04em]">模型与渠道</h2>
+        <h2 className="mt-1 font-mono text-xl font-semibold tracking-[-0.04em]">模型与渠道方案</h2>
         <p className="mt-2 max-w-2xl text-sm text-[var(--duties-secondary)]">
-          管理 LLM Provider 渠道配置。当前活跃渠道会被标记。
+          一个渠道方案 = 接口类型 + 地址 + 密钥 + 默认模型。对话默认用“当前方案”；系统模型、节点、备用链、绘图场景 Agent 都从这里选方案。
         </p>
       </div>
 
       {!isAuthenticated ? (
-        <div className="border border-[var(--duties-border)] p-4 text-sm text-[var(--duties-secondary)]">
-          修改模型设置前需要完成管理员令牌认证。
-        </div>
+        <div className="border border-[var(--duties-border)] p-4 text-sm text-[var(--duties-secondary)]">修改模型设置前需要完成管理员令牌认证。</div>
       ) : loading && !data ? (
         <div className="p-4 text-sm text-[var(--duties-secondary)]">加载中...</div>
       ) : (
         <>
-          {/* Provider cards */}
-          {providerNames.map(name => {
-            const cfg = data!.providers[name];
-            const edit = edits[name] || emptyEdit();
-            const isActive = data!.active_provider === name;
-            const isSaving = savingKey === name;
-
-            return (
-              <div
-                key={name}
-                className={`border bg-[var(--duties-panel)] p-4 ${
-                  isActive
-                    ? 'border-[var(--duties-text)]'
-                    : 'border-[var(--duties-border)]'
-                }`}
+          {/* Current scheme */}
+          <div className="border border-[var(--duties-text)] bg-[var(--duties-panel)] p-4">
+            <p className="mb-2 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">当前方案</p>
+            {channels.length === 0 ? (
+              <p className="text-xs text-[var(--duties-secondary)]">还没有渠道方案，先在下方添加一个。</p>
+            ) : (
+              <select
+                className={inputCls}
+                disabled={busy === 'active'}
+                onChange={e => void run('active', () => setActiveChannel(adminToken!, e.target.value), '已切换当前方案')}
+                value={active}
               >
+                {channels.map(c => (
+                  <option key={c.id} value={c.id}>{c.name}（{c.type}）{c.model ? ` — ${c.model}` : ''}</option>
+                ))}
+              </select>
+            )}
+          </div>
+
+          {/* Scheme cards */}
+          {channels.map(c => {
+            const e = edits[c.id] || editFrom(c);
+            const isActive = c.id === active;
+            const pulled = models[c.id] || [];
+            return (
+              <div key={c.id} className={`border bg-[var(--duties-panel)] p-4 ${isActive ? 'border-[var(--duties-text)]' : 'border-[var(--duties-border)]'}`}>
                 <div className="mb-3 flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <p className="font-mono text-sm font-semibold text-[var(--duties-text)]">{name}</p>
+                    <p className="font-mono text-sm font-semibold text-[var(--duties-text)]">{c.name}</p>
+                    <span className="font-mono text-[0.6rem] text-[var(--duties-tertiary)]">{c.id}</span>
                     {isActive && (
-                      <span className="rounded bg-[var(--duties-text)] px-1.5 py-0.5 text-[0.6rem] font-bold text-[var(--duties-bg)]">
-                        ACTIVE
-                      </span>
+                      <span className="rounded bg-[var(--duties-text)] px-1.5 py-0.5 text-[0.6rem] font-bold text-[var(--duties-bg)]">当前</span>
                     )}
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex items-center gap-3 text-xs">
                     {!isActive && (
-                      <button
-                        className="text-xs text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)]"
-                        onClick={() => handleSetActive(name)}
-                      >
-                        设为活跃
+                      <button className="text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)]"
+                        onClick={() => void run('active', () => setActiveChannel(adminToken!, c.id), `已切换到「${c.name}」`)}>
+                        设为当前
                       </button>
                     )}
                     {!isActive && (
-                      <button
-                        className="text-xs text-red-400 underline hover:text-red-300"
-                        onClick={() => handleDelete(name)}
-                      >
+                      <button className="text-red-400 underline hover:text-red-300"
+                        onClick={() => window.confirm(`确定删除方案「${c.name}」？`) && void run(`del:${c.id}`, () => deleteChannel(adminToken!, c.id), '已删除')}>
                         删除
                       </button>
                     )}
                   </div>
                 </div>
-
-                <label className="mb-1 block text-xs text-[var(--duties-secondary)]">模型</label>
-                <input
-                  className="mb-3 w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-                  onChange={e => updateEdit(name, 'model', e.target.value)}
-                  value={edit.model}
-                />
-                <label className="mb-1 block text-xs text-[var(--duties-secondary)]">基础 URL</label>
-                <input
-                  className="mb-3 w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-                  onChange={e => updateEdit(name, 'base_url', e.target.value)}
-                  value={edit.base_url}
-                />
-                <label className="mb-1 block text-xs text-[var(--duties-secondary)]">
-                  API 密钥 {cfg?.api_key_present ? `（已设置: ${cfg.api_key_redacted}）` : '（未设置）'}
-                </label>
-                <input
-                  className="mb-3 w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-                  onChange={e => updateEdit(name, 'api_key', e.target.value)}
-                  placeholder="留空以保留当前值"
-                  type="password"
-                  value={edit.api_key}
-                />
-                <label className="mb-3 flex items-center gap-2 text-xs text-[var(--duties-secondary)]">
-                  <input
-                    checked={cfg?.vision ?? true}
-                    disabled={!cfg?.model}
-                    onChange={e => handleToggleVision(cfg.model, e.target.checked)}
-                    type="checkbox"
-                  />
-                  可识图（vision）
-                  <span className="text-[var(--duties-tertiary)]">
-                    {cfg?.vision ?? true ? '图片直接发给该模型' : '图片先交给识图模型转写成文字'}
-                  </span>
-                </label>
-                <Button disabled={isSaving} onClick={() => handleSave(name)} variant="primary">
-                  {isSaving ? '保存中...' : '保存'}
-                </Button>
+                <div className="grid gap-2 sm:grid-cols-2">
+                  <div>
+                    <label className={labelCls}>名称</label>
+                    <input className={inputCls} onChange={ev => updateEdit(c.id, { name: ev.target.value })} value={e.name} />
+                  </div>
+                  <div>
+                    <label className={labelCls}>接口类型</label>
+                    <select className={inputCls} onChange={ev => updateEdit(c.id, { type: ev.target.value })} value={e.type}>
+                      {Array.from(new Set([e.type, ...(data?.registered || [])])).filter(Boolean).map(t => (
+                        <option key={t} value={t}>{t}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label className={labelCls}>
+                      基础 URL {c.base_url !== c.base_url_resolved && c.base_url_resolved ? `（实际：${c.base_url_resolved}）` : ''}
+                    </label>
+                    <input className={inputCls} onChange={ev => updateEdit(c.id, { base_url: ev.target.value })}
+                      placeholder="留空使用该类型的官方地址；可写 ${ENV_NAME}" value={e.base_url} />
+                    {c.type_hint && e.type === c.type && e.base_url === c.base_url && (
+                      <p className="mt-1 text-xs text-yellow-500">{c.type_hint}</p>
+                    )}
+                  </div>
+                  <div>
+                    <label className={labelCls}>API 密钥 {c.api_key_present ? `（已设置: ${c.api_key_redacted}）` : '（未设置）'}</label>
+                    <input className={inputCls} onChange={ev => updateEdit(c.id, { api_key: ev.target.value })}
+                      placeholder="留空以保留当前值" type="password" value={e.api_key} />
+                  </div>
+                  <div>
+                    <label className={labelCls}>默认模型</label>
+                    <div className="flex gap-2">
+                      {pulled.length > 0 ? (
+                        <select className={inputCls} onChange={ev => updateEdit(c.id, { model: ev.target.value })} value={e.model}>
+                          {!pulled.includes(e.model) && <option value={e.model}>{e.model || '（未选择）'}</option>}
+                          {pulled.map(m => <option key={m} value={m}>{m}</option>)}
+                        </select>
+                      ) : (
+                        <input className={inputCls} onChange={ev => updateEdit(c.id, { model: ev.target.value })} value={e.model} />
+                      )}
+                      <Button disabled={busy === `pull:${c.id}`} onClick={() => void pull(c)}>
+                        {busy === `pull:${c.id}` ? '拉取中' : '拉取模型'}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-3 flex flex-wrap items-center gap-4">
+                  <Button disabled={busy === `save:${c.id}`} onClick={() => void saveChannel(c)} variant="primary">
+                    {busy === `save:${c.id}` ? '保存中...' : '保存'}
+                  </Button>
+                  {c.api_key_present && (
+                    <button className="text-xs text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)]"
+                      onClick={() => void run(`save:${c.id}`, () => upsertChannel(adminToken!, c.id, { clear_api_key: true }), '密钥已清除')}>
+                      清除密钥
+                    </button>
+                  )}
+                  <label className="flex items-center gap-2 text-xs text-[var(--duties-secondary)]">
+                    <input checked={c.vision} disabled={!c.model}
+                      onChange={ev => void run('vision', () => setModelVision(adminToken!, c.model, ev.target.checked))} type="checkbox" />
+                    {c.model || '模型'} 可识图
+                    <span className="text-[var(--duties-tertiary)]">{c.vision ? '图片直接发给模型' : '图片先转写成文字'}</span>
+                  </label>
+                </div>
               </div>
             );
           })}
 
-          {/* Add new provider from registered list */}
-          {(() => {
-            const available = (data?.registered || []).filter(r => !providerNames.includes(r));
-            if (available.length === 0) return null;
-            return (
-              <div className="border border-dashed border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-                <p className="mb-3 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">添加渠道</p>
-                <div className="flex items-center gap-3">
-                  <select
-                    className="flex-1 border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-                    onChange={e => setNewName(e.target.value)}
-                    value={newName}
-                  >
-                    <option value="">选择渠道类型...</option>
-                    {available.map(name => (
-                      <option key={name} value={name}>{name}</option>
-                    ))}
-                  </select>
-                  <Button disabled={addingNew || !newName} onClick={handleAddProvider} variant="primary">
-                    {addingNew ? '添加中...' : '添加'}
-                  </Button>
-                </div>
-              </div>
-            );
-          })()}
+          {/* Add scheme */}
+          <div className="border border-dashed border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
+            <p className="mb-3 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">添加渠道方案</p>
+            <div className="flex flex-wrap items-center gap-3">
+              <input className={`${inputCls} flex-1`} onChange={e => setNewId(e.target.value)} placeholder="方案 id（字母数字 _ . -）" value={newId} />
+              <select className={`${inputCls} flex-1`} onChange={e => setNewType(e.target.value)} value={newType}>
+                <option value="">选择接口类型...</option>
+                {(data?.registered || []).map(t => <option key={t} value={t}>{t}</option>)}
+              </select>
+              <Button disabled={busy === 'add' || !newId.trim() || !newType} onClick={addChannel} variant="primary">添加</Button>
+            </div>
+          </div>
 
-          {/* System model slots (system_models.<slot>) */}
-          {adminToken && data && (
-            <>
-              {SYSTEM_SLOTS.map(s => (
-                <SystemModelCard
-                  key={s.slot}
-                  activeProvider={data.active_provider}
-                  adminToken={adminToken}
-                  description={s.description}
-                  envHint={s.envHint}
-                  modelPlaceholder={s.modelPlaceholder}
-                  providers={s.pickChannel ? Object.keys(data.providers) : undefined}
-                  slot={s.slot}
-                  title={s.title}
-                />
-              ))}
-            </>
-          )}
+          {/* System slots */}
+          {data && SYSTEM_SLOTS.map(s => (
+            <SystemModelCard
+              key={s.slot}
+              activeChannel={active}
+              channels={channels}
+              description={s.description}
+              emptyLabel={UNSET_MEANS_OFF.has(s.slot) && !data.system_models[s.slot]?.model ? '不使用（工具不可用）' : undefined}
+              onSave={ref => saveRef(s.slot, ref)}
+              title={s.title}
+              value={data.system_models[s.slot]}
+            />
+          ))}
 
-          {/* Fallback chain editor */}
+          {/* Fallback chain */}
           <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
-            <p className="mb-1 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">备用模型链</p>
-            <p className="mb-3 text-xs text-[var(--duties-secondary)]">
-              主模型请求失败时按顺序尝试。基础 URL 和密钥留空时使用对应渠道的配置；是否可识图按备用模型自己的设置。
-            </p>
-            {fbRows.length === 0 && (
-              <p className="mb-3 text-xs text-[var(--duties-tertiary)]">未配置备用模型。</p>
-            )}
-            {fbRows.map((row, i) => (
-              <div key={row.key} className="mb-3 border border-[var(--duties-border)] p-3">
-                <div className="mb-2 flex items-center justify-between">
-                  <p className="font-mono text-xs font-semibold text-[var(--duties-text)]">#{i + 1}</p>
-                  <div className="flex items-center gap-3 text-xs">
-                    <button
-                      className="text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)] disabled:opacity-40"
-                      disabled={i === 0}
-                      onClick={() => moveRow(i, -1)}
-                    >
-                      上移
-                    </button>
-                    <button
-                      className="text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)] disabled:opacity-40"
-                      disabled={i === fbRows.length - 1}
-                      onClick={() => moveRow(i, 1)}
-                    >
-                      下移
-                    </button>
-                    <button className="text-red-400 underline hover:text-red-300" onClick={() => removeRow(row.key)}>
-                      删除
-                    </button>
+            <p className="mb-1 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">备用链</p>
+            <p className="mb-3 text-xs text-[var(--duties-secondary)]">主请求失败时按顺序尝试。每项选一个方案，模型留空用方案的默认模型。</p>
+            {fbRows.length === 0 && <p className="mb-3 text-xs text-[var(--duties-tertiary)]">未配置备用项。</p>}
+            {fbRows.map((row, i) => {
+              const ch = channels.find(c => c.id === row.channel);
+              return (
+                <div key={row.key} className="mb-2 flex flex-wrap items-center gap-2">
+                  <span className="w-6 font-mono text-xs text-[var(--duties-tertiary)]">#{i + 1}</span>
+                  <select className={`${inputCls} flex-1`} onChange={e => editRows(rows => rows.map(r => r.key === row.key ? { ...r, channel: e.target.value } : r))} value={row.channel}>
+                    <option value="">选择方案...</option>
+                    {channels.map(c => <option key={c.id} value={c.id}>{c.name}（{c.type}）</option>)}
+                    {row.channel && !ch && <option value={row.channel}>{row.channel}（不存在）</option>}
+                  </select>
+                  <input className={`${inputCls} flex-1`} onChange={e => editRows(rows => rows.map(r => r.key === row.key ? { ...r, model: e.target.value } : r))}
+                    placeholder={ch?.model ? `留空使用 ${ch.model}` : '模型'} value={row.model} />
+                  <div className="flex gap-2 text-xs">
+                    <button className="underline disabled:opacity-40" disabled={i === 0}
+                      onClick={() => editRows(rows => { const n = [...rows]; [n[i - 1], n[i]] = [n[i], n[i - 1]]; return n; })}>上移</button>
+                    <button className="underline disabled:opacity-40" disabled={i === fbRows.length - 1}
+                      onClick={() => editRows(rows => { const n = [...rows]; [n[i + 1], n[i]] = [n[i], n[i + 1]]; return n; })}>下移</button>
+                    <button className="text-red-400 underline" onClick={() => editRows(rows => rows.filter(r => r.key !== row.key))}>删除</button>
                   </div>
                 </div>
-                <div className="grid gap-2 sm:grid-cols-2">
-                  <div>
-                    <label className="mb-1 block text-xs text-[var(--duties-secondary)]">渠道类型</label>
-                    <select
-                      className={inputCls}
-                      onChange={e => updateRow(row.key, { provider: e.target.value })}
-                      value={row.provider}
-                    >
-                      {Array.from(new Set([row.provider, ...(data?.registered || [])]))
-                        .filter(Boolean)
-                        .map(name => (
-                          <option key={name} value={name}>{name}</option>
-                        ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="mb-1 block text-xs text-[var(--duties-secondary)]">模型</label>
-                    <input
-                      className={inputCls}
-                      onChange={e =>
-                        updateRow(row.key, { model: e.target.value, vision: modelVision(data, e.target.value) })
-                      }
-                      value={row.model}
-                    />
-                  </div>
-                  <div>
-                    <label className="mb-1 block text-xs text-[var(--duties-secondary)]">基础 URL</label>
-                    <input
-                      className={inputCls}
-                      onChange={e => updateRow(row.key, { base_url: e.target.value })}
-                      placeholder="留空使用渠道配置"
-                      value={row.base_url}
-                    />
-                  </div>
-                  <div>
-                    <label className="mb-1 block text-xs text-[var(--duties-secondary)]">
-                      API 密钥 {row.api_key_present && !row.clear_api_key ? `（已设置: ${row.api_key_redacted}）` : ''}
-                    </label>
-                    <input
-                      className={inputCls}
-                      onChange={e => updateRow(row.key, { api_key: e.target.value })}
-                      placeholder={row.api_key_present ? '留空以保留当前值' : '留空使用渠道配置'}
-                      type="password"
-                      value={row.api_key}
-                    />
-                  </div>
-                </div>
-                <div className="mt-2 flex flex-wrap items-center gap-4 text-xs text-[var(--duties-secondary)]">
-                  <label className="flex items-center gap-2">
-                    <input
-                      checked={row.vision}
-                      disabled={!row.model.trim()}
-                      onChange={e => updateRow(row.key, { vision: e.target.checked })}
-                      type="checkbox"
-                    />
-                    可识图（vision）
-                  </label>
-                  {row.api_key_present && (
-                    <label className="flex items-center gap-2">
-                      <input
-                        checked={Boolean(row.clear_api_key)}
-                        onChange={e => updateRow(row.key, { clear_api_key: e.target.checked, api_key: '' })}
-                        type="checkbox"
-                      />
-                      清除已保存的密钥
-                    </label>
-                  )}
-                </div>
-              </div>
-            ))}
-            <div className="flex items-center gap-3">
-              <Button onClick={addRow}>添加备用模型</Button>
-              <Button disabled={fbSaving || !fbDirty} onClick={handleSaveFallbacks} variant="primary">
-                {fbSaving ? '保存中...' : '保存备用链'}
-              </Button>
+              );
+            })}
+            <div className="mt-3 flex items-center gap-3">
+              <Button onClick={() => editRows(rows => [...rows, { key: ++rowSeq, channel: active, model: '', source_index: null }])}>添加备用项</Button>
+              <Button disabled={busy === 'fallbacks' || !fbDirty} onClick={saveFallbacks} variant="primary">保存备用链</Button>
               {fbDirty && <span className="text-xs text-[var(--duties-tertiary)]">有未保存的修改</span>}
             </div>
           </div>
 
-          {/* Reload */}
           <div className="flex items-center gap-3">
-            <Button onClick={handleReload}>🔄 重载配置</Button>
+            <Button onClick={() => void run('reload', async () => { await reloadConfig(adminToken!); return getChannels(adminToken!); }, '配置已重载')}>🔄 重载配置</Button>
             <p className="text-xs text-[var(--duties-secondary)]">重新读取 config.yaml，不中断服务</p>
           </div>
         </>

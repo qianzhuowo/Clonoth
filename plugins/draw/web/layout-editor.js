@@ -631,7 +631,7 @@ const EDITABLE_BUILTINS = Object.freeze({ opening: 'opening', content: 'content'
 // 后端链预览里每段的 key（plugins/draw/planner/assembly.py 的 SECTION_KEYS）→ 块 id。
 const BLOCK_BY_SECTION_KEY = Object.freeze({ topSystem: 'opening', frame: 'frame', toolDeclaration: 'tools', content: 'content', tagGuide: 'guide', sceneRules: 'rules', limits: 'limits' });
 const TOOLS_SUMMARY = '原生工具协议时整段删除；文本协议时替换为工具说明';
-const CONTENT_HINT = '必须包含 {{characterInfo}}、{{drawRequest}}、{{recentDialogue}} 三个占位符。';
+const CONTENT_HINT = '必须包含 {{characterInfo}}、{{drawRequest}} 两个占位符。';
 const PREVIEW_DEBOUNCE_MS = 400;
 
 /** 标题里的内容预览：取第一个非空行，压成单行并截断。 */

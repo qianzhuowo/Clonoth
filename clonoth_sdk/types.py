@@ -42,6 +42,10 @@ class DeliveryContext:
     idempotency_key: str = ""
     replay_generation: int = 0
     force_replay: bool = False
+    # Terminal action that produced this outbound ("finish" / "ask" / "fail").
+    # Adapters use "fail" to show a short notice instead of the raw error and to
+    # keep it out of chat history replayed to the model.
+    action_type: str = ""
 
     def child(self, identity: str) -> "DeliveryContext":
         """Derive a stable logical-message context without mutating the parent."""
@@ -135,12 +139,8 @@ class HealthInfo:
 
 
 @dataclass
-class OpenAIConfig:
-    """OpenAI 兼容 API 的公开配置信息。
-
-    对应 GET /v1/config/openai 返回。api_key 字段为脱敏后的值。
-    """
-    base_url: str
+class ActiveModel:
+    """当前渠道方案及其模型（GET /v1/config 的 active_channel / active_model）。"""
+    channel: str
+    channel_name: str
     model: str
-    api_key_present: bool
-    api_key: str = ""

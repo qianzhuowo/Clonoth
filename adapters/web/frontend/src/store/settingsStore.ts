@@ -6,6 +6,7 @@
 // Purpose: App.tsx can use the view registry without a second routing system here.
 import { create } from 'zustand';
 
+import type { ChannelSummary } from '../api/supervisorClient';
 import type { NodeDef } from '../types';
 
 const LS_KEY_TOKEN = 'clonoth_admin_token';
@@ -35,7 +36,6 @@ interface SettingsState {
   isConnected: boolean;
   entryNodeId: string;
   availableNodes: NodeDef[];
-  modelConfig: { model: string; base_url: string; api_key_present: boolean } | null;
   // Active node tracking
   activeNodeId: string;
   activeNodeIsOverride: boolean;
@@ -43,9 +43,9 @@ interface SettingsState {
   activeEffectiveProvider: string;
   activeEffectiveModel: string;
   activeEffectiveBaseUrl: string;
-  globalModel: string;
-  globalBaseUrl: string;
-  providerModels: Record<string, string>;
+  // Channel schemes from GET /v1/config (no secrets): the current scheme and the list.
+  activeChannel: string;
+  channels: ChannelSummary[];
   // [2026-06-01] Session-level provider override cache.
   // Why: the right panel shows the model/base_url that apply only to the current
   // session. How: store the latest provider_override object returned by Supervisor.
@@ -77,9 +77,8 @@ interface SettingsState {
   setConnected: (v: boolean) => void;
   setEntryNodeId: (id: string) => void;
   setAvailableNodes: (nodes: NodeDef[]) => void;
-  setModelConfig: (cfg: { model: string; base_url: string; api_key_present: boolean } | null) => void;
   setActiveNode: (nodeId: string, isOverride: boolean, defaultId: string, effective?: { provider?: string; model?: string; baseUrl?: string }) => void;
-  setGlobalConfig: (model: string, baseUrl: string, providerModels?: Record<string, string>) => void;
+  setChannelConfig: (activeChannel: string, channels: ChannelSummary[]) => void;
   setSessionProviderOverride: (override: SessionProviderOverride | null) => void;
   setPendingProviderOverride: (override: SessionProviderOverride | null) => void;
   setSessionWorkspaceName: (name: string) => void;
@@ -96,16 +95,14 @@ export const useSettingsStore = create<SettingsState>((set) => ({
   isConnected: false,
   entryNodeId: localStorage.getItem(LS_KEY_NODE) || '',
   availableNodes: [],
-  modelConfig: null,
   activeNodeId: '',
   activeNodeIsOverride: false,
   defaultNodeId: '',
   activeEffectiveProvider: '',
   activeEffectiveModel: '',
   activeEffectiveBaseUrl: '',
-  globalModel: '',
-  globalBaseUrl: '',
-  providerModels: {},
+  activeChannel: '',
+  channels: [],
   sessionProviderOverride: null,
   pendingProviderOverride: null,
   sessionWorkspaceName: '',
@@ -132,7 +129,6 @@ export const useSettingsStore = create<SettingsState>((set) => ({
     set({ entryNodeId: id });
   },
   setAvailableNodes: (nodes) => set({ availableNodes: nodes }),
-  setModelConfig: (cfg) => set({ modelConfig: cfg }),
   setActiveNode: (nodeId, isOverride, defaultId, effective) => set({
     activeNodeId: nodeId,
     activeNodeIsOverride: isOverride,
@@ -141,7 +137,7 @@ export const useSettingsStore = create<SettingsState>((set) => ({
     activeEffectiveModel: effective?.model || '',
     activeEffectiveBaseUrl: effective?.baseUrl || '',
   }),
-  setGlobalConfig: (model, baseUrl, providerModels) => set({ globalModel: model, globalBaseUrl: baseUrl, providerModels: providerModels || {} }),
+  setChannelConfig: (activeChannel, channels) => set({ activeChannel, channels }),
   setSessionProviderOverride: (override) => set({ sessionProviderOverride: override }),
   setPendingProviderOverride: (override) => set({ pendingProviderOverride: override }),
   setSessionWorkspaceName: (name) => set({ sessionWorkspaceName: name }),

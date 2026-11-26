@@ -157,7 +157,8 @@ def test_engine_node_is_taken_over_by_draw_agent(tmp_path: Path, monkeypatch, en
     assert len(provider.calls) == 1
     llm_text = "\n".join(str(m.get("content") or "") for m in provider.calls[0]["messages"])
     assert "TPL-top-system" in llm_text and "TPL-tag-guide" in llm_text and "TPL-scene-rules" in llm_text
-    assert "艾丽丝" in llm_text and "画小艾在窗边" in llm_text and "之前聊过的" in llm_text
+    # 规划只看绘图请求，不附带近期对话
+    assert "艾丽丝" in llm_text and "画小艾在窗边" in llm_text and "之前聊过的" not in llm_text
     assert [t["function"]["name"] for t in provider.calls[0]["tools"]] == ["submit_scene_plan"]
     # 图片经 Supervisor 快通道直发；文件真实落盘
     sends = [p for url, p in http.posts if url.endswith("/v1/sessions/s1/async_tool_result")]

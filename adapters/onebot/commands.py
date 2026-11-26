@@ -116,11 +116,10 @@ async def _maybe_handle_model_command(
     event: Event,
     user_text: str,
 ) -> str | None:
-    """处理 QQ 管理员 /切换模型 <模型名> 命令，切换全局主模型。
+    """处理 QQ 管理员 /切换模型 <模型名> 命令：修改当前渠道方案的模型。
 
-    返回回复文本；None 表示不是本命令。切换通过 Supervisor 的
-    POST /v1/config/openai 实时写入 data/config.yaml；Engine 每次处理任务
-    前都会重新拉取该配置（fetch_openai_secret），因此无需重启服务。
+    返回回复文本；None 表示不是本命令。通过 Supervisor 的 PUT /v1/config/active-model
+    写入 data/config.yaml；Engine 每次任务都重新读取配置，无需重启。
     """
     text = (user_text or "").strip()
     if not text:
@@ -139,12 +138,12 @@ async def _maybe_handle_model_command(
         if not is_admin:
             return "模型命令仅限 Clonoth 管理员使用。"
         try:
-            cfg = await state._client.get_openai_config()
+            cur = await state._client.get_active_model()
         except Exception as exc:
-            logger.warning("get openai config failed: %s", exc, exc_info=True)
+            logger.warning("get active model failed: %s", exc, exc_info=True)
             return f"❌ 获取当前模型失败：{exc}"
         return (
-            f"ℹ️ 当前 model → {cfg.model or '(未设置)'}\n"
+            f"ℹ️ 当前方案 {cur.channel_name or '(未配置)'} → {cur.model or '(未设置)'}\n"
             "切换：/切换模型 <模型名>"
         )
 
@@ -159,17 +158,12 @@ async def _maybe_handle_model_command(
         if not model_name:
             return "用法：/切换模型 <模型名>"
         try:
-            out = await state._client.update_openai_config(model=model_name)
+            out = await state._client.set_active_model(model_name)
         except Exception as exc:
-            logger.warning("switch global model failed: %s", exc, exc_info=True)
+            logger.warning("switch model failed: %s", exc, exc_info=True)
             return f"❌ 切换失败：{exc}"
-        new_model = ""
-        try:
-            new_model = str((out or {}).get("openai", {}).get("model") or "").strip()
-        except Exception:
-            new_model = ""
-        logger.info("QQ admin %s switched global model -> %s", getattr(event, "user_id", ""), new_model or model_name)
-        return f"✅ model → {new_model or model_name}"
+        logger.info("QQ admin %s switched model of %s -> %s", getattr(event, "user_id", ""), out.channel, out.model)
+        return f"✅ {out.channel} 的 model → {out.model or model_name}"
 
     return None
 

@@ -1063,6 +1063,9 @@ class EventRouter:
                 event.event_id, event.seq, event.type,
             ),
         )
+        action_type = str(p.get("action_type") or "").strip()
+        if context.action_type != action_type:
+            context = replace(context, action_type=action_type)
         text = strip_protocol_markers((p.get("text") or "").strip())
         attachments = p.get("attachments") if isinstance(p.get("attachments"), list) else []
 

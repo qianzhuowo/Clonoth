@@ -14,7 +14,6 @@ import httpx
 import yaml
 
 from clonoth_runtime import (
-    fetch_llm_secret,
     get_bool,
     get_entry_node_id,
     get_float,
@@ -22,10 +21,8 @@ from clonoth_runtime import (
     get_str,
     load_runtime_config,
     load_yaml_dict,
-    normalize_llm_secret,
-    resolve_system_model,
-    SYSTEM_NODE_MODEL_SLOTS,
 )
+import clonoth_channels
 from providers import registry as provider_registry
 from toolbox.context import ToolContext, platform_is_admin_from_task_context, platform_user_id_from_task_context
 from toolbox.registry import ToolRegistry
@@ -55,25 +52,12 @@ from engine.signals.bridge import install_event_bridge
 def _provider_init_kwargs(
     rp: Any,
     *,
-    provider_name: str,
     llm_http: httpx.AsyncClient,
-    api_key: str,
-    base_url: str,
     provider_options: dict[str, Any],
 ) -> dict[str, Any]:
     """Build common constructor kwargs for provider classes."""
-    # [provider-registry 2026-05-03] 统一构造 provider 参数。
-    # 原因：runner 不应再按 provider 类型实例化不同类；做法：先组装一个超集 kwargs，
-    # 再由 _instantiate_provider 按构造签名过滤；目的：保留旧 provider 行为，同时支持新插件。
-    if provider_name in {"openai", "openai-responses"}:
-        resolved_api_key = rp.api_key or api_key
-        resolved_base_url = rp.base_url or base_url or None
-    else:
-        env_prefix = provider_name.upper().replace("-", "_")
-        fallback_env_key = os.environ.get("GEMINI_API_KEY", "") if provider_name.startswith("gemini") else ""
-        fallback_env_url = os.environ.get("GEMINI_BASE_URL", "") if provider_name.startswith("gemini") else ""
-        resolved_api_key = rp.api_key or os.environ.get(f"{env_prefix}_API_KEY", "") or fallback_env_key or api_key
-        resolved_base_url = rp.base_url or os.environ.get(f"{env_prefix}_BASE_URL", "") or fallback_env_url or None
+    resolved_api_key = rp.api_key
+    resolved_base_url = rp.base_url or None
     effective_po = _merge_provider_options(rp.provider_options or {}, provider_options)
     # Priority for sticky_session: explicit provider_options (session_override > node > runtime)
     # > config.yaml provider section (_provider_sticky_session).
@@ -125,57 +109,18 @@ def _instantiate_provider(provider_cls: type, init_kwargs: dict[str, Any]) -> An
     return provider_cls(**{key: value for key, value in init_kwargs.items() if key in allowed})
 
 
-def _apply_system_model_slot(workspace_root: Path, node: Any) -> Any:
-    """Return the node with its system_models slot applied (system nodes only).
-
-    A configured slot (config.yaml system_models.<slot> or CLONOTH_<SLOT>_* env)
-    replaces the node's own channel and model: an empty provider follows the
-    global active channel, and empty model/base_url/api_key come from that
-    channel's config section.
-    """
-    slot = SYSTEM_NODE_MODEL_SLOTS.get(node.id, "")
-    if not slot:
-        return node
-    sm = resolve_system_model(workspace_root, slot)
-    if not (sm.provider or sm.model or sm.base_url or sm.api_key):
-        return node
-    return dataclasses.replace(
-        node,
-        provider=sm.provider,
-        model=sm.model,
-        base_url=sm.base_url,
-        api_key=sm.api_key,
-    )
-
-
 def _create_provider_from_registry(
     rp: Any,
     *,
     llm_http: httpx.AsyncClient,
-    api_key: str,
-    base_url: str,
     provider_options: dict[str, Any],
 ) -> Any:
-    """Resolve and instantiate the configured provider through ProviderRegistry."""
-    requested_name = (rp.provider_type or "openai").strip().lower()
-    provider_cls = provider_registry.get(requested_name)
-    provider_name = requested_name
+    """Instantiate the channel's provider type through ProviderRegistry."""
+    provider_cls = provider_registry.get((rp.provider_type or "").strip().lower())
     if provider_cls is None:
-        # [provider-registry 2026-05-03] 未注册 provider 保持旧行为：回退到 OpenAI。
-        # 原因：过去未知 provider 会落入默认 OpenAI 分支；做法：registry miss 时取 openai；
-        # 目的：配置错误不改变历史降级语义。
-        provider_cls = provider_registry.get("openai")
-        provider_name = "openai"
-    if provider_cls is None:
-        raise RuntimeError("provider registry did not register the fallback 'openai' provider")
-    init_kwargs = _provider_init_kwargs(
-        rp,
-        provider_name=provider_name,
-        llm_http=llm_http,
-        api_key=api_key,
-        base_url=base_url,
-        provider_options=provider_options,
-    )
+        raise clonoth_channels.ChannelError(
+            f"渠道方案「{rp.channel_id}」的类型 '{rp.provider_type}' 未注册（可选：{provider_registry.list()}）")
+    init_kwargs = _provider_init_kwargs(rp, llm_http=llm_http, provider_options=provider_options)
     return _instantiate_provider(provider_cls, init_kwargs)
 
 
@@ -906,8 +851,6 @@ async def _handle_task(
         # same terminal-state fallback as model/tool errors. Previously a 401 here
         # escaped _handle_task before heartbeat setup and before complete_task,
         # leaving the task silent until the zombie reaper expired its lease.
-        cfg_raw = await fetch_llm_secret(http, sup_url)
-        api_key, base_url, default_model = normalize_llm_secret(cfg_raw)
         _hb = asyncio.create_task(_heartbeat(http, sup_url, task_id, worker_id))
 
         if kind == "node":
@@ -915,8 +858,6 @@ async def _handle_task(
                 http=http, llm_http=llm_http, sup_url=sup_url, ws_root=ws_root,
                 registry=registry, task=item, worker_id=worker_id,
                 session_id=session_id, session_generation=session_generation,
-                api_key=api_key, base_url=base_url,
-                default_model=default_model,
             )
         elif kind == "tool":
             result = await _run_tool_task(
@@ -1036,9 +977,6 @@ async def _run_node_task(
     worker_id: str,
     session_id: str,
     session_generation: int,
-    api_key: str,
-    base_url: str,
-    default_model: str,
 ) -> dict[str, Any]:
     task_id = str(task.get("task_id") or "").strip()
     node_id = str(task.get("node_id") or "").strip()
@@ -1054,15 +992,11 @@ async def _run_node_task(
     node = load_node(ws_root, node_id)
     if node is None:
         return {"action": "fail", "node_id": node_id, "error": f"node not found: {node_id}"}
-    # [AutoC 2026-08-01] api_key 检查移至 provider 构造之后。
-    # 全局 key 为空不代表最终无 key：resolve_provider 会从
-    # node.api_key / config.yaml provider section / 环境变量中取。
 
     rctx = RunContext(
         workspace_root=ws_root, supervisor_url=sup_url,
         session_id=session_id, worker_id=worker_id,
         http=http, llm_http=llm_http,
-        api_key=api_key, base_url=base_url, default_model=default_model,
         user_text=str(input_data.get("instruction") or "").strip(),
         task_id=task_id, session_generation=session_generation,
         parent_session_id=parent_session_id,
@@ -1223,30 +1157,11 @@ async def _run_node_task(
             session_provider_override = await _fetch_session_provider_override(
                 http, sup_url, str(_disp_orig["parent_session_id"]).strip()
             )
-        # [2026-06-07] Why: resolve_provider needs all provider sections from config.yaml
-        # to look up the default model for a non-global provider (e.g. openai-responses).
-        # How: load config.yaml and extract provider blocks (dicts with base_url/model/api_key).
-        # Purpose: setting provider=X on a node automatically uses X's configured model.
-        _config_data = load_yaml_dict(ws_root / "data" / "config.yaml")
-        _provider_configs = {
-            k: v for k, v in (_config_data if isinstance(_config_data, dict) else {}).items()
-            if isinstance(v, dict) and any(pk in v for pk in ("base_url", "api_key", "model"))
-        }
-        # [AutoC 2026-06-16] Why: config.yaml provider is the global active channel,
-        # not only a label in settings. How: pass it into resolve_provider as the
-        # default provider for nodes that do not pin node.provider. Purpose: switching
-        # ACTIVE to deepseek/openai-responses changes ordinary AI task routing.
-        _active_provider = str((_config_data or {}).get("provider") or "openai").strip() if isinstance(_config_data, dict) else "openai"
-        _resolve_node = _apply_system_model_slot(ws_root, node)
-        rp = resolve_provider(
-            ws_root,
-            _resolve_node,
-            default_model,
-            session_override=session_provider_override,
-            provider_configs=_provider_configs,
-            default_provider_type=_active_provider,
-        )
-        provider_cfg = (runtime_cfg.get("providers") or {}).get(rp.provider_type or "openai")
+        try:
+            rp = resolve_provider(ws_root, node, session_override=session_provider_override)
+        except clonoth_channels.ChannelError as exc:
+            return {"action": "fail", "node_id": node_id, "error": f"{exc}（节点 {node_id}）"}
+        provider_cfg = (runtime_cfg.get("providers") or {}).get(rp.provider_type)
         global_provider_options = provider_cfg.get("options") if isinstance(provider_cfg, dict) else {}
         if not isinstance(global_provider_options, dict):
             global_provider_options = {}
@@ -1286,21 +1201,18 @@ async def _run_node_task(
         # [provider-registry 2026-05-03] Provider 创建改为 registry 查找。
         # 原因：旧 if-elif 每新增 provider 都要改 runner；做法：按 rp.provider_type 找类并传统一 kwargs；
         # 目的：保持现有四个 provider 行为不变，同时让 providers/*.py 插件可自动接入。
-        provider = _create_provider_from_registry(
-            rp,
-            llm_http=llm_http,
-            api_key=api_key,
-            base_url=base_url,
-            provider_options=_po,
-        )
+        try:
+            provider = _create_provider_from_registry(rp, llm_http=llm_http, provider_options=_po)
+        except clonoth_channels.ChannelError as exc:
+            return {"action": "fail", "node_id": node_id, "error": str(exc)}
+        provider.channel_id = rp.channel_id
         # [AutoC 2026-08-01] 在 provider 构造之后检查实际解析出的 key。
-        # fallback 链：session_override → node.api_key → config.yaml provider section
-        # → {PREFIX}_API_KEY 环境变量 → 全局 api_key。全部为空才报错。
+        # key 只来自渠道方案（或会话覆盖）。
         _actual_key = getattr(provider, '_api_key', None) or ''
         if not _actual_key:
             return {
                 "action": "fail", "node_id": node_id,
-                "error": f"LLM provider api_key not configured (provider={rp.provider_type}, node={node_id})."
+                "error": f"渠道方案「{rp.channel_id}」没有 API Key（节点 {node_id}）。"
             }
 
     await rctx.emit_event("node_started", {

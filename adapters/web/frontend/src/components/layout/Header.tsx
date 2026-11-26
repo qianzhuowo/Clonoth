@@ -25,7 +25,7 @@ interface HeaderProps {
 export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingChildNodeId, onExitChildSession }: HeaderProps) => {
   const {
     adminToken, availableNodes, activeNodeId, entryNodeId, activeEffectiveModel,
-    setActiveNode, setGlobalConfig, setAvailableNodes,
+    setActiveNode, setChannelConfig, setAvailableNodes,
   } = useSettingsStore();
   const displayNodeId = activeNodeId || entryNodeId || '';
   const activeNode = availableNodes.find(n => n.id === displayNodeId);
@@ -76,9 +76,9 @@ export const Header = ({ title, sessionId, isGenerating, onTitleChange, viewingC
   // Fetch global config once
   useEffect(() => {
     getAppConfig()
-      .then(r => setGlobalConfig(r.openai?.model || '', r.openai?.base_url || '', r.provider_models || {}))
+      .then(r => setChannelConfig(r.active_channel, r.channels || []))
       .catch(() => {});
-  }, [setGlobalConfig]);
+  }, [setChannelConfig]);
 
   // Load nodes if needed
   useEffect(() => {

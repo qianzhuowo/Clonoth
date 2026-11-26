@@ -7,228 +7,296 @@ from typing import Any
 
 import yaml
 
+import clonoth_channels as chn
+
 from .types import (
     AppConfigPublic,
-    AppConfigSecret,
+    ChannelSummary,
     MimoAudioConfigPublic,
     MimoAudioConfigSecret,
     MimoAudioConfigUpdateIn,
-    OpenAIConfigPublic,
-    OpenAIConfigSecret,
-    OpenAIConfigUpdateIn,
 )
 
 
 def _resolve_env_value(value: str) -> str:
-    s = (value or "").strip()
-    if not s:
-        return ""
-    if s.startswith("${") and s.endswith("}") and len(s) > 3:
-        return os.getenv(s[2:-1].strip(), "").strip()
-    if s.startswith("$ENV{") and s.endswith("}") and len(s) > 6:
-        return os.getenv(s[5:-1].strip(), "").strip()
-    return s
+    return chn.resolve_ref(value)
 
 
 def _redact_api_key(api_key: str) -> tuple[bool, str]:
     k = (api_key or "").strip()
     if not k:
         return False, ""
-    # Environment reference (recommended)
     if k.startswith("${") and k.endswith("}") and len(k) > 3:
-        var = k[2:-1].strip()
-        return True, f"<env:{var}>"
+        return True, f"<env:{k[2:-1].strip()}>"
     if len(k) <= 4:
         return True, "****"
     return True, "****" + k[-4:]
 
 
+_CHANNEL_ID_CHARS = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+
+
 class ConfigStore:
-    """YAML-backed config store.
+    """YAML-backed store for data/config.yaml (channel schemes, slots, fallbacks, audio).
 
-    - Canonical file: data/config.yaml
-    - Contains provider selection + OpenAI settings.
-
-    注意：api_key 属于敏感信息，本仓库会将 data/config.yaml 加入 .gitignore。
+    The layout is described in ``clonoth_channels``; reading an older file migrates
+    it once and writes it back. api_key values are secrets (data/config.yaml is ignored by git).
     """
 
     def __init__(self, *, path: Path):
         self.path = path
+        # data/config.yaml -> workspace root (node YAML files migrate with the config).
+        self.root = path.parent.parent
         self._lock = threading.RLock()
-        self._config: AppConfigSecret = AppConfigSecret()
-        self._extra_keys: dict[str, Any] = {}  # preserve unknown top-level keys
-        self._openai_extra_keys: dict[str, Any] = {}
-
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.reload()
 
-    def _load_yaml_dict(self) -> dict[str, Any] | None:
+    # ---- raw file ----
+
+    def _load_raw(self) -> dict[str, Any]:
         if not self.path.exists():
-            return None
+            return {"version": 1}
+        try:
+            data = yaml.safe_load(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            bak = self.path.with_suffix(self.path.suffix + ".bak")
+            if not bak.exists():
+                self.path.replace(bak)
+            return {"version": 1}
+        return data if isinstance(data, dict) else {"version": 1}
 
-        text = self.path.read_text(encoding="utf-8")
-        if not text.strip():
-            return None
+    def _save_raw(self, data: dict[str, Any]) -> None:
+        self.path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
-        data = yaml.safe_load(text)
-        if data is None:
-            return None
-        if not isinstance(data, dict):
-            return None
-        return data
-
-    def _save_yaml(self, cfg: AppConfigSecret) -> None:
-        # [2026-05-24] Preserve unknown top-level keys (e.g. fallbacks) that
-        # plugins may have added to config.yaml but are not part of the
-        # AppConfigSecret Pydantic model. Without this, reload() would strip
-        # any key not declared in the model.
-        data = cfg.model_dump(mode="json")
-        if self._openai_extra_keys:
-            for ek, ev in self._openai_extra_keys.items():
-                data["openai"].setdefault(ek, ev)
-        if self._extra_keys:
-            data.update(self._extra_keys)
-        text = yaml.safe_dump(
-            data,
-            sort_keys=False,
-            allow_unicode=True,
-        )
-        self.path.write_text(text, encoding="utf-8")
-
-    def reload(self) -> AppConfigSecret:
+    def reload(self) -> dict[str, Any]:
         with self._lock:
-            data = self._load_yaml_dict()
-            if data is None:
-                self._config = AppConfigSecret()
-                self._save_yaml(self._config)
-                return self._config.model_copy(deep=True)
+            existed = self.path.exists()
+            data, changed = chn.migrate(self._load_raw(), root=self.root)
+            if changed or not existed:
+                self._save_raw(data)
+            return data
 
-            # Capture top-level keys not in the Pydantic model, plus extra keys inside openai block
-            _known_keys = set(AppConfigSecret.model_fields.keys())
-            self._extra_keys = {k: v for k, v in data.items() if k not in _known_keys}
-            _oai_raw = data.get("openai")
-            if isinstance(_oai_raw, dict):
-                self._openai_extra_keys = {
-                    k: v for k, v in _oai_raw.items()
-                    if k not in {"base_url", "api_key", "model"}
-                }
-            else:
-                self._openai_extra_keys = {}
-            try:
-                self._config = AppConfigSecret.model_validate(data)
-            except Exception:
-                # 备份坏配置，写回默认值
-                try:
-                    bak = self.path.with_suffix(self.path.suffix + ".bak")
-                    if self.path.exists() and not bak.exists():
-                        self.path.replace(bak)
-                except Exception:
-                    pass
-
-                self._config = AppConfigSecret()
-                self._save_yaml(self._config)
-                return self._config.model_copy(deep=True)
-
-            # 写回一次，确保字段齐全且格式统一
-            self._save_yaml(self._config)
-            return self._config.model_copy(deep=True)
-
-    def get_secret(self) -> AppConfigSecret:
-        with self._lock:
-            return self._config.model_copy(deep=True)
+    # ---- public summary ----
 
     def get_public(self) -> AppConfigPublic:
         with self._lock:
-            cfg = self._config.model_copy(deep=True)
-            cfg.openai.base_url = _resolve_env_value(cfg.openai.base_url)
-            cfg.openai.api_key = _resolve_env_value(cfg.openai.api_key)
-            cfg.openai.model = _resolve_env_value(cfg.openai.model)
-            present, redacted = _redact_api_key(cfg.openai.api_key)
-            openai_pub = OpenAIConfigPublic(
-                base_url=cfg.openai.base_url,
-                model=cfg.openai.model,
-                api_key_present=present,
-                api_key=redacted,
-            )
             data = self._load_raw()
-            pm: dict[str, str] = {}
-            for k, v in data.items():
-                if k in self._META_KEYS:
+            active = chn.active_channel_id(data)
+            summaries = [
+                ChannelSummary(id=str(c["id"]), name=str(c.get("name") or c["id"]),
+                               type=str(c.get("type") or ""), model=chn.resolve_ref(c.get("model"), self.root))
+                for c in chn.channel_list(data)
+            ]
+            active_model = next((s.model for s in summaries if s.id == active), "")
+            return AppConfigPublic(version=int(data.get("version") or 1), active_channel=active,
+                                   active_model=active_model, channels=summaries,
+                                   mimo_audio=self.get_mimo_audio_public())
+
+    def _vision(self, caps: dict[str, Any], model: str) -> bool:
+        from engine.vision import vision_from_capabilities
+        return vision_from_capabilities(caps, model)
+
+    def get_channels_public(self) -> dict[str, Any]:
+        """Channel schemes, fallback chain, slots and node choices; api_keys redacted."""
+        with self._lock:
+            data = self._load_raw()
+            caps = data.get("model_capabilities") if isinstance(data.get("model_capabilities"), dict) else {}
+            channels = []
+            for c in chn.channel_list(data):
+                present, redacted = _redact_api_key(str(c.get("api_key") or ""))
+                model = chn.resolve_ref(c.get("model"), self.root)
+                base_url = str(c.get("base_url") or "")
+                kind = str(c.get("type") or "")
+                channels.append({
+                    "id": str(c["id"]), "name": str(c.get("name") or c["id"]), "type": kind,
+                    "base_url": base_url, "base_url_resolved": chn.resolve_ref(base_url, self.root),
+                    "model": model, "api_key_present": present, "api_key_redacted": redacted,
+                    "vision": self._vision(caps, model),
+                    "type_hint": chn.type_mismatch(kind, chn.resolve_ref(base_url, self.root)),
+                })
+            by_id = {c["id"]: c for c in channels}
+            fallbacks = []
+            for entry in data.get("fallbacks") or []:
+                if not isinstance(entry, dict):
                     continue
-                if self._is_provider_block(v):
-                    m = str(_resolve_env_value(v.get("model", ""))).strip()
-                    if m:
-                        pm[k] = m
-            mimo = cfg.mimo_audio
-            mimo_present, mimo_redacted = _redact_api_key(mimo.api_key)
-            mimo_pub = MimoAudioConfigPublic(
-                base_url=mimo.base_url,
-                api_key_present=mimo_present,
-                api_key=mimo_redacted,
-                asr_path=mimo.asr_path,
-                asr_model=mimo.asr_model,
-                asr_language=mimo.asr_language,
-                tts_path=mimo.tts_path,
-                tts_model=mimo.tts_model,
-                tts_voice=mimo.tts_voice,
-                tts_format=mimo.tts_format,
-                timeout=mimo.timeout,
-                ffmpeg_path=mimo.ffmpeg_path,
-            )
-            return AppConfigPublic(version=cfg.version, provider=cfg.provider, openai=openai_pub, mimo_audio=mimo_pub, provider_models=pm)
+                cid = str(entry.get("channel") or "").strip()
+                model = str(entry.get("model") or "").strip() or by_id.get(cid, {}).get("model", "")
+                fallbacks.append({"channel": cid, "model": str(entry.get("model") or ""),
+                                  "effective_model": model, "missing": cid not in by_id,
+                                  "vision": self._vision(caps, model)})
+            return {
+                "active_channel": chn.active_channel_id(data),
+                "channels": channels,
+                "fallbacks": fallbacks,
+                "system_models": {s: self._ref_public(data, "system_models", s) for s in chn.SYSTEM_MODEL_SLOT_NAMES},
+                "node_models": {k: self._ref_public(data, "node_models", k)
+                                for k in (data.get("node_models") or {})},
+                "model_capabilities": caps,
+            }
 
-    def get_openai_secret(self) -> OpenAIConfigSecret:
+    @staticmethod
+    def _ref_public(data: dict[str, Any], scope: str, key: str) -> dict[str, str]:
+        block = data.get(scope) if isinstance(data.get(scope), dict) else {}
+        entry = block.get(key) if isinstance(block.get(key), dict) else {}
+        return {"channel": str(entry.get("channel") or ""), "model": str(entry.get("model") or "")}
+
+    # ---- channel schemes ----
+
+    def get_channel_secret(self, channel_id: str) -> chn.Channel:
         with self._lock:
-            cfg = self._config.openai.model_copy(deep=True)
-            cfg.base_url = _resolve_env_value(cfg.base_url)
-            cfg.api_key = _resolve_env_value(cfg.api_key)
-            cfg.model = _resolve_env_value(cfg.model)
-            return cfg
+            return chn.get_channel(self._load_raw(), channel_id, root=self.root)
 
-    def get_openai_public(self) -> OpenAIConfigPublic:
+    def upsert_channel(self, channel_id: str, *, name: str | None = None, type: str | None = None,
+                       base_url: str | None = None, api_key: str | None = None, model: str | None = None,
+                       clear_api_key: bool = False) -> dict[str, Any]:
+        cid = (channel_id or "").strip()
+        if not cid or not set(cid) <= _CHANNEL_ID_CHARS or len(cid) > 64:
+            raise ValueError("方案 id 只能用字母、数字、_ . -，最长 64 位")
         with self._lock:
-            cfg = self._config.model_copy(deep=True)
-            cfg.openai.base_url = _resolve_env_value(cfg.openai.base_url)
-            cfg.openai.api_key = _resolve_env_value(cfg.openai.api_key)
-            cfg.openai.model = _resolve_env_value(cfg.openai.model)
-            present, redacted = _redact_api_key(cfg.openai.api_key)
-            return OpenAIConfigPublic(
-                base_url=cfg.openai.base_url,
-                model=cfg.openai.model,
-                api_key_present=present,
-                api_key=redacted,
-            )
+            data = self._load_raw()
+            channels = [dict(c) for c in chn.channel_list(data)]
+            entry = next((c for c in channels if str(c["id"]) == cid), None)
+            if entry is None:
+                if not (type or "").strip():
+                    raise ValueError("新方案必须选择类型")
+                entry = {"id": cid, "name": cid, "type": "", "base_url": "", "api_key": "", "model": ""}
+                channels.append(entry)
+            for key, value in (("name", name), ("type", type), ("base_url", base_url), ("model", model)):
+                if value is not None:
+                    entry[key] = value.strip().lower() if key == "type" else value.strip()
+            if api_key is not None and api_key.strip():
+                entry["api_key"] = api_key.strip()
+            elif clear_api_key:
+                entry["api_key"] = ""
+            entry["name"] = entry.get("name") or cid
+            data["channels"] = channels
+            if not chn.active_channel_id({**data, "active_channel": data.get("active_channel")}) or not data.get("active_channel"):
+                data["active_channel"] = cid
+            self._save_raw(data)
+            return self.get_channels_public()
 
-    def update_openai(self, update: OpenAIConfigUpdateIn) -> AppConfigPublic:
+    def delete_channel(self, channel_id: str) -> dict[str, Any]:
         with self._lock:
-            cfg = self._config
+            data = self._load_raw()
+            used = chn.references(data, channel_id)
+            if used:
+                raise ValueError(f"方案「{channel_id}」正在使用：{'、'.join(used)}；请先改掉这些引用")
+            data["channels"] = [c for c in chn.channel_list(data) if str(c["id"]) != channel_id]
+            self._save_raw(data)
+            return self.get_channels_public()
 
-            if update.base_url is not None:
-                cfg.openai.base_url = update.base_url.strip()
-            if update.api_key is not None:
-                cfg.openai.api_key = update.api_key.strip()
-            if update.model is not None:
-                cfg.openai.model = update.model.strip()
+    def set_active_channel(self, channel_id: str) -> dict[str, Any]:
+        with self._lock:
+            data = self._load_raw()
+            if channel_id not in {str(c["id"]) for c in chn.channel_list(data)}:
+                raise ValueError(f"渠道方案不存在：{channel_id}")
+            data["active_channel"] = channel_id
+            self._save_raw(data)
+            return self.get_channels_public()
 
-            # 当前阶段只接入 openai；provider 字段保持 openai
-            cfg.provider = "openai"
+    def set_active_model(self, model: str) -> str:
+        """Change the model of the current scheme (chat commands); returns the scheme id."""
+        model = (model or "").strip()
+        if not model:
+            raise ValueError("model is required")
+        with self._lock:
+            data = self._load_raw()
+            active = chn.active_channel_id(data)
+            if not active:
+                raise ValueError("还没有配置渠道方案")
+            channels = [dict(c) for c in chn.channel_list(data)]
+            for c in channels:
+                if str(c["id"]) == active:
+                    c["model"] = model
+            data["channels"] = channels
+            self._save_raw(data)
+            return active
 
-            self._save_yaml(cfg)
-            self._config = cfg
+    # ---- fallbacks / capabilities ----
 
-            present, redacted = _redact_api_key(cfg.openai.api_key)
-            openai_pub = OpenAIConfigPublic(
-                base_url=cfg.openai.base_url,
-                model=cfg.openai.model,
-                api_key_present=present,
-                api_key=redacted,
-            )
-            mimo_pub = self.get_mimo_audio_public()
-            return AppConfigPublic(version=cfg.version, provider=cfg.provider, openai=openai_pub, mimo_audio=mimo_pub)
+    def update_fallbacks(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
+        """Replace the fallback chain. Options of the entry at ``source_index`` are preserved."""
+        with self._lock:
+            data = self._load_raw()
+            ids = {str(c["id"]) for c in chn.channel_list(data)}
+            old = [e for e in (data.get("fallbacks") or []) if isinstance(e, dict)]
+            chain: list[dict[str, Any]] = []
+            for item in entries:
+                cid = str(item.get("channel") or "").strip()
+                if cid not in ids:
+                    raise ValueError(f"备用链引用了不存在的方案：{cid or '（空）'}")
+                src = item.get("source_index")
+                base = dict(old[src]) if isinstance(src, int) and 0 <= src < len(old) else {}
+                base["channel"] = cid
+                model = str(item.get("model") or "").strip()
+                if model:
+                    base["model"] = model
+                else:
+                    base.pop("model", None)
+                chain.append(base)
+            data["fallbacks"] = chain
+            self._save_raw(data)
+            return self.get_channels_public()
+
+    def set_model_vision(self, model: str, vision: bool) -> dict[str, Any]:
+        model = (model or "").strip()
+        if not model:
+            raise ValueError("model is required")
+        with self._lock:
+            data = self._load_raw()
+            caps = data.get("model_capabilities") if isinstance(data.get("model_capabilities"), dict) else {}
+            entry = caps.get(model) if isinstance(caps.get(model), dict) else {}
+            entry["vision"] = bool(vision)
+            caps[model] = entry
+            data["model_capabilities"] = caps
+            self._save_raw(data)
+            return self.get_channels_public()
+
+    # ---- system slots / node models ----
+
+    def _update_ref(self, scope: str, key: str, channel: str | None, model: str | None) -> dict[str, str]:
+        with self._lock:
+            data = self._load_raw()
+            block = data.get(scope) if isinstance(data.get(scope), dict) else {}
+            entry = dict(block.get(key)) if isinstance(block.get(key), dict) else {}
+            if channel is not None:
+                cid = channel.strip()
+                if cid and cid not in {str(c["id"]) for c in chn.channel_list(data)}:
+                    raise ValueError(f"渠道方案不存在：{cid}")
+                entry["channel"] = cid
+            if model is not None:
+                entry["model"] = model.strip()
+            entry = {k: v for k, v in entry.items() if v}
+            if entry:
+                block[key] = entry
+            else:
+                block.pop(key, None)
+            data[scope] = block
+            self._save_raw(data)
+            return self._ref_public(data, scope, key)
+
+    def get_system_model_public(self, slot: str) -> dict[str, str]:
+        with self._lock:
+            return {"slot": slot, **self._ref_public(self._load_raw(), "system_models", slot)}
+
+    def update_system_model(self, slot: str, *, channel: str | None = None, model: str | None = None) -> dict[str, str]:
+        return {"slot": slot, **self._update_ref("system_models", slot, channel, model)}
+
+    def update_node_model(self, node_id: str, *, channel: str | None = None, model: str | None = None) -> dict[str, str]:
+        return {"node_id": node_id, **self._update_ref("node_models", node_id, channel, model)}
+
+    # ---- mimo audio ----
+
+    def _mimo_raw(self) -> MimoAudioConfigSecret:
+        raw = self._load_raw().get("mimo_audio")
+        try:
+            return MimoAudioConfigSecret.model_validate(raw if isinstance(raw, dict) else {})
+        except Exception:
+            return MimoAudioConfigSecret()
 
     def get_mimo_audio_secret(self) -> MimoAudioConfigSecret:
         with self._lock:
-            cfg = self._config.mimo_audio.model_copy(deep=True)
+            cfg = self._mimo_raw()
             cfg.base_url = _resolve_env_value(cfg.base_url) or "https://api.xiaomimimo.com"
             cfg.api_key = _resolve_env_value(cfg.api_key)
             cfg.asr_path = _resolve_env_value(cfg.asr_path) or "/v1/chat/completions"
@@ -247,251 +315,21 @@ class ConfigStore:
             cfg = self.get_mimo_audio_secret()
             present, redacted = _redact_api_key(cfg.api_key)
             return MimoAudioConfigPublic(
-                base_url=cfg.base_url,
-                api_key_present=present,
-                api_key=redacted,
-                asr_path=cfg.asr_path,
-                asr_model=cfg.asr_model,
-                asr_language=cfg.asr_language,
-                tts_path=cfg.tts_path,
-                tts_model=cfg.tts_model,
-                tts_voice=cfg.tts_voice,
-                tts_format=cfg.tts_format,
-                timeout=cfg.timeout,
-                ffmpeg_path=cfg.ffmpeg_path,
+                base_url=cfg.base_url, api_key_present=present, api_key=redacted,
+                asr_path=cfg.asr_path, asr_model=cfg.asr_model, asr_language=cfg.asr_language,
+                tts_path=cfg.tts_path, tts_model=cfg.tts_model, tts_voice=cfg.tts_voice,
+                tts_format=cfg.tts_format, timeout=cfg.timeout, ffmpeg_path=cfg.ffmpeg_path,
             )
 
     def update_mimo_audio(self, update: MimoAudioConfigUpdateIn) -> MimoAudioConfigPublic:
         with self._lock:
-            cfg = self._config
-            for key in (
-                "base_url",
-                "api_key",
-                "asr_path",
-                "asr_model",
-                "asr_language",
-                "tts_path",
-                "tts_model",
-                "tts_voice",
-                "tts_format",
-                "timeout",
-                "ffmpeg_path",
-            ):
+            data = self._load_raw()
+            block = self._mimo_raw()
+            for key in ("base_url", "api_key", "asr_path", "asr_model", "asr_language", "tts_path",
+                        "tts_model", "tts_voice", "tts_format", "timeout", "ffmpeg_path"):
                 value = getattr(update, key)
                 if value is not None:
-                    setattr(cfg.mimo_audio, key, value.strip())
-            self._save_yaml(cfg)
-            self._config = cfg
+                    setattr(block, key, value.strip())
+            data["mimo_audio"] = block.model_dump(mode="json")
+            self._save_raw(data)
             return self.get_mimo_audio_public()
-
-    # ================================================================
-    #  Multi-provider CRUD (operates on raw YAML dict)
-    # ================================================================
-
-    # system_models holds per-slot model/base_url/api_key blocks; it is not a
-    # provider even though its children look like provider blocks.
-    _META_KEYS = frozenset({"version", "provider", "fallbacks", "mimo_audio", "system_models", "model_capabilities"})
-    # Fields of one fallback entry the editor manages; other keys of an existing
-    # entry (reasoning_effort, extra headers, ...) are preserved on save.
-    _FALLBACK_EDIT_FIELDS = ("provider", "model", "base_url")
-
-    def _load_raw(self) -> dict[str, Any]:
-        """Load raw YAML dict from disk."""
-        return self._load_yaml_dict() or {"version": 1, "provider": "openai"}
-
-    def _save_raw(self, data: dict[str, Any]) -> None:
-        """Write raw dict to YAML file."""
-        text = yaml.safe_dump(data, sort_keys=False, allow_unicode=True)
-        self.path.write_text(text, encoding="utf-8")
-
-    def _is_provider_block(self, val: Any) -> bool:
-        return isinstance(val, dict) and any(k in val for k in ("base_url", "api_key", "model"))
-
-    def get_providers_public(self) -> dict[str, Any]:
-        """Providers and fallback chain with redacted api_keys, plus per-model vision flags."""
-        from engine.vision import vision_from_capabilities
-
-        with self._lock:
-            data = self._load_raw()
-            active = data.get("provider", "openai")
-            caps = data.get("model_capabilities") if isinstance(data.get("model_capabilities"), dict) else {}
-
-            providers: dict[str, dict[str, Any]] = {}
-            for key, val in data.items():
-                if key in self._META_KEYS:
-                    continue
-                if self._is_provider_block(val):
-                    raw_key = _resolve_env_value(val.get("api_key", ""))
-                    present, redacted = _redact_api_key(raw_key)
-                    model = _resolve_env_value(val.get("model", ""))
-                    providers[key] = {
-                        "base_url": _resolve_env_value(val.get("base_url", "")),
-                        "model": model,
-                        "api_key_present": present,
-                        "api_key_redacted": redacted,
-                        "vision": vision_from_capabilities(caps, model),
-                    }
-
-            fallbacks: list[dict[str, Any]] = []
-            for entry in data.get("fallbacks", []) or []:
-                if not isinstance(entry, dict):
-                    continue
-                present, redacted = _redact_api_key(str(entry.get("api_key", "") or ""))
-                model = str(entry.get("model", "") or "")
-                fallbacks.append({
-                    "provider": str(entry.get("provider", "") or ""),
-                    "model": model,
-                    "base_url": str(entry.get("base_url", "") or ""),
-                    "api_key_present": present,
-                    "api_key_redacted": redacted,
-                    "vision": vision_from_capabilities(caps, _resolve_env_value(model)),
-                })
-
-            return {
-                "active_provider": active,
-                "providers": providers,
-                "fallbacks": fallbacks,
-                "model_capabilities": caps,
-            }
-
-    def upsert_provider(self, name: str, *, base_url: str | None = None,
-                        api_key: str | None = None, model: str | None = None) -> dict[str, Any]:
-        """Create or update a provider entry."""
-        with self._lock:
-            data = self._load_raw()
-            if name not in data or not self._is_provider_block(data.get(name)):
-                # [2026-06-07] Why: _is_provider_block requires at least one of
-                # base_url/api_key/model to be present. Old code wrote empty dict
-                # {}, which passes isinstance(dict) but fails _is_provider_block.
-                # How: check _is_provider_block instead of isinstance, and always
-                # reinitialize entries that lack provider fields. Purpose: stale
-                # empty entries from old code are repaired on next upsert.
-                data[name] = {"base_url": "", "model": "", "api_key": ""}
-            if base_url is not None:
-                data[name]["base_url"] = base_url.strip()
-            if api_key is not None:
-                data[name]["api_key"] = api_key.strip()
-            if model is not None:
-                data[name]["model"] = model.strip()
-            self._save_raw(data)
-            self.reload()
-            return self.get_providers_public()
-
-    def set_active_provider(self, name: str) -> dict[str, Any]:
-        """Switch the active provider."""
-        with self._lock:
-            data = self._load_raw()
-            if name not in data or not self._is_provider_block(data.get(name)):
-                raise ValueError(f"Provider '{name}' not found in config")
-            data["provider"] = name
-            self._save_raw(data)
-            self.reload()
-            return self.get_providers_public()
-
-    def update_fallbacks(self, entries: list[dict[str, Any]]) -> dict[str, Any]:
-        """Replace the fallback chain from editor entries.
-
-        Each entry: provider, model, base_url, optional api_key and source_index.
-        ``source_index`` points at the existing entry it was edited from; that entry's
-        unmanaged keys are kept, and an empty api_key keeps its stored key (the editor
-        only ever sees the redacted form). ``clear_api_key`` removes the stored key.
-        """
-        with self._lock:
-            data = self._load_raw()
-            old = [e for e in (data.get("fallbacks", []) or []) if isinstance(e, dict)]
-            chain: list[dict[str, Any]] = []
-            for item in entries:
-                provider = str(item.get("provider", "") or "").strip()
-                model = str(item.get("model", "") or "").strip()
-                if not provider or not model:
-                    raise ValueError("Each fallback needs a provider and a model")
-                src = item.get("source_index")
-                base = dict(old[src]) if isinstance(src, int) and 0 <= src < len(old) else {}
-                for field in self._FALLBACK_EDIT_FIELDS:
-                    base[field] = str(item.get(field, "") or "").strip()
-                if not base["base_url"]:
-                    base.pop("base_url")
-                new_key = str(item.get("api_key", "") or "").strip()
-                if new_key:
-                    base["api_key"] = new_key
-                elif item.get("clear_api_key"):
-                    base.pop("api_key", None)
-                chain.append(base)
-            data["fallbacks"] = chain
-            self._save_raw(data)
-            self.reload()
-            return self.get_providers_public()
-
-    def set_model_vision(self, model: str, vision: bool) -> dict[str, Any]:
-        """Record whether ``model`` accepts image input (model_capabilities.<model>.vision)."""
-        model = (model or "").strip()
-        if not model:
-            raise ValueError("model is required")
-        with self._lock:
-            data = self._load_raw()
-            caps = data.get("model_capabilities")
-            if not isinstance(caps, dict):
-                caps = {}
-            entry = caps.get(model) if isinstance(caps.get(model), dict) else {}
-            entry["vision"] = bool(vision)
-            caps[model] = entry
-            data["model_capabilities"] = caps
-            self._save_raw(data)
-            self.reload()
-            return self.get_providers_public()
-
-    def get_system_model_public(self, slot: str) -> dict[str, Any]:
-        """system_models.<slot> with the api_key redacted."""
-        with self._lock:
-            block = (self._load_raw().get("system_models") or {}).get(slot)
-            block = block if isinstance(block, dict) else {}
-            present, redacted = _redact_api_key(str(block.get("api_key", "") or ""))
-            return {
-                "slot": slot,
-                "provider": str(block.get("provider", "") or ""),
-                "model": str(block.get("model", "") or ""),
-                "base_url": str(block.get("base_url", "") or ""),
-                "api_key_present": present,
-                "api_key_redacted": redacted,
-            }
-
-    def update_system_model(self, slot: str, *, provider: str | None = None, model: str | None = None,
-                            base_url: str | None = None, api_key: str | None = None) -> dict[str, Any]:
-        """Partial update of system_models.<slot>; None keeps a field, empty string clears it."""
-        with self._lock:
-            data = self._load_raw()
-            slots = data.get("system_models")
-            if not isinstance(slots, dict):
-                slots = {}
-            block = slots.get(slot) if isinstance(slots.get(slot), dict) else {}
-            fields = (("provider", provider), ("model", model), ("base_url", base_url), ("api_key", api_key))
-            for field, value in fields:
-                if value is None:
-                    continue
-                if value.strip():
-                    block[field] = value.strip()
-                else:
-                    block.pop(field, None)
-            if block:
-                slots[slot] = block
-            else:
-                slots.pop(slot, None)
-            data["system_models"] = slots
-            self._save_raw(data)
-            self.reload()
-            return self.get_system_model_public(slot)
-
-    def delete_provider(self, name: str) -> dict[str, Any]:
-        """Delete a provider entry."""
-        with self._lock:
-            data = self._load_raw()
-            if name not in data:
-                return self.get_providers_public()
-            if data.get("provider") == name:
-                raise ValueError(f"Cannot delete active provider '{name}'; switch to another first")
-            del data[name]
-            fb = data.get("fallbacks", []) or []
-            data["fallbacks"] = [f for f in fb if isinstance(f, dict) and f.get("provider") != name]
-            self._save_raw(data)
-            self.reload()
-            return self.get_providers_public()

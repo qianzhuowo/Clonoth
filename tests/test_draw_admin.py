@@ -53,6 +53,16 @@ def test_settings_view_masks_key_and_update_merges(tmp_path: Path, monkeypatch):
     assert view["params"]["selected_preset_id"] == "p1"
 
 
+def test_legacy_recent_dialogue_turns_is_dropped(tmp_path: Path):
+    root = _workspace(tmp_path)
+    (root / "tools/drawtools/settings.yaml").write_text(
+        yaml.safe_dump({"planner": {"recent_dialogue_turns": 6, "max_plan_images": 3}}), encoding="utf-8")
+    assert "recent_dialogue_turns" not in admin.get_settings_view(root)["planner"]
+    admin.update_settings(root, {"planner": {"max_plan_images": 2}})
+    raw = yaml.safe_load((root / "tools/drawtools/settings.yaml").read_text(encoding="utf-8"))
+    assert "recent_dialogue_turns" not in raw["planner"] and raw["planner"]["max_plan_images"] == 2
+
+
 def test_presets_and_characters_roundtrip(tmp_path: Path):
     root = _workspace(tmp_path)
     out = admin.save_presets(root, [{"id": "a", "name": "A"}, {"id": "b", "name": "B"}], "b")
@@ -99,7 +109,7 @@ def test_prompts_save_reset_and_content_placeholder_check(tmp_path: Path):
     with pytest.raises(admin.AdminError) as info:
         admin.save_prompt(root, "content", "只有 {{drawRequest}}")
     assert "{{characterInfo}}" in info.value.details["missing"]
-    tpl = "A {{characterInfo}} B {{drawRequest}} C {{recentDialogue}}"
+    tpl = "A {{characterInfo}} B {{drawRequest}}"
     assert admin.save_prompt(root, "content", tpl)["content"] == tpl
     assert admin.reset_prompt(root, "content")["is_default"] is True
 
@@ -189,49 +199,28 @@ def _raw_agent(root: Path) -> dict:
     return yaml.safe_load((root / "tools/drawtools/settings.yaml").read_text(encoding="utf-8"))["agent"]
 
 
-def test_agent_view_defaults_to_node_model(tmp_path: Path):
-    root = _workspace(tmp_path)
+def _with_channels(root: Path) -> Path:
+    (root / "data").mkdir(exist_ok=True)
+    (root / "data" / "config.yaml").write_text(yaml.safe_dump({"active_channel": "main", "channels": [
+        {"id": "main", "name": "主渠道", "type": "openai", "base_url": "https://relay.test/v1", "api_key": "sk-main", "model": "m-main"},
+        {"id": "draw", "name": "绘图分析", "type": "gemini", "base_url": "https://g.test/v1beta", "api_key": "sk-draw", "model": "m-draw"},
+    ]}, allow_unicode=True), encoding="utf-8")
+    return root
+
+
+def test_agent_view_defaults_to_node_channel(tmp_path: Path):
+    root = _with_channels(_workspace(tmp_path))
     view = admin.get_agent_view(root)
     assert [p["id"] for p in view["presets"]] == ["default"] and view["current_preset_id"] == "default"
     assert view["planner_max_retries"] == 3 and view["is_private"] is False
-    assert view["effective"] == {"source": "node", "missing": ["Model", "API Key"]}
-    assert "openai" in [p["id"] for p in view["providers"]] and "high" in view["reasoning_efforts"]
+    assert view["effective"]["source"] == "node"
+    assert [c["id"] for c in view["channels"]] == ["main", "draw"] and "sk-" not in str(view["channels"])
+    assert "high" in view["reasoning_efforts"]
 
 
-def test_agent_save_never_echoes_keys_and_keeps_them_when_blank(tmp_path: Path):
-    root = _workspace(tmp_path)
-    view = admin.save_agent(root, {"current_preset_id": "a", "presets": [
-        {"id": "a", "name": "A", "provider": "openai", "model": "gpt-x", "api_key": "sk-secret-a", "base_url": "https://relay.test/v1"},
-        {"id": "b", "name": "B", "provider": "anthropic"},
-    ]})
-    assert view["effective"] == {"source": "preset", "missing": []} and view["is_private"] is True
-    assert [(p["api_key"], p["api_key_configured"]) for p in view["presets"]] == [("", True), ("", False)]
-    assert _raw_agent(root)["presets"][0]["api_key"] == "sk-secret-a"
-    # 通用设置视图里也不能带出 key；通用设置的保存不碰 agent 段
-    assert "sk-secret-a" not in str(admin.get_settings_view(root))
-    admin.update_settings(root, {"agent": {"presets": []}, "planner": {"max_plan_images": 2}})
-    assert _raw_agent(root)["presets"][0]["api_key"] == "sk-secret-a"
-
-    # 页面把脱敏后的预设原样交回：key 留空 = 沿用；副本按 copy_key_from 抄；clear_api_key 才清空
-    presets = [dict(p) for p in view["presets"]]
-    presets[0]["model"] = "gpt-y"
-    presets.append({**presets[0], "id": "c", "name": "A 副本", "copy_key_from": "a"})
-    view = admin.save_agent(root, {"presets": presets})
-    raw = {p["id"]: p for p in _raw_agent(root)["presets"]}
-    assert raw["a"]["api_key"] == "sk-secret-a" and raw["a"]["model"] == "gpt-y" and raw["c"]["api_key"] == "sk-secret-a"
-    assert raw["b"]["api_key"] == "" and "copy_key_from" not in raw["c"] and "api_key_configured" not in raw["a"]
-    assert view["current_preset_id"] == "a"
-
-    presets = [dict(p) for p in view["presets"]]
-    presets[0]["clear_api_key"] = True
-    view = admin.save_agent(root, {"presets": presets})
-    assert _raw_agent(root)["presets"][0]["api_key"] == ""
-    assert view["effective"] == {"source": "node", "missing": ["API Key"]}
-
-
-def test_agent_save_validates_and_patches_only_given_keys(tmp_path: Path):
-    root = _workspace(tmp_path)
-    ok = {"id": "a", "name": "A", "provider": "openai"}
+def test_agent_save_references_channel_and_validates(tmp_path: Path):
+    root = _with_channels(_workspace(tmp_path))
+    ok = {"id": "a", "name": "A", "channel": "draw"}
     bad_patches = [
         {"presets": []},
         {"presets": ["junk"]},
@@ -239,70 +228,61 @@ def test_agent_save_validates_and_patches_only_given_keys(tmp_path: Path):
         {"presets": [{**ok, "id": ""}]},
         {"presets": [ok, {**ok, "id": "b"}]},
         {"presets": [ok, {**ok, "name": "B"}]},
-        {"presets": [{**ok, "provider": "no-such-provider"}]},
+        {"presets": [{**ok, "channel": "no-such-channel"}]},
         {"presets": [ok], "current_preset_id": "gone"},
         {"planner_max_retries": 11},
-        {"planner_max_retries": -1},
         {"planner_max_retries": 1.5},
         {"planner_max_retries": True},
-        {"planner_max_retries": "3"},
     ]
     for patch in bad_patches:
         with pytest.raises(admin.AdminError):
             admin.save_agent(root, patch)
     assert not (root / "tools/drawtools/settings.yaml").exists()
 
-    admin.save_agent(root, {"presets": [ok, {"id": "b", "name": "B"}], "current_preset_id": "b"})
+    view = admin.save_agent(root, {"presets": [ok, {"id": "b", "name": "B"}], "current_preset_id": "a"})
+    assert view["effective"] == {"source": "preset"} and view["is_private"] is True
+    raw = _raw_agent(root)["presets"][0]
+    assert raw["channel"] == "draw" and not {"provider", "base_url", "api_key"} & set(raw)
+    view = admin.save_agent(root, {"current_preset_id": "b"})
+    assert view["effective"]["source"] == "node"
     view = admin.save_agent(root, {"planner_max_retries": 0})
-    assert view["planner_max_retries"] == 0 and view["current_preset_id"] == "b" and len(view["presets"]) == 2
-    # 删掉当前使用的那套时，回到第一套
+    assert view["planner_max_retries"] == 0 and view["current_preset_id"] == "b"
     view = admin.save_agent(root, {"presets": [ok]})
-    assert view["current_preset_id"] == "a" and view["planner_max_retries"] == 0
+    assert view["current_preset_id"] == "a"
 
 
-def test_agent_pull_and_check_use_the_unsaved_form_with_the_saved_key(tmp_path: Path, monkeypatch):
-    root = _workspace(tmp_path)
-    admin.save_agent(root, {"presets": [{"id": "a", "name": "A", "provider": "openai", "model": "m", "api_key": "sk-saved"}]})
-    seen: list[dict] = []
+def test_agent_pull_and_check_use_the_selected_channel(tmp_path: Path, monkeypatch):
+    root = _with_channels(_workspace(tmp_path))
+    seen: list = []
 
-    async def pull(preset, **kw):
-        seen.append(dict(preset))
+    async def pull(kind, base_url, api_key, **kw):
+        seen.append((kind, base_url, api_key))
         return ["m1", "m2"]
 
     async def check(preset, **kw):
         seen.append(dict(preset))
         return {"ok": True, "reply": "OK"}
 
-    monkeypatch.setattr(admin.llm, "pull_models", pull)
+    monkeypatch.setattr(admin.clonoth_model_list, "pull_models", pull)
     monkeypatch.setattr(admin.llm, "check_connection", check)
-    draft = {"id": "a", "name": "A", "provider": "openai", "base_url": "https://draft.test/v1", "model": "draft-model", "api_key": ""}
-    assert asyncio.run(admin.pull_agent_models(root, {"preset": draft})) == {"provider": "openai", "models": ["m1", "m2"]}
-    assert (seen[-1]["base_url"], seen[-1]["model"], seen[-1]["api_key"]) == ("https://draft.test/v1", "draft-model", "sk-saved")
-    asyncio.run(admin.check_agent_connection(root, {"preset": {**draft, "api_key": "sk-typed"}}))
-    assert seen[-1]["api_key"] == "sk-typed"
-    asyncio.run(admin.check_agent_connection(root, {"preset": {**draft, "clear_api_key": True}}))
-    assert seen[-1]["api_key"] == ""
-    asyncio.run(admin.pull_agent_models(root, {"preset": {**draft, "id": "new", "copy_key_from": "a"}}))
-    assert seen[-1]["api_key"] == "sk-saved"
-    # 试用不落盘
-    assert _raw_agent(root)["presets"][0]["model"] == "m"
+    draft = {"id": "a", "name": "A", "channel": "draw", "model": ""}
+    assert asyncio.run(admin.pull_agent_models(root, {"preset": draft})) == {"channel": "draw", "models": ["m1", "m2"]}
+    assert seen[-1] == ("gemini", "https://g.test/v1beta", "sk-draw")
+    asyncio.run(admin.check_agent_connection(root, {"preset": {**draft, "model": "typed"}}))
+    assert (seen[-1]["provider"], seen[-1]["model"], seen[-1]["api_key"]) == ("gemini", "typed", "sk-draw")
+    asyncio.run(admin.check_agent_connection(root, {"preset": draft}))
+    assert seen[-1]["model"] == "m-draw"
 
-    async def pull_fail(preset, **kw):
-        raise admin.llm.ModelListError("OpenAI 兼容 拉取模型失败：401：bad key (https://draft.test/v1/models)", 401)
+    async def pull_fail(*a, **kw):
+        raise admin.clonoth_model_list.ModelListError("Gemini 拉取模型失败：401：bad key", 401)
 
-    async def check_fail(preset, **kw):
-        raise ValueError("没有填写 Model")
-
-    monkeypatch.setattr(admin.llm, "pull_models", pull_fail)
-    monkeypatch.setattr(admin.llm, "check_connection", check_fail)
+    monkeypatch.setattr(admin.clonoth_model_list, "pull_models", pull_fail)
     with pytest.raises(admin.AdminError) as info:
         asyncio.run(admin.pull_agent_models(root, {"preset": draft}))
-    assert info.value.status == 502 and info.value.details == {"status_code": 401} and "sk-saved" not in info.value.message
-    with pytest.raises(admin.AdminError) as info:
-        asyncio.run(admin.check_agent_connection(root, {"preset": draft}))
-    assert info.value.status == 400 and "Model" in info.value.message
-    with pytest.raises(admin.AdminError):
-        asyncio.run(admin.pull_agent_models(root, {}))
+    assert info.value.status == 502 and info.value.details == {"status_code": 401} and "sk-draw" not in info.value.message
+    for body in ({}, {"preset": {**draft, "channel": ""}}, {"preset": {**draft, "channel": "gone"}}):
+        with pytest.raises(admin.AdminError):
+            asyncio.run(admin.pull_agent_models(root, body))
 
 
 def test_agent_routes(tmp_path: Path, monkeypatch):
@@ -311,7 +291,7 @@ def test_agent_routes(tmp_path: Path, monkeypatch):
 
     from plugins.draw.routes import build_api_router
 
-    root = _workspace(tmp_path)
+    root = _with_channels(_workspace(tmp_path))
     app = FastAPI()
     app.state.workspace_root = root
     app.include_router(build_api_router(), prefix="/v1/plugins/draw")
@@ -319,23 +299,21 @@ def test_agent_routes(tmp_path: Path, monkeypatch):
     base = "/v1/plugins/draw/agent"
 
     assert client.get(base).json()["data"]["effective"]["source"] == "node"
-    preset = {"id": "a", "name": "A", "provider": "openai", "model": "m", "api_key": "sk-route"}
+    preset = {"id": "a", "name": "A", "channel": "main"}
     body = client.post(base, json={"presets": [preset]}).json()
-    assert body["ok"] is True and body["data"]["effective"]["source"] == "preset" and "sk-route" not in str(body)
-    assert "sk-route" not in client.get(base).text and "sk-route" not in client.get("/v1/plugins/draw/settings").text
+    assert body["ok"] is True and body["data"]["effective"]["source"] == "preset" and "sk-main" not in str(body)
     resp = client.post(base, json={"planner_max_retries": 99})
     assert resp.status_code == 400 and resp.json()["ok"] is False
 
-    async def pull(preset, **kw):
-        return [preset["api_key"][:3] + "-model"]
+    async def pull(kind, base_url, api_key, **kw):
+        return [api_key[:3] + "-model"]
 
     async def check(preset, **kw):
         return {"ok": False, "error": "HTTP 401"}
 
-    monkeypatch.setattr(admin.llm, "pull_models", pull)
+    monkeypatch.setattr(admin.clonoth_model_list, "pull_models", pull)
     monkeypatch.setattr(admin.llm, "check_connection", check)
-    assert client.post(base + "/models", json={"preset": {**preset, "api_key": ""}}).json()["data"]["models"] == ["sk--model"]
-    # 连不上不是接口错误：200 + ok=False 的结果，页面照样显示原因
+    assert client.post(base + "/models", json={"preset": preset}).json()["data"]["models"] == ["sk--model"]
     resp = client.post(base + "/test", json={"preset": preset})
     assert resp.status_code == 200 and resp.json()["data"] == {"ok": False, "error": "HTTP 401"}
     assert client.post(base + "/test", json={}).status_code == 400

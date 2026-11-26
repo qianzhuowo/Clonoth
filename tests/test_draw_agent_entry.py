@@ -12,7 +12,7 @@ import yaml
 
 from engine.protocol import ACTION_FINISH
 from plugins.draw.agent import entry as entry_mod
-from plugins.draw.agent.entry import DrawAgentEntry, build_recent_dialogue
+from plugins.draw.agent.entry import DrawAgentEntry
 from providers.base import ProviderResponse, ToolCall
 
 FAKE_CURL_ZIP = r"""
@@ -236,10 +236,13 @@ def _spy_runtime(monkeypatch) -> dict[str, Any]:
 
 
 def test_entry_uses_agent_preset_model_when_configured(tmp_path: Path, monkeypatch):
-    preset = {"id": "a1", "name": "主力", "provider": "openai", "model": "gpt-x", "api_key": "sk-test",
-              "base_url": "https://relay.test/v1", "timeout_sec": 77}
+    preset = {"id": "a1", "name": "主力", "channel": "relay", "model": "gpt-x", "timeout_sec": 77}
     root = _workspace(tmp_path, monkeypatch, planner={"tool_protocol": "text", "timeout_sec": 5},
                       agent={"current_preset_id": "a1", "presets": [{"id": "a0", "name": "别的"}, preset]})
+    (root / "data").mkdir(exist_ok=True)
+    (root / "data" / "config.yaml").write_text(yaml.safe_dump({"active_channel": "relay", "channels": [
+        {"id": "relay", "name": "中转", "type": "openai", "base_url": "https://relay.test/v1", "api_key": "sk-test", "model": "m0"},
+    ]}), encoding="utf-8")
     seen = _spy_runtime(monkeypatch)
     created: list[tuple[dict, Any]] = []
     planner_provider = FakeProvider([_plan_response()])
@@ -258,6 +261,7 @@ def test_entry_uses_agent_preset_model_when_configured(tmp_path: Path, monkeypat
     assert node_provider.requests == [] and len(planner_provider.requests) == 1
     assert len(created) == 1 and created[0][1] is ctx.rctx.llm_http
     assert (created[0][0]["id"], created[0][0]["model"], created[0][0]["api_key"]) == ("a1", "gpt-x", "sk-test")
+    assert created[0][0]["provider"] == "openai" and planner_provider.channel_id == "relay"
     # 工具调用格式与超时跟着预设走，不再读 planner 段里的旧值
     assert seen["timeout"] == 77.0 and type(seen["protocol"]) is type(entry_mod.create_tool_protocol("native"))
 
@@ -273,13 +277,13 @@ def test_entry_without_presets_keeps_node_model_and_legacy_planner_values(tmp_pa
 
 
 def test_entry_reports_unusable_agent_preset_without_retrying(tmp_path: Path, monkeypatch):
-    preset = {"id": "a1", "name": "坏预设", "provider": "no-such-provider", "model": "m", "api_key": "sk-test"}
+    preset = {"id": "a1", "name": "坏预设", "channel": "no-such-channel", "model": "m"}
     root = _workspace(tmp_path, monkeypatch, agent={"presets": [preset]})
     delays = _no_sleep(monkeypatch)
     node_provider = FakeProvider([_plan_response()])
     text = _handle(root, node_provider).action.result["text"]
-    assert text.startswith("场景规划失败：场景 Agent 预设「坏预设」无法使用") and "未知的 Provider" in text
-    assert "sk-test" not in text and node_provider.requests == [] and delays == []
+    assert text.startswith("场景规划失败：场景 Agent 预设「坏预设」无法使用") and "渠道方案不存在" in text
+    assert node_provider.requests == [] and delays == []
 
 
 def test_entry_missing_api_key_reports_each_failure(tmp_path: Path, monkeypatch):
@@ -367,11 +371,3 @@ def test_entry_delivery_session_falls_back_to_own_session():
     assert pick(SimpleNamespace(session_id="s1", task_context={"dispatch_origin": {"parent_session_id": "p"}})) == "p"
 
 
-def test_recent_dialogue_keeps_last_turns_without_tool_messages():
-    history = [
-        {"role": "user", "content": "a"}, {"role": "assistant", "content": "b", "tool_calls": [{"id": "x"}]},
-        {"role": "tool", "content": "r"}, {"role": "assistant", "content": [{"type": "text", "text": "c"}]},
-        {"role": "user", "content": "d"},
-    ]
-    assert build_recent_dialogue(history, 2) == "助手: c\n用户: d"
-    assert build_recent_dialogue(history, 0) == ""

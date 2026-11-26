@@ -37,9 +37,6 @@ class RunContext:
     http: httpx.AsyncClient
     llm_http: httpx.AsyncClient
     parent_session_id: str = ""
-    api_key: str = ""
-    base_url: str = ""
-    default_model: str = "gpt-4o-mini"
     user_text: str = ""
     task_id: str = ""
     session_generation: int = 0

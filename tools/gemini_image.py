@@ -12,8 +12,7 @@ as an attachment path compatible with Clonoth's multimodal pipeline.
   - 图片发送统一交给 supervisor 的 dispatch_attachment 路由（子节点任务完成时
     自动发送），工具本身不再 POST intermediate_reply，避免双发同一张图。
 
-API 渠道配置：读环境变量或 .env 的 CLONOTH_IMAGE_GEMINI_MODEL/BASE_URL/API_KEY，
-  留空则回退 GEMINI_* / OPENAI_*（model 默认 gemini-3-pro-image-preview）。
+API 渠道：data/config.yaml system_models.image 引用的渠道方案（设置 → 系统模型）。
 """
 
 SPEC = {
@@ -85,6 +84,20 @@ if __name__ == "__main__":
         print(json.dumps({"ok": False, "error": str(error), "data": {"result": f"ERROR: {error}"}}, ensure_ascii=False))
         sys.exit(1)
 
+    def _slot_channel(slot):
+        """Settings → 系统模型 data/config.yaml system_models.<slot>; None when unset."""
+        import os as _os
+        from pathlib import Path as _Path
+        code_root = _Path(__file__).resolve().parent.parent
+        root = _Path(_os.environ.get("CLONOTH_WORKSPACE") or code_root)
+        if str(code_root) not in sys.path:
+            sys.path.insert(0, str(code_root))
+        import clonoth_channels as chn
+        try:
+            return chn.slot_channel(chn.load_config(root), slot, root=root)
+        except chn.ChannelError as error:
+            fail(f"生图渠道配置错误：{error}")
+
     # [2026-07-19] 方案 X：工具不再自己推图，发图统一交给 supervisor 的
     # dispatch_attachment 路由（和 NovelAI 一致），避免与它双发同一张图。
 
@@ -107,54 +120,20 @@ if __name__ == "__main__":
     else:
         image_paths = []
 
-    # ============================================================
-    # API 渠道配置解析
-    # 优先级：环境变量/.env 的 CLONOTH_IMAGE_GEMINI_* > 主渠道回退
-    # ============================================================
-    def _load_dotenv():
-        """Fallback: read .env file if env vars missing."""
-        env_path = Path.cwd() / ".env"
-        kv = {}
-        if env_path.exists():
-            for line in env_path.read_text(encoding="utf-8").splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                kv[k.strip()] = v.strip().strip("'\"")
-        return kv
-
-    dotenv = _load_dotenv()
-
-    def _env(key: str) -> str:
-        return (os.environ.get(key, "") or dotenv.get(key, "")).strip()
-
-
-    def _pick(env_suffix: str, *fallbacks: str) -> str:
-        v = _env(f"CLONOTH_IMAGE_GEMINI_{env_suffix}")
-        if v:
-            return v
-        for fb in fallbacks:
-            if fb and fb.strip():
-                return fb.strip()
-        return ""
-
-    # model: 优先 args > slot 配置 > CLONOTH_IMAGE_GEMINI_MODEL > 默认
-    model = str(args.get("model") or "").strip()
-    if not model:
-        model = _pick("MODEL", "gemini-3-pro-image-preview")
-
-    # api_key: image_gemini 专属 > GEMINI_API_KEY > OPENAI_API_KEY
-    api_key = _pick("API_KEY", _env("GEMINI_API_KEY"), _env("OPENAI_API_KEY"))
-    # base_url: image_gemini 专属 > GEMINI_BASE_URL > OPENAI_BASE_URL
-    base_url = _pick("BASE_URL", _env("GEMINI_BASE_URL"), _env("OPENAI_BASE_URL")).rstrip("/")
-
+    ch = _slot_channel("image")
+    if ch is None:
+        fail("Gemini 生图未配置：在 设置 → 系统模型 → 生图(Gemini) 选择渠道方案")
+    model = str(args.get("model") or ch.model or "gemini-3-pro-image-preview").strip()
+    api_key = ch.api_key
+    base_url = ch.base_url.rstrip("/")
     if not api_key:
-        fail("No API key found: set CLONOTH_IMAGE_GEMINI_API_KEY in .env")
+        fail(f"渠道方案「{ch.name}」没有 API Key")
 
     # ---- 构建请求 ----
-    if base_url.endswith("/v1"):
-        base_url = base_url[:-3]
+    for suffix in ("/v1beta", "/v1"):
+        if base_url.endswith(suffix):
+            base_url = base_url[: -len(suffix)]
+            break
     if not base_url:
         base_url = "https://generativelanguage.googleapis.com"
     url = f"{base_url}/v1beta/models/{model}:generateContent?key={api_key}"

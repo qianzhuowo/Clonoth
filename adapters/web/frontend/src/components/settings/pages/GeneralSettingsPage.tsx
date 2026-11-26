@@ -4,7 +4,7 @@
 // authentication no longer requires editing App.tsx or unrelated settings pages.
 import { useEffect, useState } from 'react';
 
-import { checkAdminAuth, checkHealth, getModelConfig, getNodes, pluginApiRequest } from '../../../api/supervisorClient';
+import { checkAdminAuth, checkHealth, getNodes, pluginApiRequest } from '../../../api/supervisorClient';
 import { stopEventPump } from '../../../store/eventPump';
 import { useSettingsStore } from '../../../store/settingsStore';
 import type { NodeDef } from '../../../types';
@@ -19,7 +19,6 @@ export const GeneralSettingsPage = () => {
     setAuthenticated,
     setAvailableNodes,
     setConnected,
-    setModelConfig,
   } = useSettingsStore();
   const [tokenInput, setTokenInput] = useState(adminToken || '');
   const [authError, setAuthError] = useState('');
@@ -34,10 +33,6 @@ export const GeneralSettingsPage = () => {
       const nodes = await getNodes(token);
       setAvailableNodes(nodes.filter((n: NodeDef) => n.type === 'ai' && !n.id.startsWith('system.')));
     } catch { /* keep existing cached nodes if refresh fails */ }
-    try {
-      const cfg = await getModelConfig(token);
-      setModelConfig(cfg);
-    } catch { /* keep existing cached model config if refresh fails */ }
   };
 
   useEffect(() => {
@@ -89,7 +84,6 @@ export const GeneralSettingsPage = () => {
     setAdminToken(null);
     setAuthenticated(false);
     setAvailableNodes([]);
-    setModelConfig(null);
     setTokenInput('');
     // Clear local auth first so mounted panels stop renewal immediately. The
     // captured Bearer credential is used only to revoke the short-lived grants.

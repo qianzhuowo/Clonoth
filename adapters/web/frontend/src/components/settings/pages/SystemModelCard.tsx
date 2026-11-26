@@ -1,7 +1,8 @@
-// System model slot card (data/config.yaml system_models.<slot>).
+// A scheme + model reference editor: system_models.<slot> or node_models.<node_id>.
+// Empty scheme = the current scheme; empty model = the scheme's own model.
 import { useEffect, useState } from 'react';
 
-import { type SystemModelPublic, getSystemModel, updateSystemModel } from '../../../api/supervisorClient';
+import type { ChannelPublic, ChannelRef } from '../../../api/supervisorClient';
 import { errorText, notify } from '../../../store/toastStore';
 import { Button } from '../../common';
 
@@ -9,45 +10,33 @@ const inputCls =
   'w-full border border-[var(--duties-border)] bg-transparent px-3 py-2 font-mono text-sm text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]';
 
 interface Props {
-  adminToken: string;
-  slot: string;
   title: string;
   description: string;
-  /** Configured channel names; omit for slots that do not pick a channel (vision). */
-  providers?: string[];
-  activeProvider?: string;
-  modelPlaceholder: string;
-  envHint: string;
+  channels: ChannelPublic[];
+  activeChannel: string;
+  value: ChannelRef | undefined;
+  /** Text for the empty-scheme option; defaults to “当前方案”. */
+  emptyLabel?: string;
+  onSave: (ref: ChannelRef) => Promise<void>;
 }
 
-export const SystemModelCard = ({
-  adminToken,
-  slot,
-  title,
-  description,
-  providers,
-  activeProvider,
-  modelPlaceholder,
-  envHint,
-}: Props) => {
-  const [current, setCurrent] = useState<SystemModelPublic | null>(null);
-  const [edit, setEdit] = useState({ provider: '', model: '', base_url: '', api_key: '' });
+export const SystemModelCard = ({ title, description, channels, activeChannel, value, emptyLabel, onSave }: Props) => {
+  const [edit, setEdit] = useState<ChannelRef>({ channel: '', model: '' });
   const [saving, setSaving] = useState(false);
 
-  const apply = (s: SystemModelPublic) => {
-    setCurrent(s);
-    setEdit({ provider: s.provider, model: s.model, base_url: s.base_url, api_key: '' });
-  };
-
   useEffect(() => {
-    getSystemModel(adminToken, slot).then(apply).catch(err => notify.error(`${title}：${errorText(err, '加载失败')}`));
-  }, [adminToken, slot]);
+    setEdit({ channel: value?.channel || '', model: value?.model || '' });
+  }, [value?.channel, value?.model]);
 
-  const save = async (payload: { provider?: string; model?: string; base_url?: string; api_key?: string }, done: string) => {
+  const active = channels.find(c => c.id === activeChannel);
+  const picked = channels.find(c => c.id === (edit.channel || activeChannel));
+  const dirty = edit.channel !== (value?.channel || '') || edit.model !== (value?.model || '');
+
+  const save = async () => {
     setSaving(true);
     try {
-      apply(await updateSystemModel(adminToken, slot, payload));
-      notify.success(done);
+      await onSave({ channel: edit.channel, model: edit.model.trim() });
+      notify.success(`${title}已保存`);
     } catch (err) {
       notify.error(`${title}：${errorText(err, '保存失败')}`);
     } finally {
@@ -55,78 +44,38 @@ export const SystemModelCard = ({
     }
   };
 
-  const handleSave = () => {
-    const payload: { provider?: string; model: string; base_url: string; api_key?: string } = {
-      model: edit.model,
-      base_url: edit.base_url,
-    };
-    if (providers) payload.provider = edit.provider;
-    if (edit.api_key) payload.api_key = edit.api_key;
-    void save(payload, `${title}已保存`);
-  };
-
-  const inheritFrom = providers
-    ? (edit.provider ? `${edit.provider} 渠道` : `当前渠道 ${activeProvider || ''}`)
-    : envHint;
-
   return (
     <div className="border border-[var(--duties-border)] bg-[var(--duties-panel)] p-4">
       <p className="mb-1 font-mono text-[0.6rem] uppercase tracking-[0.2em] text-[var(--duties-tertiary)]">{title}</p>
       <p className="mb-3 text-xs text-[var(--duties-secondary)]">{description}</p>
-      {providers && (
-        <>
-          <label className="mb-1 block text-xs text-[var(--duties-secondary)]">渠道</label>
-          <select
-            className={`mb-3 ${inputCls}`}
-            onChange={e => setEdit(v => ({ ...v, provider: e.target.value }))}
-            value={edit.provider}
-          >
-            <option value="">跟随当前渠道（{activeProvider || '未设置'}）</option>
-            {providers.map(name => (
-              <option key={name} value={name}>{name}</option>
+      <div className="grid gap-2 sm:grid-cols-2">
+        <div>
+          <label className="mb-1 block text-xs text-[var(--duties-secondary)]">渠道方案</label>
+          <select className={inputCls} onChange={e => setEdit(v => ({ ...v, channel: e.target.value }))} value={edit.channel}>
+            <option value="">{emptyLabel || `当前方案（${active?.name || '未设置'}）`}</option>
+            {channels.map(c => (
+              <option key={c.id} value={c.id}>{c.name}（{c.type}）</option>
             ))}
-            {edit.provider && !providers.includes(edit.provider) && (
-              <option value={edit.provider}>{edit.provider}（未配置）</option>
+            {edit.channel && !channels.some(c => c.id === edit.channel) && (
+              <option value={edit.channel}>{edit.channel}（不存在）</option>
             )}
           </select>
-        </>
-      )}
-      <label className="mb-1 block text-xs text-[var(--duties-secondary)]">模型</label>
-      <input
-        className={`mb-3 ${inputCls}`}
-        onChange={e => setEdit(v => ({ ...v, model: e.target.value }))}
-        placeholder={modelPlaceholder}
-        value={edit.model}
-      />
-      <label className="mb-1 block text-xs text-[var(--duties-secondary)]">基础 URL</label>
-      <input
-        className={`mb-3 ${inputCls}`}
-        onChange={e => setEdit(v => ({ ...v, base_url: e.target.value }))}
-        placeholder={`留空使用${inheritFrom}的地址`}
-        value={edit.base_url}
-      />
-      <label className="mb-1 block text-xs text-[var(--duties-secondary)]">
-        API 密钥 {current?.api_key_present ? `（已设置: ${current.api_key_redacted}）` : `（未设置，使用${inheritFrom}的密钥）`}
-      </label>
-      <input
-        className={`mb-3 ${inputCls}`}
-        onChange={e => setEdit(v => ({ ...v, api_key: e.target.value }))}
-        placeholder="留空以保留当前值"
-        type="password"
-        value={edit.api_key}
-      />
-      <div className="flex items-center gap-3">
-        <Button disabled={saving} onClick={handleSave} variant="primary">
+        </div>
+        <div>
+          <label className="mb-1 block text-xs text-[var(--duties-secondary)]">模型</label>
+          <input
+            className={inputCls}
+            onChange={e => setEdit(v => ({ ...v, model: e.target.value }))}
+            placeholder={picked?.model ? `留空使用 ${picked.model}` : '留空使用方案的模型'}
+            value={edit.model}
+          />
+        </div>
+      </div>
+      <div className="mt-3 flex items-center gap-3">
+        <Button disabled={saving || !dirty} onClick={save} variant="primary">
           {saving ? '保存中...' : '保存'}
         </Button>
-        {current?.api_key_present && (
-          <button
-            className="text-xs text-[var(--duties-secondary)] underline hover:text-[var(--duties-text)]"
-            onClick={() => void save({ api_key: '' }, `${title}密钥已清除`)}
-          >
-            清除密钥
-          </button>
-        )}
+        {dirty && <span className="text-xs text-[var(--duties-tertiary)]">有未保存的修改</span>}
       </div>
     </div>
   );

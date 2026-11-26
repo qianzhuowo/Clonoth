@@ -312,8 +312,10 @@ def test_read_media_legacy_paths_and_concurrent_mixed_inputs(tmp_path, monkeypat
     image, video = tmp_path / "sample.png", tmp_path / "sample.mp4"
     image.write_bytes(b"image bytes")
     video.write_bytes(b"video bytes")
-    monkeypatch.setenv("GEMINI_API_KEY", "test-key")
-    monkeypatch.setenv("GEMINI_BASE_URL", "https://api.example.test/v1")
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "config.yaml").write_text(
+        "active_channel: g\nchannels:\n- {id: g, type: gemini, base_url: 'https://api.example.test', api_key: test-key, model: m}\n",
+        encoding="utf-8")
     captured = []
 
     def respond(request, timeout):

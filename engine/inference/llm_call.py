@@ -132,6 +132,36 @@ def _is_retryable_error(resp) -> bool:
     return True
 
 
+_REASONING_KEYS = ("reasoning_content", "reasoning", "thinking")
+
+
+def drop_foreign_reasoning(messages: list[dict[str, Any]], channel: str, model: str) -> list[dict[str, Any]]:
+    """Signatures and thinking content are only valid for the channel + model that produced them.
+
+    Assistant turns recorded with another channel/model (or with no provenance) keep their
+    text and tool calls; thought signatures, raw provider parts and reasoning are removed.
+    """
+    out: list[dict[str, Any]] = []
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            out.append(msg)
+            continue
+        key = "_meta" if isinstance(msg.get("_meta"), dict) else "meta"
+        meta = msg.get(key) if isinstance(msg.get(key), dict) else {}
+        if channel and meta.get("channel") == channel and meta.get("model") == model:
+            out.append(msg)
+            continue
+        clean = {k: v for k, v in msg.items() if k not in _REASONING_KEYS}
+        if meta:
+            clean[key] = {k: v for k, v in meta.items()
+                          if k not in ("metadata", "reasoning", "has_reasoning", "thought_summary")}
+        if isinstance(msg.get("tool_calls"), list):
+            clean["tool_calls"] = [{k: v for k, v in tc.items() if k != "extra_content"} if isinstance(tc, dict) else tc
+                                   for tc in msg["tool_calls"]]
+        out.append(clean)
+    return out
+
+
 def _build_messages_for_provider(
     messages: list[dict[str, Any]],
     formatter: Any,
@@ -139,6 +169,8 @@ def _build_messages_for_provider(
 ) -> list[dict[str, Any]]:
     """Build the message view that should be handed to the provider."""
     messages = [{k: v for k, v in message.items() if k != "response_info"} for message in messages]
+    messages = drop_foreign_reasoning(messages, str(getattr(provider, "channel_id", "") or ""),
+                                      str(getattr(provider, "model", "") or ""))
     # Dynamic context stays where it was emitted; moving it on later steps
     # invalidates the provider's cached prefix and tool-call pairing positions.
     provider_name = getattr(provider, "name", "") or ""

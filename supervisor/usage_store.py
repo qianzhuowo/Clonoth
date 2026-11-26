@@ -71,20 +71,6 @@ class UsageStore:
         with self._connect() as db:
             if db.execute("SELECT COUNT(*) FROM llm_usage_logs").fetchone()[0] > 0:
                 return
-        provider_models: dict[str, str] = {
-            "anthropic": "claude-sonnet-4-6",
-            "deepseek": "deepseek-chat",
-            "gemini": "gemini-2.5-flash",
-            "openai": "gpt-5.4",
-            "openai-responses": "gpt-5.4",
-        }
-        cfg_file = self.path.parent / "config.yaml"
-        if cfg_file.is_file():
-            raw_cfg = yaml.safe_load(cfg_file.read_text(encoding="utf-8", errors="ignore")) or {}
-            for prov in list(provider_models):
-                block = raw_cfg.get(prov)
-                if isinstance(block, dict) and block.get("model"):
-                    provider_models[prov] = str(block["model"]).strip()
         rows_to_insert = []
         for jf in sorted(conv_dir.glob("*.jsonl")):
             if jf.name.startswith("branch_"):
@@ -102,7 +88,7 @@ class UsageStore:
                 ts = datetime.fromisoformat(ts_str).timestamp() if ts_str else jf.stat().st_mtime
                 node_id = str(rec.get("source_node_id") or "")
                 provider = str(meta.get("provider") or "")
-                model = str(meta.get("model") or provider_models.get(provider) or provider or "unknown")
+                model = str(meta.get("model") or provider or "unknown")
                 rows_to_insert.append((
                     ts, session_id, str(rec.get("source_task_id") or ""),
                     str(meta.get("llm_request_id") or ""), node_id,

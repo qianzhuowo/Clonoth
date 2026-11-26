@@ -285,25 +285,6 @@ class AdminStateOut(BaseModel):
     engine_runtime: dict[str, Any] = Field(default_factory=dict)
 
 
-class OpenAIConfigSecret(BaseModel):
-    base_url: str = "https://api.openai.com/v1"
-    api_key: str = ""
-    model: str = "gpt-4o-mini"
-
-
-class OpenAIConfigUpdateIn(BaseModel):
-    base_url: str | None = None
-    api_key: str | None = None
-    model: str | None = None
-
-
-class OpenAIConfigPublic(BaseModel):
-    base_url: str
-    model: str
-    api_key_present: bool
-    api_key: str
-
-
 class MimoAudioConfigSecret(BaseModel):
     base_url: str = "https://api.xiaomimimo.com"
     api_key: str = ""
@@ -347,64 +328,49 @@ class MimoAudioConfigPublic(BaseModel):
     ffmpeg_path: str
 
 
-class AppConfigSecret(BaseModel):
-    version: int = 1
-    provider: str = "openai"
-    openai: OpenAIConfigSecret = Field(default_factory=OpenAIConfigSecret)
-    mimo_audio: MimoAudioConfigSecret = Field(default_factory=MimoAudioConfigSecret)
+class ChannelSummary(BaseModel):
+    """渠道方案摘要（不含密钥）"""
+    id: str
+    name: str = ""
+    type: str = ""
+    model: str = ""
 
 
 class AppConfigPublic(BaseModel):
     version: int = 1
-    provider: str = "openai"
-    openai: OpenAIConfigPublic
+    active_channel: str = ""
+    active_model: str = ""
+    channels: list[ChannelSummary] = Field(default_factory=list)
     mimo_audio: MimoAudioConfigPublic
-    # [2026-06-07] Why: the frontend Header needs to resolve the default model
-    # for any provider (not just the active one) when a node sets provider but
-    # leaves model empty. How: include a mapping of provider name → model.
-    # Purpose: displayModel can show the correct provider-specific model.
-    provider_models: dict[str, str] = Field(default_factory=dict)
 
 
-class ProviderConfigPublic(BaseModel):
-    """单个渠道的公开配置（api_key 脱敏）"""
-    base_url: str = ""
-    model: str = ""
-    api_key_present: bool = False
-    api_key_redacted: str = ""
-
-
-class ProvidersResponse(BaseModel):
-    """所有渠道配置响应"""
-    active_provider: str = "openai"
-    providers: dict[str, ProviderConfigPublic] = Field(default_factory=dict)
-    fallbacks: list[dict[str, Any]] = Field(default_factory=list)
-
-
-class ProviderUpdateIn(BaseModel):
-    """更新渠道请求（部分更新）"""
+class ChannelUpdateIn(BaseModel):
+    """新建/更新渠道方案（部分更新）；api_key 留空保留原值"""
+    name: str | None = None
+    type: str | None = None
     base_url: str | None = None
     api_key: str | None = None
     model: str | None = None
+    clear_api_key: bool = False
 
 
-class ActiveProviderIn(BaseModel):
-    """切换活跃渠道"""
-    provider: str
+class ActiveChannelIn(BaseModel):
+    channel: str
+
+
+class ActiveModelIn(BaseModel):
+    """修改当前方案的模型（聊天命令用）"""
+    model: str
 
 
 class FallbackEntryIn(BaseModel):
-    """备用链编辑器的一项。api_key 留空保留 source_index 指向的原条目的 key。"""
-    provider: str
-    model: str
-    base_url: str = ""
-    api_key: str = ""
-    clear_api_key: bool = False
+    """备用链的一项：引用渠道方案，model 留空用方案自己的模型"""
+    channel: str
+    model: str = ""
     source_index: int | None = None
 
 
 class FallbacksUpdateIn(BaseModel):
-    """更新 fallback 链"""
     fallbacks: list[FallbackEntryIn]
 
 
@@ -414,12 +380,18 @@ class ModelVisionIn(BaseModel):
     vision: bool
 
 
-class SystemModelUpdateIn(BaseModel):
-    """更新 system_models.<slot>；None 保持不变，空字符串清除"""
-    provider: str | None = None
+class ChannelRefUpdateIn(BaseModel):
+    """system_models.<slot> / node_models.<node>；None 保持不变，空字符串清除"""
+    channel: str | None = None
     model: str | None = None
-    base_url: str | None = None
-    api_key: str | None = None
+
+
+class ChannelModelsIn(BaseModel):
+    """拉取模型列表：已保存方案用 channel；表单草稿用 type/base_url/api_key（api_key 空时取 channel 的）"""
+    channel: str = ""
+    type: str = ""
+    base_url: str = ""
+    api_key: str = ""
 
 
 class ConfigReloadOut(BaseModel):

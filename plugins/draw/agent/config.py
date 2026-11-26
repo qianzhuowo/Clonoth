@@ -138,7 +138,6 @@ DEFAULT_PLANNER_CFG: dict[str, Any] = {
     "timeout_sec": 180,
     "max_plan_images": 4,
     "override_size": "auto",
-    "recent_dialogue_turns": 6,
     "send_each_image": True,
     "layout": None,
     "field_descriptions": {},
@@ -168,6 +167,8 @@ def load_draw_settings(workspace_root: Path) -> dict[str, Any]:
             logger.warning("draw agent: 解析 settings 失败: %s", exc)
     settings = deep_merge(DEFAULT_SETTINGS, raw if isinstance(raw, dict) else {})
     planner = settings.get("planner") if isinstance(settings.get("planner"), dict) else {}
+    # 已废弃的字段：规划不再附带近期对话，旧配置里的值直接丢掉（下次保存即从文件消失）。
+    planner.pop("recent_dialogue_turns", None)
     settings["planner"] = deep_merge(DEFAULT_PLANNER_CFG, planner)
     # 场景 Agent 预设（规划模型的接口配置）。没有预设时由上面的 planner.tool_protocol / timeout_sec 生成“默认”。
     settings["agent"] = normalize_agent_settings(settings.get("agent"), settings["planner"])

@@ -32,12 +32,12 @@ PLUGIN_META = {
     # 的默认内容模板。
 }
 
-# [2026-09-13] _worker 默认节点内容。字段与原插件声明一致；provider/model 留空
-# 表示跟随全局默认，用户可在设置页节点编辑器中修改这两个字段。
+# [2026-09-13] _worker 默认节点内容。用哪个渠道方案/模型在设置页节点编辑器里选
+# （存 data/config.yaml node_models），不写在节点文件里。
 WORKER_NODE_YAML = """id: _worker
 type: ai
 name: Temporary worker node
-description: Anonymous ephemeral child node invoked automatically by spawn_worker. Adjust provider and model in the settings node editor to change its default model.
+description: Anonymous ephemeral child node invoked automatically by spawn_worker. Pick its channel scheme and model in the settings node editor.
 persistent: false
 control_tools:
   - finish
@@ -52,8 +52,6 @@ prompt: |
   You are a capable assistant running inside a multi-agent system. Complete the task below, then submit your result.
 
   {{instruction}}
-model: ""
-provider: ""
 delegate_targets: []
 """
 
@@ -155,7 +153,7 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
 
     [2026-05-28] 工作流程：
     1. 读取模板节点（先 config/nodes/ 文件，再插件声明）
-    2. 替换 id / name / description / persistent / memory_book / provider 字段
+    2. 替换 id / name / description / persistent / memory_book 字段
     3. 写入 config/nodes/{name}.yaml
     4. 可选：追加到 caller_node_id 的 delegate_targets
     5. 创建 data/memory/{memory_book}/ 目录
@@ -175,7 +173,6 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     # memory_book 默认等于 name，用于记忆 namespace 子目录隔离
     memory_book = str(args.get("memory_book", "")).strip() or name
     persistent = bool(args.get("persistent", True))
-    provider = str(args.get("provider", "")).strip()
     caller_node_id = str(args.get("caller_node_id", "")).strip()
 
     workspace_root = ctx.workspace_root
@@ -208,8 +205,8 @@ async def create_agent(args: dict[str, Any], ctx: ToolContext) -> dict[str, Any]
     # memory_book 作为 extra 字段，会被 Node.load_node 收进 extra dict，
     # 供 save_memory 等插件通过 ToolContext._node_extra 零 IO 读取
     tmpl_data["memory_book"] = memory_book
-    if provider:
-        tmpl_data["provider"] = provider
+    for key in ("provider", "model", "base_url", "api_key"):
+        tmpl_data.pop(key, None)
 
     # Step 5: 审批守卫 + 写入新节点 yaml
     from toolbox._common import request_guard
@@ -313,10 +310,6 @@ PLUGIN_META["tools"] = [
                 "persistent": {
                     "type": "boolean",
                     "description": "Whether to persist; default true",
-                },
-                "provider": {
-                    "type": "string",
-                    "description": "Override provider",
                 },
                 "caller_node_id": {
                     "type": "string",

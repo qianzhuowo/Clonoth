@@ -68,7 +68,7 @@ async def _startup() -> None:
     # 时能把匿名别名/群昵称回解为真实 QQ 号，避免直接把代号当纯文本 @ 出去。
     set_at_alias_resolver(lambda token: state.ANON.resolve_at_alias_to_real(token, state.PROFILES.name_index))
     # [AutoC] QQ 管理员 /切换模型 命令需要调用受 admin_token 保护的
-    # POST /v1/config/openai，因此这里把 Supervisor 写出的 data/.admin_token
+    # PUT /v1/config/active-model，因此这里把 Supervisor 写出的 data/.admin_token
     # 传给 ClonothClient（每次请求实时读取，token 轮换也能跟上）。
     state._client = ClonothClient(
         CLONOTH_BASE_URL,

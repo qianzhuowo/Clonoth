@@ -99,18 +99,14 @@ character_tags:
   path: tools/drawtools/character_tags.yaml
   auto_search_unknown: true
 llm:
-  provider: openai
-  model_env: DRAW_TAG_MODEL
-  api_key_env: DRAW_TAG_API_KEY
-  base_url_env: DRAW_TAG_BASE_URL
   use_stream: false
 prompts:
   top_system_path: tools/drawtools/prompts/novelai/top-system.md
   tag_guide_path: tools/drawtools/prompts/novelai/tag-guide.md
   scene_rules_path: tools/drawtools/prompts/novelai/scene-rules.md
-# 场景 Agent（规划模型）的接口预设：由面板“场景 Agent”页写入私有 settings.yaml，key 不要写在这个模板里。
-# 只管 draw.novelai_planner；draw.image_gen 仍用节点自身的模型配置。
-# 当前预设没填 Model 或 API Key 时不接管，规划用节点自身的配置（config/nodes/draw.novelai_planner.yaml，即 DRAW_TAG_*）。
+# 场景 Agent（规划模型）的预设：由面板“场景 Agent”页写入私有 settings.yaml，每套预设引用一个渠道方案（channel）。
+# 只管 draw.novelai_planner；draw.image_gen 用节点自身的渠道（主设置 → 节点模型）。
+# 当前预设没选渠道方案时不接管，规划用节点自身的渠道。
 agent:
   # 整次规划失败后的自动重试次数（0-10，0 = 不重试）；只重试规划，不重试出图
   planner_max_retries: 3

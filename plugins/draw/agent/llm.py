@@ -3,10 +3,9 @@
 预设存在 tools/drawtools/settings.yaml 的 agent 段，这里负责：
 - 规范化预设与整段设置（缺失时由旧的 planner.tool_protocol / planner.timeout_sec 生成一套“默认”预设）；
 - 按预设创建模型调用对象（engine 进程规划时用，管理面板“测试连接”时也用）；
-- 拉取模型列表（由后端代发，浏览器不接触 key）；
 - 判定“整次规划失败后要不要重试、等多久”。
 
-预设没填 Model 或 API Key 时不接管，规划仍用节点自身的模型配置（config/nodes/draw.novelai_planner.yaml）。
+预设引用一个渠道方案（data/config.yaml channels）；没选方案时不接管，规划用节点自身的渠道（设置 → 节点模型）。
 不在模块顶层 import providers：管理面板所在的 supervisor 进程只在真正需要时才加载它。
 """
 from __future__ import annotations
@@ -18,9 +17,11 @@ import math
 import random
 import re
 import time
+from pathlib import Path
 from typing import Any, Callable, Mapping
-from urllib.parse import urlsplit
 from uuid import uuid4
+
+import clonoth_channels as chn
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,6 @@ RETRY_MAX_DELAY_SEC = 30.0
 TOOL_MODES = ("native", "text")
 REASONING_MODES = ("inherit", "on", "off")
 REASONING_EFFORTS = ("", "minimal", "low", "medium", "high", "xhigh", "max")
-MODEL_LIST_AUTHS = ("auto", "bearer", "x-api-key", "x-goog-api-key")
 
 # 采样参数：key -> (默认值, 下限, 上限, 是否整数)。未启用的项不进请求。
 SAMPLING_SPECS: dict[str, tuple[float, float | None, float | None, bool]] = {
@@ -91,12 +91,6 @@ PROVIDER_INFO: dict[str, dict[str, Any]] = {
     },
 }
 PROVIDER_ORDER = ("openai", "openai-responses", "anthropic", "gemini-aistudio", "gemini-vertex", "gemini", "deepseek")
-_LIST_AUTH_BY_FAMILY = {"anthropic": ("auto", "bearer", "x-api-key"), "gemini": ("auto", "bearer", "x-goog-api-key")}
-
-MODEL_EXCLUDE_KEYWORDS = (
-    "embedding", "embed", "rerank", "reranker", "tts", "speech", "audio",
-    "whisper", "transcription", "stt", "image", "sdxl", "flux", "moderation",
-)
 
 # 重试也不会变好的失败：取消、配置 / 输入 / 提示词错误、我们自己的合同错误、自定义工具次数超限。
 NON_RETRYABLE_CODES = frozenset({
@@ -155,11 +149,10 @@ def normalize_preset(raw: Any) -> dict[str, Any]:
     return {
         "id": preset_id,
         "name": str(src.get("name") or "").strip()[:MAX_NAME_LENGTH] or DEFAULT_PRESET_NAME,
-        "provider": str(src.get("provider") or "openai").strip().lower() or "openai",
-        "base_url": str(src.get("base_url") or "").strip(),
-        "api_key": str(src.get("api_key") or "").strip(),
+        # 渠道方案 id（data/config.yaml channels）；空 = 跟随节点 draw.novelai_planner 的渠道。
+        "channel": str(src.get("channel") or "").strip(),
+        # 空 = 用方案自己的模型。
         "model": str(src.get("model") or "").strip(),
-        "model_list_auth": _choice(src.get("model_list_auth"), MODEL_LIST_AUTHS, "auto"),
         # 0 = 不发送，由接口决定。
         "max_tokens": _number(src.get("max_tokens"), 0, 0, 1_000_000, True),
         # 0 = 不限时。
@@ -227,8 +220,20 @@ def current_preset(agent: Mapping[str, Any] | None) -> dict[str, Any]:
 
 
 def preset_is_configured(preset: Mapping[str, Any] | None) -> bool:
-    """Model 和 API Key 都填了才接管规划；否则用节点自身的模型配置。"""
-    return bool(str((preset or {}).get("model") or "").strip() and str((preset or {}).get("api_key") or "").strip())
+    """选了渠道方案才接管规划；否则用节点自身的渠道（设置 → 节点模型）。"""
+    return bool(str((preset or {}).get("channel") or "").strip())
+
+
+def resolve_preset(preset: Mapping[str, Any], workspace_root: Path | str) -> dict[str, Any]:
+    """预设 + 所选渠道方案 → 带 provider/base_url/api_key/model 的完整调用参数。"""
+    cfg = chn.load_config(workspace_root)
+    try:
+        ch = chn.get_channel(cfg, str(preset.get("channel") or ""), model=str(preset.get("model") or ""),
+                             root=workspace_root)
+    except chn.ChannelError as error:
+        raise ValueError(str(error)) from error
+    return {**dict(preset), "provider": ch.type, "base_url": ch.base_url, "api_key": ch.api_key,
+            "model": ch.model, "channel_name": ch.name}
 
 
 # ---- 供应商 ----
@@ -251,7 +256,6 @@ def list_providers() -> list[dict[str, Any]]:
             "sampling": list(info.get("sampling") or ()),
             "sampling_note": info.get("sampling_note", ""),
             "reasoning_note": info.get("reasoning_note", ""),
-            "list_auth": list(_LIST_AUTH_BY_FAMILY.get(info["family"], ())),
         })
     return out
 
@@ -340,7 +344,7 @@ def create_provider(preset: Mapping[str, Any], *, http: Any) -> Any:
     model = str(preset.get("model") or "").strip()
     api_key = str(preset.get("api_key") or "").strip()
     if not model:
-        raise ValueError("没有填写 Model")
+        raise ValueError("渠道方案没有模型")
     if not api_key:
         raise ValueError("没有填写 API Key")
     family = provider_info(name)["family"]
@@ -356,153 +360,6 @@ def create_provider(preset: Mapping[str, Any], *, http: Any) -> Any:
 
 
 # ---- 拉取模型 ----
-
-class ModelListError(Exception):
-    def __init__(self, message: str, status: int = 0) -> None:
-        super().__init__(message)
-        self.message = message
-        self.status = status
-
-
-def filter_models(models: list[Any]) -> list[str]:
-    """去重并剔除向量 / 语音 / 生图类模型；全被剔除时退回原列表。"""
-    unique: list[str] = []
-    for item in models:
-        text = str(item or "").strip()
-        if text and text not in unique:
-            unique.append(text)
-    kept = [m for m in unique if not any(word in m.lower() for word in MODEL_EXCLUDE_KEYWORDS)]
-    return kept or unique
-
-
-def extract_model_ids(data: Any) -> list[str]:
-    """兼容 {data:[{id}]}（OpenAI / Anthropic）、{models:[{name:'models/x'}]}（Google）和纯数组。"""
-    if isinstance(data, Mapping):
-        items = data.get("data") if isinstance(data.get("data"), list) else data.get("models")
-    else:
-        items = data
-    out: list[str] = []
-    for item in items if isinstance(items, list) else []:
-        if isinstance(item, str):
-            value = item
-        elif isinstance(item, Mapping):
-            value = str(item.get("id") or item.get("name") or "")
-        else:
-            continue
-        value = value.strip()
-        if value.startswith("models/"):
-            value = value[len("models/"):]
-        if value:
-            out.append(value)
-    return out
-
-
-_API_VERSION_SUFFIX = re.compile(r"/v\d+[a-z0-9]*$", re.IGNORECASE)
-
-
-def model_list_urls(base_url: str, prefix: str) -> list[str]:
-    """地址已带版本段（/v1、/v1beta、/custom/v3）时只试 {base}/models；否则先试带前缀的再试不带的。"""
-    base = str(base_url or "").strip().rstrip("/")
-    if not base:
-        return []
-    if _API_VERSION_SUFFIX.search(base):
-        return [f"{base}/models"]
-    return [f"{base}{prefix}/models", f"{base}/models"]
-
-
-def resolve_list_auth(preset: Mapping[str, Any], base_url: str) -> str:
-    """模型列表的鉴权方式。auto：官方域名用原生头，其它地址（中转）用 Bearer。"""
-    family = provider_info(str(preset.get("provider") or ""))["family"]
-    choice = str(preset.get("model_list_auth") or "auto")
-    allowed = _LIST_AUTH_BY_FAMILY.get(family, ())
-    if choice != "auto" and choice in allowed:
-        return choice
-    host = (urlsplit(base_url).hostname or "").lower()
-    if family == "anthropic" and (host == "anthropic.com" or host.endswith(".anthropic.com")):
-        return "x-api-key"
-    if family == "gemini" and (host == "googleapis.com" or host.endswith(".googleapis.com")):
-        return "x-goog-api-key"
-    return "bearer"
-
-
-def _error_snippet(response: Any) -> str:
-    try:
-        payload = response.json()
-    except ValueError:
-        payload = None
-    if isinstance(payload, Mapping):
-        error = payload.get("error")
-        candidates = [error.get("message") if isinstance(error, Mapping) else None, payload.get("message"),
-                      payload.get("detail"), error]
-        for item in candidates:
-            if isinstance(item, str) and item.strip():
-                return item.strip()[:200]
-    try:
-        return str(response.text or "").strip()[:160]
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-async def pull_models(preset: Mapping[str, Any], *, client: Any = None, timeout: float = 20.0) -> list[str]:
-    """按预设向供应商要模型列表。401 / 403 立刻停止，不换地址重试。"""
-    import httpx
-
-    info = provider_info(str(preset.get("provider") or ""))
-    base = (str(preset.get("base_url") or "").strip() or str(info.get("default_base_url") or "")).rstrip("/")
-    if not base:
-        raise ModelListError("请先填写 Base URL。")
-    if not base.startswith(("http://", "https://")):
-        base = "https://" + base
-    api_key = str(preset.get("api_key") or "").strip()
-    auth = resolve_list_auth(preset, base)
-    headers = {"Accept": "application/json"}
-    prefix = "/v1"
-    if info["family"] == "anthropic":
-        headers["anthropic-version"] = "2023-06-01"
-    if auth == "x-goog-api-key":
-        prefix = "/v1beta"
-    if api_key:
-        if auth == "bearer":
-            headers["Authorization"] = f"Bearer {api_key}"
-        else:
-            headers[auth] = api_key
-
-    owns_client = client is None
-    if owns_client:
-        # trust_env=False：与 engine 调模型时一致（不读环境里的代理设置），这里拉得到 = 规划时连得上。
-        client = httpx.AsyncClient(timeout=httpx.Timeout(timeout, connect=10.0), trust_env=False)
-    last: tuple[int, str, str] | None = None
-    try:
-        for url in model_list_urls(base, prefix):
-            try:
-                response = await client.get(url, headers=headers)
-            except httpx.HTTPError as error:
-                last = (0, f"{type(error).__name__}: {error}".strip(": "), url)
-                continue
-            status = int(response.status_code)
-            if status >= 400:
-                last = (status, _error_snippet(response), url)
-                if status in (401, 403):
-                    break
-                continue
-            try:
-                data = response.json()
-            except ValueError:
-                last = (status, "返回的不是 JSON", url)
-                continue
-            models = filter_models(extract_model_ids(data))
-            if models:
-                return models
-            last = (status, "返回成功，但模型列表为空", url)
-    finally:
-        if owns_client:
-            await client.aclose()
-    label = info["label"]
-    if last is None:
-        raise ModelListError(f"{label} 拉取模型失败：未获取到模型列表。")
-    status, detail, url = last
-    raise ModelListError(f"{label} 拉取模型失败：{status or '网络错误'}" + (f"：{detail}" if detail else "") + f" ({url})", status)
-
 
 # ---- 测试连接 ----
 

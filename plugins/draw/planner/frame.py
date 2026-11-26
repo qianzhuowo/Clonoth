@@ -1,7 +1,8 @@
 """规划请求的固定部分：材料说明、输出去向、材料块与数量约束（对应 LWB scene-planner-frame.js
 + scene-planner.js 的 buildCharacterInfoForLLM / buildSessionLimitsLine）。
 
-本项目的材料来源：已录入角色清单 + 本次绘图请求 + 近期对话（无世界书、无插图点）。
+本项目的材料来源：已录入角色清单 + 本次绘图请求（无世界书、无插图点）。绘图请求由 bot 整理好再交给规划，
+是唯一的叙事来源；不再附带近期对话（群聊杂音会干扰选角色和写 tag）。
 用户可改的内容（开场、指南、场景规则）围绕这些固定文本注入。
 """
 from __future__ import annotations
@@ -10,8 +11,8 @@ from typing import Any, Mapping, Sequence
 
 from .profile import PlannerProfile, normalize_profile
 
-# 模板占位符：保存校验时要求 content 模板含这三项。
-CONTENT_PLACEHOLDERS: tuple[str, ...] = ("{{characterInfo}}", "{{drawRequest}}", "{{recentDialogue}}")
+# 模板占位符：保存校验时要求 content 模板含这两项。
+CONTENT_PLACEHOLDERS: tuple[str, ...] = ("{{characterInfo}}", "{{drawRequest}}")
 
 CONTENT_TEMPLATE = (
     "<content>\n"
@@ -19,9 +20,6 @@ CONTENT_TEMPLATE = (
     "---\n"
     "【绘图请求】\n"
     "{{drawRequest}}\n"
-    "---\n"
-    "【近期对话】\n"
-    "{{recentDialogue}}\n"
     "</content>"
 )
 
@@ -31,7 +29,7 @@ def build_frame_text(profile: PlannerProfile | Mapping[str, Any] | None) -> str:
     return (
         "## 你收到的材料\n"
         "- <content>：本次唯一的叙事来源。开头是【已录入角色】列表；固定外貌由角色库自动写入，你只写本图中的状态，"
-        "不要重复固定外貌里已有的 tag；之后是本次的【绘图请求】与【近期对话】。\n"
+        "不要重复固定外貌里已有的 tag；之后是本次的【绘图请求】。\n"
         "- 绘图要求中的数量约束：images 数量、每图人数上限。\n"
         "\n"
         "## 你的输出去哪\n"
@@ -107,13 +105,11 @@ def build_character_info(present_characters: Sequence[Mapping[str, Any]] | None)
     return f"【已录入角色】\n{legend}" + "\n".join(lines)
 
 
-def build_content_block(template: str | None, *, character_info: str, draw_request: str,
-                        recent_dialogue: str) -> str:
+def build_content_block(template: str | None, *, character_info: str, draw_request: str) -> str:
     """字面替换占位符（不做二次展开，正文里的 {{…}} 不会被再次替换）。"""
     text = template if isinstance(template, str) and template.strip() else CONTENT_TEMPLATE
     text = text.replace("{{characterInfo}}", character_info or "【已录入角色】: 无")
     text = text.replace("{{drawRequest}}", str(draw_request or "").strip() or "（无）")
-    text = text.replace("{{recentDialogue}}", str(recent_dialogue or "").strip() or "（无）")
     return text
 
 

@@ -11,7 +11,6 @@ import {
   clearSessionWorkspace,
   getActiveNode,
   getAppConfig,
-  getModelConfig,
   getNodes,
   getSessionProviderOverride,
   getSessionWorkspace,
@@ -32,10 +31,14 @@ interface SessionConfigPanelProps {
 }
 
 interface SessionModelEdit {
-  provider: string;
+  channel: string;
   model: string;
-  base_url: string;
-  api_key: string;
+}
+
+const EMPTY_EDIT: SessionModelEdit = { channel: '', model: '' };
+
+function editFrom(override: Record<string, unknown> | null | undefined): SessionModelEdit {
+  return { channel: stringField(override, 'channel'), model: stringField(override, 'model') };
 }
 
 interface SessionWorkspaceEdit {
@@ -143,22 +146,20 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     entryNodeId,
     activeEffectiveModel,
     activeEffectiveBaseUrl,
-    providerModels,
+    activeChannel,
+    channels,
     sessionProviderOverride,
     setActiveNode,
     setAvailableNodes,
-    setGlobalConfig,
-    setModelConfig,
+    setChannelConfig,
     setSessionProviderOverride,
     setPendingProviderOverride,
   } = useSettingsStore();
-  const registeredProviders = Object.keys(providerModels);
   const setSettingsTab = useViewStore(state => state.setSettingsTab);
 
   const [nodeSaving, setNodeSaving] = useState(false);
   const [modelSaving, setModelSaving] = useState(false);
-  const [apiKeyPresent, setApiKeyPresent] = useState(false);
-  const [edit, setEdit] = useState<SessionModelEdit>({ provider: '', model: '', base_url: '', api_key: '' });
+  const [edit, setEdit] = useState<SessionModelEdit>(EMPTY_EDIT);
   const [sessionWorkspace, setSessionWorkspace] = useState<{ name?: string; path?: string | null } | null>(null);
   const [wsEdit, setWsEdit] = useState<SessionWorkspaceEdit>({ name: '', path: '' });
   const [wsSaving, setWsSaving] = useState(false);
@@ -192,7 +193,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
         .catch(() => {});
     }
     getAppConfig()
-      .then(r => setGlobalConfig(r.openai?.model || '', r.openai?.base_url || '', r.provider_models || {}))
+      .then(r => setChannelConfig(r.active_channel, r.channels || []))
       .catch(() => {});
     if (adminToken) {
       if (availableNodes.length === 0) {
@@ -200,27 +201,15 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
           .then(nodes => setAvailableNodes(nodes.filter((n: NodeDef) => n.type === 'ai' && !n.id.startsWith('system.'))))
           .catch(() => {});
       }
-      getModelConfig(adminToken)
-        .then(cfg => {
-          setModelConfig(cfg);
-          setApiKeyPresent(Boolean(cfg.api_key_present));
-        })
-        .catch(() => {});
       if (sid) {
         getSessionProviderOverride(sid, adminToken)
           .then(override => {
             setSessionProviderOverride(override);
-            setEdit({
-              provider: stringField(override, 'provider') || stringField(override, 'provider_type'),
-              model: stringField(override, 'model'),
-              base_url: stringField(override, 'base_url'),
-              api_key: '',
-            });
-            setApiKeyPresent(Boolean(override.api_key));
+            setEdit(editFrom(override));
           })
           .catch(() => {
             setSessionProviderOverride(null);
-            setEdit({ provider: '', model: '', base_url: '', api_key: '' });
+            setEdit(EMPTY_EDIT);
           });
         getSessionWorkspace(sid, adminToken)
           .then(ws => {
@@ -236,16 +225,10 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
         // (if any) so reopening the modal shows the previous selection.
         const pending = useSettingsStore.getState().pendingProviderOverride;
         setSessionProviderOverride(pending);
-        setEdit({
-          provider: stringField(pending, 'provider') || stringField(pending, 'provider_type'),
-          model: stringField(pending, 'model'),
-          base_url: stringField(pending, 'base_url'),
-          api_key: '',
-        });
-        setApiKeyPresent(Boolean(pending?.api_key));
+        setEdit(editFrom(pending));
       }
     }
-  }, [adminToken, availableNodes.length, setActiveNode, setAvailableNodes, setGlobalConfig, setModelConfig, setSessionProviderOverride, sid]);
+  }, [adminToken, availableNodes.length, setActiveNode, setAvailableNodes, setChannelConfig, setSessionProviderOverride, sid]);
 
   const handleCopySessionId = async () => {
     if (!sid) return;
@@ -288,11 +271,10 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       // [2026-06-16] Welcome page: no session yet. Store the override locally;
       // it will be applied via postInbound when the first message creates a session.
       const next: Record<string, unknown> = {};
-      for (const key of ['provider', 'model', 'base_url'] as const) {
+      for (const key of ['channel', 'model'] as const) {
         const value = edit[key].trim();
         if (value) next[key] = value;
       }
-      if (edit.api_key.trim()) next.api_key = edit.api_key.trim();
       setPendingProviderOverride(next);
       setSessionProviderOverride(next);
       notify.success('模型已为下一条消息保存');
@@ -302,23 +284,16 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
 
     setModelSaving(true);
     try {
-      const next = { ...(sessionProviderOverride || {}) } as Record<string, unknown>;
-      for (const key of ['provider', 'model', 'base_url'] as const) {
+      // A session override is a scheme + model; older provider/base_url/api_key fields are dropped.
+      const next: Record<string, unknown> = {};
+      for (const key of ['channel', 'model'] as const) {
         const value = edit[key].trim();
         if (value) next[key] = value;
-        else delete next[key];
       }
-      if (edit.api_key.trim()) next.api_key = edit.api_key.trim();
 
       const saved = await updateSessionProviderOverride(sid, adminToken, next);
       setSessionProviderOverride(saved);
-      setEdit({
-        provider: stringField(saved, 'provider') || stringField(saved, 'provider_type'),
-        model: stringField(saved, 'model'),
-        base_url: stringField(saved, 'base_url'),
-        api_key: '',
-      });
-      setApiKeyPresent(Boolean(saved.api_key));
+      setEdit(editFrom(saved));
       const active = await getActiveNode(sid);
       setActiveNode(active.node_id, active.is_override, active.default_node_id, {
         provider: active.effective_provider || '',
@@ -384,8 +359,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
       // [2026-06-16] Welcome page: clear the pending override.
       setPendingProviderOverride(null);
       setSessionProviderOverride(null);
-      setEdit({ provider: '', model: '', base_url: '', api_key: '' });
-      setApiKeyPresent(false);
+      setEdit(EMPTY_EDIT);
       notify.success('会话模型覆盖已清除');
       return;
     }
@@ -395,8 +369,7 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
     try {
       const cleared = await clearSessionProviderOverride(sid, adminToken);
       setSessionProviderOverride(cleared);
-      setEdit({ provider: '', model: '', base_url: '', api_key: '' });
-      setApiKeyPresent(false);
+      setEdit(EMPTY_EDIT);
       const active = await getActiveNode(sid);
       setActiveNode(active.node_id, active.is_override, active.default_node_id, {
         provider: active.effective_provider || '',
@@ -502,49 +475,35 @@ export const SessionConfigPanel = ({ sessionId, focus = 'default' }: SessionConf
             </span>
           </div>
 
-          <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">供应商（渠道）</label>
+          <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">渠道方案</label>
           <select
             className="mb-2 w-full border border-[var(--duties-border)] bg-[var(--duties-bg)] px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-            onChange={e => setEdit(p => ({ ...p, provider: e.target.value }))}
-            value={edit.provider}
+            onChange={e => setEdit(p => ({ ...p, channel: e.target.value }))}
+            value={edit.channel}
           >
-            <option value="">默认（继承全局）</option>
-            {registeredProviders.map(name => (
-              <option key={name} value={name}>
-                {name}{providerModels[name] ? ` — ${providerModels[name]}` : ''}
+            <option value="">默认（节点 / 当前方案 {channels.find(c => c.id === activeChannel)?.name || activeChannel || '未设置'}）</option>
+            {channels.map(c => (
+              <option key={c.id} value={c.id}>
+                {c.name}{c.model ? ` — ${c.model}` : ''}
               </option>
             ))}
+            {edit.channel && !channels.some(c => c.id === edit.channel) && (
+              <option value={edit.channel}>{edit.channel}（不存在）</option>
+            )}
           </select>
 
           <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">模型</label>
           <input
             className="mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
             onChange={e => setEdit(p => ({ ...p, model: e.target.value }))}
-            placeholder={activeEffectiveModel || '继承的模型'}
+            placeholder={activeEffectiveModel || '留空使用方案的模型'}
             value={edit.model}
           />
 
-          <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">基础 URL</label>
-          <input
-            className="mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-            onChange={e => setEdit(p => ({ ...p, base_url: e.target.value }))}
-            placeholder={'继承的基础 URL'}
-            value={edit.base_url}
-          />
-
-          <label className="mb-1 block text-[0.62rem] text-[var(--duties-secondary)]">API 密钥 {apiKeyPresent ? '（已设置）' : '（可选）'}</label>
-          <input
-            className="mb-2 w-full border border-[var(--duties-border)] bg-transparent px-2 py-1.5 font-mono text-[0.65rem] text-[var(--duties-text)] outline-none focus:border-[var(--duties-text)]"
-            onChange={e => setEdit(p => ({ ...p, api_key: e.target.value }))}
-            placeholder="留空以保留当前值"
-            type="password"
-            value={edit.api_key}
-          />
-
           {/* Save/Clear only visible when user has modified something */}
-          {(edit.provider.trim() !== '' || edit.model.trim() !== '' || edit.base_url.trim() !== '' || edit.api_key.trim() !== '' || hasSessionOverride) && (
+          {(edit.channel.trim() !== '' || edit.model.trim() !== '' || hasSessionOverride) && (
             <div className="flex gap-2">
-              <Button className="h-8 flex-1 px-2 text-[0.55rem]" disabled={modelSaving || (!edit.provider.trim() && !edit.model.trim() && !edit.base_url.trim() && !edit.api_key.trim())} onClick={handleSaveModel} variant="primary">
+              <Button className="h-8 flex-1 px-2 text-[0.55rem]" disabled={modelSaving || (!edit.channel.trim() && !edit.model.trim())} onClick={handleSaveModel} variant="primary">
                 {modelSaving ? '保存中…' : '保存'}
               </Button>
               {hasSessionOverride && (

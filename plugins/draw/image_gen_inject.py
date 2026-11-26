@@ -32,9 +32,7 @@ def build_availability_text(gpt_ok: bool, gemini_ok: bool) -> str:
     if not gpt_ok and not gemini_ok:
         lines.append(
             "\n当前**没有任何生图渠道被配置**。不要调用任何生图工具，直接用 finish "
-            "如实告诉用户：生图功能尚未配置，需要在环境变量或工作区 .env 中配置 "
-            "CLONOTH_IMAGE_GPT_MODEL/BASE_URL/API_KEY 或 "
-            "CLONOTH_IMAGE_GEMINI_MODEL/BASE_URL/API_KEY。"
+            "如实告诉用户：生图功能尚未配置，需要在 设置 → 系统模型 → 生图 中选择渠道方案。"
         )
     return "\n".join(lines)
 

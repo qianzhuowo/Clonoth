@@ -5,8 +5,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from clonoth_runtime import load_yaml_dict, load_runtime_config, resolve_env_ref
-from providers import registry as provider_registry
+from clonoth_runtime import load_yaml_dict, load_runtime_config
 
 from engine.faces.nodes import declared_node
 
@@ -38,9 +37,6 @@ class Node:
     type: str  # "ai" | "tool" | "script"
     name: str = ""
     description: str = ""
-    model: str = ""          # 模型名称，空 = 使用全局默认
-    api_key: str = ""        # 可选独立 API key（支持 $ENV{} 语法）
-    base_url: str = ""       # 可选独立 base URL（支持 $ENV{} 语法）
     prompt: str | list = ""  # system prompt：字符串模式或 block 列表模式
     # [AutoC 2026-06-09] Why: script nodes need deterministic inline Python without invoking an LLM.
     # How: store the YAML script body verbatim and keep execution timeout on the node model.
@@ -60,9 +56,7 @@ class Node:
     # How: 节点 YAML 可配置 output 为目标 node_id 或 __source__，load_node 只解析并保留原始声明。
     # Purpose: 让节点保持纯处理单元，后续路由统一由 Supervisor 决定。
     output: str = ""
-    # [provider-registry 2026-05-03] provider 是 registry key，空字符串表示使用默认 provider。
-    # 原因：provider 列表已插件化；做法：不在类型注释中列死内置名称；目的：新增 provider 无需改 Node 定义。
-    provider: str = ""
+    # 节点用哪个渠道方案/模型存在 data/config.yaml node_models（clonoth_channels.node_channel）。
     provider_options: dict = field(default_factory=dict)  # 透传给 provider 的参数（thinking/reasoning 等）
     delegate_targets: list[str] = field(default_factory=list)
     # [2026-05-27] persistent 标记：声明该节点为持久节点。
@@ -141,16 +135,6 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
         script_timeout_sec = 30.0
     if script_timeout_sec <= 0:
         script_timeout_sec = 30.0
-
-    # model：直接值或 $ENV{} 引用
-    raw_model = str(data.get("model") or "").strip()
-    model = resolve_env_ref(raw_model) if raw_model else ""
-
-    # 可选独立 api_key / base_url
-    raw_api_key = str(data.get("api_key") or "").strip()
-    api_key = resolve_env_ref(raw_api_key) if raw_api_key else ""
-    raw_base_url = str(data.get("base_url") or "").strip()
-    base_url = resolve_env_ref(raw_base_url) if raw_base_url else ""
 
     # [AutoC 2026-08-31] "allow" 作为 "allowlist" 别名。Why: dict 形态给出
     # allow 列表时 mode 写 "allow" 是直观写法（mini 节点配置实测踩坑：
@@ -242,13 +226,6 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
     raw_output = str(data.get("output") or "").strip()
     output = raw_output
 
-    # provider — 节点 yaml 可指定 provider 类型
-    raw_provider = str(data.get("provider") or "").strip().lower()
-    # [provider-registry 2026-05-03] 从 registry 动态校验 provider 名称。
-    # 原因：固定白名单会阻止新 provider 插件；做法：读取 ProviderRegistry.list()；
-    # 目的：注册成功的 provider 可以直接被节点配置使用，未知值仍回退为空字符串。
-    provider = raw_provider if raw_provider in {"", *provider_registry.list()} else ""
-
     # provider_options — 透传给 provider 的参数（如 Anthropic thinking、OpenAI reasoning 等）
     raw_po = data.get("provider_options")
     provider_options = dict(raw_po) if isinstance(raw_po, dict) else {}
@@ -286,9 +263,9 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
     # [2026-05-27] extra dict：收集 yaml 中 core 不认识的字段（如 memory_book），
     # 供插件层通过 ToolContext._node_extra 零 IO 读取。
     _KNOWN_KEYS = {
-        "kind", "id", "type", "name", "description", "model", "api_key",
-        "base_url", "prompt", "tool_access", "skills", "memories",
-        "tool_mode", "output_mode", "output", "provider", "provider_options",
+        "kind", "id", "type", "name", "description",
+        "prompt", "tool_access", "skills", "memories",
+        "tool_mode", "output_mode", "output", "provider_options",
         "delegate_targets", "persistent", "script", "script_timeout_sec",
         "control_tools",
     }
@@ -299,9 +276,6 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
         type=node_type,
         name=str(data.get("name") or nid).strip(),
         description=str(data.get("description") or "").strip(),
-        model=model,
-        api_key=api_key,
-        base_url=base_url,
         prompt=prompt,
         script=script,
         script_timeout_sec=script_timeout_sec,
@@ -311,7 +285,6 @@ def _node_from_dict(workspace_root: Path, nid: str, data: dict) -> Node | None:
         tool_mode=tool_mode,
         output_mode=output_mode,
         output=output,
-        provider=provider,
         provider_options=provider_options,
         delegate_targets=delegate_targets,
         persistent=persistent,

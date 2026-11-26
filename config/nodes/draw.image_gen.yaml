@@ -3,11 +3,7 @@ type: ai
 name: "通用生图（GPT / Gemini）"
 description: "通用生图分析与生成节点。将用户生图/图片编辑需求转成合适工具调用，使用 gpt_image_2 或 gemini_image 生成图片，支持垫图。生成的图片由平台自动发送。"
 
-provider: openai
-# [2026-08-01] 绘图分析(写 tag/prompt)专用模型，与压缩/摘要/读图/生图隔离。
-model: $ENV{DRAW_TAG_MODEL}
-api_key: $ENV{DRAW_TAG_API_KEY}
-base_url: $ENV{DRAW_TAG_BASE_URL}
+# 用哪个渠道方案/模型：主设置 → 节点模型（data/config.yaml node_models），默认是迁移生成的「绘图分析」方案。
 
 tool_mode: json
 output_mode: hybrid

@@ -150,18 +150,18 @@ def test_legacy_preempt_consumption_still_clears_everything():
     assert task.preempt_attachments == []
 
 
-def test_openai_extension_keys_survive_mimo_configuration_updates(tmp_path):
+def test_channel_options_survive_mimo_configuration_updates(tmp_path):
     path = tmp_path / "config.yaml"
     path.write_text(yaml.safe_dump({
-        "openai": {"model": "test", "reasoning_field": "reasoning_content", "custom": {"enabled": True}},
+        "openai": {"model": "test", "api_key": "k", "reasoning_field": "reasoning_content"},
         "mimo_audio": {"tts_voice": "test-voice"},
     }), encoding="utf-8")
     store = ConfigStore(path=path)
     store.reload()
     store.update_mimo_audio(MimoAudioConfigUpdateIn(tts_model="updated-model"))
     saved = yaml.safe_load(path.read_text(encoding="utf-8"))
-    assert saved["openai"]["reasoning_field"] == "reasoning_content"
-    assert saved["openai"]["custom"] == {"enabled": True}
+    assert "openai" not in saved and saved["channels"][0]["reasoning_field"] == "reasoning_content"
+    assert saved["mimo_audio"]["tts_model"] == "updated-model"
     assert store.get_mimo_audio_secret().tts_voice == "test-voice"
 
 

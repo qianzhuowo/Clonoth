@@ -87,19 +87,13 @@ def test_image_tool_spec_is_discoverable(rel, name):
     assert spec and spec.get("name") == name
 
 
-@pytest.mark.parametrize("rel", ["gemini_image.py", "gpt_image_2.py"])
-def test_image_tool_has_no_system_models_dependency(rel):
-    assert "system_models" not in (TOOLS / rel).read_text(encoding="utf-8")
-
-
-@pytest.mark.parametrize("rel, var", [("gemini_image.py", "CLONOTH_IMAGE_GEMINI_API_KEY"), ("gpt_image_2.py", "CLONOTH_IMAGE_GPT_API_KEY")])
-def test_image_tool_without_key_fails_naming_its_variable(tmp_path, rel, var):
-    env = {k: v for k, v in os.environ.items() if "API_KEY" not in k and "BASE_URL" not in k and not k.startswith("CLONOTH_IMAGE_")}
-    env["PYTHONIOENCODING"] = "utf-8"
+@pytest.mark.parametrize("rel, slot", [("gemini_image.py", "image"), ("gpt_image_2.py", "image_gpt")])
+def test_image_tool_without_slot_fails_naming_the_setting(tmp_path, rel, slot):
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8", "CLONOTH_WORKSPACE": str(tmp_path)}
     proc = subprocess.run(
         [sys.executable, str(TOOLS / rel)], input=json.dumps({"prompt": "a cat"}),
         capture_output=True, text=True, encoding="utf-8", timeout=60, env=env, cwd=str(tmp_path),
     )
     payload = json.loads(proc.stdout.strip().splitlines()[-1])
     assert proc.returncode == 1 and payload["ok"] is False
-    assert var in payload["error"]
+    assert "系统模型" in payload["error"] and "生图" in payload["error"]

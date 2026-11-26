@@ -31,17 +31,17 @@ from plugins.draw.image_gen_inject import PLACEHOLDER, ImageGenAvailabilityInjec
 from plugins.draw.novelai_prompts import render_novelai_prompts
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-CHANNEL_ENV = ("CLONOTH_IMAGE_GPT_MODEL", "CLONOTH_IMAGE_GEMINI_MODEL")
+def _image_slots(root: Path, *slots: str) -> None:
+    import yaml
+    (root / "data").mkdir(exist_ok=True)
+    (root / "data" / "config.yaml").write_text(yaml.safe_dump({
+        "active_channel": "c", "channels": [{"id": "c", "type": "openai", "base_url": "https://x.test/v1", "api_key": "k"}],
+        "system_models": {s: {"channel": "c", "model": f"{s}-model"} for s in slots},
+    }), encoding="utf-8")
 
 
 def _run(coro):
     return asyncio.run(coro)
-
-
-@pytest.fixture(autouse=True)
-def _clean_channel_env(monkeypatch):
-    for key in CHANNEL_ENV:
-        monkeypatch.delenv(key, raising=False)
 
 
 def _node(node_id: str, extra: dict | None = None):
@@ -177,15 +177,14 @@ def test_gating_hides_everything_when_no_channel_configured(tmp_path):
     assert hidden == {"tools": {"gpt_image_2", "gemini_image"}, "delegate_targets": {"draw.image_gen"}}
 
 
-def test_gating_reads_dotenv_and_keeps_draw_node(tmp_path):
-    (tmp_path / ".env").write_text("CLONOTH_IMAGE_GEMINI_MODEL='gemini-test'\n", encoding="utf-8")
+def test_gating_reads_system_model_slots_and_keeps_draw_node(tmp_path):
+    _image_slots(tmp_path, "image")
     hidden = image_gen_visibility(_vis_ctx(tmp_path))
     assert hidden == {"tools": {"gpt_image_2"}, "delegate_targets": set()}
 
 
 def test_gating_hides_nothing_when_both_configured(tmp_path, monkeypatch):
-    monkeypatch.setenv("CLONOTH_IMAGE_GPT_MODEL", "gpt-test")
-    monkeypatch.setenv("CLONOTH_IMAGE_GEMINI_MODEL", "gemini-test")
+    _image_slots(tmp_path, "image", "image_gpt")
     assert image_gen_visibility(_vis_ctx(tmp_path)) is None
 
 
@@ -265,7 +264,7 @@ def test_character_inject_skips_other_nodes_and_misses(tmp_path):
 
 
 def test_image_gen_inject_replaces_placeholder(tmp_path, monkeypatch):
-    monkeypatch.setenv("CLONOTH_IMAGE_GPT_MODEL", "gpt-test")
+    _image_slots(tmp_path, "image_gpt")
     ctx = _prompt_ctx(tmp_path, "draw.image_gen", messages=[{"role": "system", "content": f"A {PLACEHOLDER} B"}])
     result = _run(ImageGenAvailabilityInjector().handle(ctx))
     content = ctx.messages[0]["content"]

@@ -3,14 +3,9 @@ type: ai
 name: "NovelAI 绘图分析与生成"
 description: "绘图场景规划节点：由 plugins/draw/agent 在 before_prompt_build 钩子接管，组装规划消息链 → 模型调用 submit_scene_plan → 编译 NovelAI 请求并生成图片 → 直接 finish。"
 
-provider: openai
-# [2026-08-01] 绘图分析(写 tag/prompt)专用模型，与压缩/摘要/读图/生图隔离。
-model: $ENV{DRAW_TAG_MODEL}
-api_key: $ENV{DRAW_TAG_API_KEY}
-base_url: $ENV{DRAW_TAG_BASE_URL}
+# 用哪个渠道方案/模型：主设置 → 节点模型（data/config.yaml node_models），默认是迁移生成的「绘图分析」方案。
 
-# 面板“场景 Agent”页的当前预设填了 Model 和 API Key 时，规划改用预设里的接口，上面三项只作兜底；
-# 但引擎在接管前仍会检查本节点能解析出 key，所以 DRAW_TAG_API_KEY（或全局 key）要保留。
+# 面板“场景 Agent”页的当前预设选了渠道方案时，规划改用那个方案；没选时用本节点的渠道。
 # 工具协议由场景 Agent 预设的 tool_mode 决定（native / text；还没有预设时取 settings.yaml 的 planner.tool_protocol），
 # 此处 tool_mode 只影响引擎常规循环；agent 接管后不会走常规循环。
 tool_mode: json

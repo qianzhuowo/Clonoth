@@ -11,7 +11,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 // through full raw YAML reloads. How: import only the existing raw read/write wrappers
 // alongside the earlier node, skill, and tool helpers. Purpose: the panel can update
 // one selected item without introducing new API contracts or touching other panels.
-import { getNodeRaw, getSchedulesRaw, getToolRaw, reloadTools, updateNodeRaw, updateSchedulesRaw, updateToolRaw } from '../../../api/supervisorClient';
+import { getChannels, getNodeRaw, getSchedulesRaw, updateNodeModel, type ChannelsResponse, getToolRaw, reloadTools, updateNodeRaw, updateSchedulesRaw, updateToolRaw } from '../../../api/supervisorClient';
 // [2026-06-02] Use shared lightweight structured YAML helpers in the two requested panels.
 // Why: MCP clients and automation schedules already have parse and serialize helpers
 // that preserve the expected config shape. How: import the form state types and
@@ -23,6 +23,7 @@ import { useSettingsStore } from '../../../store/settingsStore';
 import { errorText, notify } from '../../../store/toastStore';
 import { inferToolRisk, riskClassName, riskLabel } from '../../../utils/toolRisk';
 import { YamlEditor } from '../../common';
+import { SystemModelCard } from '../pages/SystemModelCard';
 
 const PanelShell = ({ title, eyebrow, children }: { title: string; eyebrow?: string; children: ReactNode }) => (
   <section className="flex h-full min-h-0 flex-col overflow-y-auto p-3">
@@ -51,8 +52,6 @@ const EMPTY_NODE_CONFIG_FORM: NodeConfigFormState = {
   name: '',
   description: '',
   type: 'ai',
-  model: '',
-  provider: '',
   memory_book: '',
   persistent: false,
   delegate_targetsText: '',
@@ -103,8 +102,7 @@ export const ApprovalsSettingsRightPanel = () => {
 
 export const AgentsSettingsRightPanel = () => {
   const adminToken = useSettingsStore(state => state.adminToken);
-  const providerModels = useSettingsStore(state => state.providerModels);
-  const registeredProviders = Object.keys(providerModels);
+  const [channelData, setChannelData] = useState<ChannelsResponse | null>(null);
   const node = useSettingsSelectionStore(state => state.selectedNode);
   const [nodeYaml, setNodeYaml] = useState('');
   const [nodeConfigForm, setNodeConfigForm] = useState<NodeConfigFormState>(EMPTY_NODE_CONFIG_FORM);
@@ -120,6 +118,17 @@ export const AgentsSettingsRightPanel = () => {
     // How: merge individual field changes into the parsed form state. Purpose: saving
     // can serialize the full form back into the selected node YAML.
     setNodeConfigForm((current) => ({ ...current, ...patch }));
+  };
+
+  useEffect(() => {
+    if (!adminToken) return;
+    getChannels(adminToken).then(setChannelData).catch(() => setChannelData(null));
+  }, [adminToken, node?.id]);
+
+  const saveNodeModel = async (ref: { channel: string; model: string }) => {
+    if (!adminToken || !node) return;
+    await updateNodeModel(adminToken, node.id, ref);
+    setChannelData(await getChannels(adminToken));
   };
 
   useEffect(() => {
@@ -234,25 +243,16 @@ export const AgentsSettingsRightPanel = () => {
                     <option value="router">router</option>
                   </select>
                 </label>
-                <label className="block">
-                  <span className={STRUCTURED_LABEL_CLASS}>模型</span>
-                  <input className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ model: event.target.value })} value={nodeConfigForm.model} />
-                </label>
-                <label className="block">
-                  <span className={STRUCTURED_LABEL_CLASS}>供应商（渠道），可选</span>
-                  <select
-                    className={STRUCTURED_INPUT_CLASS}
-                    onChange={(event) => updateNodeConfigForm({ provider: event.target.value })}
-                    value={nodeConfigForm.provider}
-                  >
-                    <option value="">默认（继承全局）</option>
-                    {registeredProviders.map(name => (
-                      <option key={name} value={name}>
-                        {name}{providerModels[name] ? ` — ${providerModels[name]}` : ''}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                {nodeConfigForm.type === 'ai' && channelData && (
+                  <SystemModelCard
+                    activeChannel={channelData.active_channel}
+                    channels={channelData.channels}
+                    description="这个节点用哪个渠道方案和模型；都留空 = 当前方案。"
+                    onSave={saveNodeModel}
+                    title="节点模型"
+                    value={channelData.node_models[nodeConfigForm.id]}
+                  />
+                )}
                 <label className="block">
                   <span className={STRUCTURED_LABEL_CLASS}>记忆簿，可选</span>
                   <input className={STRUCTURED_INPUT_CLASS} onChange={(event) => updateNodeConfigForm({ memory_book: event.target.value })} value={nodeConfigForm.memory_book} />

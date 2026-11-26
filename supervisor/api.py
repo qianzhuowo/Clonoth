@@ -50,14 +50,13 @@ from .types import (
     MimoAudioConfigPublic,
     MimoAudioConfigSecret,
     MimoAudioConfigUpdateIn,
-    OpenAIConfigPublic,
-    OpenAIConfigSecret,
-    OpenAIConfigUpdateIn,
-    ProviderUpdateIn,
-    ActiveProviderIn,
+    ActiveChannelIn,
+    ActiveModelIn,
+    ChannelModelsIn,
+    ChannelRefUpdateIn,
+    ChannelUpdateIn,
     FallbacksUpdateIn,
     ModelVisionIn,
-    SystemModelUpdateIn,
     OpRequestIn,
     OpRequestOut,
     OutboundMessageIn,
@@ -79,6 +78,7 @@ from .types import (
 from .admin_api import create_admin_router
 from .admin_api import get_admin_token, get_web_auth, init_web_auth, verify_admin_token
 from engine.model import resolve_provider
+from clonoth_channels import ChannelError
 from engine.node import load_node
 from clonoth_runtime import load_runtime_config
 from .local_onnx_tts import LocalOnnxTts, config_from_mapping
@@ -89,12 +89,6 @@ logger = logging.getLogger(__name__)
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _provider_public_value(cfg: Any, key: str) -> str:
-    if isinstance(cfg, dict):
-        return str(cfg.get(key) or "")
-    return str(getattr(cfg, key, "") or "")
 
 
 def _resolve_session_active_node_effective(
@@ -120,47 +114,19 @@ def _resolve_session_active_node_effective(
         })
         return result
 
-    providers_payload = cs.get_providers_public()
-    provider_blocks = (
-        providers_payload.get("providers", {}) if isinstance(providers_payload, dict)
-        else getattr(providers_payload, "providers", {})
-    )
-    provider_configs: dict[str, dict[str, str]] = {}
-    for name, cfg in provider_blocks.items():
-        provider_configs[str(name)] = {
-            "model": _provider_public_value(cfg, "model"),
-            "base_url": _provider_public_value(cfg, "base_url"),
-        }
-
-    active_provider = str(
-        providers_payload.get("active_provider", "") if isinstance(providers_payload, dict)
-        else getattr(providers_payload, "active_provider", "")
-    ) or "openai"
-    default_model = (
-        provider_configs.get(active_provider, {}).get("model")
-        or provider_configs.get("openai", {}).get("model")
-        or ""
-    )
     route_session_id = str(result.get("session_id") or session_id or "").strip()
     override = st.get_session_provider_override(route_session_id) or {}
-    rp = resolve_provider(
-        Path(st.workspace_root),
-        node,
-        default_model,
-        session_override=override,
-        provider_configs=provider_configs,
-        # [AutoC 2026-06-16] Why: /active_node must mirror the engine runner's
-        # provider selection. How: use config.yaml provider as the default channel
-        # for nodes without node.provider. Purpose: the header shows the same
-        # provider/model that the next task will use.
-        default_provider_type=active_provider,
-    )
+    try:
+        rp = resolve_provider(Path(st.workspace_root), node, session_override=override)
+    except ChannelError:
+        result.update({"effective_provider": "", "effective_model": "", "effective_base_url": "",
+                       "effective_channel": ""})
+        return result
     result.update({
         "effective_provider": rp.provider_type,
         "effective_model": rp.model,
-        "effective_base_url": rp.base_url or "",
-        "node_provider": node.provider or "",
-        "node_model": node.model or "",
+        "effective_base_url": rp.base_url,
+        "effective_channel": rp.channel_id,
     })
     return result
 
@@ -435,63 +401,23 @@ def create_app(
         cs: ConfigStore = app.state.config_store
         return cs.get_public()
 
-    @app.get("/v1/config/openai", response_model=OpenAIConfigPublic)
-    async def get_openai_config_public() -> OpenAIConfigPublic:
-        cs: ConfigStore = app.state.config_store
-        return cs.get_openai_public()
-
-    @app.get("/v1/config/openai/secret", response_model=OpenAIConfigSecret)
-    async def get_openai_config_secret(request: Request) -> OpenAIConfigSecret:
-        verify_admin_token(request)
-        cs: ConfigStore = app.state.config_store
-        return cs.get_openai_secret()
-
-    @app.post("/v1/config/openai", response_model=AppConfigPublic)
-    async def update_openai_config(body: OpenAIConfigUpdateIn, request: Request) -> AppConfigPublic:
-        verify_admin_token(request)
-        cs: ConfigStore = app.state.config_store
-        st: SupervisorState = app.state.state
-
-        out = cs.update_openai(body)
-        st.eventlog.append(
-            session_id="__system__",
-            component="supervisor",
-            type_="config_updated",
-            payload={
-                "provider": out.provider,
-                "openai": out.openai.model_dump(mode="json"),
-                "ts": _now().isoformat(),
-            },
-        )
-        return out
-
     @app.get("/v1/config/mimo-audio", response_model=MimoAudioConfigPublic)
     async def get_mimo_audio_config(request: Request) -> MimoAudioConfigPublic:
         verify_admin_token(request)
-        cs: ConfigStore = app.state.config_store
-        return cs.get_mimo_audio_public()
+        return app.state.config_store.get_mimo_audio_public()
 
     @app.get("/v1/config/mimo-audio/secret", response_model=MimoAudioConfigSecret)
     async def get_mimo_audio_config_secret(request: Request) -> MimoAudioConfigSecret:
         verify_admin_token(request)
-        cs: ConfigStore = app.state.config_store
-        return cs.get_mimo_audio_secret()
+        return app.state.config_store.get_mimo_audio_secret()
 
     @app.post("/v1/config/mimo-audio", response_model=MimoAudioConfigPublic)
     async def update_mimo_audio_config(body: MimoAudioConfigUpdateIn, request: Request) -> MimoAudioConfigPublic:
         verify_admin_token(request)
-        cs: ConfigStore = app.state.config_store
         st: SupervisorState = app.state.state
-        out = cs.update_mimo_audio(body)
-        st.eventlog.append(
-            session_id="__system__",
-            component="supervisor",
-            type_="config_updated",
-            payload={
-                "mimo_audio": out.model_dump(mode="json"),
-                "ts": _now().isoformat(),
-            },
-        )
+        out = app.state.config_store.update_mimo_audio(body)
+        st.eventlog.append(session_id="__system__", component="supervisor", type_="config_updated",
+                           payload={"mimo_audio": out.model_dump(mode="json"), "ts": _now().isoformat()})
         return out
 
     @app.post("/v1/config/reload", response_model=ConfigReloadOut)
@@ -499,99 +425,118 @@ def create_app(
         verify_admin_token(request)
         cs: ConfigStore = app.state.config_store
         st: SupervisorState = app.state.state
-
         cs.reload()
-        out = cs.get_public()
-        st.eventlog.append(
-            session_id="__system__",
-            component="supervisor",
-            type_="config_reloaded",
-            payload={"ts": _now().isoformat()},
-        )
-        return ConfigReloadOut(ok=True, config=out)
+        st.eventlog.append(session_id="__system__", component="supervisor", type_="config_reloaded",
+                           payload={"ts": _now().isoformat()})
+        return ConfigReloadOut(ok=True, config=cs.get_public())
 
     # ================================================================
-    #  Multi-provider config API
+    #  Channel schemes (data/config.yaml channels / active_channel / ...)
     # ================================================================
 
-    # [2026-06-07] Why: PUT/DELETE/set-active responses were missing the
-    # registered provider list, causing the frontend dropdown to disappear
-    # after any mutation. How: extract a helper that appends registered to
-    # every provider response. Purpose: the add-channel dropdown persists.
-    def _with_registered(result: dict[str, Any]) -> dict[str, Any]:
+    def _channels_out(result: dict[str, Any]) -> dict[str, Any]:
         from providers import registry as provider_registry
         result["registered"] = provider_registry.list()
         return result
 
-    @app.get("/v1/config/providers")
-    async def get_providers(request: Request) -> dict[str, Any]:
-        verify_admin_token(request)
-        cs: ConfigStore = app.state.config_store
-        return _with_registered(cs.get_providers_public())
+    def _config_call(fn: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return fn(*args, **kwargs)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
-    @app.put("/v1/config/providers/{name}")
-    async def upsert_provider(name: str, body: ProviderUpdateIn, request: Request) -> dict[str, Any]:
+    def _log_channel_change(what: str) -> None:
+        st: SupervisorState = app.state.state
+        st.eventlog.append(session_id="__system__", component="supervisor", type_="config_updated",
+                           payload={"channels": what, "ts": _now().isoformat()})
+
+    @app.get("/v1/config/channels")
+    async def get_channels(request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        return _channels_out(app.state.config_store.get_channels_public())
+
+    @app.put("/v1/config/channels/{channel_id}")
+    async def upsert_channel(channel_id: str, body: ChannelUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
         from providers import registry as provider_registry
-        if name not in provider_registry.list():
-            raise HTTPException(status_code=400, detail=f"Unknown provider '{name}'. Available: {provider_registry.list()}")
-        cs: ConfigStore = app.state.config_store
-        return _with_registered(cs.upsert_provider(name, base_url=body.base_url, api_key=body.api_key, model=body.model))
+        if body.type is not None and body.type.strip().lower() not in provider_registry.list():
+            raise HTTPException(status_code=400, detail=f"未知类型 '{body.type}'，可选：{provider_registry.list()}")
+        out = _config_call(app.state.config_store.upsert_channel, channel_id, **body.model_dump())
+        _log_channel_change(f"upsert {channel_id}")
+        return _channels_out(out)
 
-    @app.delete("/v1/config/providers/{name}")
-    async def delete_provider(name: str, request: Request) -> dict[str, Any]:
+    @app.delete("/v1/config/channels/{channel_id}")
+    async def delete_channel(channel_id: str, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
-        cs: ConfigStore = app.state.config_store
-        try:
-            return _with_registered(cs.delete_provider(name))
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        out = _config_call(app.state.config_store.delete_channel, channel_id)
+        _log_channel_change(f"delete {channel_id}")
+        return _channels_out(out)
 
-    @app.put("/v1/config/active-provider")
-    async def set_active_provider(body: ActiveProviderIn, request: Request) -> dict[str, Any]:
+    @app.put("/v1/config/active-channel")
+    async def set_active_channel(body: ActiveChannelIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
+        out = _config_call(app.state.config_store.set_active_channel, body.channel)
+        _log_channel_change(f"active {body.channel}")
+        return _channels_out(out)
+
+    @app.put("/v1/config/active-model")
+    async def set_active_model(body: ActiveModelIn, request: Request) -> dict[str, Any]:
+        """Change the model of the current scheme (used by !model / /切换模型)."""
+        verify_admin_token(request)
+        cid = _config_call(app.state.config_store.set_active_model, body.model)
+        _log_channel_change(f"model {cid} -> {body.model}")
+        return {"channel": cid, "model": body.model.strip()}
+
+    @app.post("/v1/config/channels/models")
+    async def pull_channel_models(body: ChannelModelsIn, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        import clonoth_model_list
         cs: ConfigStore = app.state.config_store
+        kind, base_url, api_key = body.type.strip().lower(), body.base_url.strip(), body.api_key.strip()
+        if body.channel:
+            saved = _config_call(cs.get_channel_secret, body.channel)
+            kind, base_url, api_key = kind or saved.type, base_url or saved.base_url, api_key or saved.api_key
+        else:
+            import clonoth_channels
+            base_url = clonoth_channels.resolve_ref(base_url, cs.root)
+            api_key = clonoth_channels.resolve_ref(api_key, cs.root)
         try:
-            return _with_registered(cs.set_active_provider(body.provider))
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            models = await clonoth_model_list.pull_models(kind, base_url, api_key)
+        except clonoth_model_list.ModelListError as e:
+            raise HTTPException(status_code=502, detail=e.message)
+        return {"type": kind, "models": models}
 
     @app.put("/v1/config/fallbacks")
     async def update_fallbacks(body: FallbacksUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
-        cs: ConfigStore = app.state.config_store
-        try:
-            return _with_registered(cs.update_fallbacks([e.model_dump() for e in body.fallbacks]))
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        out = _config_call(app.state.config_store.update_fallbacks, [e.model_dump() for e in body.fallbacks])
+        _log_channel_change("fallbacks")
+        return _channels_out(out)
 
     @app.put("/v1/config/model-vision")
     async def set_model_vision(body: ModelVisionIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
-        cs: ConfigStore = app.state.config_store
-        try:
-            return _with_registered(cs.set_model_vision(body.model, body.vision))
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-
-    def _check_system_model_slot(slot: str) -> None:
-        from clonoth_runtime import SYSTEM_MODEL_SLOT_NAMES
-        if slot not in SYSTEM_MODEL_SLOT_NAMES:
-            raise HTTPException(status_code=404, detail=f"Unknown system model slot '{slot}'")
-
-    @app.get("/v1/config/system-models/{slot}")
-    async def get_system_model(slot: str, request: Request) -> dict[str, Any]:
-        verify_admin_token(request)
-        _check_system_model_slot(slot)
-        return app.state.config_store.get_system_model_public(slot)
+        return _channels_out(_config_call(app.state.config_store.set_model_vision, body.model, body.vision))
 
     @app.put("/v1/config/system-models/{slot}")
-    async def update_system_model(slot: str, body: SystemModelUpdateIn, request: Request) -> dict[str, Any]:
+    async def update_system_model(slot: str, body: ChannelRefUpdateIn, request: Request) -> dict[str, Any]:
         verify_admin_token(request)
-        _check_system_model_slot(slot)
-        return app.state.config_store.update_system_model(
-            slot, provider=body.provider, model=body.model, base_url=body.base_url, api_key=body.api_key,
-        )
+        from clonoth_channels import SYSTEM_MODEL_SLOT_NAMES
+        if slot not in SYSTEM_MODEL_SLOT_NAMES:
+            raise HTTPException(status_code=404, detail=f"Unknown system model slot '{slot}'")
+        out = _config_call(app.state.config_store.update_system_model, slot, channel=body.channel, model=body.model)
+        _log_channel_change(f"slot {slot}")
+        return out
+
+    @app.put("/v1/config/node-models/{node_id}")
+    async def update_node_model(node_id: str, body: ChannelRefUpdateIn, request: Request) -> dict[str, Any]:
+        verify_admin_token(request)
+        node = load_node(Path(app.state.state.workspace_root), node_id)
+        if node is None or node.type != "ai":
+            raise HTTPException(status_code=404, detail=f"不是 AI 节点：{node_id}")
+        out = _config_call(app.state.config_store.update_node_model, node_id, channel=body.channel, model=body.model)
+        _log_channel_change(f"node {node_id}")
+        return out
 
     def _mimo_config() -> dict[str, str]:
         """读取 Mimo 语音服务配置。"""

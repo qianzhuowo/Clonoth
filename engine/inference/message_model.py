@@ -32,6 +32,8 @@ class MessageMeta:
     """
     # ── 通用字段 ──
     provider: str = ""              # 生成该消息的 provider (claude/gemini/openai)
+    channel: str = ""               # 生成该消息的渠道方案 id（回放时判断签名/思维内容能否原样带回）
+    model: str = ""                 # 生成该消息的模型
     # [2026-05-01] 默认工具模式改为 fake-native。
     # 原因：历史上的 native 实际是文本化 fake-native；无标记旧消息必须按旧格式读取。
     tool_mode: str = "fake-native"  # fake-native / native / json — 该消息使用的工具调用格式
@@ -91,6 +93,10 @@ class MessageMeta:
         d: dict[str, Any] = {}
         if self.provider:
             d["provider"] = self.provider
+        if self.channel:
+            d["channel"] = self.channel
+        if self.model:
+            d["model"] = self.model
         # [2026-05-01] 只省略 fake-native 默认值；真 native 必须显式写入，
         # 目的：下一轮 build_llm_messages 能把真 native 历史路由到 NativeToolFormatter。
         if self.tool_mode and self.tool_mode != "fake-native":
@@ -160,6 +166,8 @@ class MessageMeta:
 
         return cls(
             provider=str(data.get("provider") or ""),
+            channel=str(data.get("channel") or ""),
+            model=str(data.get("model") or ""),
             tool_mode=str(data.get("tool_mode") or "fake-native"),
             message_type=str(data.get("message_type") or ""),
             timestamp=str(data.get("timestamp") or ""),

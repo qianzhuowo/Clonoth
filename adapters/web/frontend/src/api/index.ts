@@ -20,8 +20,6 @@ export {
   // beside the existing admin config helpers. Purpose: future settings code does
   // not need to couple directly to supervisorClient.ts for this endpoint.
   getAllToolNames,
-  getModelConfig,
-  updateModelConfig,
   decideApproval,
   cancelActiveTasks,
   // [2026-06-06] Why: the chat context popover may import through the API barrel in

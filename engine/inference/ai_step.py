@@ -306,8 +306,11 @@ async def _handle_tool_calls_inner(ls: _LoopState, resp, step: int) -> TaskActio
     # [fix 2026-04-18] provider 名称改为动态获取，不再硬编码 "openai"。
     # ls.provider.name 由 BaseProvider.name 提供，各 provider 子类在初始化时传入。
     _provider_name = (getattr(ls.rctx, 'response_info', {}) or {}).get('provider') or getattr(ls.provider, 'name', '') or 'unknown'
+    _resp_info = getattr(ls.rctx, 'response_info', {}) or {}
     _tc_meta = MessageMeta(
         provider=_provider_name,
+        channel=_resp_info.get('channel') or getattr(ls.provider, 'channel_id', '') or '',
+        model=_resp_info.get('model') or getattr(ls.provider, 'model', '') or '',
         tool_mode=getattr(ls.node, 'tool_mode', 'fake-native'),
         message_type="assistant",
         timestamp=datetime.now(timezone.utc).isoformat(),
@@ -1353,6 +1356,7 @@ async def run_ai_node(
         ls.rctx.response_info = {
             "provider": _p_meta.get("_fallback_provider") or getattr(_usage_ctx.provider, "name", "") or _p_meta.get("provider") or "unknown",
             "model": _p_meta.get("_fallback_model") or getattr(_usage_ctx.provider, "model", "") or _p_meta.get("model") or "",
+            "channel": _p_meta.get("_fallback_channel") or getattr(_usage_ctx.provider, "channel_id", "") or "",
             "notices": list(_usage_result.channels.get("response_notices") or []),
             "usage": dict(resp.usage or {}),
         }

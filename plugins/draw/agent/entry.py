@@ -1,6 +1,6 @@
 """绘图 agent 入口：before_prompt_build 钩子接管 draw.novelai_planner。
 
-流程：装配材料（已录入角色 / 绘图请求 / 近期对话）→ 按布局组装规划消息链 →
+流程：装配材料（已录入角色 / 绘图请求）→ 按布局组装规划消息链 →
 PlannerRuntime 跑模型直到拿到合法的 submit_scene_plan → 逐张编译 NovelAI 请求并生成 →
 每张完成即经 Supervisor 直发给用户（async_tool_result 快通道）→ 返回 finish。
 引擎常规循环不再参与：provider 只由运行时调用，历史由这里影子写入 ConversationStore。
@@ -62,20 +62,6 @@ def _text_of(content: Any) -> str:
     if isinstance(content, list):
         return " ".join(str(c.get("text", "")) for c in content if isinstance(c, dict) and c.get("type", "text") == "text")
     return str(content or "")
-
-
-def build_recent_dialogue(history: Any, turns: int) -> str:
-    """最近 turns 条 user/assistant 文本消息，去掉工具消息与空内容。"""
-    if not isinstance(history, list) or turns <= 0:
-        return ""
-    lines: list[str] = []
-    for msg in history:
-        if not isinstance(msg, dict) or msg.get("role") not in {"user", "assistant"}:
-            continue
-        text = _text_of(msg.get("content")).strip()
-        if text and not msg.get("tool_calls"):
-            lines.append(f"{'用户' if msg['role'] == 'user' else '助手'}: {text}")
-    return "\n".join(lines[-turns:])
 
 
 def match_present_characters(characters: list[dict[str, Any]], instruction: str, history: Any) -> list[dict[str, Any]]:
@@ -259,14 +245,16 @@ class DrawAgentEntry:
         return _finish(node_id, text, attachments)
 
     def _planner_provider(self, ctx: Any, cfg: PlannerConfig) -> Any:
-        """规划用的模型调用对象：场景 Agent 预设填了 Model 和 API Key 就按预设创建，否则用节点自身的。"""
+        """规划用的模型调用对象：场景 Agent 预设选了渠道方案就按方案创建，否则用节点自身的。"""
         agent_preset = cfg.agent_preset
         if not llm.preset_is_configured(agent_preset):
             return ctx.provider
         rctx = ctx.rctx
         http = getattr(rctx, "llm_http", None) or getattr(rctx, "http", None)
         try:
-            return llm.create_provider(agent_preset, http=http)
+            provider = llm.create_provider(llm.resolve_preset(agent_preset, rctx.workspace_root), http=http)
+            provider.channel_id = agent_preset["channel"]
+            return provider
         except Exception as error:  # noqa: BLE001
             raise ScenePlannerError(
                 f"场景 Agent 预设「{agent_preset.get('name')}」无法使用：{error}", "AGENT_PRESET_INVALID") from error
@@ -317,7 +305,6 @@ class DrawAgentEntry:
             "content": build_content_block(
                 planner.get("content_template"), character_info=build_character_info(present),
                 draw_request=instruction,
-                recent_dialogue=build_recent_dialogue(history, int(planner.get("recent_dialogue_turns") or 0)),
             ),
             "guide": build_guide_section(cfg.texts.get("guide", ""), cfg.profile),
             "rules": build_rules_section(cfg.texts.get("rules", "")),

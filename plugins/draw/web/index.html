@@ -80,7 +80,6 @@
           <label class="f">max_attempts（纠错轮次）<input type="number" id="a-attempts" min="1" max="10"></label>
           <label class="f">max_custom_tool_calls<input type="number" id="a-custom" min="0" max="20"></label>
           <label class="f">max_plan_images（硬上限）<input type="number" id="a-maximg" min="1" max="16"></label>
-          <label class="f">recent_dialogue_turns<input type="number" id="a-turns" min="0" max="40"></label>
           <label class="f row"><input type="checkbox" id="a-sendeach"> 每张完成即发送</label>
         </div>
       </div>
@@ -118,12 +117,9 @@
           <div class="form">
             <label class="f">名称<input type="text" id="ag-name" maxlength="64"></label>
             <label class="f row"><input type="checkbox" id="ag-current"> 设为当前使用</label>
-            <label class="f">Provider<select id="ag-provider"></select></label>
-            <label class="f">Base URL<input type="text" id="ag-base"></label>
-            <div class="f">API Key（不回显，留空不改）<div class="inline"><input type="password" id="ag-key" autocomplete="new-password"><button class="op small danger" id="ag-key-clear" type="button">清空</button></div></div>
-            <div class="f">Model<div class="inline"><input type="text" id="ag-model"><button class="op small" id="ag-pull" type="button">拉取模型</button></div><select id="ag-pulled" style="display:none"></select><span class="hint" id="ag-pull-state"></span></div>
-            <label class="f" id="ag-auth-wrap">模型列表鉴权（只影响“拉取模型”）<select id="ag-auth"></select></label>
-            <label class="f">最大输出 Token（0 = 接口默认）<input type="number" id="ag-maxtok" min="0" step="1"></label>
+            <label class="f">渠道方案（在主设置 → 模型 里管理）<select id="ag-channel"></select></label>
+<div class="f">Model（留空用方案的模型）<div class="inline"><input type="text" id="ag-model"><button class="op small" id="ag-pull" type="button">拉取模型</button></div><select id="ag-pulled" style="display:none"></select><span class="hint" id="ag-pull-state"></span></div>
+<label class="f">最大输出 Token（0 = 接口默认）<input type="number" id="ag-maxtok" min="0" step="1"></label>
             <label class="f">单次请求超时（秒，0 = 不限）<input type="number" id="ag-timeout" min="0" max="3600" step="1"></label>
             <label class="f">工具调用格式<select id="ag-tool"><option value="native">原生 Tool Calling</option><option value="text">文本协议（&lt;&lt;&lt;TOOL_CALL&gt;&gt;&gt; JSON 块）</option></select></label>
             <label class="f">Reasoning<select id="ag-rmode"><option value="inherit">跟随模型默认</option><option value="on">开启</option><option value="off">关闭</option></select></label>
@@ -272,7 +268,7 @@
 
     <!-- 提示词模板 -->
     <section class="view" id="view-prompts">
-      <div class="head"><h2>提示词模板</h2><span class="hint">开场、TAG 指南、场景规则在“请求结构”里对应的行上编辑；content 模板必须含 {{characterInfo}} {{drawRequest}} {{recentDialogue}}。</span></div>
+      <div class="head"><h2>提示词模板</h2><span class="hint">开场、TAG 指南、场景规则在“请求结构”里对应的行上编辑；content 模板必须含 {{characterInfo}} {{drawRequest}}。</span></div>
       <div class="tabs" id="pr-tabs">
         <button data-key="layout" class="active">请求结构</button>
         <button data-key="content">content 模板</button>

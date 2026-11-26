@@ -23,6 +23,9 @@ from typing import Any, Iterator, Mapping
 
 import yaml
 
+import clonoth_channels as chn
+import clonoth_model_list
+
 from . import characters as character_rules
 from . import presets as preset_rules
 from .agent import llm
@@ -142,8 +145,6 @@ def get_settings_view(root: Path) -> dict[str, Any]:
     configured = bool(resolve_api_key(merged, Path(root)))
     out = {k: (_mask(v) if k == "api" else v) for k, v in merged.items()}
     out["api"] = _mask(api)
-    # agent 段里有规划模型的 key：这里只给脱敏后的预设，完整视图走 get_agent_view。
-    out["agent"] = {**merged["agent"], "presets": [_agent_preset_view(p) for p in merged["agent"]["presets"]]}
     out["api_key_configured"] = configured
     out["is_private"] = raw_private
     return out
@@ -168,6 +169,7 @@ def update_settings(root: Path, patch: Mapping[str, Any]) -> dict[str, Any]:
                 continue
             current[key] = value
         if section == "planner":
+            current.pop("recent_dialogue_turns", None)  # 已废弃，保存时从文件里去掉
             if "content_template" in current:
                 template = str(current.get("content_template") or "")
                 if template.strip():
@@ -193,41 +195,41 @@ def update_settings(root: Path, patch: Mapping[str, Any]) -> dict[str, Any]:
 
 # ---- scene agent (planner model) ----
 
-def _agent_preset_view(preset: Mapping[str, Any]) -> dict[str, Any]:
-    out = dict(preset)
-    out["api_key_configured"] = bool(str(out.get("api_key") or "").strip())
-    out["api_key"] = ""
-    return out
+def _channel_choices(root: Path) -> list[dict[str, str]]:
+    cfg = chn.load_config(root)
+    return [{"id": str(c["id"]), "name": str(c.get("name") or c["id"]), "type": str(c.get("type") or ""),
+             "model": str(c.get("model") or "")} for c in chn.channel_list(cfg)]
 
 
 def get_agent_view(root: Path) -> dict[str, Any]:
-    """场景 Agent 页的数据：预设（key 不回显）、可选的供应商、当前生效的是预设还是节点自身配置。"""
+    """场景 Agent 页的数据：预设、可选的渠道方案、当前生效的是预设还是节点自身的渠道。"""
     root = Path(root)
     agent = load_draw_settings(root)["agent"]
     current = llm.current_preset(agent)
-    missing = [label for label, value in (("Model", current["model"]), ("API Key", current["api_key"])) if not value]
+    channels = _channel_choices(root)
+    known = {c["id"] for c in channels}
+    if not current["channel"]:
+        effective = {"source": "node", "reason": "未选择渠道方案"}
+    elif current["channel"] not in known:
+        effective = {"source": "node", "reason": f"渠道方案「{current['channel']}」不存在"}
+    else:
+        effective = {"source": "preset"}
     return {
         "current_preset_id": agent["current_preset_id"],
-        "presets": [_agent_preset_view(p) for p in agent["presets"]],
+        "presets": agent["presets"],
         "planner_max_retries": agent["planner_max_retries"],
+        "channels": channels,
         "providers": llm.list_providers(),
         "reasoning_efforts": [e for e in llm.REASONING_EFFORTS if e],
-        "effective": {"source": "node" if missing else "preset", "missing": missing},
+        "effective": effective,
         "is_private": _private_path(root, "settings.yaml").is_file(),
     }
-
-
-def _saved_agent_key(saved: Mapping[str, Mapping[str, Any]], item: Mapping[str, Any]) -> str:
-    """预设没带 key 时沿用已保存的：先按自身 id 找，新建的预设按 copy_key_from 找来源。"""
-    source = saved.get(str(item.get("id") or "")) or saved.get(str(item.get("copy_key_from") or ""))
-    return str(source.get("api_key") or "") if source else ""
 
 
 def save_agent(root: Path, patch: Mapping[str, Any]) -> dict[str, Any]:
     """写入 agent 段。patch 里出现的键才改：presets（整表）、current_preset_id、planner_max_retries。"""
     root = Path(root)
     agent = load_draw_settings(root)["agent"]
-    saved = {p["id"]: p for p in agent["presets"]}
     presets = agent["presets"]
     if "presets" in patch:
         incoming = patch.get("presets")
@@ -235,7 +237,7 @@ def save_agent(root: Path, patch: Mapping[str, Any]) -> dict[str, Any]:
             raise AdminError("至少要保留一套预设")
         if len(incoming) > llm.MAX_PRESETS:
             raise AdminError(f"预设最多 {llm.MAX_PRESETS} 套")
-        known = set(llm.provider_names())
+        known = {c["id"] for c in _channel_choices(root)}
         ids: set[str] = set()
         names: set[str] = set()
         presets = []
@@ -257,10 +259,8 @@ def save_agent(root: Path, patch: Mapping[str, Any]) -> dict[str, Any]:
             if preset_id in ids:
                 raise AdminError(f"预设 id 重复：{preset_id}")
             preset = llm.normalize_preset(item)
-            if preset["provider"] not in known:
-                raise AdminError(f"未知的 Provider：{preset['provider']}")
-            if not preset["api_key"]:
-                preset["api_key"] = "" if item.get("clear_api_key") else _saved_agent_key(saved, item)
+            if preset["channel"] and preset["channel"] not in known:
+                raise AdminError(f"渠道方案不存在：{preset['channel']}")
             ids.add(preset_id)
             names.add(name)
             presets.append(preset)
@@ -286,24 +286,26 @@ def save_agent(root: Path, patch: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _agent_draft(root: Path, body: Mapping[str, Any]) -> dict[str, Any]:
-    """“拉取模型 / 测试连接”用的是页面上还没保存的表单：没带 key 就补上已保存的那一个。"""
+    """“拉取模型 / 测试连接”用页面上还没保存的表单，渠道参数取自所选方案。"""
     item = body.get("preset")
     if not isinstance(item, Mapping):
         raise AdminError("缺少 preset")
     preset = llm.normalize_preset(item)
-    if not preset["api_key"] and not item.get("clear_api_key"):
-        saved = {p["id"]: p for p in load_draw_settings(Path(root))["agent"]["presets"]}
-        preset["api_key"] = _saved_agent_key(saved, item)
-    return preset
+    if not preset["channel"]:
+        raise AdminError("先选择一个渠道方案")
+    try:
+        return llm.resolve_preset(preset, root)
+    except ValueError as error:
+        raise AdminError(str(error))
 
 
 async def pull_agent_models(root: Path, body: Mapping[str, Any]) -> dict[str, Any]:
     preset = _agent_draft(root, body)
     try:
-        models = await llm.pull_models(preset)
-    except llm.ModelListError as error:
+        models = await clonoth_model_list.pull_models(preset["provider"], preset["base_url"], preset["api_key"])
+    except clonoth_model_list.ModelListError as error:
         raise AdminError(error.message, status=502, details={"status_code": error.status})
-    return {"provider": preset["provider"], "models": models}
+    return {"channel": preset["channel"], "models": models}
 
 
 async def check_agent_connection(root: Path, body: Mapping[str, Any]) -> dict[str, Any]:
@@ -562,8 +564,7 @@ def preview_chain(root: Path, *, layout: Any = None, texts_override: Mapping[str
     texts = {
         "opening": opening,
         "frame": build_frame_text(cfg.profile),
-        "content": build_content_block(content_tpl, character_info="", draw_request="{{drawRequest}}",
-                                       recent_dialogue="{{recentDialogue}}"),
+        "content": build_content_block(content_tpl, character_info="", draw_request="{{drawRequest}}"),
         "guide": build_guide_section(guide, cfg.profile),
         "rules": build_rules_section(rules),
         "limits": build_limits_line(cfg.preset.get("max_images", 0), max_chars, planner.get("max_plan_images", 0)),

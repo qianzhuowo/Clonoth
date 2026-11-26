@@ -3,7 +3,7 @@
 // Guides the user through configuring their first LLM provider.
 import { useState } from 'react';
 
-import { getAppConfig, setActiveProvider, upsertProvider } from '../../api/supervisorClient';
+import { getAppConfig, setActiveChannel, upsertChannel } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
 import { Button } from '../common';
 
@@ -37,7 +37,7 @@ const PRESETS: Record<string, { label: string; base_url: string; model: string; 
 };
 
 export const SetupWizard = () => {
-  const { adminToken, setGlobalConfig } = useSettingsStore();
+  const { adminToken, setChannelConfig } = useSettingsStore();
   const [step, setStep] = useState<Step>('provider');
   const [providerKey, setProviderKey] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
@@ -67,19 +67,18 @@ export const SetupWizard = () => {
     setSaving(true);
     setError('');
     try {
-      await upsertProvider(adminToken, name, {
+      // The scheme id is the name with unsupported characters replaced; custom endpoints speak OpenAI format.
+      const id = name.replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/^-+|-+$/g, '') || 'main';
+      await upsertChannel(adminToken, id, {
+        name,
+        type: providerKey === 'custom' ? 'openai' : providerKey,
         base_url: baseUrl.trim(),
         api_key: apiKey.trim(),
         model: model.trim(),
       });
-      await setActiveProvider(adminToken, name);
-      // Refresh global config so the app picks up the new provider
+      await setActiveChannel(adminToken, id);
       const config = await getAppConfig();
-      setGlobalConfig(
-        config.openai?.model || '',
-        config.openai?.base_url || '',
-        config.provider_models || {},
-      );
+      setChannelConfig(config.active_channel, config.channels || []);
       setStep('done');
     } catch (err) {
       setError(err instanceof Error ? err.message : '保存失败');

@@ -13,8 +13,8 @@ SDK 是纯协议层，不包含任何平台（Discord / Telegram 等）相关逻
   POST   /v1/tasks/{id}/preempt               ← _handle_agent_inner() Preempt V2
   GET    /v1/sessions/{id}/running_tasks      ← _handle_agent_inner() preempt 目标查找
   GET    /v1/health                           ← 健康检查
-  GET    /v1/config/openai                    ← !model show
-  POST   /v1/config/openai                    ← !model set/key/url
+  GET    /v1/config                           ← !model show（当前渠道方案与模型）
+  PUT    /v1/config/active-model              ← !model set（改当前方案的模型）
   POST   /v1/admin/restart                    ← 重启流程
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ from typing import Any, AsyncGenerator
 
 import httpx
 
-from .types import Event, HealthInfo, InboundResult, OpenAIConfig, RunningTask
+from .types import ActiveModel, Event, HealthInfo, InboundResult, RunningTask
 
 
 class ClonothClient:
@@ -437,47 +437,22 @@ class ClonothClient:
             workspace_root=str(d.get("workspace_root", "")),
         )
 
-    async def get_openai_config(self) -> OpenAIConfig:
-        """查询当前 OpenAI 兼容 API 配置（公开信息）。
-
-        对应 GET /v1/config/openai。
-        提取自 bot_adapter.py !model show 命令。
-
-        Raises:
-            httpx.HTTPStatusError: 请求失败时抛出
-        """
-        resp = await self._http().get(f"{self._base_url}/v1/config/openai")
+    async def get_active_model(self) -> ActiveModel:
+        """当前渠道方案及其模型（GET /v1/config）。"""
+        resp = await self._http().get(f"{self._base_url}/v1/config")
         resp.raise_for_status()
         d = resp.json()
-        return OpenAIConfig(
-            base_url=d.get("base_url", ""),
-            model=d.get("model", ""),
-            api_key_present=bool(d.get("api_key_present", False)),
-            api_key=d.get("api_key", ""),
-        )
+        names = {c.get("id"): c.get("name") for c in d.get("channels") or [] if isinstance(c, dict)}
+        cid = str(d.get("active_channel") or "")
+        return ActiveModel(channel=cid, channel_name=str(names.get(cid) or cid), model=str(d.get("active_model") or ""))
 
-    async def update_openai_config(
-        self, **kwargs: Any,
-    ) -> dict[str, Any]:
-        """更新 OpenAI 兼容 API 配置。
-
-        对应 POST /v1/config/openai。
-        提取自 bot_adapter.py !model set/key/url 命令。
-
-        Args:
-            **kwargs: 要更新的字段，可选 model, base_url, api_key
-
-        Returns:
-            更新后的完整配置 dict（AppConfigPublic 格式）
-
-        Raises:
-            httpx.HTTPStatusError: 请求失败时抛出
-        """
-        resp = await self._http().post(
-            f"{self._base_url}/v1/config/openai", json=kwargs,
-        )
+    async def set_active_model(self, model: str) -> ActiveModel:
+        """修改当前渠道方案的模型（PUT /v1/config/active-model，需要 admin token）。"""
+        resp = await self._http().put(f"{self._base_url}/v1/config/active-model", json={"model": model})
         resp.raise_for_status()
-        return resp.json()
+        d = resp.json()
+        return ActiveModel(channel=str(d.get("channel") or ""), channel_name=str(d.get("channel") or ""),
+                           model=str(d.get("model") or ""))
 
     async def reset_conversation(self, conversation_key: str) -> dict[str, Any]:
         """清空会话上下文：下一条消息将开启新 session。

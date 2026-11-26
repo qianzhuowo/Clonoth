@@ -654,49 +654,59 @@ export function updateConfigRaw(token: string, yaml: string): Promise<any> {
   return writeRawConfig('/admin/config/config/raw', token, yaml);
 }
 
-// ── Multi-provider config ──
+// ── Channel schemes (data/config.yaml channels / active_channel) ──
 
-export interface ProviderConfigPublic {
+export interface ChannelPublic {
+  id: string;
+  name: string;
+  type: string;
   base_url: string;
+  base_url_resolved: string;
   model: string;
   api_key_present: boolean;
   api_key_redacted: string;
   vision: boolean;
+  /** Non-empty when the address format does not fit the chosen type. */
+  type_hint: string;
 }
 
 export interface FallbackEntryPublic {
-  provider: string;
+  channel: string;
+  /** Model override; empty = the scheme's own model. */
   model: string;
-  base_url: string;
-  api_key_present: boolean;
-  api_key_redacted: string;
+  effective_model: string;
+  missing: boolean;
   vision: boolean;
 }
 
 export interface FallbackEntryUpdate {
-  provider: string;
+  channel: string;
   model: string;
-  base_url: string;
-  api_key: string;
-  clear_api_key?: boolean;
   source_index: number | null;
 }
 
-export interface ProvidersResponse {
-  active_provider: string;
-  providers: Record<string, ProviderConfigPublic>;
+export interface ChannelRef {
+  channel: string;
+  model: string;
+}
+
+export interface ChannelsResponse {
+  active_channel: string;
+  channels: ChannelPublic[];
   fallbacks: FallbackEntryPublic[];
+  system_models: Record<string, ChannelRef>;
+  node_models: Record<string, ChannelRef>;
   model_capabilities: Record<string, { vision?: boolean }>;
   registered: string[];
 }
 
-export interface SystemModelPublic {
-  slot: string;
-  provider: string;
-  model: string;
-  base_url: string;
-  api_key_present: boolean;
-  api_key_redacted: string;
+export interface ChannelUpdate {
+  name?: string;
+  type?: string;
+  base_url?: string;
+  api_key?: string;
+  model?: string;
+  clear_api_key?: boolean;
 }
 
 export interface MimoAudioConfigPublic {
@@ -742,77 +752,60 @@ export async function updateMimoAudioConfig(token: string, data: MimoAudioConfig
   return resp.json();
 }
 
-export async function getProviders(token: string): Promise<ProvidersResponse> {
-  const resp = await apiFetch('/config/providers', { headers: authHeaders(token) });
+const jsonInit = (token: string, method: string, body?: unknown): RequestInit => ({
+  method,
+  headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
+  ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+});
+
+export async function getChannels(token: string): Promise<ChannelsResponse> {
+  const resp = await apiFetch('/config/channels', { headers: authHeaders(token) });
   return resp.json();
 }
 
-export async function upsertProvider(
+export async function upsertChannel(token: string, id: string, data: ChannelUpdate): Promise<ChannelsResponse> {
+  const resp = await apiFetch(`/config/channels/${encodeURIComponent(id)}`, jsonInit(token, 'PUT', data));
+  return resp.json();
+}
+
+export async function deleteChannel(token: string, id: string): Promise<ChannelsResponse> {
+  const resp = await apiFetch(`/config/channels/${encodeURIComponent(id)}`, { method: 'DELETE', headers: authHeaders(token) });
+  return resp.json();
+}
+
+export async function setActiveChannel(token: string, channel: string): Promise<ChannelsResponse> {
+  const resp = await apiFetch('/config/active-channel', jsonInit(token, 'PUT', { channel }));
+  return resp.json();
+}
+
+/** Pull the model list: a saved scheme by id, or draft type/base_url/api_key (empty key = the scheme's). */
+export async function pullChannelModels(
   token: string,
-  name: string,
-  data: { base_url?: string; api_key?: string; model?: string },
-): Promise<ProvidersResponse> {
-  const resp = await apiFetch(`/config/providers/${encodeURIComponent(name)}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(data),
-  });
+  data: { channel?: string; type?: string; base_url?: string; api_key?: string },
+): Promise<{ type: string; models: string[] }> {
+  const resp = await apiFetch('/config/channels/models', jsonInit(token, 'POST', data));
   return resp.json();
 }
 
-export async function deleteProvider(token: string, name: string): Promise<ProvidersResponse> {
-  const resp = await apiFetch(`/config/providers/${encodeURIComponent(name)}`, {
-    method: 'DELETE',
-    headers: authHeaders(token),
-  });
+export async function updateFallbacks(token: string, fallbacks: FallbackEntryUpdate[]): Promise<ChannelsResponse> {
+  const resp = await apiFetch('/config/fallbacks', jsonInit(token, 'PUT', { fallbacks }));
   return resp.json();
 }
 
-export async function setActiveProvider(token: string, provider: string): Promise<ProvidersResponse> {
-  const resp = await apiFetch('/config/active-provider', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ provider }),
-  });
+export async function setModelVision(token: string, model: string, vision: boolean): Promise<ChannelsResponse> {
+  const resp = await apiFetch('/config/model-vision', jsonInit(token, 'PUT', { model, vision }));
   return resp.json();
 }
 
-export async function updateFallbacks(
-  token: string,
-  fallbacks: FallbackEntryUpdate[],
-): Promise<ProvidersResponse> {
-  const resp = await apiFetch('/config/fallbacks', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ fallbacks }),
-  });
+/** system_models.<slot>: undefined keeps a field, empty string clears it (empty slot = current scheme). */
+export async function updateSystemModel(token: string, slot: string, data: Partial<ChannelRef>): Promise<ChannelRef> {
+  const resp = await apiFetch(`/config/system-models/${encodeURIComponent(slot)}`, jsonInit(token, 'PUT', data));
   return resp.json();
 }
 
-export async function setModelVision(token: string, model: string, vision: boolean): Promise<ProvidersResponse> {
-  const resp = await apiFetch('/config/model-vision', {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify({ model, vision }),
-  });
-  return resp.json();
-}
-
-export async function getSystemModel(token: string, slot: string): Promise<SystemModelPublic> {
-  const resp = await apiFetch(`/config/system-models/${encodeURIComponent(slot)}`, { headers: authHeaders(token) });
-  return resp.json();
-}
-
-export async function updateSystemModel(
-  token: string,
-  slot: string,
-  data: { provider?: string; model?: string; base_url?: string; api_key?: string },
-): Promise<SystemModelPublic> {
-  const resp = await apiFetch(`/config/system-models/${encodeURIComponent(slot)}`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(data),
-  });
+/** node_models.<node_id>: same rules as system slots. */
+export async function updateNodeModel(token: string, nodeId: string, data: Partial<ChannelRef>): Promise<ChannelRef> {
+  const resp = await apiFetch(`/config/node-models/${encodeURIComponent(nodeId)}`, jsonInit(token, 'PUT', data));
   return resp.json();
 }
 
@@ -936,30 +929,6 @@ export async function getAllToolNames(token: string): Promise<string[]> {
   // client settings page can show recommended tools plus every other tool returned
   // by the running server, while failed auth still falls back in the UI.
   const resp = await apiFetch('/admin/config/all-tool-names', { headers: authHeaders(token) });
-  return resp.json();
-}
-
-// ── Model config ──
-
-export async function getModelConfig(token: string): Promise<{
-  model: string;
-  base_url: string;
-  api_key_present: boolean;
-  api_key?: string;
-}> {
-  const resp = await apiFetch('/config/openai/secret', { headers: authHeaders(token) });
-  return resp.json();
-}
-
-export async function updateModelConfig(
-  token: string,
-  params: { model?: string; base_url?: string; api_key?: string },
-): Promise<any> {
-  const resp = await apiFetch('/config/openai', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders(token) },
-    body: JSON.stringify(params),
-  });
   return resp.json();
 }
 
@@ -1152,8 +1121,7 @@ export interface ActiveNodeResponse {
   effective_provider?: string;
   effective_model?: string;
   effective_base_url?: string;
-  node_provider?: string;
-  node_model?: string;
+  effective_channel?: string;
 }
 
 export async function getActiveNode(sessionId: string): Promise<ActiveNodeResponse> {
@@ -1172,15 +1140,21 @@ export async function switchNode(sessionId: string, targetNodeId: string): Promi
 
 // ── App config (public, no auth needed) ──
 
+export interface ChannelSummary {
+  id: string;
+  name: string;
+  type: string;
+  model: string;
+}
+
 export interface AppConfigPublic {
   version?: number;
-  provider: string;
-  openai: { model: string; base_url: string; api_key_present?: boolean; api_key?: string };
+  active_channel: string;
+  active_model: string;
+  channels: ChannelSummary[];
   entry_node_id?: string;
   default_entry_node_id?: string;
   shell?: { entry_node_id?: string };
-  // [2026-06-07] Provider name → default model mapping for all configured providers.
-  provider_models?: Record<string, string>;
 }
 
 export async function getConfig(): Promise<AppConfigPublic> {

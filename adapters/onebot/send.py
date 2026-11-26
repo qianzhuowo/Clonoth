@@ -30,6 +30,8 @@ from nonebot.adapters.onebot.v11 import MessageSegment
 from nonebot.adapters.onebot.v11.exception import ActionFailed
 from pathlib import Path
 from typing import Any
+
+FAIL_NOTICE_TEXT = "出错了，这次没能回复，请稍后再试。"
 from typing import Dict
 from typing import List
 from typing import Optional
@@ -1571,6 +1573,11 @@ async def _send_text_and_attachments(
 ) -> None:
     """统一发送最终文本/TTS 语音/附件，并持久绑定回复所依据的来源图片。"""
     conv_key = target.get("conversation_key")
+    # 任务失败：群里只发一句简短提示（原始报错只留在网页与日志），且不写入群历史，
+    # 避免报错文字作为 Bot 发言进入后续上下文。
+    failed = send_context is not None and send_context.action_type == "fail"
+    if failed:
+        text = FAIL_NOTICE_TEXT
     text, voice_segments = voice.voice_plan(text or "", target, input_modality)
     # 2026-05-01 修改原因：私聊没有群历史缓存，不应写入 _group_history；群聊
     # 仍保留原来的 Bot 回复入库逻辑，维持后续 @Bot 请求的上下文连续性。
@@ -1581,7 +1588,7 @@ async def _send_text_and_attachments(
             text,
             source_attachments=source_attachments,
             send_context=send_context,
-        ) and target.get("type") == "group":
+        ) and target.get("type") == "group" and not failed:
             group_id = target.get("group_id")
             if group_id is not None:
                 history._record_bot_reply(int(group_id), text)

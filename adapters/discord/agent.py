@@ -643,12 +643,11 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
 
     if sub == "show":
         try:
-            cfg = await rt.clonoth_client.get_openai_config()
+            cur = await rt.clonoth_client.get_active_model()
             lines = [
-                "🤖 **Global Config**",
-                f"Model: `{cfg.model}`",
-                f"Base URL: `{cfg.base_url}`",
-                f"API Key: {'✅ ' + cfg.api_key if cfg.api_key_present else '❌ not set'}",
+                "🤖 **Current channel scheme**",
+                f"Scheme: `{cur.channel_name or '(none)'}`",
+                f"Model: `{cur.model or '(not set)'}`",
             ]
             if session_id:
                 try:
@@ -677,17 +676,15 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
                         lines.append(f"Model: `{_an.get('effective_model', '?')}`")
                         if _an.get('effective_base_url'):
                             lines.append(f"Base URL: `{_an.get('effective_base_url')}`")
-                        if _an.get('node_provider'):
-                            lines.append(f"Node provider: `{_an.get('node_provider')}`")
-                        if _an.get('node_model'):
-                            lines.append(f"Node model: `{_an.get('node_model')}`")
+                        if _an.get('effective_channel'):
+                            lines.append(f"Scheme: `{_an.get('effective_channel')}`")
                 except Exception:
                     pass
-            # Fallback chain from /config/providers
+            # Fallback chain from /config/channels
             try:
                 _http = rt.clonoth_client._http()
                 _base = rt.clonoth_client._base_url
-                _prov_resp = await _http.get(f"{_base}/v1/config/providers")
+                _prov_resp = await _http.get(f"{_base}/v1/config/channels")
                 if _prov_resp.status_code == 200:
                     _prov = _prov_resp.json()
                     _fbs = _prov.get("fallbacks", [])
@@ -695,7 +692,7 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
                         lines.append("")
                         lines.append("🔄 **Fallback chain**")
                         for _i, _fb in enumerate(_fbs):
-                            _fb_label = _fb.get("provider", "") or _fb.get("model", "") or str(_fb)
+                            _fb_label = " / ".join(x for x in (_fb.get("channel", ""), _fb.get("model", "")) if x) or str(_fb)
                             lines.append(f"{_i + 1}. `{_fb_label}`")
             except Exception:
                 pass
@@ -711,9 +708,8 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
         model_name = parts[2].strip()
         try:
             if is_global:
-                resp = await rt.clonoth_client.update_openai_config(model=model_name)
-                actual = resp.get("openai", {}).get("model", model_name)
-                await message.reply(f"✅ **Global** model → `{actual}`", mention_author=False)
+                out = await rt.clonoth_client.set_active_model(model_name)
+                await message.reply(f"✅ **{out.channel}** model → `{out.model}`", mention_author=False)
             elif session_id:
                 ov = await rt.clonoth_client.get_session_provider_override(session_id)
                 current = ov.get("provider_override", {})
@@ -733,8 +729,7 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
         api_key = parts[2].strip()
         try:
             if is_global:
-                await rt.clonoth_client.update_openai_config(api_key=api_key)
-                await message.reply("✅ **Global** API key updated", mention_author=False)
+                await message.reply("⚠️ Edit the channel scheme's API key in the web settings.", mention_author=False)
             elif session_id:
                 ov = await rt.clonoth_client.get_session_provider_override(session_id)
                 current = ov.get("provider_override", {})
@@ -754,9 +749,7 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
         base_url = parts[2].strip()
         try:
             if is_global:
-                resp = await rt.clonoth_client.update_openai_config(base_url=base_url)
-                actual = resp.get("openai", {}).get("base_url", base_url)
-                await message.reply(f"✅ **Global** base URL → `{actual}`", mention_author=False)
+                await message.reply("⚠️ Edit the channel scheme's base URL in the web settings.", mention_author=False)
             elif session_id:
                 ov = await rt.clonoth_client.get_session_provider_override(session_id)
                 current = ov.get("provider_override", {})
@@ -787,7 +780,7 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
         provider_type = parts[2].strip()
         try:
             if is_global:
-                await message.reply("⚠️ Global provider change not supported via command. Edit node YAML.", mention_author=False)
+                await message.reply("⚠️ Switch the current channel scheme in the web settings.", mention_author=False)
             elif session_id:
                 ov = await rt.clonoth_client.get_session_provider_override(session_id)
                 current = ov.get("provider_override", {})
@@ -795,7 +788,7 @@ async def handle_model_command(rt: Any, message: discord.Message, raw_text: str)
                 await rt.clonoth_client.set_session_provider_override(session_id, current)
                 await message.reply(f"✅ **Session** provider → `{provider_type}`", mention_author=False)
             else:
-                await message.reply("⚠️ No session found. Use node YAML.", mention_author=False)
+                await message.reply("⚠️ No session found for this channel.", mention_author=False)
         except Exception as e:
             await message.reply(f"❌ Error: {e}", mention_author=False)
         return True

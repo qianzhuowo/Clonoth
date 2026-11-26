@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 import pytest
 
+import clonoth_model_list
 from plugins.draw.agent import llm
 from plugins.draw.planner.contract import ScenePlannerError
 from providers import registry
@@ -14,8 +15,11 @@ from providers import registry
 USER = [{"role": "user", "content": "hi"}]
 
 
-def _preset(**over: Any) -> dict[str, Any]:
-    return llm.normalize_preset({"id": "p", "name": "P", "provider": "openai", "model": "m", "api_key": "sk-test", **over})
+def _preset(provider: str = "openai", base_url: str = "", api_key: str = "sk-test", auth: str = "auto",
+            **over: Any) -> dict[str, Any]:
+    """A preset after resolve_preset: normalized fields plus the channel's type / address / key."""
+    preset = llm.normalize_preset({"id": "p", "name": "P", "model": "m", **over})
+    return {**preset, "provider": provider, "base_url": base_url, "api_key": api_key, "auth": auth}
 
 
 def _on(value: Any) -> dict[str, Any]:
@@ -28,14 +32,14 @@ def test_settings_without_presets_derive_default_from_legacy_planner():
     agent = llm.normalize_agent_settings({"presets": []}, {"tool_protocol": "text", "timeout_sec": 99})
     assert agent["current_preset_id"] == "default" and agent["planner_max_retries"] == 3
     preset = agent["presets"][0]
-    assert (preset["name"], preset["tool_mode"], preset["timeout_sec"], preset["provider"]) == ("默认", "text", 99, "openai")
+    assert (preset["name"], preset["tool_mode"], preset["timeout_sec"], preset["channel"]) == ("默认", "text", 99, "")
     assert not llm.preset_is_configured(preset)
 
 
 def test_settings_keep_presets_fix_duplicate_ids_and_unknown_current():
     agent = llm.normalize_agent_settings({
         "current_preset_id": "gone", "planner_max_retries": 0,
-        "presets": [{"id": "a", "name": "A", "model": "m", "api_key": "k"}, {"id": "a", "name": "B"}, "junk"],
+        "presets": [{"id": "a", "name": "A", "channel": "main"}, {"id": "a", "name": "B"}, "junk"],
     }, {"tool_protocol": "text"})
     ids = [p["id"] for p in agent["presets"]]
     assert len(ids) == 2 and ids[0] == "a" and ids[1] != "a"
@@ -55,13 +59,14 @@ def test_planner_max_retries_never_turns_blank_into_zero(value, expected):
 
 def test_preset_values_are_clamped():
     preset = llm.normalize_preset({
-        "name": "  ", "provider": " Anthropic ", "tool_mode": "weird", "timeout_sec": -5, "max_tokens": "abc",
-        "model_list_auth": "nope", "reasoning": {"mode": "ON", "effort": "ultra"},
+        "name": "  ", "channel": " draw ", "provider": "anthropic", "api_key": "k", "tool_mode": "weird",
+        "timeout_sec": -5, "max_tokens": "abc", "reasoning": {"mode": "ON", "effort": "ultra"},
         "sampling": {"temperature": _on(5), "top_k": _on(0), "top_p": {"enabled": "yes", "value": "0.3"}},
     })
-    assert preset["id"].startswith("agent-") and preset["name"] == "默认" and preset["provider"] == "anthropic"
+    assert preset["id"].startswith("agent-") and preset["name"] == "默认" and preset["channel"] == "draw"
+    assert not {"provider", "api_key", "base_url"} & set(preset)
     assert preset["tool_mode"] == "native" and preset["timeout_sec"] == 0 and preset["max_tokens"] == 0
-    assert preset["model_list_auth"] == "auto" and preset["reasoning"] == {"mode": "on", "effort": ""}
+    assert preset["reasoning"] == {"mode": "on", "effort": ""}
     assert preset["sampling"]["temperature"] == {"enabled": True, "value": 2.0}
     assert preset["sampling"]["top_k"] == {"enabled": True, "value": 1}
     # 只有明确的 true 才算启用
@@ -88,8 +93,7 @@ def test_list_providers_puts_known_first_and_describes_each():
     ids = [p["id"] for p in providers]
     assert ids[:3] == ["openai", "openai-responses", "anthropic"] and set(ids) == set(registry.list())
     by_id = {p["id"]: p for p in providers}
-    assert by_id["openai"]["sampling"] == list(llm.SAMPLING_SPECS) and by_id["openai"]["list_auth"] == []
-    assert by_id["anthropic"]["list_auth"] == ["auto", "bearer", "x-api-key"] and by_id["anthropic"]["sampling_note"]
+    assert by_id["openai"]["sampling"] == list(llm.SAMPLING_SPECS) and by_id["anthropic"]["sampling_note"]
     assert llm.provider_info("third-party")["sampling"] == ()
 
 
@@ -134,7 +138,7 @@ def test_gemini_sampling_travels_in_provider_options():
 
 
 def test_create_provider_rejects_incomplete_presets():
-    for over, word in (({"provider": "nope"}, "未知的 Provider"), ({"model": ""}, "Model"), ({"api_key": ""}, "API Key")):
+    for over, word in (({"provider": "nope"}, "未知的 Provider"), ({"model": ""}, "模型"), ({"api_key": ""}, "API Key")):
         with pytest.raises(ValueError) as info:
             llm.create_provider(_preset(**over), http=None)
         assert word in str(info.value)
@@ -151,11 +155,12 @@ def _pull(preset: dict[str, Any], handler) -> tuple[list[str], list[httpx.Reques
 
     async def run() -> list[str]:
         async with httpx.AsyncClient(transport=httpx.MockTransport(record)) as client:
-            return await llm.pull_models(preset, client=client)
+            return await clonoth_model_list.pull_models(preset["provider"], preset["base_url"], preset["api_key"],
+                                                        auth=preset.get("auth", "auto"), client=client)
 
     try:
         return asyncio.run(run()), seen
-    except llm.ModelListError as error:
+    except clonoth_model_list.ModelListError as error:
         error.requests = seen  # type: ignore[attr-defined]
         raise
 
@@ -178,7 +183,7 @@ def test_pull_models_uses_single_url_when_base_has_version():
 
 
 def test_pull_models_stops_on_auth_failure():
-    with pytest.raises(llm.ModelListError) as info:
+    with pytest.raises(clonoth_model_list.ModelListError) as info:
         _pull(_preset(base_url="https://relay.test"), lambda r: httpx.Response(401, json={"error": {"message": "bad key"}}))
     error = info.value
     assert error.status == 401 and len(error.requests) == 1
@@ -194,7 +199,7 @@ def test_pull_models_native_auth_on_official_hosts_and_bearer_on_relays():
 
     _, seen = _pull(_preset(provider="anthropic", base_url="https://relay.test"), ok)
     assert seen[0].headers["authorization"] == "Bearer sk-test" and "x-api-key" not in seen[0].headers
-    _, seen = _pull(_preset(provider="anthropic", base_url="https://relay.test", model_list_auth="x-api-key"), ok)
+    _, seen = _pull(_preset(provider="anthropic", base_url="https://relay.test", auth="x-api-key"), ok)
     assert seen[0].headers["x-api-key"] == "sk-test"
 
     google = lambda r: httpx.Response(200, json={"models": [{"name": "models/gemini-x"}, {"name": "models/embedding-001"}]})  # noqa: E731
@@ -204,15 +209,12 @@ def test_pull_models_native_auth_on_official_hosts_and_bearer_on_relays():
     assert seen[0].headers["x-goog-api-key"] == "sk-test"
 
 
-def test_pull_models_reports_missing_base_url_and_empty_lists():
-    with pytest.raises(llm.ModelListError) as info:
-        _pull(_preset(provider="third-party"), lambda r: httpx.Response(200, json={}))
-    assert info.value.message == "请先填写 Base URL。"
-    with pytest.raises(llm.ModelListError) as info:
+def test_pull_models_reports_empty_lists():
+    with pytest.raises(clonoth_model_list.ModelListError) as info:
         _pull(_preset(base_url="https://relay.test/v1"), lambda r: httpx.Response(200, json={"data": []}))
     assert "模型列表为空" in info.value.message
     # 全被关键词剔除时退回原列表
-    assert llm.filter_models(["text-embedding-3", "tts-1"]) == ["text-embedding-3", "tts-1"]
+    assert clonoth_model_list.filter_models(["text-embedding-3", "tts-1"]) == ["text-embedding-3", "tts-1"]
 
 
 # ---- 测试连接 ----

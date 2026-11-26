@@ -239,6 +239,33 @@ def test_child_context_gives_each_message_under_one_event_a_stable_key() -> None
     second = root.child("text:1:world")
     assert first.event_id == same.event_id
     assert first.event_id != second.event_id
+
+
+@pytest.mark.parametrize("action_type", ["fail", "finish"])
+def test_failed_task_sends_short_notice_and_skips_group_history(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, action_type: str,
+) -> None:
+    runtime = _load_runtime(monkeypatch, tmp_path)
+    sent: list[str] = []
+    recorded: list[str] = []
+
+    async def fake_split(bot, target, text, **kwargs):
+        sent.append(text)
+        return True
+
+    monkeypatch.setattr(runtime.send, "_send_split_text", fake_split)
+    monkeypatch.setattr(runtime.send.history, "_record_bot_reply", lambda gid, text: recorded.append(text))
+    raw = "[error] Error: Current provider response failed: Corrupted thought signature."
+    asyncio.run(runtime.send._send_text_and_attachments(
+        object(), {"type": "group", "group_id": 1}, raw if action_type == "fail" else "hello", [],
+        send_context=DeliveryContext(event_id="evt", action_type=action_type),
+    ))
+    if action_type == "fail":
+        assert sent == [runtime.send.FAIL_NOTICE_TEXT] and recorded == []
+    else:
+        assert sent == ["hello"] and recorded == ["hello"]
+
+
 def test_real_attachment_stack_awaits_all_and_aggregates_failure(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:

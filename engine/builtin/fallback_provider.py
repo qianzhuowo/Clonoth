@@ -14,10 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from .result import hook_result
-from clonoth_runtime import resolve_env_ref
+import clonoth_channels as chn
 from engine.protocol import TaskAction
 from engine.vision import model_has_vision
 
@@ -35,65 +33,6 @@ PLUGIN_META = {
     "name": "fallback_provider",
     "description": "Primary API failure auto-fallback to backup providers",
 }
-
-
-def _load_config(workspace_root: str | Path) -> dict[str, Any]:
-    """Read full data/config.yaml."""
-    cfg_path = Path(workspace_root) / "data" / "config.yaml"
-    if not cfg_path.exists():
-        return {}
-    try:
-        with open(cfg_path, encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except Exception as exc:
-        logger.warning("fallback_provider: failed to load config: %s", exc)
-        return {}
-
-
-def _resolve_fallback_entry(fb_cfg: dict[str, Any], full_cfg: dict[str, Any]) -> dict[str, Any]:
-    """Resolve a fallback entry by merging with its provider config block.
-
-    Expected config layout:
-        deepseek:
-          base_url: https://api.deepseek.com
-          api_key: sk-xxx
-          model: deepseek-v4-pro
-        fallbacks:
-          - provider: deepseek          # just reference, auto-inherits from deepseek: block
-          - provider: openai            # inherits from openai: block
-            model: claude-sonnet-4-6    # override model only
-
-    Resolution order for each field (base_url, api_key, model):
-      1. Explicit value in fallback entry
-      2. Value from the provider config block (e.g. deepseek:)
-    """
-    provider_name = (fb_cfg.get("provider") or "openai").strip().lower()
-    provider_block = full_cfg.get(provider_name, {})
-    if (not isinstance(provider_block, dict) or not provider_block) and provider_name in ("gemini", "gemini-vertex", "gemini-aistudio"):
-        provider_block = full_cfg.get("gemini-vertex") or full_cfg.get("gemini") or {}
-    if not isinstance(provider_block, dict):
-        provider_block = {}
-
-    po: dict[str, Any] = {}
-    for _opt_key in ("reasoning_field", "reasoning_effort", "max_tokens", "max_completion_tokens", "thought_summary"):
-        _val = fb_cfg.get(_opt_key) if _opt_key in fb_cfg else provider_block.get(_opt_key)
-        if _val is not None:
-            po[_opt_key] = _val
-
-    def _field(name: str) -> str:
-        # Same "${ENV}" convention as the main provider and system_models; an
-        # unresolved reference would otherwise be used verbatim as a URL/key.
-        own = resolve_env_ref(str(fb_cfg.get(name) or "").strip()).strip()
-        return own or resolve_env_ref(str(provider_block.get(name) or "").strip()).strip()
-
-    return {
-        "provider": provider_name,
-        "base_url": _field("base_url"),
-        "api_key": _field("api_key"),
-        "model": _field("model"),
-        "sticky_session": fb_cfg["sticky_session"] if "sticky_session" in fb_cfg else provider_block.get("sticky_session"),
-        "provider_options": po,
-    }
 
 
 def _is_retryable(status_code: int | None, error: str | None = None) -> bool:
@@ -205,9 +144,8 @@ class FallbackProviderHandler:
         if not workspace_root:
             return None
 
-        full_cfg = _load_config(workspace_root)
-        fallbacks_raw = full_cfg.get("fallbacks", [])
-        if not isinstance(fallbacks_raw, list) or not fallbacks_raw:
+        fallbacks_raw = chn.fallback_channels(chn.load_config(workspace_root), root=workspace_root)
+        if not fallbacks_raw:
             return None
 
         original_error = getattr(resp, "error", "unknown")
@@ -236,20 +174,14 @@ class FallbackProviderHandler:
         fallback_errors: list[str] = []
 
         # Try each fallback in chain order
-        for i, fb_raw in enumerate(fallbacks_raw):
-            if not isinstance(fb_raw, dict):
-                continue
-            fb_cfg = _resolve_fallback_entry(fb_raw, full_cfg)
-            fb_provider_type = fb_cfg["provider"]
-            fb_base_url = fb_cfg["base_url"]
-            fb_api_key = fb_cfg["api_key"]
-            fb_model = fb_cfg["model"] or original_model
+        for i, fb_ch in enumerate(fallbacks_raw):
+            fb_provider_type = fb_ch.type
+            fb_base_url = fb_ch.base_url
+            fb_api_key = fb_ch.api_key
+            fb_model = fb_ch.model or original_model
+            fb_options = {k: v for k, v in fb_ch.options.items() if k != "sticky_session"}
 
-            _orig_name = getattr(original_provider, "name", "")
-            _same_provider = (
-                fb_provider_type == _orig_name
-                or ({fb_provider_type, _orig_name} <= {"gemini", "gemini-vertex"})
-            )
+            _same_provider = fb_ch.id == getattr(original_provider, "channel_id", "")
             if (
                 len(fallbacks_raw) > 1
                 and _same_provider
@@ -277,7 +209,7 @@ class FallbackProviderHandler:
                 )
                 _fb_http = wrap_http_with_sticky_session(
                     rctx.llm_http,
-                    fb_cfg.get("sticky_session"),
+                    fb_ch.options.get("sticky_session"),
                     _fb_sticky_sid,
                 )
                 fb_provider = _create_fallback_provider(
@@ -286,8 +218,10 @@ class FallbackProviderHandler:
                     api_key=fb_api_key,
                     model=fb_model,
                     http=_fb_http,
-                    provider_options=fb_cfg.get("provider_options"),
+                    provider_options=fb_options,
                 )
+                if fb_provider is not None:
+                    fb_provider.channel_id = fb_ch.id
                 if fb_provider is None:
                     logger.warning(
                         "fallback_provider: skipping fallback[%d] — unsupported provider type '%s'",
@@ -307,7 +241,7 @@ class FallbackProviderHandler:
                     _messages_have_images(messages)
                     and not model_has_vision(workspace_root, fb_model)
                 )
-                attempt = {"provider": fb_provider_type, "model": fb_model, "index": i}
+                attempt = {"provider": fb_provider_type, "channel": fb_ch.id, "model": fb_model, "index": i}
                 t0 = time.monotonic()
                 new_resp = await call_provider(fb_provider)
                 if isinstance(new_resp, TaskAction):
@@ -330,6 +264,7 @@ class FallbackProviderHandler:
                         i, elapsed, fb_base_url[:40], fb_model,
                     )
                     new_resp.provider_meta["_fallback_provider"] = fb_provider_type
+                    new_resp.provider_meta["_fallback_channel"] = fb_ch.id
                     new_resp.provider_meta["_fallback_model"] = fb_model
                     ctx.response = new_resp
                     ctx.provider = fb_provider  # This hook response only, not the configured provider.
@@ -369,7 +304,7 @@ class FallbackProviderHandler:
                 )
                 # [fix 2026-05-28] Record exception-type failures too.
                 fallback_errors.append(
-                    f"[Fallback {fb_cfg.get('provider', '?')} exception: {str(exc)[:150]}]"
+                    f"[Fallback {fb_ch.id} exception: {str(exc)[:150]}]"
                 )
 
         # [fix 2026-05-28] Why: when all fallbacks fail, the user only sees the

@@ -69,19 +69,6 @@ VIDEO_MIMES = {
 }
 
 
-def _load_dotenv(root: Path) -> dict[str, str]:
-    env_path = root / ".env"
-    if not env_path.is_file():
-        return {}
-    values = {}
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, value = line.split("=", 1)
-            values[key.strip()] = value.strip().strip("\"'")
-    return values
-
-
 def _prepare_media(raw_path: str, root: Path) -> tuple[dict, bool]:
     path = Path(raw_path)
     if not path.is_absolute():
@@ -119,27 +106,17 @@ def _prepare_media(raw_path: str, root: Path) -> tuple[dict, bool]:
             temp_path.unlink(missing_ok=True)
 
 
-def _vision_slot(root: Path, dotenv: dict[str, str]) -> dict[str, str]:
-    """data/config.yaml system_models.vision (model/base_url/api_key), ${ENV} refs resolved."""
-    cfg_path = root / "data" / "config.yaml"
-    if not cfg_path.is_file():
-        return {}
+def _vision_channel(root: Path):
+    """Settings → 识图模型 (system_models.vision); unset = the current channel scheme."""
+    code_root = str(Path(__file__).resolve().parent.parent)
+    if code_root not in sys.path:
+        sys.path.insert(0, code_root)
+    import clonoth_channels as chn
+    cfg = chn.load_config(root)
     try:
-        import yaml
-        data = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-    except Exception:
-        return {}
-    block = ((data.get("system_models") or {}) if isinstance(data, dict) else {}).get("vision")
-    if not isinstance(block, dict):
-        return {}
-    out = {}
-    for field in ("model", "base_url", "api_key"):
-        value = str(block.get(field) or "").strip()
-        match = re.fullmatch(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", value)
-        if match:
-            value = (os.environ.get(match.group(1)) or dotenv.get(match.group(1)) or "").strip()
-        out[field] = value
-    return out
+        return chn.slot_channel(cfg, "vision", root=root) or chn.get_channel(cfg, root=root)
+    except chn.ChannelError as error:
+        raise ValueError(f"识图模型未配置：{error}") from error
 
 
 def read_media(args: dict, root: Path) -> dict:
@@ -152,24 +129,16 @@ def read_media(args: dict, root: Path) -> dict:
     if not paths:
         raise ValueError("Provide path, image_path, video_path, or paths")
 
-    dotenv = _load_dotenv(root)
-
-    def env(name: str) -> str:
-        return (os.environ.get(name) or dotenv.get(name) or "").strip()
-
-    # The vision model is configured once (Settings → 识图模型 / system_models.vision);
-    # per field: config > CLONOTH_VISION_* env > the Gemini/OpenAI channel defaults.
-    slot = _vision_slot(root, dotenv)
-    api_key = (slot.get("api_key") or env("CLONOTH_VISION_API_KEY")
-               or env("GEMINI_API_KEY") or env("OPENAI_API_KEY"))
-    base_url = (slot.get("base_url") or env("CLONOTH_VISION_BASE_URL") or env("GEMINI_BASE_URL")
-                or env("OPENAI_BASE_URL") or "https://generativelanguage.googleapis.com").rstrip("/")
-    if base_url.endswith("/v1"):
-        base_url = base_url[:-3]
+    ch = _vision_channel(root)
+    if not ch.type.startswith("gemini"):
+        raise ValueError(f"识图需要 Gemini 类型的渠道方案，当前是「{ch.name}」({ch.type})")
+    api_key = ch.api_key
+    base_url = re.sub(r"/v1(beta)?$", "", (ch.base_url or "https://generativelanguage.googleapis.com").rstrip("/"))
     if not api_key:
-        raise ValueError("No vision model API key: set system_models.vision.api_key, CLONOTH_VISION_API_KEY, GEMINI_API_KEY or OPENAI_API_KEY")
-    model = str(args.get("model") or slot.get("model") or env("CLONOTH_VISION_MODEL")
-                or "gemini-3.8-flash").strip()
+        raise ValueError(f"渠道方案「{ch.name}」没有 API Key")
+    model = str(args.get("model") or ch.model).strip()
+    if not model:
+        raise ValueError(f"渠道方案「{ch.name}」没有模型")
 
     with ThreadPoolExecutor(max_workers=min(len(paths), 8)) as pool:
         prepared = list(pool.map(lambda path: _prepare_media(path, root), paths))

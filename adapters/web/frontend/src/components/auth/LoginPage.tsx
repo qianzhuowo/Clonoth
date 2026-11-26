@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 
 import {
-  checkAdminAuth, getAppConfig, getAuthStatus, getNodes, getProviders,
+  checkAdminAuth, getAppConfig, getAuthStatus, getChannels, getNodes,
   loginWithCredentials, setupAuth, type AuthStatus,
 } from '../../api/supervisorClient';
 import { useSettingsStore } from '../../store/settingsStore';
@@ -14,7 +14,7 @@ type LoginMode = 'loading' | 'setup' | 'jwt' | 'token';
 export const LoginPage = () => {
   const {
     adminToken, setAdminToken, setAuthenticated, setAvailableNodes,
-    setEntryNodeId, setNeedsSetup, setGlobalConfig,
+    setEntryNodeId, setNeedsSetup, setChannelConfig,
   } = useSettingsStore();
 
   const [mode, setMode] = useState<LoginMode>('loading');
@@ -46,13 +46,9 @@ export const LoginPage = () => {
   const checkSetupNeeded = async (token: string) => {
     try {
       const config = await getAppConfig();
-      setGlobalConfig(
-        config.openai?.model || '',
-        config.openai?.base_url || '',
-        config.provider_models || {},
-      );
-      const providers = await getProviders(token);
-      const anyKeyPresent = Object.values(providers.providers).some(p => p.api_key_present);
+      setChannelConfig(config.active_channel, config.channels || []);
+      const { channels } = await getChannels(token);
+      const anyKeyPresent = channels.some(c => c.api_key_present);
       if (!anyKeyPresent) {
         setNeedsSetup(true);
       }

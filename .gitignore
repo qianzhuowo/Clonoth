@@ -165,4 +165,9 @@ profile*.out
 /flamegraph*.svg
 /stop-diag-*.txt
 /*.har
-/screenshot*.png
+# Local UI check screenshots, probe scripts and their output at the repo root
+/*.png
+/*.jpg
+/*.out
+/sigtest*.py
+/roletest*.py

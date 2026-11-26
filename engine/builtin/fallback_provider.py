@@ -60,6 +60,10 @@ def _is_retryable(status_code: int | None, error: str | None = None) -> bool:
         'safeguard', 'content_filter', 'refused', 'safety', 'cyber',
         'not allowed', 'community guidelines', 'moderation',
     }
+    # Each fallback is its own channel (address + key + model): a rejected key,
+    # exhausted balance or a model this gateway route lacks says nothing about the next one.
+    if status_code in (401, 402, 404):
+        return True
     if status_code == 403 and error:
         err_lower = error.lower()
         if any(kw in err_lower for kw in _CONTENT_MODERATION_KEYWORDS):

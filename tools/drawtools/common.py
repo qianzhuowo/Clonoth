@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -52,7 +53,7 @@ DEFAULT_PRESET: dict[str, Any] = {
     "name": "默认 (V4.5 Full)",
     "positive_prefix": "best quality, amazing quality, very aesthetic, absurdres",
     "negative_prefix": "lowres, bad anatomy, bad hands, missing fingers, extra digits, fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts, signature, watermark, username, blurry",
-    "max_images": 4,
+    "max_images": 0,
     "max_characters_per_image": 4,
     "params": {
         "model": "nai-diffusion-4-5-full",
@@ -129,16 +130,70 @@ def selected_preset(settings: dict[str, Any] | None = None, preset_ref: str = ""
     return presets[0]
 
 
+def find_preset(settings: dict[str, Any], preset_ref: str) -> dict[str, Any] | None:
+    """按 id / name / 别名精确查找预设；找不到返回 None（不回退默认）。"""
+    ref = str(preset_ref or "").strip().lower()
+    if not ref:
+        return None
+    for preset in iter_presets(settings):
+        pid = str(preset.get("id") or "").strip().lower()
+        name = str(preset.get("name") or "").strip().lower()
+        aliases = preset.get("aliases") if isinstance(preset.get("aliases"), list) else []
+        if ref in {pid, name, *(str(a).strip().lower() for a in aliases)}:
+            return preset
+    return None
+
+
+def write_settings(settings: dict[str, Any]) -> None:
+    """原子写 settings.yaml：先写临时文件再替换，避免并发/中断留下半截文件。"""
+    SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    text = yaml.safe_dump(settings, allow_unicode=True, sort_keys=False)
+    fd, tmp_name = tempfile.mkstemp(prefix=".settings.", suffix=".tmp", dir=str(SETTINGS_PATH.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.replace(tmp_name, SETTINGS_PATH)
+    finally:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+
+
 def set_selected_preset(preset_ref: str) -> dict[str, Any]:
     settings = load_settings()
-    target = selected_preset(settings, preset_ref)
+    target = find_preset(settings, preset_ref)
+    if target is None:
+        # 旧实现找不到会静默回退到默认预设并把默认 id 写进配置，用户以为切换成功。
+        available = ", ".join(str(p.get("id") or "") for p in iter_presets(settings))
+        raise ValueError(f"preset not found: {preset_ref!r} (available: {available})")
     target_id = str(target.get("id") or "").strip()
     if not target_id:
         raise ValueError("preset has no id")
     settings.setdefault("params", {})["selected_preset_id"] = target_id
     # 用户运行期选择写入 settings.yaml；仓库只应维护 settings.example.yaml，避免升级覆盖用户配置。
-    SETTINGS_PATH.write_text(yaml.safe_dump(settings, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    write_settings(settings)
     return target
+
+
+def read_workspace_dotenv(workspace_root: Path | None = None) -> dict[str, str]:
+    """读取工作区 .env（KEY=VALUE，忽略注释与空行，去掉成对引号）。"""
+    env_path = (workspace_root or WORKSPACE_ROOT) / ".env"
+    kv: dict[str, str] = {}
+    try:
+        if not env_path.exists():
+            return kv
+        for line in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[7:].strip()
+            k, v = line.split("=", 1)
+            kv[k.strip()] = v.strip().strip("'\"")
+    except Exception:
+        return {}
+    return kv
 
 
 def resolve_api_key(settings: dict[str, Any]) -> str:
@@ -152,6 +207,11 @@ def resolve_api_key(settings: dict[str, Any]) -> str:
     env_name = str(api_cfg.get("api_key_env") or "NOVELAI_API_KEY").strip()
     if env_name:
         value = os.environ.get(env_name, "").strip()
+        if value:
+            return value
+        # 工具以子进程运行，toolbox 会把含 API_KEY 的环境变量全部剥掉（防泄漏），
+        # 所以环境变量在生产里永远是空的；这里按约定回退到工作区 .env。
+        value = read_workspace_dotenv().get(env_name, "").strip()
         if value:
             return value
     return ""

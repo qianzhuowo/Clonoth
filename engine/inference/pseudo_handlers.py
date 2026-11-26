@@ -50,6 +50,34 @@ def _paths_to_attachments(paths: list, workspace_root: Path) -> list[dict]:
     return result
 
 
+def _dispatch_result_attachments_already_sent(ls: _LoopState) -> bool:
+    """本回合的 dispatch_result 附件是否已由 Supervisor 直发（dispatch_attachment）。
+
+    Why: 绘图子任务的图片已经发过一次，调用方模型看到回调里的路径后往往会再用
+    reply/finish 把同一张图发第二遍。How: 读 task_context 里 Supervisor 透传的标记。
+    Purpose: 同一张生成图恰好发出一次。
+    """
+    task_context = getattr(ls.rctx, "task_context", {}) or {}
+    if not isinstance(task_context, dict):
+        return False
+    if str(task_context.get("inbound_message_type") or "").strip() != "dispatch_result":
+        return False
+    return bool(task_context.get("inbound_attachments_outbound_sent"))
+
+
+def _reject_already_sent_dispatch_paths(ls: _LoopState, selected_paths: Any) -> list:
+    """已直发的 dispatch_result 回合里，丢弃 reply/finish 选中的全部附件路径。
+
+    不按文件名匹配：Supervisor 直发后回调 payload 故意不带 attachments，没有可对照的集合；
+    且 _select_attachments 会把文件另存为新路径，文件名对照也不可靠。
+    """
+    if not isinstance(selected_paths, list) or not selected_paths:
+        return selected_paths if isinstance(selected_paths, list) else []
+    if not _dispatch_result_attachments_already_sent(ls):
+        return selected_paths
+    return []
+
+
 def _emit_pseudo_tool_result(
     ls: _LoopState,
     pseudo_call,
@@ -126,6 +154,7 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
             })
             return None
         _reply_att_paths = args.get("attachment_paths") or args.get("attachments") or []
+        _reply_att_paths = _reject_already_sent_dispatch_paths(ls, _reply_att_paths)
         _reply_atts = _paths_to_attachments(_reply_att_paths, ls.rctx.workspace_root) if _reply_att_paths else []
         if reply_text or _reply_atts:
             _reply_payload: dict[str, Any] = {
@@ -203,12 +232,16 @@ async def _handle_pseudo_tool(ls: _LoopState, pseudo_call, step: int) -> TaskAct
         final_atts = []
         if terminal_name == "finish":
             _selected_paths = args.get("attachment_paths") or args.get("attachments")
+            _selected_paths = _reject_already_sent_dispatch_paths(ls, _selected_paths)
             if isinstance(_selected_paths, list) and _selected_paths:
                 final_atts = _select_attachments(
                     ls.collected_attachments, _selected_paths,
                     workspace_root=ls.rctx.workspace_root,
                     session_id=ls.rctx.session_id,
                 )
+            elif ls.tool_produced_attachments and not _dispatch_result_attachments_already_sent(ls):
+                # 本任务内工具产出的附件（如同步生图）随 finish 自动带出，模型不必显式填路径。
+                final_atts = list(ls.tool_produced_attachments)
 
         _tool_start_payload: dict[str, Any] = {
             "tool_call_id": _call_id,

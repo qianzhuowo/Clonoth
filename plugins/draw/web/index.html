@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>绘图</title>
+<script>
+/* 首屏主题：宿主（PluginPanel 的 themeBridge）要等本页 load 之后才注入主题变量，在那之前页面只有 style.css 里的缺省色，
+   所以会先闪一下别的配色。这里在样式表生效之前就把宿主当前的主题变量抄过来；取不到（单独打开本页）时沿用缺省色。 */
+(function () {
+  try {
+    var host = window.parent;
+    if (!host || host === window) return;
+    var computed = host.getComputedStyle(host.document.documentElement);
+    var names = ['bg', 'panel', 'surface', 'muted', 'text', 'secondary', 'tertiary', 'border', 'accent'];
+    for (var i = 0; i < names.length; i++) {
+      var value = computed.getPropertyValue('--duties-' + names[i]).trim();
+      if (value) document.documentElement.style.setProperty('--duties-' + names[i], value);
+    }
+  } catch (error) { /* 跨源或宿主不可访问：保持缺省色 */ }
+})();
+</script>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="layout-editor.css">
+</head>
+<body>
+<div class="app">
+  <nav class="side" id="nav">
+    <h1>绘图</h1>
+    <a data-view="test">快速测试</a>
+    <a data-view="api">API 配置</a>
+    <a data-view="agent">场景 Agent</a>
+    <a data-view="params">绘图参数</a>
+    <a data-view="chars">角色标签</a>
+    <a data-view="images">图片管理</a>
+    <a data-view="prompts">提示词模板</a>
+  </nav>
+  <main>
+    <!-- 快速测试 -->
+    <section class="view" id="view-test">
+      <div class="head"><h2>快速测试</h2><span class="hint">不经过规划模型，直接按场景 + 角色生成一张；先“预览请求”看拼接结果。</span></div>
+      <div class="card">
+        <div class="form">
+          <label class="f wide">scene（画面整体，英文 tag，预设前缀自动拼在前面）<textarea id="t-scene" placeholder="indoors, window, sunlight, upper body, looking at viewer"></textarea></label>
+          <label class="f">orientation<select id="t-orient"><option value="portrait">portrait 竖幅</option><option value="landscape">landscape 横幅</option></select></label>
+          <label class="f">预设<select id="t-preset"></select></label>
+          <label class="f">seed（留空随机）<input type="number" id="t-seed" min="0" placeholder="随机"></label>
+          <label class="f">尺寸覆盖<select id="t-size"><option value="">按预设</option><option value="auto">auto</option><option value="832x1216">832x1216</option><option value="1216x832">1216x832</option><option value="1024x1024">1024x1024</option><option value="768x1280">768x1280</option><option value="1280x768">1280x768</option></select></label>
+        </div>
+        <h3 style="margin-top:12px">角色（name 命中角色库则自动带固定外貌；未录入须填 appear）</h3>
+        <div id="t-chars"></div>
+        <div class="actions"><button class="op small" id="t-add-char">+ 角色</button></div>
+        <div class="actions">
+          <button class="op" id="t-dry">预览请求</button>
+          <button class="op primary" id="t-run">生成一张</button>
+          <span class="hint" id="t-state"></span>
+        </div>
+      </div>
+      <div class="card" id="t-result" style="display:none">
+        <h3>结果</h3>
+        <pre class="code" id="t-out"></pre>
+        <img class="result-img" id="t-img" alt="" style="display:none">
+      </div>
+    </section>
+
+    <!-- API 配置 -->
+    <section class="view" id="view-api">
+      <div class="head"><h2>API 配置</h2><span class="hint" id="api-hint"></span></div>
+      <div class="card"><h3>NovelAI</h3>
+        <div class="form">
+          <label class="f">API key（留空不改）<input type="password" id="a-key" autocomplete="off" placeholder="已配置则留空"></label>
+          <label class="f">base_url<input type="text" id="a-base" placeholder="https://image.novelai.net"></label>
+          <label class="f">timeout_sec<input type="number" id="a-timeout" min="10"></label>
+          <label class="f">api_key_env（环境变量名）<input type="text" id="a-keyenv" placeholder="NOVELAI_API_KEY"></label>
+        </div>
+        <div class="actions"><button class="op danger" id="a-clear">清空已保存的 key</button></div>
+      </div>
+      <div class="card"><h3>规划 agent <span class="hint">模型接口、工具调用格式、单次请求超时在“场景 Agent”页；画幅在“绘图参数”页的预设里</span></h3>
+        <div class="form narrow">
+          <label class="f">max_attempts（纠错轮次）<input type="number" id="a-attempts" min="1" max="10"></label>
+          <label class="f">max_custom_tool_calls<input type="number" id="a-custom" min="0" max="20"></label>
+          <label class="f">max_plan_images（硬上限）<input type="number" id="a-maximg" min="1" max="16"></label>
+          <label class="f">recent_dialogue_turns<input type="number" id="a-turns" min="0" max="40"></label>
+          <label class="f row"><input type="checkbox" id="a-sendeach"> 每张完成即发送</label>
+        </div>
+      </div>
+      <div class="card"><h3>生成重试</h3>
+        <div class="form narrow">
+          <label class="f">retry_max_attempts<input type="number" id="g-retry" min="0"></label>
+          <label class="f">retry_wait_sec<input type="number" id="g-wait" min="0" step="0.5"></label>
+          <label class="f">request_delay_sec<input type="number" id="g-delay" min="0" step="0.5"></label>
+          <label class="f">lock_retry_max_attempts<input type="number" id="g-lretry" min="0"></label>
+          <label class="f">lock_retry_wait_min_sec<input type="number" id="g-lmin" min="0" step="0.5"></label>
+          <label class="f">lock_retry_wait_max_sec<input type="number" id="g-lmax" min="0" step="0.5"></label>
+        </div>
+      </div>
+      <div class="card"><h3>存储清理</h3>
+        <div class="form narrow">
+          <label class="f row"><input type="checkbox" id="s-enabled"> 自动清理</label>
+          <label class="f">retention_days<input type="number" id="s-days" min="0"></label>
+          <label class="f">max_total_mb<input type="number" id="s-mb" min="0"></label>
+          <label class="f">cleanup_interval_sec<input type="number" id="s-interval" min="60"></label>
+        </div>
+      </div>
+      <div class="actions"><button class="op primary" id="a-save">保存</button><button class="op" id="a-reload">重新加载</button></div>
+    </section>
+
+    <!-- 场景 Agent -->
+    <section class="view" id="view-agent">
+      <div class="head"><h2>场景 Agent</h2><span class="hint">把绘图请求规划成分镜的模型。只管 NovelAI 场景规划（draw.novelai_planner）；通用生图 draw.image_gen 不受这里影响。</span></div>
+      <div class="card status" id="ag-effective"></div>
+      <div class="split">
+        <div>
+          <div class="list" id="ag-list"></div>
+          <div class="actions"><button class="op small" id="ag-add">+ 新预设</button><button class="op small" id="ag-dup">复制当前</button><button class="op small danger" id="ag-del">删除当前</button></div>
+        </div>
+        <div class="card" id="ag-form">
+          <div class="form">
+            <label class="f">名称<input type="text" id="ag-name" maxlength="64"></label>
+            <label class="f row"><input type="checkbox" id="ag-current"> 设为当前使用</label>
+            <label class="f">Provider<select id="ag-provider"></select></label>
+            <label class="f">Base URL<input type="text" id="ag-base"></label>
+            <div class="f">API Key（不回显，留空不改）<div class="inline"><input type="password" id="ag-key" autocomplete="new-password"><button class="op small danger" id="ag-key-clear" type="button">清空</button></div></div>
+            <div class="f">Model<div class="inline"><input type="text" id="ag-model"><button class="op small" id="ag-pull" type="button">拉取模型</button></div><select id="ag-pulled" style="display:none"></select><span class="hint" id="ag-pull-state"></span></div>
+            <label class="f" id="ag-auth-wrap">模型列表鉴权（只影响“拉取模型”）<select id="ag-auth"></select></label>
+            <label class="f">最大输出 Token（0 = 接口默认）<input type="number" id="ag-maxtok" min="0" step="1"></label>
+            <label class="f">单次请求超时（秒，0 = 不限）<input type="number" id="ag-timeout" min="0" max="3600" step="1"></label>
+            <label class="f">工具调用格式<select id="ag-tool"><option value="native">原生 Tool Calling</option><option value="text">文本协议（&lt;&lt;&lt;TOOL_CALL&gt;&gt;&gt; JSON 块）</option></select></label>
+            <label class="f">Reasoning<select id="ag-rmode"><option value="inherit">跟随模型默认</option><option value="on">开启</option><option value="off">关闭</option></select></label>
+            <label class="f" id="ag-effort-wrap">思考强度<select id="ag-effort"></select></label>
+            <span class="hint wide" id="ag-rnote"></span>
+          </div>
+          <h3 style="margin-top:12px">采样参数（勾选的才发送，其余用接口默认）</h3>
+          <div class="samp" id="ag-samp"></div>
+          <div class="hint" id="ag-snote" style="margin-top:4px"></div>
+          <div class="actions"><button class="op primary" id="ag-save">保存全部预设</button><button class="op" id="ag-test">测试连接</button><span class="hint" id="ag-dirty" style="color:var(--warn)"></span></div>
+          <div class="hint" id="ag-result" style="margin-top:6px"></div>
+        </div>
+      </div>
+      <div class="card" style="margin-top:12px"><h3>失败自动重试</h3>
+        <div class="form narrow"><label class="f">失败重试次数（0–10）<input type="number" id="ag-retries" min="0" max="10" step="1" inputmode="numeric"></label></div>
+        <div class="hint" style="margin-top:6px">场景规划失败时自动重试，填 0 关闭，改了就保存。只重试规划，不重试出图；重试会增加模型用量。</div>
+      </div>
+    </section>
+
+    <!-- 绘图参数 -->
+    <section class="view" id="view-params">
+      <div class="head"><h2>绘图参数</h2><span class="hint">一套预设 = 固定标签 + 模型与采样 + 尺寸 + 数量限制；<b>当前默认</b>的那套用于 QQ 生图。</span></div>
+      <div class="split">
+        <div>
+          <div class="list" id="p-list"></div>
+          <div class="actions"><button class="op small" id="p-add">+ 新预设</button><button class="op small" id="p-dup">复制当前</button><button class="op small danger" id="p-del">删除当前</button></div>
+          <div class="actions"><button class="op small" id="p-up" title="把当前预设在列表里上移一位">上移</button><button class="op small" id="p-down" title="把当前预设在列表里下移一位">下移</button><button class="op small" id="p-import" title="导入小白X 导出的参数预设文件（.json）">导入</button><button class="op small" id="p-export" title="导出成小白X 能导入的参数预设文件">导出当前</button><input type="file" id="p-file" accept=".json,application/json" style="display:none"></div>
+          <div class="hint" id="p-import-note" style="margin-top:6px"></div>
+        </div>
+        <div class="card" id="p-form">
+          <h3>基本</h3>
+          <div class="form">
+            <label class="f">名称<input type="text" id="p-name" maxlength="64"></label>
+            <label class="f">id（唯一，用来引用这套预设）<input type="text" id="p-id" maxlength="64"></label>
+            <label class="f">别名（逗号分隔）<input type="text" id="p-aliases"></label>
+            <label class="f row"><input type="checkbox" id="p-selected"> 设为当前默认</label>
+          </div>
+          <h3 style="margin-top:12px">固定标签</h3>
+          <div class="form">
+            <label class="f wide">正向固定（画风、画师、质量词；拼在每张图的场景前面）<textarea id="p-pos" placeholder="best quality, amazing quality..."></textarea></label>
+            <label class="f wide">负向固定（每张图都排除的内容）<textarea id="p-neg" placeholder="lowres, bad anatomy..."></textarea></label>
+          </div>
+          <h3 style="margin-top:12px">模型与采样</h3>
+          <div class="form">
+            <div class="f">模型<select id="p-model-sel"></select><input type="text" id="p-model" placeholder="模型 ID" style="display:none"></div>
+            <div class="f">采样器<select id="p-sampler-sel"></select><input type="text" id="p-sampler" placeholder="采样器 ID" style="display:none"></div>
+            <div class="f">调度器<select id="p-scheduler-sel"></select><input type="text" id="p-scheduler" placeholder="调度器 ID" style="display:none"></div>
+          </div>
+          <h3 style="margin-top:12px">尺寸与参数</h3>
+          <div class="form">
+            <label class="f">尺寸<select id="p-size"></select></label>
+            <div class="f" id="p-custom-size" style="display:none">宽 × 高（64 的倍数）<div class="inline"><input type="number" id="p-width" placeholder="宽" inputmode="numeric"><input type="number" id="p-height" placeholder="高" inputmode="numeric"></div></div>
+            <label class="f">步数<input type="number" id="p-steps" step="1" inputmode="numeric"></label>
+            <label class="f">CFG<input type="number" id="p-scale" step="0.1"></label>
+            <label class="f">种子（-1 = 每张随机）<input type="number" id="p-seed" step="1" inputmode="numeric"></label>
+          </div>
+          <h3 style="margin-top:12px">数量限制</h3>
+          <div class="form">
+            <label class="f">要求出图数（0 = 由规划模型决定）<input type="number" id="p-maximg" step="1" inputmode="numeric"></label>
+            <label class="f">每张图最多角色数（0 = 不限）<input type="number" id="p-maxchar" step="1" inputmode="numeric"></label>
+          </div>
+        <h3 style="margin-top:12px">增强选项</h3>
+        <div class="form">
+          <label class="f" id="p-uc-wrap">负面预设<select id="p-uc"></select></label>
+          <label class="f" data-p-v5>V5 质量词<select id="p-v5-quality"></select></label>
+          <label class="f" data-p-v5>V5 负面预设<select id="p-v5-uc"></select></label>
+          <label class="f" id="p-rescale-wrap">CFG 重缩放<input type="number" id="p-rescale" step="0.05"></label>
+          <label class="f row" id="p-quality-wrap"><input type="checkbox" id="p-quality"> 质量增强</label>
+          <label class="f row" data-p-v5><input type="checkbox" id="p-transparent"> 透明背景（V5）</label>
+          <label class="f row" id="p-smea-wrap"><input type="checkbox" id="p-smea"> 自动 SMEA</label>
+            <label class="f row" id="p-variety-wrap"><input type="checkbox" id="p-variety"> 多样性增强（V4.5）</label>
+            <label class="f row" data-p-v3><input type="checkbox" id="p-sm"> SMEA</label>
+            <label class="f row" data-p-v3><input type="checkbox" id="p-smdyn"> SMEA 动态</label>
+            <label class="f row" data-p-v3><input type="checkbox" id="p-decrisper"> Decrisper</label>
+          </div>
+          <div class="hint" id="p-note" style="margin-top:8px;color:var(--warn)"></div>
+          <div class="actions"><button class="op primary" id="p-save">保存全部预设</button><span class="hint" id="p-dirty" style="color:var(--warn)"></span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 角色标签 -->
+    <section class="view" id="view-chars">
+      <div class="head"><h2>角色标签</h2><span class="hint">绘图请求里出现角色的名称或别名时，自动带上这里的外貌和服装；停用的角色、关闭的分组不参与。</span><input type="text" id="c-search" placeholder="搜索名称、别名、外貌" style="width:180px"></div>
+      <div class="split">
+        <div>
+          <select id="c-filter" title="只显示一部分角色" style="margin-bottom:6px"></select>
+          <div class="list" id="c-list"></div>
+          <div class="hint" id="c-stats" style="margin-top:6px"></div>
+          <div class="actions"><button class="op small" id="c-add">+ 新角色</button><button class="op small" id="c-dup" title="复制一份当前角色（别名不复制）">复制当前</button><button class="op small danger" id="c-del">删除当前</button></div>
+          <div class="actions"><button class="op small" id="c-up" title="在所在分组里上移一位">上移</button><button class="op small" id="c-down" title="在所在分组里下移一位">下移</button></div>
+          <div class="card" style="margin-top:12px">
+            <h3>分组</h3>
+            <div id="c-groups"></div>
+            <div class="inline" style="margin-top:6px"><input type="text" id="c-group-name" placeholder="新分组名称"><button class="op small" id="c-group-add">新建分组</button></div>
+          </div>
+          <div class="card">
+            <h3>导入 / 导出</h3>
+            <div class="hint" style="margin-bottom:3px">导入时遇到已有的角色</div>
+            <div class="inline"><select id="c-import-conflict"><option value="replace">用文件里的内容替换</option><option value="skip">跳过，保留现有的</option></select><button class="op small" id="c-import" title="导入小白X 导出的角色标签文件（.json）；并进当前列表，保存后生效">导入</button></div>
+            <label class="f row" style="margin-top:6px"><input type="checkbox" id="c-import-disabled"> 新增的角色先停用</label>
+            <div class="hint" style="margin:8px 0 3px">导出范围</div>
+            <div class="inline"><select id="c-export-scope"><option value="all">全部角色</option><option value="group">当前角色所在的分组</option><option value="one">只导出当前角色</option></select><button class="op small" id="c-export" title="导出成小白X 能导入的角色标签文件">导出</button></div>
+            <input type="file" id="c-file" accept=".json,application/json" style="display:none">
+          </div>
+        </div>
+        <div>
+          <div class="card" id="c-form">
+            <h3>基本</h3>
+            <div class="form">
+              <label class="f">名称（聊天里怎么称呼就怎么写）<input type="text" id="c-name"></label>
+              <label class="f">别名（逗号分隔）<input type="text" id="c-aliases" placeholder="昵称, 外文名"></label>
+              <div class="f">类型<select id="c-type-sel"></select><input type="text" id="c-type" placeholder="如 mature female" style="display:none"></div>
+              <label class="f">分组<select id="c-group"></select></label>
+              <label class="f">Danbooru 角色 tag（没有就留空）<input type="text" id="c-danbooru" placeholder="hatsune_miku"></label>
+              <label class="f row"><input type="checkbox" id="c-enabled"> 启用（停用后不参与出图）</label>
+            </div>
+            <h3 style="margin-top:12px">外貌</h3>
+            <div class="form">
+              <label class="f wide">固定外貌（发色、发型、瞳色等不随场景变的特征，英文 tag）<textarea id="c-appearance" placeholder="long hair, silver hair, blue eyes"></textarea></label>
+              <label class="f wide">负向标签（画这个角色时要排除的内容）<textarea id="c-negative" placeholder="hat, glasses" style="min-height:48px"></textarea></label>
+            </div>
+            <h3 style="margin-top:12px">服装参考</h3>
+            <div class="hint" style="margin-bottom:6px">规划模型按场景从里面挑一套；取消勾选的那一条不会发给它。</div>
+            <div id="c-outfits"></div>
+            <div class="actions" style="margin-top:0"><button class="op small" id="c-add-outfit">+ 服装</button></div>
+            <h3 style="margin-top:12px">动态标签</h3>
+            <div class="hint" style="margin-bottom:6px">按情境才出现的状态（表情、受伤、变身等），规划模型按画面选用；取消勾选的那一条不会发给它。</div>
+            <div id="c-states"></div>
+            <div class="actions" style="margin-top:0"><button class="op small" id="c-add-state">+ 动态标签</button></div>
+          </div>
+          <div class="card" id="c-empty" style="display:none"><span class="hint">还没有角色。点左边的“+ 新角色”添加，或者导入角色标签文件。</span></div>
+          <div class="actions"><button class="op primary" id="c-save">保存全部角色</button><button class="op" id="c-reload" title="从服务器重新读取角色库；在 QQ 里录入的角色要重新载入才会出现在这里">重新载入</button><span class="hint" id="c-dirty" style="color:var(--warn)"></span></div>
+          <div class="hint" id="c-note" style="margin-top:6px"></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 图片管理 -->
+    <section class="view" id="view-images">
+      <div class="head"><h2>图片管理</h2><span class="hint" id="i-stats"></span>
+        <button class="op small" id="i-reload">刷新</button><button class="op small" id="i-selall">全选</button>
+        <button class="op small danger" id="i-del" disabled>删除选中</button><button class="op small" id="i-cleanup">按策略清理</button></div>
+      <div class="grid" id="i-grid"></div>
+    </section>
+
+    <!-- 提示词模板 -->
+    <section class="view" id="view-prompts">
+      <div class="head"><h2>提示词模板</h2><span class="hint">开场、TAG 指南、场景规则在“请求结构”里对应的行上编辑；content 模板必须含 {{characterInfo}} {{drawRequest}} {{recentDialogue}}。</span></div>
+      <div class="tabs" id="pr-tabs">
+        <button data-key="layout" class="active">请求结构</button>
+        <button data-key="content">content 模板</button>
+        <button data-key="fields">工具字段说明</button>
+        <button data-key="preview">链预览</button>
+      </div>
+      <div class="card" id="pr-editor" style="display:none">
+        <textarea class="tall" id="pr-text"></textarea>
+        <div class="actions"><button class="op primary" id="pr-save">保存</button><button class="op" id="pr-reset">恢复默认</button><span class="hint" id="pr-state"></span></div>
+      </div>
+      <div class="card" id="pr-fields" style="display:none">
+        <div id="pr-fields-list"></div>
+        <div class="actions"><button class="op primary" id="pr-fields-save">保存字段说明</button><button class="op" id="pr-fields-reset">全部恢复默认</button></div>
+      </div>
+      <div class="card" id="pr-layout">
+        <div id="layout-editor-root"></div>
+        <div class="actions"><button class="op primary" id="pr-layout-save">保存结构</button><button class="op" id="pr-layout-discard">放弃未保存的改动</button><span class="hint" id="pr-layout-state"></span></div>
+      </div>
+      <div class="card" id="pr-preview" style="display:none">
+        <div class="actions" style="margin:0 0 8px"><button class="op small" id="pr-preview-reload">刷新预览</button><span class="hint">顺序与实际发送一致；工具定义在最后。</span><span class="hint" id="pr-preview-note" style="color:var(--warn)"></span></div>
+        <div class="chain" id="pr-chain"></div>
+      </div>
+    </section>
+  </main>
+</div>
+<div id="msg"></div>
+<div id="lightbox"><img id="lightbox-img" alt=""></div>
+<script src="layout-editor.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

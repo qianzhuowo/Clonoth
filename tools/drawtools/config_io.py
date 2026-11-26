@@ -18,8 +18,8 @@ def ensure_user_configs() -> list[str]:
         (DRAWTOOLS_DIR / "settings.example.yaml", DRAWTOOLS_DIR / "settings.yaml"),
         (DRAWTOOLS_DIR / "character_tags.example.yaml", DRAWTOOLS_DIR / "character_tags.yaml"),
         (PROMPT_DIR / "top-system.example.md", PROMPT_DIR / "top-system.md"),
-        (PROMPT_DIR / "output-format.example.md", PROMPT_DIR / "output-format.md"),
         (PROMPT_DIR / "tag-guide.example.md", PROMPT_DIR / "tag-guide.md"),
+        (PROMPT_DIR / "scene-rules.example.md", PROMPT_DIR / "scene-rules.md"),
     ]
     created: list[str] = []
     for src, dst in pairs:

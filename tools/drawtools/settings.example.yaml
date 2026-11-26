@@ -52,8 +52,10 @@ params:
     negative_prefix: lowres, bad anatomy, bad hands, missing fingers, extra digits,
       fewer digits, cropped, worst quality, low quality, normal quality, jpeg artifacts,
       signature, watermark, username, blurry
-    max_images: 4
+    max_images: 0
     max_characters_per_image: 4
+    # 画幅：auto = 按每张图的构图方向取 832x1216（竖）或 1216x832（横）；default = 用 params 里的 width / height
+    override_size: auto
     params:
       model: nai-diffusion-4-5-full
       sampler: k_euler_ancestral
@@ -75,8 +77,9 @@ params:
       anime style, soft lighting, pastel colors, delicate eyes
     negative_prefix: lowres, bad anatomy, bad hands, missing fingers, extra digits,
       fewer digits, cropped, worst quality, low quality, watermark, blurry
-    max_images: 4
+    max_images: 0
     max_characters_per_image: 4
+    override_size: auto
     params:
       model: nai-diffusion-4-5-full
       sampler: k_euler_ancestral
@@ -103,5 +106,31 @@ llm:
   use_stream: false
 prompts:
   top_system_path: tools/drawtools/prompts/novelai/top-system.md
-  output_format_path: tools/drawtools/prompts/novelai/output-format.md
   tag_guide_path: tools/drawtools/prompts/novelai/tag-guide.md
+  scene_rules_path: tools/drawtools/prompts/novelai/scene-rules.md
+# 场景 Agent（规划模型）的接口预设：由面板“场景 Agent”页写入私有 settings.yaml，key 不要写在这个模板里。
+# 只管 draw.novelai_planner；draw.image_gen 仍用节点自身的模型配置。
+# 当前预设没填 Model 或 API Key 时不接管，规划用节点自身的配置（config/nodes/draw.novelai_planner.yaml，即 DRAW_TAG_*）。
+agent:
+  # 整次规划失败后的自动重试次数（0-10，0 = 不重试）；只重试规划，不重试出图
+  planner_max_retries: 3
+  presets: []
+# 场景规划 agent（draw.novelai_planner 由 plugins/draw/agent 接管）
+planner:
+  # tool_protocol 与 timeout_sec 现在跟着上面的 agent 预设走；这里的值只在还没有预设时用来生成“默认”预设。
+  # 工具协议：native=模型原生 function calling；text=<<<TOOL_CALL>>> JSON 文本块
+  tool_protocol: native
+  # 校验失败回错重提的最大轮次；纯自定义工具（如 search_web）轮次不占次数，总上限 max_custom_tool_calls
+  max_attempts: 3
+  max_custom_tool_calls: 5
+  # 单次请求超时（秒）
+  timeout_sec: 180
+  # 全局硬上限：预设 max_images=0 时由 agent 决定张数，但不超过此值
+  max_plan_images: 4
+  # 画幅现在跟着绘图参数预设走（预设的 override_size + params.width / height，在面板“绘图参数”页设置）。
+  # 这一项只给还没写 override_size 的旧预设用：填了固定尺寸（如 1024x1024）就沿用它，auto 即按构图方向。
+  override_size: auto
+  # 请求结构布局（面板“提示词模板→请求结构”编辑器写入；null 表示用内置默认顺序）
+  layout: null
+  # submit_scene_plan 字段说明覆盖（面板写入；缺省用内置说明）
+  field_descriptions: {}

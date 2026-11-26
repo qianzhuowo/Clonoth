@@ -137,8 +137,9 @@ config/nodes/_persona.md
 /tools/drawtools/settings.yaml
 /tools/drawtools/character_tags.yaml
 /tools/drawtools/prompts/novelai/top-system.md
-/tools/drawtools/prompts/novelai/output-format.md
 /tools/drawtools/prompts/novelai/tag-guide.md
+/tools/drawtools/prompts/novelai/tag-guide-v5.md
+/tools/drawtools/prompts/novelai/scene-rules.md
 
 # Editor / merge leftovers and scratch files
 *.bak

@@ -310,7 +310,15 @@ async def _deliver_async_result(
                     elif isinstance(a, str):
                         attachments.append(a)
 
-        payload: dict = {"message": preempt_text, "task_id": task_id}
+        payload: dict = {"message": preempt_text, "task_id": task_id, "tool_name": tool_name}
+        # Supervisor 根据 success 决定成功带图时是否直发附件；失败结果必须回到模型。
+        if isinstance(result, dict) and (result.get("ok") is False or result.get("success") is False):
+            payload["success"] = False
+        else:
+            payload["success"] = True
+        _node_id = str(getattr(tool_ctx, "node_id", "") or "").strip()
+        if _node_id:
+            payload["node_id"] = _node_id
         if attachments:
             payload["attachment_paths"] = attachments
 
@@ -351,7 +359,7 @@ async def _deliver_async_result(
                     f'⛔ Async tool "{tool_name}" (id: {async_tool_id}) was cancelled.'
                     if _is_cancelled else
                     f'❌ Async tool "{tool_name}" (id: {async_tool_id}) failed: {e}'
-                ), "task_id": task_id},
+                ), "task_id": task_id, "tool_name": tool_name, "success": False},
             )
         except Exception:
             pass

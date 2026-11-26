@@ -412,6 +412,9 @@ class TaskStoreMixin:
         _inbound_caller_node_id = str(payload.get("caller_node_id") or "").strip()
         if _inbound_caller_node_id:
             inbound_metadata["inbound_caller_node_id"] = _inbound_caller_node_id
+        if bool(payload.get("attachments_outbound_sent")):
+            # 子任务附件已由 Supervisor 直发，引擎侧 reply/finish 据此丢弃重发。
+            inbound_metadata["inbound_attachments_outbound_sent"] = True
         # [2026-05-29 方案C第一步] 为什么：dispatch 子任务的父频道不能再靠
         # agent: 字符串反解析。怎么改：在入口 task input 生成前准备结构化
         # dispatch 元数据，并把 parent_conversation_key 同步到 task_context。

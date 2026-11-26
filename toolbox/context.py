@@ -18,6 +18,17 @@ def platform_user_id_from_task_context(task_context: Any) -> str:
     return str(auth.get("user_id") or "").strip()
 
 
+def platform_is_admin_from_task_context(task_context: Any) -> bool:
+    """Admin flag recorded by the platform adapter in task_context.platform_auth.
+
+    Only an explicit ``True`` counts; a missing or malformed identity is non-admin.
+    """
+    if not isinstance(task_context, dict):
+        return False
+    auth = task_context.get("platform_auth")
+    return isinstance(auth, dict) and auth.get("is_admin") is True
+
+
 @dataclass
 class ToolContext:
     supervisor_url: str
@@ -51,6 +62,9 @@ class ToolContext:
     # Platform user who triggered the root inbound (task_context.platform_auth.user_id;
     # dispatch children inherit it). Lets platform tools resolve "send to me".
     platform_user_id: str = ""
+    # Whether that user is a platform admin (task_context.platform_auth.is_admin, set by
+    # the trusted adapter, never by tool arguments). Admin-only tools check this.
+    platform_is_admin: bool = False
 
     @property
     def effective_workspace(self) -> Path:

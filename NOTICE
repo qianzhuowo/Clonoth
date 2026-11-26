@@ -1,0 +1,18 @@
+Clonoth
+Copyright (c) Clonoth contributors
+
+This product includes software derived from LittleWhiteBox (小白X),
+a SillyTavern extension by biex, licensed under the Apache License, Version 2.0.
+Copyright 2025 biex
+https://www.apache.org/licenses/LICENSE-2.0
+
+Based on LittleWhiteBox by biex. The following parts of this repository are
+ported or adapted from LittleWhiteBox `modules/draw/`:
+
+- plugins/draw/planner/        (scene-plan contract, tool schema, layout, handoff, frame, assembly)
+- plugins/draw/agent/          (planner runtime and retry/correction loop)
+- plugins/draw/backends/novelai.py (character prompt assembly and NovelAI V4.5 request compilation)
+- plugins/draw/web/            (prompt layout editor and sortable list)
+- tools/drawtools/prompts/novelai/top-system.example.md   (opening.md)
+- tools/drawtools/prompts/novelai/tag-guide.example.md    (TAG编写指南-V4.5.md)
+- tools/drawtools/prompts/novelai/scene-rules.example.md  (scene-rules.md)

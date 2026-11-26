@@ -1281,6 +1281,67 @@ class TaskRouterMixin:
 
 
     # ------------------------------------------------------------------ #
+    #  子任务附件直发
+    # ------------------------------------------------------------------ #
+
+    def _emit_dispatch_attachment_outbound_locked(
+        self,
+        *,
+        session_id: str,
+        conversation_key: str,
+        task: Task,
+        attachments: list[Any] | None,
+    ) -> bool:
+        """把子任务产出的附件直接作为 outbound_message 发给用户（须持 self._lock）。
+
+        Why: 绘图子任务（draw.novelai_planner / draw.image_gen）完成后，图片原本
+        只随 dispatch_result 回到调用方节点，调用方模型常常只回一句“已生成”而不带
+        附件，图片就到不了 QQ/Discord。How: 子任务完成即由 Supervisor 直发附件，
+        随后的回调只携带 attachments_outbound_sent 标记；用子任务 id 在 task.input
+        上打标防重发（本仓库没有 find_outbound_delivery）。Purpose: 生成的图片恰好
+        发出一次，不依赖调用方模型是否记得转发。
+        """
+        if not session_id or not attachments:
+            return False
+        if session_id not in self.sessions:
+            return False
+        if bool(task.input.get("_dispatch_attachments_sent")):
+            return True
+        node_id = str(task.node_id or task.tool_name or "").strip()
+        payload: dict[str, Any] = {
+            "text": "",
+            "attachments": list(attachments),
+            "message_type": "dispatch_attachment",
+            "action_type": "dispatch_attachment",
+            "child_task_id": task.task_id,
+            "child_node_id": node_id,
+        }
+        child_session_id = str(task.input.get("child_session_id") or "").strip()
+        if child_session_id:
+            payload["child_session_id"] = child_session_id
+        if node_id:
+            payload["node_id"] = node_id
+        if conversation_key:
+            # 适配器重启后 SDK 仍可凭 payload 里的 conversation_key 投递。
+            payload["conversation_key"] = conversation_key
+        evt = self.eventlog.append(
+            session_id=session_id,
+            component="supervisor",
+            type_="outbound_message",
+            payload=payload,
+        )
+        task.input["_dispatch_attachments_sent"] = True
+        try:
+            self._apply_outbound_message(
+                seq=int(evt.get("seq", 0) or 0),
+                session_id=session_id,
+                payload=payload,
+            )
+        except Exception as exc:
+            log.warning("dispatch attachment outbound apply failed: %s", exc)
+        return True
+
+    # ------------------------------------------------------------------ #
     #  异步 dispatch 结果注入
     # ------------------------------------------------------------------ #
 
@@ -1337,6 +1398,18 @@ class TaskRouterMixin:
         # 或内部注入都应通过 fork 分支并发处理。做法：移除 running/suspended 入口任务的
         # 自动 preempt 分支，直接创建 inbound。目的：同一 session 下多个入口分支可并行运行。
 
+        conv_key = session_info.conversation_key
+        channel = session_info.channel
+        # 子任务附件先直发用户，再决定回调走 preempt 还是 inbound；两条路都不再带附件。
+        attachments_outbound_sent = self._emit_dispatch_attachment_outbound_locked(
+            session_id=route_session_id,
+            conversation_key=conv_key,
+            task=task,
+            attachments=result_atts,
+        ) if result_atts else False
+        if attachments_outbound_sent:
+            result_atts = None
+
         # [AutoC 2026-07-05] 无 branch 模式下优先 preempt running task，避免并发写同一 ConversationStore
         # [2026-09-13] preempt 改为追加语义：多个回调并发到达不再互相覆盖。
         branchless_task = self._is_branchless_running_task_locked(route_session_id)
@@ -1348,8 +1421,6 @@ class TaskRouterMixin:
             return
 
         # ---- branch 模式或无 running task：创建 inbound → 新 branch task ----
-        conv_key = session_info.conversation_key
-        channel = session_info.channel
         msg_id = f"async_dispatch:{task.task_id}"
 
         payload: dict[str, Any] = {
@@ -1363,7 +1434,9 @@ class TaskRouterMixin:
             "child_task_id": task.task_id,
             "child_session_id": child_session_id,
         }
-        if result_atts:
+        if attachments_outbound_sent:
+            payload["attachments_outbound_sent"] = True
+        elif result_atts:
             payload["attachments"] = result_atts
         carry_platform_auth(payload, task)
 
@@ -1447,6 +1520,18 @@ class TaskRouterMixin:
             else None
         )
 
+        conv_key = session_info.conversation_key
+        channel = session_info.channel
+        # 子任务附件先直发用户；必须排在承接查找之前，preempt 路径同样不再带附件。
+        attachments_outbound_sent = self._emit_dispatch_attachment_outbound_locked(
+            session_id=target_session_id,
+            conversation_key=conv_key,
+            task=task,
+            attachments=result_atts,
+        ) if result_atts else False
+        if attachments_outbound_sent:
+            result_atts = None
+
         # [2026-09-13] 三级承接查找：优先 preempt "认识"派发记录的活跃 task
         # （origin task 本身，或带承接标记的 fork task），都不在时才 fork 新
         # inbound 并打标记。preempt 注入为追加语义，多条回调不互相覆盖。
@@ -1454,7 +1539,10 @@ class TaskRouterMixin:
         if carrier is not None:
             self._append_preempt_to_task_locked(
                 carrier,
-                self._format_dispatch_preempt_text(task, fallback_result),
+                self._format_dispatch_preempt_text(
+                    task, fallback_result,
+                    attachments_outbound_sent=attachments_outbound_sent,
+                ),
                 result_atts,
                 source="dispatch_origin_result",
                 child_task=task,
@@ -1462,8 +1550,6 @@ class TaskRouterMixin:
             return
 
         # ---- branch 模式或无 running task：构造 inbound payload 并注入目标 session ----
-        conv_key = session_info.conversation_key
-        channel = session_info.channel
         msg_id = f"dispatch_origin:{task.task_id}"
 
         payload: dict[str, Any] = {
@@ -1481,7 +1567,9 @@ class TaskRouterMixin:
         # 身份，后续同源回调据此找到它并 preempt 注入，不再各自 fork。
         if origin_task_id:
             payload["_dispatch_owner_root_task_id"] = origin_task_id
-        if result_atts:
+        if attachments_outbound_sent:
+            payload["attachments_outbound_sent"] = True
+        elif result_atts:
             payload["attachments"] = result_atts
         carry_platform_auth(payload, task)
 
@@ -1534,7 +1622,10 @@ class TaskRouterMixin:
             return best
         return self._is_branchless_running_task_locked(target_session_id)
 
-    def _format_dispatch_preempt_text(self, task: Task, fallback_result: dict[str, Any]) -> str:
+    def _format_dispatch_preempt_text(
+        self, task: Task, fallback_result: dict[str, Any], *,
+        attachments_outbound_sent: bool = False,
+    ) -> str:
         """构造 preempt 注入用的子任务回调文本（机器标签包裹）。
 
         [2026-09-13] Why: 回调以 user 角色进入对话，裸自然语言无法与用户发言
@@ -1551,6 +1642,9 @@ class TaskRouterMixin:
         if task.task_id:
             meta["task_id"] = task.task_id
         meta["status"] = str((task.result or {}).get("action") or "").strip() or "finish"
+        if attachments_outbound_sent:
+            # 附件已由 Supervisor 直发，告知调用方模型不要再转发一次。
+            meta["attachments_delivered"] = True
         instr = str(task.input.get("instruction") or "").strip()
         if instr:
             if len(instr) > 120:
@@ -1623,10 +1717,16 @@ class TaskRouterMixin:
             return None
         return task
 
-    def inject_async_result(self, session_id: str, text: str, attachments: list | None = None, source_task_id: str = "") -> dict[str, Any]:
+    def inject_async_result(
+        self, session_id: str, text: str, attachments: list | None = None, source_task_id: str = "",
+        *, node_id: str = "", tool_name: str = "", success: bool | None = None,
+    ) -> dict[str, Any]:
         """注入异步工具结果到 session。
 
-        优先复用 dispatch 的三级承接查找（原任务、同源承接分支、无分支入口），
+        成功且带附件的异步工具（如 nai_generate）走直发快通道：附件作为 outbound_message
+        直接发给用户，不再经过调用方模型。仅引擎显式上报 success=True 时启用；失败结果和
+        无成功信息的旧式调用必须把文本送回模型，不走快通道。
+        其余情况优先复用 dispatch 的三级承接查找（原任务、同源承接分支、无分支入口），
         找到后追加 preempt；否则创建带源任务归属的 inbound，供后续结果复用。
         """
         with self._lock:
@@ -1635,6 +1735,39 @@ class TaskRouterMixin:
                 return {"ok": False, "error": "session not found"}
 
             result_atts = list(attachments or [])
+
+            if result_atts and success is True:
+                payload: dict[str, Any] = {
+                    "text": "",
+                    "attachments": [{"path": p} for p in result_atts],
+                    "message_type": "async_tool_attachment",
+                    "action_type": "async_tool_attachment",
+                }
+                _node_id = str(node_id or "").strip()
+                if _node_id:
+                    payload["node_id"] = _node_id
+                if source_task_id:
+                    payload["task_id"] = source_task_id
+                _tool = str(tool_name or "").strip()
+                if _tool:
+                    payload["tool_name"] = _tool
+                if session_info.conversation_key:
+                    payload["conversation_key"] = session_info.conversation_key
+                evt = self.eventlog.append(
+                    session_id=session_id,
+                    component="supervisor",
+                    type_="outbound_message",
+                    payload=payload,
+                )
+                try:
+                    self._apply_outbound_message(
+                        seq=int(evt.get("seq", 0) or 0),
+                        session_id=session_id,
+                        payload=payload,
+                    )
+                except Exception as exc:
+                    log.warning("async tool attachment outbound apply failed: %s", exc)
+                return {"ok": True, "strategy": "outbound_attachment"}
 
             # ---- 策略 1 & 2：三级承接查找（优先原 task 本身 running/pending，其次同源已唤醒的承接 branch task，最后无 branch 模式入口 task） ----
             target_task: Task | None = self._find_dispatch_callback_carrier_locked(source_task_id, session_id)

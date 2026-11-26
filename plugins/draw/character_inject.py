@@ -19,6 +19,7 @@ import yaml
 
 from engine.hooks.types import HookResult
 
+from . import characters as character_rules
 from .paths import drawtools_file
 
 logger = logging.getLogger(__name__)
@@ -40,10 +41,8 @@ def load_characters(workspace_root: Path) -> list[dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("draw.character_inject: 读取角色库失败: %s", exc)
         return []
-    chars = data.get("characters") if isinstance(data, dict) else []
-    if not isinstance(chars, list):
-        return []
-    return [c for c in chars if isinstance(c, dict)]
+    # 只留参与出图的：角色和所在分组都启用，停用的服装 / 动态标签条目去掉。
+    return character_rules.active_characters(data)
 
 
 def _norm(text: Any) -> str:

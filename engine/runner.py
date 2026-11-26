@@ -27,7 +27,7 @@ from clonoth_runtime import (
     SYSTEM_NODE_MODEL_SLOTS,
 )
 from providers import registry as provider_registry
-from toolbox.context import ToolContext, platform_user_id_from_task_context
+from toolbox.context import ToolContext, platform_is_admin_from_task_context, platform_user_id_from_task_context
 from toolbox.registry import ToolRegistry
 
 from .inference import run_ai_node
@@ -1016,6 +1016,12 @@ def _build_task_context(input_data: dict[str, Any]) -> dict[str, Any]:
         ctx["_output_chain"] = True
     if input_data.get("caller_task_id"):
         ctx["caller_task_id"] = input_data["caller_task_id"]
+    # 子任务附件已由 Supervisor 直发（dispatch_attachment）时，让 reply/finish 能识别并拒绝重发。
+    _inbound_mtype = str(input_data.get("inbound_message_type") or "").strip()
+    if _inbound_mtype:
+        ctx.setdefault("inbound_message_type", _inbound_mtype)
+    if bool(input_data.get("inbound_attachments_outbound_sent")):
+        ctx["inbound_attachments_outbound_sent"] = True
     return ctx
 
 
@@ -1580,6 +1586,7 @@ async def _run_tool_task(
         parent_session_id=parent_session_id,
         conversation_key=str(_task_ctx.get("conversation_key", "")).strip(),
         platform_user_id=platform_user_id_from_task_context(_task_ctx),
+        platform_is_admin=platform_is_admin_from_task_context(_task_ctx),
         approval_poll_interval_sec=0.5,
         # [AutoC 2026-05-31] Why: direct standalone tool tasks can still trigger
         # policy approvals. How: use the task id as the best available tool_call_id

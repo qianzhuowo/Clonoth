@@ -289,7 +289,7 @@ def _section_ctx(root: Path, node_id: str):
 
 
 def test_novelai_prompts_order_and_template_fallback(tmp_path):
-    for name in ("top-system", "tag-guide", "output-format"):
+    for name in ("top-system", "tag-guide", "scene-rules"):
         _write_drawtools(tmp_path, f"prompts/novelai/{name}.example.md", f"EXAMPLE-{name}")
     _write_drawtools(tmp_path, "prompts/novelai/tag-guide.md", "PRIVATE-tag-guide")
 
@@ -297,8 +297,8 @@ def test_novelai_prompts_order_and_template_fallback(tmp_path):
     content = msg["content"]
     assert msg["role"] == "system" and content.startswith("## 绘图提示词模板")
     assert "PRIVATE-tag-guide" in content and "EXAMPLE-tag-guide" not in content
-    assert content.index("### Top System") < content.index("### TAG Guide") < content.index("### Output Format")
-    assert "EXAMPLE-top-system" in content and "EXAMPLE-output-format" in content
+    assert content.index("### Top System") < content.index("### TAG Guide") < content.index("### Scene Rules")
+    assert "EXAMPLE-top-system" in content and "EXAMPLE-scene-rules" in content
 
 
 def test_novelai_prompts_only_for_planner(tmp_path):
@@ -310,7 +310,7 @@ def test_repo_ships_novelai_example_templates():
     """仓库自带三份模板，私有文件缺失时 draw.novelai_planner 仍有完整提示词。"""
     msg = render_novelai_prompts(_section_ctx(REPO_ROOT, "draw.novelai_planner"))
     assert msg is not None
-    for title in ("### Top System", "### TAG Guide", "### Output Format"):
+    for title in ("### Top System", "### TAG Guide", "### Scene Rules"):
         assert title in msg["content"]
 
 

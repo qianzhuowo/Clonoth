@@ -221,12 +221,17 @@ if __name__ == "__main__":
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    filename = str(args.get("filename") or "").strip()
-    if not filename:
+    import re as _re
+
+    # 净化文件名：只取 basename，去掉路径分隔符与非法字符，防止模型传入 ../ 逃出输出目录。
+    filename = Path(str(args.get("filename") or "").strip().replace("\\", "/")).name
+    filename = _re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._")
+    if not filename or filename.lower() in {".png", "png"}:
         digest = hashlib.md5(f"{prompt}:{seed}".encode("utf-8")).hexdigest()[:10]
         filename = f"nai_{digest}_{uuid.uuid4().hex[:6]}.png"
     if not filename.lower().endswith(".png"):
         filename += ".png"
+    filename = filename[-120:]
 
     tmp_zip = tmp_dir / f"nai_{seed}_{uuid.uuid4().hex}.zip"
     tmp_payload = tmp_dir / f"nai_{seed}_{uuid.uuid4().hex}.json"
@@ -277,6 +282,16 @@ if __name__ == "__main__":
             return False
         return "concurrent generation is locked" in (body or "").lower()
 
+    # 允许用环境变量替换 curl 命令（单个可执行文件路径，或 JSON 数组形式的命令前缀），
+    # 离线测试据此注入假 curl；Windows 下 PATH 里的 curl.cmd 不会被 subprocess 选中。
+    _curl_override = os.environ.get("NOVELAI_CURL_BIN", "").strip()
+    if _curl_override.startswith("["):
+        curl_cmd = [str(x) for x in json.loads(_curl_override)]
+    elif _curl_override:
+        curl_cmd = [_curl_override]
+    else:
+        curl_cmd = ["curl"]
+
     def should_retry(code: str, stderr: str) -> bool:
         if code in {"429", "500", "502", "503", "504"}:
             return True
@@ -317,20 +332,31 @@ if __name__ == "__main__":
                     tmp_zip.unlink(missing_ok=True)
                 except Exception:
                     pass
-                result = subprocess.run(
-                    [
-                        "curl", "-s", "-m", str(timeout_sec),
-                        api_url,
-                        "-H", f"Authorization: Bearer {api_key}",
-                        "-H", "Content-Type: application/json",
-                        "-d", f"@{tmp_payload}",
-                        "-o", str(tmp_zip),
-                        "-w", "%{http_code}",
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout_sec + 10,
-                )
+                try:
+                    result = subprocess.run(
+                        [
+                            *curl_cmd, "-s", "-m", str(timeout_sec),
+                            api_url,
+                            "-H", f"Authorization: Bearer {api_key}",
+                            "-H", "Content-Type: application/json",
+                            "-d", f"@{tmp_payload}",
+                            "-o", str(tmp_zip),
+                            "-w", "%{http_code}",
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=timeout_sec + 10,
+                    )
+                except subprocess.TimeoutExpired:
+                    # 原实现让 TimeoutExpired 直接抛出，stdout 没有 JSON，引擎只能报“工具输出不是 JSON”。
+                    last_error = f"NovelAI API request timed out after {timeout_sec}s"
+                    if attempt >= retry_max_attempts:
+                        fail(last_error)
+                    attempt += 1
+                    time.sleep(retry_wait_sec)
+                    continue
+                except FileNotFoundError:
+                    fail("curl executable not found; NovelAI generation requires curl on PATH")
                 http_code = (result.stdout or "").strip()
                 # 兼容中转/反代返回 201 Created 的情况：
                 # 只要是 2xx 就视为成功，响应体（zip/PNG）后续统一解析。
@@ -356,9 +382,20 @@ if __name__ == "__main__":
             if request_delay_sec > 0:
                 time.sleep(request_delay_sec)
 
-        with zipfile.ZipFile(tmp_zip, "r") as zf:
-            zf.extractall(extract_dir)
-        images = [p for p in extract_dir.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}]
+        if not tmp_zip.exists() or tmp_zip.stat().st_size == 0:
+            fail("NovelAI API returned an empty response body")
+        if zipfile.is_zipfile(tmp_zip):
+            with zipfile.ZipFile(tmp_zip, "r") as zf:
+                zf.extractall(extract_dir)
+            images = [p for p in extract_dir.iterdir() if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}]
+        elif tmp_zip.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n":
+            # 部分中转直接返回裸 PNG 而非 zip。
+            raw_png = extract_dir / "image_0.png"
+            shutil.copyfile(tmp_zip, raw_png)
+            images = [raw_png]
+        else:
+            # 2xx 但响应体既不是 zip 也不是 PNG（多为中转返回的 JSON/HTML 错误页），不能再抛 BadZipFile。
+            fail(f"NovelAI API returned an unexpected body: {read_error_body() or 'not a zip/png'}")
         if not images:
             fail("No image found in NovelAI response zip")
         dst = out_dir / filename

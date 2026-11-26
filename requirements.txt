@@ -3,6 +3,7 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
 python-multipart>=0.0.9
 httpx>=0.27.0
+msgpack>=1.0.0             # NovelAI V5 image stream (plugins/draw/backends/novelai.py)
 pydantic>=2.6.0
 python-dotenv>=1.0.0
 PyYAML>=6.0.1

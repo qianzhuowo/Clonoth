@@ -74,6 +74,8 @@ pnpm-debug.log*
 .codex/
 secret_skills/
 docs/migration/
+# Local-only development docs (roadmap, designs, pre-push checklist and its helper scripts)
+docs/dev/
 .idea/
 .vscode/
 .vs/
@@ -102,8 +104,17 @@ test-results/
 test-reports/
 test-output/
 playwright-report/
+# Local check/scan outputs (scripts write reports here; never commit them)
+/outputs/
+/reports/
+/check-reports/
 nosetests.xml
 .cache/
+# pytest/coverage scratch output (pytest --basetemp, lcov exports)
+/.pytest-tmp/
+pytest-of-*/
+*.lcov
+lcov.info
 
 # Local runtime databases outside /data
 *.sqlite3

@@ -27,8 +27,8 @@ def _clean(monkeypatch):
 
 
 def test_known_sticker_is_named():
-    state.remember_sent_faces(101, ["旋覆打招呼"])
-    assert history.label_bot_faces("[图片]", "101") == "[表情包: 旋覆打招呼]"
+    state.remember_sent_faces(101, ["小助手打招呼"])
+    assert history.label_bot_faces("[图片]", "101") == "[表情包: 小助手打招呼]"
 
 
 def test_multiple_and_extra_placeholders():
@@ -50,14 +50,14 @@ def test_registry_bounded_and_ignores_empty(monkeypatch):
     assert len(state._sent_message_faces) == 2
 
 
-@pytest.mark.parametrize("marker", ["[表情:旋覆打招呼]", "[表情： 旋覆打招呼]", "[QQ_EMOJI:旋覆打招呼]", "[emoji:旋覆打招呼]"])
+@pytest.mark.parametrize("marker", ["[表情:小助手打招呼]", "[表情： 小助手打招呼]", "[QQ_EMOJI:小助手打招呼]", "[emoji:小助手打招呼]"])
 def test_bot_reply_history_shows_sticker_record(monkeypatch, marker):
     from collections import defaultdict, deque
     monkeypatch.setattr(state, "_group_history", defaultdict(lambda: deque(maxlen=20)))
     monkeypatch.setattr(state, "_group_content_records", defaultdict(lambda: deque(maxlen=20)))
     history._record_bot_reply(8888889, f"来啦~ {marker}")
     line = state._group_history[8888889][-1]
-    assert line.endswith("Bot: 来啦~ [表情包: 旋覆打招呼]")
+    assert line.endswith("Bot: 来啦~ [表情包: 小助手打招呼]")
     # The history form is a record, not a send instruction.
     from adapters.onebot.emoji_handler import _QQ_EMOJI_RE
     assert not _QQ_EMOJI_RE.search(line)

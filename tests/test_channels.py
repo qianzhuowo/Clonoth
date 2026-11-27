@@ -15,7 +15,7 @@ _CFG = {
         {"id": "vision", "type": "gemini", "base_url": "http://gw/v1beta", "api_key": "kv", "model": "see"},
         {"id": "compact", "type": "openai", "base_url": "http://gw/v1", "api_key": "kc", "model": "flash", "enabled": False},
         {"id": "image", "type": "gemini", "base_url": "http://gw/v1beta", "api_key": "ki", "model": "img", "enabled": False},
-        {"id": "fb", "type": "openai", "base_url": "http://gw/v1", "api_key": "k2", "model": "rp/g4", "reasoning_effort": "low"},
+        {"id": "fb", "type": "openai", "base_url": "http://gw/v1", "api_key": "k2", "model": "relay-b/g4", "reasoning_effort": "low"},
         {"id": "fb-off", "type": "openai", "base_url": "http://gw/v1", "api_key": "k3", "model": "x", "enabled": False},
         {"id": "draw", "type": "openai", "base_url": "http://gw/v1", "api_key": "kd", "model": "d"},
     ],
@@ -44,7 +44,7 @@ def test_roles_switches_nodes_and_fallbacks():
     assert (chn.node_channel(_CFG, "draw.image_gen").id, chn.node_channel(_CFG, "draw.image_gen").model) == ("draw", "draw-m")
     assert chn.node_channel(_CFG, "qq.orchestrator").id == "main"
     chain = chn.fallback_channels(_CFG)
-    assert [(c.id, c.model) for c in chain] == [("fb", "rp/g4")]
+    assert [(c.id, c.model) for c in chain] == [("fb", "relay-b/g4")]
     assert chain[0].options == {"reasoning_effort": "low", "max_tokens": 9}
     assert [chn.role_of(_CFG, c) for c in ("main", "image", "fb", "draw")] == ["main", "image", "fallback", "other"]
     assert chn.references(_CFG, "draw") == ["节点模型 draw.image_gen"]
@@ -83,12 +83,12 @@ def _legacy_workspace(root: Path) -> dict:
         "gemini-aistudio": {"base_url": "http://gw/v1beta", "api_key": "sk-main", "model": "g4", "thought_summary": True},
         "openai": {"base_url": "${OPENAI_BASE_URL}", "api_key": "${OPENAI_API_KEY}", "model": ""},
         "deepseek": {"base_url": "https://api.deepseek.com", "api_key": "", "model": "deepseek-chat"},
-        "fallbacks": [{"provider": "openai", "model": "rp/g4"}, {"provider": "openai", "model": "LL/g4"}],
+        "fallbacks": [{"provider": "openai", "model": "relay-b/g4"}, {"provider": "openai", "model": "relay-a/g4"}],
         "system_models": {
             "compact": {"model": "deepseek-flash"},
             "summary": {"model": "deepseek-flash", "base_url": "${OPENAI_BASE_URL}", "api_key": "${OPENAI_API_KEY}"},
             "image_gpt": {"model": "gpt-image-2", "base_url": "http://img/v1", "api_key": "sk-img"},
-            "vision": {"model": "LL/g4"},
+            "vision": {"model": "relay-a/g4"},
         },
         "mimo_audio": {"tts_voice": "v"},
     }
@@ -105,14 +105,14 @@ def test_migrate_gives_every_role_its_own_channel(tmp_path):
     assert "deepseek" not in by_id  # never-filled block is dropped
     # roles that pointed at a shared scheme got their own copy with their model
     assert (by_id["compact"]["base_url"], by_id["compact"]["model"]) == ("http://gw/v1beta", "deepseek-flash")
-    assert (by_id["vision"]["base_url"], by_id["vision"]["model"]) == ("http://gw/v1beta", "LL/g4")
+    assert (by_id["vision"]["base_url"], by_id["vision"]["model"]) == ("http://gw/v1beta", "relay-a/g4")
     assert (by_id["summary"]["base_url"], by_id["summary"]["model"]) == ("${OPENAI_BASE_URL}", "deepseek-flash")
     assert (by_id["image_gpt"]["base_url"], by_id["image_gpt"]["model"]) == ("http://img/v1", "gpt-image-2")
     # each fallback is its own channel; the first one takes over the scheme that only served it
     first, second = (by_id[e["channel"]] for e in data["fallbacks"])
     assert data["fallbacks"] == [{"channel": first["id"]}, {"channel": second["id"]}]
-    assert (first["base_url"], first["model"]) == ("${OPENAI_BASE_URL}", "rp/g4")
-    assert (second["base_url"], second["model"], second["name"]) == ("${OPENAI_BASE_URL}", "LL/g4", "备用链路 2")
+    assert (first["base_url"], first["model"]) == ("${OPENAI_BASE_URL}", "relay-b/g4")
+    assert (second["base_url"], second["model"], second["name"]) == ("${OPENAI_BASE_URL}", "relay-a/g4", "备用链路 2")
     # both draw nodes point at one 「绘图分析」 channel; node files lose their model lines
     draw_refs = {data["node_models"][n]["channel"] for n in ("draw.image_gen", "draw.novelai_planner")}
     assert len(draw_refs) == 1 and by_id[draw_refs.pop()]["name"] == "绘图分析"
@@ -126,7 +126,7 @@ def test_migrate_gives_every_role_its_own_channel(tmp_path):
     # resolving through the migrated config gives the same endpoints as before
     assert chn.slot_channel(data, "summary", root=tmp_path).api_key == "sk-oa"
     assert chn.node_channel(data, "draw.novelai_planner", root=tmp_path).api_key == "sk-draw"
-    assert [c.model for c in chn.fallback_channels(data, root=tmp_path)] == ["rp/g4", "LL/g4"]
+    assert [c.model for c in chn.fallback_channels(data, root=tmp_path)] == ["relay-b/g4", "relay-a/g4"]
     again, changed = chn.migrate(data, root=tmp_path)
     assert not changed and again == data
 
@@ -136,20 +136,20 @@ def test_migrate_active_channel_layout(tmp_path):
     data, changed = chn.migrate({
         "active_channel": "gemini",
         "channels": [{"id": "gemini", "name": "主渠道", "type": "gemini", "base_url": "u1", "api_key": "k1", "model": "S/g"},
-                     {"id": "fallback-1", "name": "备用", "type": "openai", "base_url": "u2", "api_key": "k2", "model": "LL/g"},
+                     {"id": "fallback-1", "name": "备用", "type": "openai", "base_url": "u2", "api_key": "k2", "model": "relay-a/g"},
                      {"id": "draw", "name": "绘图分析", "type": "openai", "base_url": "u2", "api_key": "k3", "model": "d"}],
         "system_models": {"summary": {"channel": "fallback-1", "model": "flash"}, "image": {"channel": "fallback-1"}},
-        "fallbacks": [{"channel": "fallback-1", "model": "rp/g"}, {"channel": "gemini", "model": "LL/g"}],
+        "fallbacks": [{"channel": "fallback-1", "model": "relay-b/g"}, {"channel": "gemini", "model": "relay-a/g"}],
         "node_models": {"draw.image_gen": {"channel": "draw"}, "x.node": {"channel": "gemini"}},
     }, root=tmp_path)
     by_id = {c["id"]: c for c in data["channels"]}
     assert changed and "gemini" not in by_id and by_id["main"]["model"] == "S/g"
     assert data["node_models"]["x.node"] == {"channel": "main"}
     assert (by_id["summary"]["base_url"], by_id["summary"]["model"]) == ("u2", "flash")
-    assert by_id["image"]["model"] == "LL/g"
+    assert by_id["image"]["model"] == "relay-a/g"
     assert data["fallbacks"] == [{"channel": "fallback-1"}, {"channel": "fallback-2"}]
-    assert by_id["fallback-1"]["model"] == "rp/g"
-    assert (by_id["fallback-2"]["base_url"], by_id["fallback-2"]["model"]) == ("u1", "LL/g")
+    assert by_id["fallback-1"]["model"] == "relay-b/g"
+    assert (by_id["fallback-2"]["base_url"], by_id["fallback-2"]["model"]) == ("u1", "relay-a/g")
 
 
 def test_migrate_empty_config_has_no_default_channel():
@@ -159,8 +159,8 @@ def test_migrate_empty_config_has_no_default_channel():
 
 def test_model_list_keeps_every_model():
     import clonoth_model_list
-    assert clonoth_model_list.filter_models(["LL/gpt-image-2.6-sunburst", "tts-1", "tts-1", "g4"]) == [
-        "LL/gpt-image-2.6-sunburst", "tts-1", "g4"]
+    assert clonoth_model_list.filter_models(["relay-a/gpt-image-2.6-sunburst", "tts-1", "tts-1", "g4"]) == [
+        "relay-a/gpt-image-2.6-sunburst", "tts-1", "g4"]
 
 
 def _assistant(channel: str | None, model: str | None) -> dict:

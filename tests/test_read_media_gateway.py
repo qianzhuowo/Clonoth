@@ -77,11 +77,11 @@ def test_explicit_model_arg_wins(captured):
 def test_vision_channel_is_used(captured, monkeypatch):
     root, seen = captured
     monkeypatch.setenv("SLOT_KEY", "slot-key")
-    _config(root, "gemini", "https://gw.example", vision={"model": "LL/gemini-4-argon"})
+    _config(root, "gemini", "https://gw.example", vision={"model": "relay-a/gemini-x"})
     out = read_media_mod.read_media({"path": "pic.png"}, root)
-    assert out["data"]["model"] == "LL/gemini-4-argon"
+    assert out["data"]["model"] == "relay-a/gemini-x"
     assert "/v1beta/v1beta/" not in seen["url"]
-    assert "/models/LL/gemini-4-argon:generateContent" in seen["url"] and "key=slot-key" in seen["url"]
+    assert "/models/relay-a/gemini-x:generateContent" in seen["url"] and "key=slot-key" in seen["url"]
 
 
 def test_openai_channel_reads_images_via_chat_completions(captured, monkeypatch):

@@ -4,7 +4,7 @@ from engine.builtin.fallback_provider import _is_retryable
 
 def test_channel_specific_rejections_fall_back():
     for code in (401, 402, 404, 429, 500, 503):
-        assert _is_retryable(code, "All S/gemini-4-argon error: Not Found")
+        assert _is_retryable(code, "All relay-c/gemini-x error: Not Found")
     assert _is_retryable(None)
 
 

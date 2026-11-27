@@ -44,7 +44,7 @@ def test_unlisted_models_can_see(tmp_path):
     assert vision.model_has_vision(tmp_path, "anything") is True
     _write_caps(tmp_path, "model_capabilities:\n  deepseek-flash: {vision: false}\n")
     assert vision.model_has_vision(tmp_path, "deepseek-flash") is False
-    assert vision.model_has_vision(tmp_path, "LL/gemini-4-argon") is True
+    assert vision.model_has_vision(tmp_path, "relay-a/gemini-x") is True
 
 
 def test_images_allowed_rules(tmp_path):

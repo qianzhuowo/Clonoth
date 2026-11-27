@@ -3,7 +3,7 @@
 Some OpenAI-compatible gateways in front of Gemini return the model's thought text
 inside ``content`` instead of a reasoning field. Observed shapes:
 
-    "ির" + "thinking\\n<thought...></body><reply>"     (current LL/gemini-4-argon)
+    "ির" + "thinking\\n<thought...></body><reply>"     (seen on a relay-served Gemini model)
     "<thinking>\\n<thought...></thinking><reply>"       (older history)
 
 Detection only looks at the first line: optional non-ASCII garbage or ``<`` followed

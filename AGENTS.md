@@ -28,7 +28,7 @@ cp policy.example.yaml data/policy.yaml
 python main.py
 ```
 
-Production deployments use PM2. The main process is `clonoth_runtime.py` (spawns Supervisor which spawns Engine).
+Production deployments use systemd (unit templates in `deploy/systemd/`, replace `@INSTALL_DIR@`). `clonoth.service` runs `main.py`, which spawns Supervisor (which spawns Engine) and restarts Supervisor when it exits with code 75; `clonoth-onebot.service` runs the QQ adapter after `/v1/health` is up; `clonoth-data-cleanup.timer` runs data cleanup. PM2 is not used.
 
 ## Testing
 
@@ -83,8 +83,8 @@ Inbound message → Supervisor creates Task → Engine executes Node → Tool ca
 
 | Path | Purpose |
 |---|---|
-| `main.py` | Entry point |
-| `clonoth_runtime.py` | Runtime bootstrap (Supervisor → Engine) |
+| `main.py` | Entry point (launcher; restarts Supervisor on exit code 75) |
+| `clonoth_runtime.py` | Runtime config loading (`config/runtime.yaml`) |
 | `supervisor/task_router.py` | Core task routing, completion handling, turn summary triggering |
 | `supervisor/task_store.py` | Task persistence, session management, inbound dispatch |
 | `supervisor/api.py` | HTTP API endpoints (admin, inbound, tasks) |
@@ -95,7 +95,8 @@ Inbound message → Supervisor creates Task → Engine executes Node → Tool ca
 | `engine/turn_summary.py` | Turn-level summarization |
 | `engine/conversation_store.py` | Conversation JSONL read/write |
 | `engine/hooks/registry.py` | Hook registration and dispatch |
-| `providers/llm_call.py` | Unified LLM call with retry/fallback |
+| `engine/inference/llm_call.py` | Unified LLM call with retry (fallback via `engine/builtin/fallback_provider.py`) |
+| `clonoth_channels.py` | Channel scheme: channels, role slots, node models, fallbacks |
 | `config/nodes/*.yaml` | Node definitions (model, tools, personality) |
 | `data/config.yaml` | Runtime configuration |
 | `data/policy.yaml` | Approval and security policies |
@@ -117,13 +118,13 @@ Examples:
 
 ## Code Sync Flow (Production)
 
-All changes MUST be made in the source repo (`clonoth_original/`) first:
+All changes MUST be made in the development repo first; production instances only receive committed code:
 
-1. Edit files in source repo (`clonoth_original/`)
-2. `py_compile` check
-3. `git add -A && git commit -m 'type(scope): ...'`
-4. Copy to production instances
-5. Restart affected services
+1. Edit files in the development repo
+2. `py_compile` check and the relevant `pytest` run
+3. `git add -A && git commit -m 'type(scope): ...'`, then push
+4. On the server: `git pull` in the install dir (the server has no node toolchain; build the web frontend on a build machine and copy `adapters/web/frontend/dist/`, see `adapters/web/README.md`)
+5. Restart affected services (`systemctl restart clonoth` / `clonoth-onebot`)
 
 **Never edit production directories directly.**
 

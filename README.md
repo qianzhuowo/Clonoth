@@ -152,7 +152,7 @@ CLONOTH_PORT=8765
 
 启动后访问 `http://localhost:8765/web/` 进入 Web 界面。
 
-生产环境建议使用 systemd、PM2 等进程管理器。如果使用 PM2，可参考根目录中的 `ecosystem.config.js`。
+生产环境使用 systemd，单元模板见 `deploy/systemd/`（替换 `@INSTALL_DIR@` 后安装）。
 
 ### 6. 一步部署（快捷命令）
 

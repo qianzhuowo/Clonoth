@@ -129,11 +129,11 @@ server {
 
 ### 构建产物同步
 
-在多实例部署中，应在 `clonoth_original` 中执行 `npm run build`，然后将整个 `dist/` 目录（包括 `index.html`）复制到各生产实例。不要在生产实例中单独构建，因为每次 Vite 构建会生成不同的文件名哈希，导致 `index.html` 引用的文件名与实际文件不匹配。
+在多实例部署中，应在构建机（开发仓库）中执行 `npm run build`，然后将整个 `dist/` 目录（包括 `index.html`）复制到各生产实例。不要在生产实例中单独构建：一是每次 Vite 构建会生成不同的文件名哈希，导致 `index.html` 引用的文件名与实际文件不匹配；二是低配服务器上构建前端内存压力大。
 
 ```bash
 # 正确做法
-cd /path/to/clonoth_original/adapters/web/frontend
+cd /path/to/clonoth-dev/adapters/web/frontend
 npm ci
 npm run build
 rm -rf /path/to/production/adapters/web/frontend/dist

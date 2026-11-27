@@ -48,8 +48,8 @@ interface RoleInfo {
 const ROLES: Record<string, RoleInfo> = {
   main: { title: '主模型', description: '对话默认使用；节点没有单独指定渠道时都用它。' },
   vision: {
-    title: '识图模型', toggle: 'follow', defaultType: 'gemini',
-    description: 'read_media 识图工具，以及不能看图的模型收到图片时的自动转写。需要 Gemini 格式。关闭“单独设置”则用主模型。',
+    title: '识图模型', toggle: 'follow',
+    description: 'read_media 识图工具，以及不能看图的模型收到图片时的自动转写。Gemini 格式可识别图片和视频，OpenAI 格式只识别图片。关闭“单独设置”则用主模型。',
   },
   compact: { title: '上下文压缩模型', toggle: 'follow', description: '会话超过压缩阈值时把旧消息压成摘要。关闭“单独设置”则用主模型。' },
   summary: { title: '轮次摘要模型', toggle: 'follow', description: '每轮任务结束后生成简短执行摘要。关闭“单独设置”则用主模型。' },

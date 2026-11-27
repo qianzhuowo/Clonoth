@@ -35,7 +35,7 @@ from ..planner.frame import (
 from ..planner.tool import create_submit_scene_plan_tool
 from ..presets import effective_max_characters
 from . import llm
-from .config import PlannerConfig, load_planner_config
+from .config import PlannerConfig, iter_presets, load_planner_config
 from .protocol import create_tool_protocol
 from .runtime import PlannerRequest, PlannerResult, PlannerRuntime
 
@@ -310,8 +310,9 @@ class DrawAgentEntry:
             "rules": build_rules_section(cfg.texts.get("rules", "")),
             "limits": build_limits_line(limits["max_images"], limits["max_characters_per_image"], limits["max_plan_images"]),
         }
+        presets = iter_presets(cfg.settings)
         submit_tool = create_submit_scene_plan_tool(
-            profile=cfg.profile, descriptions=planner.get("field_descriptions") or None, **limits,
+            profile=cfg.profile, descriptions=planner.get("field_descriptions") or None, presets=presets, **limits,
         )
         custom_specs = self._custom_tool_specs(ctx.node)
         tools = [submit_tool, *(registry_tool_to_openai(s) for s in custom_specs)]
@@ -322,7 +323,8 @@ class DrawAgentEntry:
             messages.append({"role": "user", "content": retry_correction})
 
         def validate(calls: list[dict[str, Any]]) -> dict[str, Any]:
-            return parse_submitted_scene_plan(calls, present_characters=present, center_mode=cfg.profile.center_mode, **limits)
+            return parse_submitted_scene_plan(calls, present_characters=present, center_mode=cfg.profile.center_mode,
+                                              presets=presets, **limits)
 
         runtime = PlannerRuntime(
             provider=provider, protocol=protocol, rctx=rctx, node_id=node_id,

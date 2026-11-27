@@ -448,8 +448,12 @@ def parse_submitted_scene_plan(tool_calls: Sequence[Mapping[str, Any]] | None, *
                                present_characters: Sequence[Mapping[str, Any]] | None = None,
                                max_images: Any = 0, max_plan_images: Any = 0,
                                max_characters_per_image: Any = 0, center_mode: str = "grid",
-                               allow_repair: bool = True, context: str = "") -> dict[str, Any]:
-    """tool_calls: [{name, arguments}]；返回 {tasks, argumentRepair?}。"""
+                               allow_repair: bool = True, context: str = "",
+                               presets: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """tool_calls: [{name, arguments}]；返回 {tasks, preset?, argumentRepair?}。
+
+    preset 填了就按 presets 的 id / 名字 / 别名找（不分大小写），找到后每个任务带上预设 id；找不到要求模型改正。
+    """
     calls = list(tool_calls or [])
     if not calls:
         ctx = f"（{context}）" if context else ""
@@ -489,6 +493,27 @@ def parse_submitted_scene_plan(tool_calls: Sequence[Mapping[str, Any]] | None, *
         present_characters=present_characters,
     )
     result: dict[str, Any] = {"tasks": tasks}
+    preset_id = _match_preset(parameters.get("preset"), presets or ())
+    if preset_id:
+        result["preset"] = preset_id
+        for task in tasks:
+            task["preset"] = preset_id
     if parsed.get("argumentRepair"):
         result["argumentRepair"] = parsed["argumentRepair"]
     return result
+
+
+def _match_preset(value: Any, presets: Sequence[Mapping[str, Any]]) -> str:
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return ""
+    if not isinstance(value, str):
+        fail_schema("parameters.preset", "必须是字符串（预设名字），或者不填", value)
+    key = value.strip().lower()
+    for p in presets:
+        names = {str(p.get("id") or ""), str(p.get("name") or ""), *(str(a) for a in p.get("aliases") or [])}
+        if key in {n.strip().lower() for n in names if n.strip()}:
+            return str(p.get("id"))
+    choices = [str(p.get("name") or p.get("id")) for p in presets]
+    fail_schema("parameters.preset", "不是可选的画师串预设；用户说的不在列表里时不要填 preset，把画师 tag 写进 scene",
+                value, choices)
+    return ""

@@ -6,7 +6,7 @@ interact 语法、uc 范围、post_prompt）来自 profile。本项目去掉了 
 from __future__ import annotations
 
 import copy
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from .contract import SCENE_TITLE_MAX_LENGTH, SUBMIT_SCENE_PLAN_TOOL_NAME
 from .profile import PlannerProfile, normalize_profile
@@ -56,6 +56,22 @@ ORIENTATION_DESCRIPTION = (
 SCENE_DESCRIPTION = "画面整体：人数与关系、构图与视角、背景、光影、氛围，逗号分隔的英文 tag。角色个体的外貌与动作不写在这里。拼在正向提示词最前。"
 
 POST_PROMPT_DESCRIPTION = "本字段留空不写"
+
+PRESET_DESCRIPTION = (
+    "画师串预设，可选，大多数时候不填。"
+    "用户说“用 xx 预设”“xx 画师串”“xx 画风”，并且 xx 是下面列出的某一项（名字或别名）时，填它的名字；"
+    "系统会把这个预设的画师串原样拼进提示词，scene 里不要再写这些画师 tag。"
+    "用户直接写出画师 tag，或说的不在列表里时不填，把画师 tag 当普通 tag 写进 scene。"
+)
+
+
+def preset_choices_text(presets: Sequence[Mapping[str, Any]]) -> str:
+    """可选画师串预设：每项“名字（别名：a、b）”，分号隔开。"""
+    items = []
+    for p in presets:
+        aliases = [str(a) for a in p.get("aliases") or [] if str(a).strip()]
+        items.append(f"{p.get('name') or p.get('id')}" + (f"（别名：{'、'.join(aliases)}）" if aliases else ""))
+    return "；".join(items)
 
 NAME_DESCRIPTION = "角色名。已录入角色用【已录入角色】中的名称，原文用别名也归一到该名称。未知角色用原文名字，无名时用简短称呼。"
 FORM_DESCRIPTION = "多形态角色必填：本图出现的形态名，取自该角色的“形态”列表；单形态角色省略。"
@@ -185,8 +201,12 @@ def list_field_descriptions(tool: Mapping[str, Any]) -> list[dict[str, str]]:
 def create_submit_scene_plan_tool(*, max_images: Any = 0, max_plan_images: Any = 0,
                                   max_characters_per_image: Any = 0,
                                   profile: PlannerProfile | Mapping[str, Any] | None = None,
-                                  descriptions: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    """OpenAI function-calling 形状：{type:'function', function:{name, description, parameters}}。"""
+                                  descriptions: Mapping[str, Any] | None = None,
+                                  presets: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+    """OpenAI function-calling 形状：{type:'function', function:{name, description, parameters}}。
+
+    presets：可选的画师串预设；有两套以上时多一个顶层可选字段 preset（填名字）。
+    """
     exact = _normalize_limit(max_images)
     plan_cap = _normalize_limit(max_plan_images)
     char_cap = _normalize_limit(max_characters_per_image)
@@ -238,6 +258,9 @@ def create_submit_scene_plan_tool(*, max_images: Any = 0, max_plan_images: Any =
             },
         },
     }
+    if presets and len(presets) > 1:
+        tool["function"]["parameters"]["properties"]["preset"] = _string_schema(
+            f"{PRESET_DESCRIPTION}可选：{preset_choices_text(presets)}")
     apply_field_description_overrides(tool, descriptions)
     return tool
 

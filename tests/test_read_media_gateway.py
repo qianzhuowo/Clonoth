@@ -84,8 +84,34 @@ def test_vision_channel_is_used(captured, monkeypatch):
     assert "/models/LL/gemini-4-argon:generateContent" in seen["url"] and "key=slot-key" in seen["url"]
 
 
-def test_non_gemini_channel_is_rejected(captured):
+def test_openai_channel_reads_images_via_chat_completions(captured, monkeypatch):
+    root, seen = captured
+    _config(root, "openai", "https://x.test/v1")
+    payload = {"choices": [{"message": {"content": "a red square"}}], "usage": {"total_tokens": 7}}
+
+    class _Ctx(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake(request, timeout=None):
+        seen["url"], seen["auth"] = request.full_url, request.get_header("Authorization")
+        seen["body"] = json.loads(request.data.decode("utf-8"))
+        return _Ctx(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(read_media_mod.urllib_request, "urlopen", fake)
+    out = read_media_mod.read_media({"path": "pic.png"}, root)
+    assert out["data"]["description"] == "a red square" and out["data"]["tokens_used"] == 7
+    assert seen["url"] == "https://x.test/v1/chat/completions" and seen["auth"] == "Bearer test-key"
+    content = seen["body"]["messages"][0]["content"]
+    assert content[0]["image_url"]["url"].startswith("data:image/png;base64,") and content[-1]["type"] == "text"
+
+
+def test_openai_channel_rejects_video(captured):
     root, _ = captured
     _config(root, "openai", "https://x.test/v1")
+    (root / "clip.mp4").write_bytes(b"0" * 16)
     with pytest.raises(ValueError, match="Gemini"):
-        read_media_mod.read_media({"path": "pic.png"}, root)
+        read_media_mod.read_media({"path": "clip.mp4"}, root)

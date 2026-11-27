@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Unified media understanding tool (images + videos) using Gemini native multimodal API."""
+"""Media understanding tool. Gemini-format vision channel: images + videos; OpenAI format: images only."""
 
 SPEC = {
     "pure": True,
@@ -8,7 +8,7 @@ SPEC = {
     "async_mode": False,
     "description": (
         "[For non-multimodal models or video analysis; do NOT use on images if you can see images natively.] "
-        "Analyze one or more local image or video files using the configured Gemini-native vision model. "
+        "Analyze one or more local image or video files using the configured vision model (videos need a Gemini-format vision channel). "
         "Returns a comprehensive description covering OCR text, layout, visual style, objects, people, actions, "
         "and (for videos) scene timeline, motion, dialogue, and audio. "
         "Videos >60s automatically upgrade to background async execution and deliver results via preempt."
@@ -37,7 +37,7 @@ SPEC = {
             },
             "model": {
                 "type": "string",
-                "description": "Optional Gemini multimodal model to use. Default: the configured vision model",
+                "description": "Optional multimodal model to use. Default: the configured vision model",
             },
         },
         "required": [],
@@ -130,19 +130,14 @@ def read_media(args: dict, root: Path) -> dict:
         raise ValueError("Provide path, image_path, video_path, or paths")
 
     ch = _vision_channel(root)
-    if not ch.type.startswith("gemini"):
-        raise ValueError(f"识图需要 Gemini 类型的渠道方案，当前是「{ch.name}」({ch.type})")
-    api_key = ch.api_key
-    base_url = re.sub(r"/v1(beta)?$", "", (ch.base_url or "https://generativelanguage.googleapis.com").rstrip("/"))
-    if not api_key:
-        raise ValueError(f"渠道方案「{ch.name}」没有 API Key")
+    if not ch.api_key:
+        raise ValueError(f"渠道「{ch.name}」没有 API Key")
     model = str(args.get("model") or ch.model).strip()
     if not model:
-        raise ValueError(f"渠道方案「{ch.name}」没有模型")
+        raise ValueError(f"渠道「{ch.name}」没有模型")
 
     with ThreadPoolExecutor(max_workers=min(len(paths), 8)) as pool:
         prepared = list(pool.map(lambda path: _prepare_media(path, root), paths))
-    parts = [part for part, _ in prepared]
     video_only = all(is_video for _, is_video in prepared)
     instruction = (
         "Analyze this video in comprehensive detail (scene timeline with timestamps, visible text, "
@@ -153,31 +148,60 @@ def read_media(args: dict, root: Path) -> dict:
     focus = str(args.get("prompt") or args.get("focus") or "").strip()
     if focus:
         instruction += f"\n\nAdditionally, focus specifically on: {focus}"
-    parts.append({"text": instruction})
-    # Explicit role: the official API tolerates its absence, but gateways often require user/model.
-    body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": {"temperature": 0.15, "maxOutputTokens": 8192}}
-    request = urllib_request.Request(
-        f"{base_url}/v1beta/models/{model}:generateContent?key={api_key}",
-        data=json.dumps(body).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST",
-    )
+    if ch.type.startswith("gemini"):
+        description, tokens = _ask_gemini(ch, model, [part for part, _ in prepared], instruction)
+    else:
+        if any(is_video for _, is_video in prepared):
+            raise ValueError(f"识别视频需要 Gemini 格式的识图渠道，当前「{ch.name}」是 {ch.type} 格式（只能识别图片）")
+        description, tokens = _ask_openai(ch, model, [part for part, _ in prepared], instruction)
+    if not description:
+        raise ValueError("Empty response from model")
+    return {"ok": True, "data": {
+        "result": description, "description": description, "model": model, "files": paths, "tokens_used": tokens,
+    }}
+
+
+def _post_json(url: str, body: dict, headers: dict[str, str]) -> dict:
+    request = urllib_request.Request(url, data=json.dumps(body).encode("utf-8"),
+                                     headers={"Content-Type": "application/json", **headers}, method="POST")
     try:
         with urllib_request.urlopen(request, timeout=240) as response:
-            result = json.loads(response.read().decode("utf-8"))
+            return json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         detail = error.read().decode("utf-8", errors="replace")[:2000]
         raise ValueError(f"API HTTP {error.code}: {detail}") from error
+
+
+def _ask_gemini(ch, model: str, parts: list[dict], instruction: str) -> tuple[str, int | None]:
+    base_url = re.sub(r"/v1(beta)?$", "", (ch.base_url or "https://generativelanguage.googleapis.com").rstrip("/"))
+    # Explicit role: the official API tolerates its absence, but gateways often require user/model.
+    body = {"contents": [{"role": "user", "parts": [*parts, {"text": instruction}]}],
+            "generationConfig": {"temperature": 0.15, "maxOutputTokens": 8192}}
+    result = _post_json(f"{base_url}/v1beta/models/{model}:generateContent?key={ch.api_key}", body, {})
     candidates = result.get("candidates") or []
     if not candidates:
         raise ValueError(f"No candidates in response: {json.dumps(result, ensure_ascii=False)[:500]}")
     response_parts = (candidates[0].get("content") or {}).get("parts") or []
-    description = "".join(part.get("text", "") for part in response_parts if not part.get("thought")).strip()
-    if not description:
-        raise ValueError("Empty response from model")
-    return {"ok": True, "data": {
-        "result": description, "description": description, "model": model, "files": paths,
-        "tokens_used": (result.get("usageMetadata") or {}).get("totalTokenCount"),
-    }}
+    text = "".join(part.get("text", "") for part in response_parts if not part.get("thought")).strip()
+    return text, (result.get("usageMetadata") or {}).get("totalTokenCount")
 
+
+def _ask_openai(ch, model: str, parts: list[dict], instruction: str) -> tuple[str, int | None]:
+    """OpenAI Chat Completions: images as data-URL image_url parts."""
+    base_url = (ch.base_url or "https://api.openai.com/v1").rstrip("/")
+    content = [{"type": "image_url", "image_url": {"url": f"data:{p['inlineData']['mimeType']};base64,{p['inlineData']['data']}"}}
+               for p in parts]
+    content.append({"type": "text", "text": instruction})
+    body = {"model": model, "messages": [{"role": "user", "content": content}], "temperature": 0.15, "max_tokens": 8192}
+    result = _post_json(f"{base_url}/chat/completions", body, {"Authorization": f"Bearer {ch.api_key}"})
+    choices = result.get("choices") or []
+    if not choices:
+        raise ValueError(f"No choices in response: {json.dumps(result, ensure_ascii=False)[:500]}")
+    message = choices[0].get("message") or {}
+    text = message.get("content") or ""
+    if isinstance(text, list):
+        text = "".join(str(part.get("text") or "") for part in text if isinstance(part, dict))
+    return str(text).strip(), (result.get("usage") or {}).get("total_tokens")
 
 if __name__ == "__main__":
     try:

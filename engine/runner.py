@@ -343,12 +343,16 @@ def _find_pseudo_history_marker(content: str) -> tuple[str, int]:
     return tail[:separator_pos], pos
 
 
-def _wrap_dispatch_result_text(text: str, *, message_type: str, source: str = "", task_id: str = "") -> str:
+def _wrap_dispatch_result_text(text: str, *, message_type: str, source: str = "", task_id: str = "",
+                               attachments_delivered: bool = False) -> str:
     meta = {}
     if source:
         meta["source"] = source
     if task_id:
         meta["task_id"] = task_id
+    if attachments_delivered:
+        # 与 supervisor preempt 路径同名：附件已发给用户，模型不必再查找或转发。
+        meta["attachments_delivered"] = True
     kind = "async_tool" if message_type == "async_tool_result" else "dispatch"
     return f'<dispatch_result kind="{kind}">\n' + json.dumps(meta, ensure_ascii=False) + "\n" + text + "\n</dispatch_result>"
 
@@ -360,7 +364,8 @@ def _wrap_stored_inbound_callback(content: Any, *, message_type: str, meta: dict
     def wrap(text: str) -> str:
         if text.lstrip().startswith("<dispatch_result"):
             return text
-        return _wrap_dispatch_result_text(text, message_type=message_type, source=meta.get("child_node_id", ""), task_id=meta.get("child_task_id", ""))
+        return _wrap_dispatch_result_text(text, message_type=message_type, source=meta.get("child_node_id", ""), task_id=meta.get("child_task_id", ""),
+                                          attachments_delivered=bool(meta.get("attachments_delivered")))
     if isinstance(content, str):
         return wrap(content)
     if isinstance(content, list) and content and content[0].get("type") == "text":
@@ -1269,6 +1274,7 @@ async def _run_node_task(
         or ""
     ).strip()
     _inbound_caller_node_id = str(input_data.get("inbound_caller_node_id") or "").strip()
+    _inbound_attachments_delivered = bool(input_data.get("inbound_attachments_outbound_sent"))
     # [AutoC 2026-08-31] Why: the summary field has been removed from the kernel
     # contract; a dispatch_result callback is written when it carries raw text or
     # attachments. Purpose: ConversationStore keeps a structured callback row based
@@ -1307,6 +1313,8 @@ async def _run_node_task(
             _inbound_meta["child_node_id"] = _inbound_node_id
         if _inbound_caller_node_id:
             _inbound_meta["caller_node_id"] = _inbound_caller_node_id
+        if _inbound_attachments_delivered:
+            _inbound_meta["attachments_delivered"] = True
         if input_attachments:
             # [AutoC 2026-06-17] Why: ConversationStore content keeps provider-style
             # multimodal blocks, but the web history API needs the original attachment
@@ -1338,7 +1346,8 @@ async def _run_node_task(
         # async_tool_result 与 dispatch_result 共用标签，kind 属性区分来源。
         # Purpose: 两条回调路径（preempt / fork inbound）的投递形态一致，模型可
         # 靠识别这是系统投递的子任务产物而非用户发言。
-        instruction = _wrap_dispatch_result_text(instruction, message_type=_inbound_message_type, source=_inbound_node_id, task_id=_inbound_child_task_id)
+        instruction = _wrap_dispatch_result_text(instruction, message_type=_inbound_message_type, source=_inbound_node_id, task_id=_inbound_child_task_id,
+                                                 attachments_delivered=_inbound_attachments_delivered)
 
     # Phase 0/1: Signal System — 初始化信号总线并安装 JSONL 桥接。
     # get_bus() 返回全局单例，install_event_bridge 是幂等的（多次调用只注册一次）。

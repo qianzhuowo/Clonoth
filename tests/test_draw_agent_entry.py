@@ -135,6 +135,7 @@ def test_entry_plans_generates_sends_and_finishes(tmp_path: Path, monkeypatch):
     assert len(sends) == 2 and all(p["success"] is True and p["node_id"] == "draw.novelai_planner" for p in sends)
     assert all((root / p["attachment_paths"][0]).exists() for p in sends)
     assert "attachments" not in result.action.result
+    assert result.action.result["attachments_delivered"] == 2
     # 消息链：模型看到的 system 含模板文本与角色信息，没有 tools 标记残留
     llm_messages = provider.requests[0]["messages"]
     joined = "\n".join(str(m.get("content") or "") for m in llm_messages)
@@ -344,6 +345,7 @@ def test_entry_falls_back_to_finish_attachments_when_direct_send_fails(tmp_path:
     result = asyncio.run(DrawAgentEntry(registry=None).handle(_ctx(root, FakeProvider([_plan_response()]), FailingHttp())))
     atts = result.action.result["attachments"]
     assert len(atts) == 2 and all(a["type"] == "image" and a["path"].startswith("data/attachments/novelai/") for a in atts)
+    assert "attachments_delivered" not in result.action.result
 
 
 def test_entry_sends_images_to_parent_session_when_dispatched(tmp_path: Path, monkeypatch):

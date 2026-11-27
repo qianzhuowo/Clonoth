@@ -51,10 +51,14 @@ SEND_TOOL_NAME = "nai_generate"
 _sleep = asyncio.sleep
 
 
-def _finish(node_id: str, text: str, attachments: list[dict[str, Any]] | None = None) -> HookResult:
+def _finish(node_id: str, text: str, attachments: list[dict[str, Any]] | None = None,
+            delivered: int = 0) -> HookResult:
     result: dict[str, Any] = {"text": text}
     if attachments:
         result["attachments"] = attachments
+    if delivered:
+        # 已经直发给用户的图片数；Supervisor 据此告诉调用方模型图片已送达。
+        result["attachments_delivered"] = delivered
     return HookResult(action=TaskAction(action=ACTION_FINISH, node_id=node_id, result=result))
 
 
@@ -240,9 +244,9 @@ class DrawAgentEntry:
             self._shadow_write(rctx, node_id, {"role": "assistant", "content": text}, MessageType.ASSISTANT)
             return _finish(node_id, text)
 
-        text, attachments = await self._generate(rctx, cfg, node_id, result)
+        text, attachments, delivered = await self._generate(rctx, cfg, node_id, result)
         self._shadow_write(rctx, node_id, {"role": "assistant", "content": text}, MessageType.ASSISTANT)
-        return _finish(node_id, text, attachments)
+        return _finish(node_id, text, attachments, delivered)
 
     def _planner_provider(self, ctx: Any, cfg: PlannerConfig) -> Any:
         """规划用的模型调用对象：场景 Agent 预设选了渠道方案就按方案创建，否则用节点自身的。"""
@@ -341,12 +345,13 @@ class DrawAgentEntry:
         return await runtime.run(request)
 
     async def _generate(self, rctx: Any, cfg: PlannerConfig, node_id: str,
-                        result: PlannerResult) -> tuple[str, list[dict[str, Any]]]:
+                        result: PlannerResult) -> tuple[str, list[dict[str, Any]], int]:
         planner = cfg.planner
         send_each = bool(planner.get("send_each_image", True))
         ok: list[dict[str, Any]] = []
         failed: list[str] = []
         pending_attachments: list[dict[str, Any]] = []
+        delivered = 0
         api_key, base_url = cfg.api_key, cfg.base_url
         for task in result.tasks:
             check_cancelled = getattr(rctx, "check_cancelled", None)
@@ -378,7 +383,9 @@ class DrawAgentEntry:
                 "content": json.dumps({"ok": True, "path": image["path"], "seed": image["seed"], "title": image["title"],
                                        "prompt": image["prompt"]}, ensure_ascii=False),
             }, MessageType.TOOL_RESULT)
-            if not (send_each and await self._send_image(rctx, node_id, image["path"])):
+            if send_each and await self._send_image(rctx, node_id, image["path"]):
+                delivered += 1
+            else:
                 pending_attachments.append(image["attachment"])
 
         parts: list[str] = []
@@ -405,4 +412,4 @@ class DrawAgentEntry:
                 logger.debug("draw agent: 检查打断失败", exc_info=True)
         if not parts:
             parts.append("没有生成任何图片。")
-        return "，".join(parts) if len(parts) == 1 else "\n".join(parts), pending_attachments
+        return ("，".join(parts) if len(parts) == 1 else "\n".join(parts)), pending_attachments, delivered

@@ -162,6 +162,16 @@ def carry_platform_auth(payload: dict[str, Any], source_task: Task | None) -> No
         payload["platform_auth"] = dict(auth)
 
 
+def _child_delivered_attachments(result: Any) -> bool:
+    """子节点 finish 是否声明已自行把附件直发给用户（result.attachments_delivered）。"""
+    if not isinstance(result, dict):
+        return False
+    try:
+        return int(result.get("attachments_delivered") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 class TaskRouterMixin:
     """提供 _route_completed_task_locked 及其子路由方法。
 
@@ -1409,6 +1419,8 @@ class TaskRouterMixin:
         ) if result_atts else False
         if attachments_outbound_sent:
             result_atts = None
+        # 子节点自己已直发的附件（如 NovelAI 逐张直发）同样算已送达，调用方模型不必再找、再发。
+        attachments_delivered = attachments_outbound_sent or _child_delivered_attachments(fallback_result)
 
         # [AutoC 2026-07-05] 无 branch 模式下优先 preempt running task，避免并发写同一 ConversationStore
         # [2026-09-13] preempt 改为追加语义：多个回调并发到达不再互相覆盖。
@@ -1434,9 +1446,9 @@ class TaskRouterMixin:
             "child_task_id": task.task_id,
             "child_session_id": child_session_id,
         }
-        if attachments_outbound_sent:
+        if attachments_delivered:
             payload["attachments_outbound_sent"] = True
-        elif result_atts:
+        if result_atts:
             payload["attachments"] = result_atts
         carry_platform_auth(payload, task)
 
@@ -1531,6 +1543,7 @@ class TaskRouterMixin:
         ) if result_atts else False
         if attachments_outbound_sent:
             result_atts = None
+        attachments_delivered = attachments_outbound_sent or _child_delivered_attachments(fallback_result)
 
         # [2026-09-13] 三级承接查找：优先 preempt "认识"派发记录的活跃 task
         # （origin task 本身，或带承接标记的 fork task），都不在时才 fork 新
@@ -1541,7 +1554,7 @@ class TaskRouterMixin:
                 carrier,
                 self._format_dispatch_preempt_text(
                     task, fallback_result,
-                    attachments_outbound_sent=attachments_outbound_sent,
+                    attachments_outbound_sent=attachments_delivered,
                 ),
                 result_atts,
                 source="dispatch_origin_result",
@@ -1567,9 +1580,19 @@ class TaskRouterMixin:
         # 身份，后续同源回调据此找到它并 preempt 注入，不再各自 fork。
         if origin_task_id:
             payload["_dispatch_owner_root_task_id"] = origin_task_id
-        if attachments_outbound_sent:
+        # 回调唤醒的就是派发者节点，不交给会话的默认入口节点。派发者本身是被委派的
+        # 子节点时，唤醒任务沿用它的 dispatch_origin：结果继续交回它的调用方，
+        # 而不是作为一个能直接对用户说话的新入口任务。
+        if caller_node:
+            payload["entry_node_id"] = caller_node
+        origin_task = self.tasks.get(origin_task_id) if origin_task_id else None
+        upstream_origin = origin_task.input.get("_dispatch_origin") if origin_task is not None else None
+        if isinstance(upstream_origin, dict) and upstream_origin:
+            payload["dispatch_origin"] = dict(upstream_origin)
+            payload["entry_node_id"] = origin_task.node_id
+        if attachments_delivered:
             payload["attachments_outbound_sent"] = True
-        elif result_atts:
+        if result_atts:
             payload["attachments"] = result_atts
         carry_platform_auth(payload, task)
 

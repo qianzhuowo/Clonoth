@@ -128,6 +128,77 @@ def test_dispatch_attachment_not_sent_twice_for_same_child(parent) -> None:
     assert len(_events(state, sid, "outbound_message")) == 1
 
 
+def test_child_declared_delivery_marks_callback_without_resending(parent) -> None:
+    """子节点自己逐张直发（NovelAI）：回调不带附件，但两条路径都注明已送达。"""
+    state, sid, caller = parent
+    caller.status = TaskStatus.completed
+    child = _child(state, sid, caller)
+    with state._lock:
+        state._inject_dispatch_result_via_origin_locked(child, {"text": "已生成 4 张图片", "attachments_delivered": 4})
+    assert not _events(state, sid, "outbound_message")
+    ip = _events(state, sid, "inbound_message")[0]["payload"]
+    assert ip["attachments_outbound_sent"] is True and "attachments" not in ip
+
+    running = _create(state, sid, "qq.orchestrator", {"instruction": "画"})
+    running.status = TaskStatus.running
+    child2 = _create(state, sid, CHILD_NODE, {"instruction": "画", "_dispatch_origin": {
+        "parent_session_id": sid, "caller_node_id": "qq.orchestrator", "origin_task_id": running.task_id,
+    }})
+    with state._lock:
+        state._inject_dispatch_result_via_origin_locked(child2, {"text": "已生成 1 张图片", "attachments_delivered": 1})
+    assert '"attachments_delivered": true' in running.preempt_message
+
+
+def test_late_result_to_finished_nested_dispatcher_returns_to_its_caller(parent) -> None:
+    """被委派的中间节点先结束、它的子任务结果迟到：唤醒的是该中间节点本身，
+    并沿用它的 dispatch_origin（结果继续交回上游），而不是用会话默认入口节点直接对用户说话。"""
+    state, sid, caller = parent
+    caller.status = TaskStatus.completed
+    child_sid = state.get_or_create_session(channel="test", conversation_key="agent:bootstrap.executor:test:draw")
+    executor_origin = {
+        "parent_session_id": sid, "caller_node_id": "qq.orchestrator", "origin_task_id": caller.task_id,
+        "parent_conversation_key": "test:draw", "context_mode": "fresh",
+    }
+    executor = _create(state, child_sid, "bootstrap.executor", {"instruction": "列出路径", "_dispatch_origin": executor_origin})
+    executor.status = TaskStatus.completed
+    reviewer = _create(state, child_sid, "bootstrap.cmd_reviewer", {"instruction": "ls", "_dispatch_origin": {
+        "parent_session_id": child_sid, "caller_node_id": "bootstrap.executor", "origin_task_id": executor.task_id,
+    }})
+
+    with state._lock:
+        state._inject_dispatch_result_via_origin_locked(reviewer, {"text": "returncode=0\na.png"})
+
+    woken = [t for t in state.tasks.values() if t.input.get("inbound_message_type") == "dispatch_result"]
+    assert len(woken) == 1
+    assert woken[0].node_id == "bootstrap.executor"
+    assert woken[0].input["_dispatch_origin"]["origin_task_id"] == caller.task_id
+    assert woken[0].input["_dispatch_origin"]["parent_session_id"] == sid
+    assert woken[0].input["_dispatch_owner_root_task_id"] == executor.task_id
+
+
+def test_late_result_to_finished_root_caller_wakes_caller_node(parent) -> None:
+    state, sid, caller = parent
+    caller.status = TaskStatus.completed
+    child = _child(state, sid, caller)
+    with state._lock:
+        state._inject_dispatch_result_via_origin_locked(child, {"text": "done"})
+    woken = [t for t in state.tasks.values() if t.input.get("inbound_message_type") == "dispatch_result"]
+    assert [t.node_id for t in woken] == ["qq.orchestrator"]
+    assert not woken[0].input.get("_dispatch_origin")
+
+
+def test_runner_wrapper_marks_delivered_attachments() -> None:
+    from engine.runner import _wrap_dispatch_result_text, _wrap_stored_inbound_callback
+
+    live = _wrap_dispatch_result_text("已生成", message_type="dispatch_result", source=CHILD_NODE, task_id="t",
+                                      attachments_delivered=True)
+    stored = _wrap_stored_inbound_callback("已生成", message_type="dispatch_result", meta={
+        "child_node_id": CHILD_NODE, "child_task_id": "t", "attachments_delivered": True,
+    })
+    assert '"attachments_delivered": true' in live and live == stored
+    assert "attachments_delivered" not in _wrap_dispatch_result_text("x", message_type="dispatch_result")
+
+
 def test_async_tool_success_with_attachments_goes_straight_out(tmp_path: Path) -> None:
     state = _state(tmp_path)
     sid = state.get_or_create_session(channel="test", conversation_key="test:async")
